@@ -159,6 +159,68 @@ test("matches canonical cwd aliases and lowers confidence when branch is absent"
   );
 });
 
+test("canonicalizes tool event cwd to the same real path as observed cwds", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-event-cwd-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+
+  const projects = join(root, "projects");
+  const repo = join(root, "repo");
+  const repoNested = join(repo, "nested");
+  const alias = join(root, "repo-alias");
+  const aliasNested = join(alias, "nested");
+  await Promise.all([
+    mkdir(projects, { recursive: true }),
+    mkdir(repoNested, { recursive: true }),
+  ]);
+  await symlink(repo, alias, "dir");
+  const assistantEntry = JSON.stringify({
+    parentUuid: "canonical-event-entry",
+    isSidechain: false,
+    cwd: aliasNested,
+    gitBranch: "feature/parser",
+    sessionId: "canonical-event",
+    type: "assistant",
+    message: {
+      id: "canonical-event-message",
+      role: "assistant",
+      content: [{
+        type: "tool_use",
+        id: "canonical-event-tool",
+        name: "Read",
+        input: { file_path: "src/value.ts" },
+      }],
+    },
+    uuid: "canonical-assistant-entry",
+    timestamp: "2026-07-31T03:00:01.000Z",
+  });
+  await writeFile(
+    join(projects, "canonical-event.jsonl"),
+    `${transcript({
+      sessionId: "canonical-event",
+      cwd: aliasNested,
+      branch: "feature/parser",
+    })}${assistantEntry}\n`,
+  );
+
+  const sessions = await discoverClaudeSessions(projects, {
+    repoRoot: repo,
+    headBranch: "feature/parser",
+    startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+  });
+
+  const session = sessions[0];
+  const canonicalCwd = await realpath(repoNested);
+  assert.deepEqual(session?.observed_cwds, [canonicalCwd]);
+  const toolUse = session?.events.find((event) =>
+    event.kind === "tool_use" &&
+    event.tool_use_id === "canonical-event-tool"
+  );
+  assert.ok(toolUse?.kind === "tool_use");
+  assert.equal(toolUse.cwd, canonicalCwd);
+  assert.equal(toolUse.entry_uuid, "canonical-assistant-entry");
+});
+
 test("recognizes another worktree through the shared git directory", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-worktree-"));
   t.after(async () => rm(root, { recursive: true, force: true }));
@@ -166,20 +228,43 @@ test("recognizes another worktree through the shared git directory", async (t) =
   const projects = join(root, "projects");
   const repo = join(root, "main-repo");
   const worktree = join(root, "worktree");
+  const worktreeNested = join(worktree, "nested");
+  const repoNested = join(repo, "nested");
   const worktreeGitDir = join(repo, ".git", "worktrees", "feature");
   await Promise.all([
     mkdir(projects, { recursive: true }),
     mkdir(worktreeGitDir, { recursive: true }),
-    mkdir(worktree, { recursive: true }),
+    mkdir(worktreeNested, { recursive: true }),
+    mkdir(repoNested, { recursive: true }),
   ]);
   await writeFile(join(worktree, ".git"), `gitdir: ${worktreeGitDir}\n`);
+  const assistantEntry = JSON.stringify({
+    parentUuid: "worktree-session-entry",
+    isSidechain: false,
+    cwd: worktreeNested,
+    gitBranch: "feature/parser",
+    sessionId: "worktree-session",
+    type: "assistant",
+    message: {
+      id: "worktree-message",
+      role: "assistant",
+      content: [{
+        type: "tool_use",
+        id: "worktree-read",
+        name: "Read",
+        input: { file_path: "value.ts" },
+      }],
+    },
+    uuid: "worktree-assistant-entry",
+    timestamp: "2026-07-31T03:00:01.000Z",
+  });
   await writeFile(
     join(projects, "worktree.jsonl"),
-    transcript({
+    `${transcript({
       sessionId: "worktree-session",
-      cwd: worktree,
+      cwd: worktreeNested,
       branch: "feature/parser",
-    }),
+    })}${assistantEntry}\n`,
   );
 
   const sessions = await discoverClaudeSessions(projects, {
@@ -193,6 +278,15 @@ test("recognizes another worktree through the shared git directory", async (t) =
     sessions.map((session) => session.session_id),
     ["worktree-session"],
   );
+  assert.deepEqual(sessions[0]?.observed_cwds, [
+    await realpath(repoNested),
+  ]);
+  const toolUse = sessions[0]?.events.find((event) =>
+    event.kind === "tool_use" && event.tool_use_id === "worktree-read"
+  );
+  assert.ok(toolUse?.kind === "tool_use");
+  assert.equal(toolUse.cwd, await realpath(repoNested));
+  assert.deepEqual(toolUse.paths, ["value.ts"]);
 });
 
 test("keeps copied transcripts separate even when their session ids and message ids match", async (t) => {

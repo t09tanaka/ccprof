@@ -261,18 +261,125 @@ function missingBranchWarning(session: Session): SourceWarning {
 }
 
 async function canonicalizeSession(session: Session): Promise<Session> {
-  const observedCwds = await Promise.all(
-    session.observed_cwds.map((cwd) => canonicalPath(cwd)),
+  const [observedCwds, events, sourcePath] = await Promise.all([
+    Promise.all(
+      session.observed_cwds.map((cwd) => canonicalPath(cwd)),
+    ),
+    Promise.all(
+      session.events.map(async (event) => {
+        if (
+          event.kind !== "tool_use" ||
+          event.cwd === undefined ||
+          event.cwd === ""
+        ) {
+          return event;
+        }
+        return {
+          ...event,
+          cwd: await canonicalPath(event.cwd),
+        };
+      }),
+    ),
+    canonicalPath(session.source_path),
+  ]);
+  const eventCwds = events.flatMap((event) =>
+    event.kind === "tool_use" &&
+      event.cwd !== undefined &&
+      event.cwd !== ""
+      ? [event.cwd]
+      : []
   );
-  const sourcePath = await canonicalPath(session.source_path);
   return {
     ...session,
     source_path: sourcePath,
-    observed_cwds: [...new Set(observedCwds)],
+    observed_cwds: [...new Set([...observedCwds, ...eventCwds])],
+    events,
     warnings: session.warnings.map((warning) => ({
       ...warning,
       source_path: sourcePath,
     })),
+  };
+}
+
+async function rebaseWorktreeCwd(
+  cwd: string,
+  repoRoot: string,
+  repoGitDirectory: string | undefined,
+): Promise<string> {
+  if (isWithin(repoRoot, cwd) || repoGitDirectory === undefined) {
+    return cwd;
+  }
+  const [marker, cwdGitDirectory] = await Promise.all([
+    findGitMarker(cwd),
+    commonGitDirectory(cwd),
+  ]);
+  if (
+    marker === undefined ||
+    cwdGitDirectory === undefined ||
+    cwdGitDirectory !== repoGitDirectory
+  ) {
+    return cwd;
+  }
+  const worktreeRoot = await canonicalPath(dirname(marker));
+  if (!isWithin(worktreeRoot, cwd)) {
+    return cwd;
+  }
+  const relativeCwd = relative(worktreeRoot, cwd);
+  if (
+    isAbsolute(relativeCwd) ||
+    relativeCwd === ".." ||
+    relativeCwd.startsWith(`..${sep}`)
+  ) {
+    return cwd;
+  }
+  const rebased = await canonicalPath(resolve(repoRoot, relativeCwd));
+  return isWithin(repoRoot, rebased) ? rebased : cwd;
+}
+
+async function alignSessionCwdsToRepository(
+  session: Session,
+  repoRoot: string,
+): Promise<Session> {
+  const repoGitDirectory = await commonGitDirectory(repoRoot);
+  const distinctCwds = [...new Set([
+    ...session.observed_cwds,
+    ...session.events.flatMap((event) =>
+      event.kind === "tool_use" &&
+        event.cwd !== undefined &&
+        event.cwd !== ""
+        ? [event.cwd]
+        : []
+    ),
+  ])];
+  const mappedCwds = new Map(
+    await Promise.all(
+      distinctCwds.map(async (cwd) => [
+        cwd,
+        await rebaseWorktreeCwd(cwd, repoRoot, repoGitDirectory),
+      ] as const),
+    ),
+  );
+  const events = session.events.map((event) =>
+    event.kind === "tool_use" &&
+      event.cwd !== undefined &&
+      event.cwd !== ""
+      ? { ...event, cwd: mappedCwds.get(event.cwd) ?? event.cwd }
+      : event
+  );
+  const eventCwds = events.flatMap((event) =>
+    event.kind === "tool_use" &&
+      event.cwd !== undefined &&
+      event.cwd !== ""
+      ? [event.cwd]
+      : []
+  );
+  return {
+    ...session,
+    observed_cwds: [...new Set([
+      ...session.observed_cwds.map((cwd) => mappedCwds.get(cwd) ?? cwd),
+      ...eventCwds,
+    ])],
+    events,
   };
 }
 
@@ -351,6 +458,10 @@ export async function discoverClaudeSessions(
       ) {
         continue;
       }
+      const alignedSession = await alignSessionCwdsToRepository(
+        session,
+        repoRoot,
+      );
 
       const key = `${session.session_id}\u0000${session.source_path}`;
       if (seen.has(key)) {
@@ -358,12 +469,15 @@ export async function discoverClaudeSessions(
       }
       seen.add(key);
       if (hasBranch) {
-        sessions.push(session);
+        sessions.push(alignedSession);
       } else {
         sessions.push({
-          ...session,
-          confidence: lowerConfidence(session.confidence),
-          warnings: [...session.warnings, missingBranchWarning(session)],
+          ...alignedSession,
+          confidence: lowerConfidence(alignedSession.confidence),
+          warnings: [
+            ...alignedSession.warnings,
+            missingBranchWarning(alignedSession),
+          ],
         });
       }
     }
