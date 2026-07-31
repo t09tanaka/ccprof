@@ -12,7 +12,10 @@ import { buildFlakyEditRelevance } from "../src/core/analyze.js";
 import { parseExplicitTestMap } from "../src/analysis/test-map.js";
 import type { AnalysisRecord } from "../src/store/analyses.js";
 import { detectContextBloat } from "../src/rules/context-bloat.js";
-import { detectFlakyTests } from "../src/rules/flaky-test.js";
+import {
+  detectFlakyTests,
+  flakyEditRelevanceKey,
+} from "../src/rules/flaky-test.js";
 import { findingKey } from "../src/rules/shared.js";
 import { detectSerialSlack } from "../src/rules/serial-slack.js";
 
@@ -273,6 +276,149 @@ test("R005 accepts conservative read-only commands but rejects overlap and mutat
       [],
       command,
     );
+  }
+});
+
+test("R005 uses command relevance paths for independent test build and check commands", () => {
+  const findings = detectSerialSlack([
+    matchedAction("test", 0, 100, "contributing_run", {
+      tool_name: "Bash",
+      command: "npm test",
+      paths: [],
+      relevance_paths: ["test/unit.test.ts"],
+    }),
+    matchedAction("build", 110, 310, "contributing_run", {
+      tool_name: "Bash",
+      command: "npm run build",
+      paths: [],
+      relevance_paths: ["src/app.ts"],
+    }),
+    matchedAction("check", 320, 470, "contributing_run", {
+      tool_name: "Bash",
+      command: "cargo check -p helper",
+      paths: [],
+      relevance_paths: ["crates/helper/src/lib.rs"],
+    }),
+  ]);
+
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0]?.recoverable.estimated_ms, 250);
+  assert.deepEqual(findings[0]?.evidence.paths, [
+    "crates/helper/src/lib.rs",
+    "src/app.ts",
+    "test/unit.test.ts",
+  ]);
+});
+
+test("R005 accepts independently mapped custom validation commands", () => {
+  const findings = detectSerialSlack([
+    matchedAction("mapped-a", 0, 100, "contributing_run", {
+      tool_name: "Bash",
+      command: "make test-a",
+      normalized_command: "make test-a",
+      relevance_paths: ["src/a.ts"],
+    }),
+    matchedAction("mapped-b", 110, 230, "redundant_run", {
+      tool_name: "Bash",
+      command: "make test-b",
+      normalized_command: "make test-b",
+      relevance_paths: ["src/b.ts"],
+    }),
+  ]);
+
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0]?.recoverable.estimated_ms, 100);
+  assert.doesNotMatch(
+    findings[0]?.fix_recipe.suggestion ?? "",
+    /read-only/iu,
+  );
+  assert.match(
+    findings[0]?.fix_recipe.suggestion ?? "",
+    /validation/iu,
+  );
+});
+
+test("R005 rejects validation commands without proven disjoint relevance", () => {
+  for (const actions of [
+    [
+      matchedAction("unknown-scope", 0, 100, "contributing_run", {
+        tool_name: "Bash",
+        command: "npm test",
+        relevance_paths: [],
+      }),
+      matchedAction("known-scope", 110, 210, "contributing_run", {
+        tool_name: "Bash",
+        command: "cargo check",
+        relevance_paths: ["src/a.ts"],
+      }),
+    ],
+    [
+      matchedAction("overlap-parent", 0, 100, "contributing_run", {
+        tool_name: "Bash",
+        command: "npm test",
+        relevance_paths: ["src"],
+      }),
+      matchedAction("overlap-child", 110, 210, "contributing_run", {
+        tool_name: "Bash",
+        command: "npm run build",
+        relevance_paths: ["src/a.ts"],
+      }),
+    ],
+    [
+      matchedAction("opaque", 0, 100, "contributing_run", {
+        tool_name: "Bash",
+        command: "npm test && npm run build",
+        relevance_paths: ["test/a.test.ts"],
+      }),
+      matchedAction("check", 110, 210, "contributing_run", {
+        tool_name: "Bash",
+        command: "cargo check",
+        relevance_paths: ["src/b.ts"],
+      }),
+    ],
+    [
+      matchedAction("write", 0, 100, "unexplained", {
+        tool_name: "Bash",
+        command: "node scripts/write-output.js",
+        normalized_command: "node scripts/write-output.js",
+        relevance_paths: ["generated/output.json"],
+      }),
+      matchedAction("test", 110, 210, "contributing_run", {
+        tool_name: "Bash",
+        command: "npm test",
+        relevance_paths: ["test/a.test.ts"],
+      }),
+    ],
+    [
+      matchedAction("unexplained-mapped", 0, 100, "unexplained", {
+        tool_name: "Bash",
+        command: "make test-a",
+        normalized_command: "make test-a",
+        relevance_paths: ["src/a.ts"],
+      }),
+      matchedAction("mapped", 110, 210, "contributing_run", {
+        tool_name: "Bash",
+        command: "make test-b",
+        normalized_command: "make test-b",
+        relevance_paths: ["src/b.ts"],
+      }),
+    ],
+    [
+      matchedAction("opaque-mapped", 0, 100, "contributing_run", {
+        tool_name: "Bash",
+        command: "make test-a && touch generated.txt",
+        normalized_command: "make test-a",
+        relevance_paths: ["src/a.ts"],
+      }),
+      matchedAction("mapped", 110, 210, "contributing_run", {
+        tool_name: "Bash",
+        command: "make test-b",
+        normalized_command: "make test-b",
+        relevance_paths: ["src/b.ts"],
+      }),
+    ],
+  ]) {
+    assert.deepEqual(detectSerialSlack(actions), []);
   }
 });
 
@@ -748,8 +894,14 @@ test("R008 edit relevance wiring is conservative across current test commands", 
     matchedAction("pathless", 80, 90, "contributing_edit"),
   ], testMap);
 
-  assert.equal(relevance.get("related"), "related");
-  assert.equal(relevance.get("unrelated"), "unrelated");
+  assert.equal(
+    relevance.get(flakyEditRelevanceKey("related", "npm test")),
+    "related",
+  );
+  assert.equal(
+    relevance.get(flakyEditRelevanceKey("unrelated", "cargo test")),
+    "unrelated",
+  );
   assert.equal(relevance.has("pathless"), false);
 
   const unknown = buildFlakyEditRelevance([
@@ -781,5 +933,122 @@ test("R008 edit relevance wiring is conservative across current test commands", 
     opaque.has("edit"),
     false,
     "an opaque command keeps edit relevance unknown",
+  );
+});
+
+test("R008 scopes edit relevance to the failing normalized command", () => {
+  const testMap = parseExplicitTestMap({
+    mappings: [
+      {
+        source: ["src/suite-a/**"],
+        tests: ["test/suite-a/**"],
+        commands: ["npm run test:a"],
+      },
+      {
+        source: ["src/suite-b/**"],
+        tests: ["test/suite-b/**"],
+        commands: ["npm run test:b"],
+      },
+    ],
+  });
+  const actions = [
+    matchedAction("failed-a", 0, 40, "contributing_run", {
+      tool_name: "Bash",
+      tool_use_id: "failed-a",
+      command: "npm run test:a",
+      normalized_command: "npm run test:a",
+    }),
+    matchedAction("suite-b-edit", 50, 60, "contributing_edit", {
+      tool_name: "Edit",
+      tool_use_id: "suite-b-edit",
+      paths: ["src/suite-b/value.ts"],
+    }),
+    matchedAction("passed-a", 70, 100, "redundant_run", {
+      tool_name: "Bash",
+      tool_use_id: "passed-a",
+      command: "npm run test:a",
+      normalized_command: "npm run test:a",
+    }),
+    matchedAction("observed-b", 110, 130, "contributing_run", {
+      tool_name: "Bash",
+      tool_use_id: "observed-b",
+      command: "npm run test:b",
+      normalized_command: "npm run test:b",
+    }),
+  ];
+
+  const findings = detectFlakyTests(actions, {
+    toolResults: [
+      toolResult("failed-a", 40, "failure"),
+      toolResult("passed-a", 100, "success"),
+    ],
+    editRelevanceByActionId: buildFlakyEditRelevance(actions, testMap),
+  });
+
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0]?.target, "npm run test:a");
+  assert.equal(findings[0]?.evidence.unrelated_edit_count, 1);
+});
+
+test("R008 keeps command-scoped unknown edit relevance conservative", () => {
+  const testMap = parseExplicitTestMap({
+    mappings: [
+      {
+        source: ["src/suite-b/**"],
+        tests: ["test/suite-b/**"],
+        commands: ["npm run test:b"],
+      },
+      {
+        source: ["src/suite-c/**"],
+        tests: ["test/suite-c/**"],
+        commands: ["npm test -- -t suite-c"],
+      },
+    ],
+  });
+  const actions = [
+    matchedAction("failed-c", 0, 40, "contributing_run", {
+      tool_name: "Bash",
+      tool_use_id: "failed-c",
+      command: "npm test -- -t suite-c",
+      normalized_command: "npm test -- -t suite-c",
+    }),
+    matchedAction("suite-b-edit", 50, 60, "contributing_edit", {
+      tool_name: "Edit",
+      tool_use_id: "suite-b-edit",
+      paths: ["src/suite-b/value.ts"],
+    }),
+    matchedAction("passed-c", 70, 100, "redundant_run", {
+      tool_name: "Bash",
+      tool_use_id: "passed-c",
+      command: "npm test -- -t suite-c",
+      normalized_command: "npm test -- -t suite-c",
+    }),
+    matchedAction("observed-b", 110, 130, "contributing_run", {
+      tool_name: "Bash",
+      tool_use_id: "observed-b",
+      command: "npm run test:b",
+      normalized_command: "npm run test:b",
+    }),
+  ];
+  const relevance = buildFlakyEditRelevance(actions, testMap);
+
+  assert.equal(
+    relevance.has(
+      flakyEditRelevanceKey(
+        "suite-b-edit",
+        "npm test -- -t suite-c",
+      ),
+    ),
+    false,
+  );
+  assert.deepEqual(
+    detectFlakyTests(actions, {
+      toolResults: [
+        toolResult("failed-c", 40, "failure"),
+        toolResult("passed-c", 100, "success"),
+      ],
+      editRelevanceByActionId: relevance,
+    }),
+    [],
   );
 });

@@ -33,6 +33,31 @@ interface HistoricalPrEvidence {
   sessionRefs: Set<string>;
 }
 
+function hasHistoricalDuplicateEvidence(
+  finding: AnalysisRecord["findings"][number],
+  evidence: object,
+): boolean {
+  if (Reflect.has(evidence, "duplicate_count")) {
+    const duplicateCount = Reflect.get(evidence, "duplicate_count");
+    return Number.isSafeInteger(duplicateCount) && duplicateCount > 0;
+  }
+
+  const intervalIds = Reflect.get(evidence, "interval_ids");
+  return finding.recoverable !== null &&
+    typeof finding.recoverable === "object" &&
+    typeof finding.recoverable.min === "number" &&
+    Number.isFinite(finding.recoverable.min) &&
+    finding.recoverable.min > 0 &&
+    Array.isArray(intervalIds) &&
+    intervalIds.length > 0 &&
+    intervalIds.every(
+      (intervalId) =>
+        typeof intervalId === "string" &&
+        intervalId.startsWith("R003:") &&
+        intervalId.length > "R003:".length,
+    );
+}
+
 function normalizedPath(value: unknown): string | null {
   if (typeof value !== "string") return null;
   try {
@@ -118,6 +143,7 @@ function historicalRediscoveryByPath(
       ) {
         continue;
       }
+      if (!hasHistoricalDuplicateEvidence(finding, evidence)) continue;
       const rawPaths = Reflect.get(evidence, "paths");
       const rawSessionRefs = Reflect.get(evidence, "session_refs");
       if (
@@ -231,7 +257,10 @@ export function detectRediscovery(
       const duplicates = current.filter(
         ({ read }) => read.match === "duplicate_read",
       );
-      const claimedActions = current.flatMap(({ read, inference }) =>
+      const evidenceActions = current.flatMap(({ read, inference }) =>
+        inference === undefined ? [read] : [read, inference]
+      );
+      const claimedActions = duplicates.flatMap(({ read, inference }) =>
         inference === undefined ? [read] : [read, inference]
       );
       const recoverable = recoverableClaim(
@@ -239,9 +268,10 @@ export function detectRediscovery(
         target,
         claimedActions,
       );
-      if (recoverable.estimated_ms === 0) return [];
+      const historical = historyByPath.get(target);
+      if (recoverable.estimated_ms === 0 && historical === undefined) return [];
       const toolUseIds = sortedUnique(
-        current.flatMap(({ read }) =>
+        duplicates.flatMap(({ read }) =>
           read.tool_use_id === undefined ? [] : [read.tool_use_id]
         ),
       );
@@ -256,14 +286,15 @@ export function detectRediscovery(
             : 0);
       }, 0);
       const readDurationMs = durationMs(
-        current.map(({ read }) => read.interval),
+        duplicates.map(({ read }) => read.interval),
       );
       const inferenceDurationMs = durationMs(
-        current.flatMap(({ inference }) =>
+        duplicates.flatMap(({ inference }) =>
           inference === undefined ? [] : [inference.interval]
         ),
       );
-      const historical = historyByPath.get(target);
+      const confidenceActions =
+        claimedActions.length === 0 ? evidenceActions : claimedActions;
       return [createFindingCandidate({
         rule_id: "R003",
         title: "Repeated file rediscovery",
@@ -271,7 +302,7 @@ export function detectRediscovery(
         cause: null,
         scope: "claude_md",
         confidence: minimumConfidence(
-          claimedActions.flatMap((action) => [
+          confidenceActions.flatMap((action) => [
             action.confidence,
             action.match_confidence,
           ]),
@@ -279,7 +310,7 @@ export function detectRediscovery(
         target,
         evidence: {
           session_refs: sortedUnique(
-            claimedActions.flatMap((action) => action.session_refs),
+            evidenceActions.flatMap((action) => action.session_refs),
           ),
           interval_ids: recoverable.intervals.map(
             (interval) => interval.interval_id,
@@ -308,7 +339,7 @@ export function detectRediscovery(
           verify: "git diff -- CLAUDE.md",
         },
         caveats: sortedUnique([
-          ...claimedActions.flatMap((action) => action.caveats),
+          ...evidenceActions.flatMap((action) => action.caveats),
           ...(missingTokenEvidence
             ? ["Token-size evidence was unavailable for at least one duplicate read."]
             : []),

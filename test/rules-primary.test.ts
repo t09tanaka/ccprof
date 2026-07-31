@@ -714,8 +714,8 @@ test("R003 connects a current safe read to prior rediscovery by normalized path 
 
   assert.ok(finding !== undefined);
   assert.equal(finding.finding_key, findingKey("R003", "src/a.ts"));
-  assert.equal(finding.recoverable.estimated_ms, 120);
-  assert.deepEqual(finding.evidence.interval_ids, ["R003:current-read"]);
+  assert.equal(finding.recoverable.estimated_ms, 0);
+  assert.deepEqual(finding.evidence.interval_ids, []);
   assert.equal(finding.evidence.duplicate_count, 0);
   assert.equal(finding.evidence.current_read_count, 1);
   assert.deepEqual(finding.evidence.historical_prs, [
@@ -729,6 +729,52 @@ test("R003 connects a current safe read to prior rediscovery by normalized path 
     "old-b#read",
   ]);
   assert.match(finding.caveats.join("\n"), /2 prior PRs/iu);
+});
+
+test("R003 does not reuse a zero-recoverable history trend as duplicate evidence", () => {
+  const firstSafeRead = matchedAction("first-safe", 0, 100, "safe_read", {
+    paths: ["src/a.ts"],
+    target: "src/a.ts",
+    tool_use_id: "first-safe",
+    tool_name: "Read",
+  });
+  const trend = detectRediscovery([firstSafeRead], {
+    history: [
+      historyRecord("actual-duplicate", "main...actual", 1, [
+        storedRediscoveryFinding("src/a.ts", 1, "actual#duplicate"),
+      ]),
+    ],
+  })[0];
+  assert.ok(trend !== undefined);
+  assert.equal(trend.recoverable.estimated_ms, 0);
+  assert.equal(trend.evidence.duplicate_count, 0);
+
+  const {
+    target: _target,
+    recoverable,
+    ...storedTrendMetadata
+  } = trend;
+  const storedTrend: Finding = {
+    ...storedTrendMetadata,
+    recoverable: {
+      min: 0,
+      bound: recoverable.bound,
+    },
+  };
+  const nextSafeRead = matchedAction("next-safe", 200, 300, "safe_read", {
+    paths: ["src/a.ts"],
+    target: "src/a.ts",
+    tool_use_id: "next-safe",
+    tool_name: "Read",
+  });
+
+  const nextFindings = detectRediscovery([nextSafeRead], {
+    history: [
+      historyRecord("trend-only", "main...trend", 2, [storedTrend]),
+    ],
+  });
+
+  assert.deepEqual(nextFindings, []);
 });
 
 test("R003 does not double-claim a within-PR duplicate when history has the same path", () => {
@@ -755,13 +801,66 @@ test("R003 does not double-claim a within-PR duplicate when history has the same
   const finding = detectRediscovery(actions, { history })[0];
 
   assert.ok(finding !== undefined);
-  assert.equal(finding.recoverable.estimated_ms, 150);
-  assert.deepEqual(finding.evidence.interval_ids, [
-    "R003:duplicate",
-    "R003:first",
-  ]);
+  assert.equal(finding.recoverable.estimated_ms, 100);
+  assert.deepEqual(finding.evidence.interval_ids, ["R003:duplicate"]);
   assert.equal(finding.evidence.duplicate_count, 1);
   assert.equal(finding.evidence.current_read_count, 2);
+});
+
+test("R003 history never makes the current safe read or its inference recoverable", () => {
+  const actions = [
+    matchedAction("first", 0, 50, "safe_read", {
+      paths: ["src/a.ts"],
+      target: "src/a.ts",
+      tool_use_id: "first",
+      tool_name: "Read",
+    }),
+    matchedAction("first-inference", 50, 90, "safe_read", {
+      kind: "inference",
+      paths: ["src/a.ts"],
+      target: "src/a.ts",
+      tool_use_id: "first",
+      tool_name: "Read",
+    }),
+    matchedAction("duplicate", 100, 200, "duplicate_read", {
+      paths: ["src/a.ts"],
+      target: "src/a.ts",
+      tool_use_id: "duplicate",
+      tool_name: "Read",
+    }),
+    matchedAction("duplicate-inference", 200, 230, "duplicate_read", {
+      kind: "inference",
+      paths: ["src/a.ts"],
+      target: "src/a.ts",
+      tool_use_id: "duplicate",
+      tool_name: "Read",
+    }),
+  ];
+  const history = [
+    historyRecord("old", "main...old", 1, [
+      storedRediscoveryFinding("src/a.ts", 1, "old#read"),
+    ]),
+  ];
+
+  const finding = detectRediscovery(actions, {
+    history,
+    estimatedTokensByToolUseId: new Map([
+      ["first", 1_000],
+      ["duplicate", 200],
+    ]),
+  })[0];
+
+  assert.ok(finding !== undefined);
+  assert.equal(finding.recoverable.estimated_ms, 130);
+  assert.deepEqual(finding.evidence.interval_ids, [
+    "R003:duplicate",
+    "R003:duplicate-inference",
+  ]);
+  assert.equal(finding.evidence.duration_ms, 130);
+  assert.equal(finding.evidence.read_duration_ms, 100);
+  assert.equal(finding.evidence.post_result_inference_ms, 30);
+  assert.equal(finding.evidence.estimated_tokens, 200);
+  assert.deepEqual(finding.evidence.historical_prs, ["main...old"]);
 });
 
 test("R004 reports all active wait but claims only explicit or tightly phrased approvals", () => {

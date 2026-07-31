@@ -23,6 +23,17 @@ import { isReadOnlyCommand } from "./serial-slack.js";
 
 export type EditRelevance = "related" | "unrelated";
 
+const COMMAND_SCOPED_EDIT_RELEVANCE_PREFIX = "\0";
+
+export function flakyEditRelevanceKey(
+  actionId: string,
+  command: string,
+): string {
+  return `${COMMAND_SCOPED_EDIT_RELEVANCE_PREFIX}${
+    JSON.stringify([actionId, normalizeCommand(command) ?? command])
+  }`;
+}
+
 export interface FlakyTestOptions {
   toolResults: readonly ToolResultEvent[];
   editRelevanceByActionId?: ReadonlyMap<string, EditRelevance>;
@@ -149,6 +160,18 @@ function isEdit(action: MatchedAction): boolean {
   );
 }
 
+function editRelevanceForCommand(
+  relevance: ReadonlyMap<string, EditRelevance> | undefined,
+  edit: MatchedAction,
+  command: string,
+): EditRelevance | undefined {
+  const scoped = relevance?.get(
+    flakyEditRelevanceKey(edit.action_id, command),
+  );
+  if (scoped !== undefined) return scoped;
+  return relevance?.get(edit.action_id);
+}
+
 function hasUnknownMutationRisk(action: MatchedAction): boolean {
   if (
     action.match !== "unexplained" ||
@@ -248,7 +271,12 @@ function episodeFor(
   const edits = intersecting.filter(isEdit);
   if (
     edits.some(
-      (edit) => editRelevance?.get(edit.action_id) !== "unrelated",
+      (edit) =>
+        editRelevanceForCommand(
+          editRelevance,
+          edit,
+          failure.command,
+        ) !== "unrelated",
     )
   ) {
     return null;

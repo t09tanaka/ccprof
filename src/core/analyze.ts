@@ -48,6 +48,7 @@ import { detectChronicCost } from "../rules/chronic-cost.js";
 import { detectContextBloat } from "../rules/context-bloat.js";
 import {
   detectFlakyTests,
+  flakyEditRelevanceKey,
   type EditRelevance,
 } from "../rules/flaky-test.js";
 import { detectHumanWait } from "../rules/human-wait.js";
@@ -307,7 +308,12 @@ function tokenEstimates(
 
 function mappedTestCommands(testMap: TestMap): ReadonlySet<string> {
   return new Set(
-    testMap.mappings.flatMap((mapping) => mapping.commands),
+    testMap.mappings
+      .flatMap((mapping) => mapping.commands)
+      .filter((command) => {
+        const family = classifyCommand(command).family;
+        return family === "test" || family === "other";
+      }),
   );
 }
 
@@ -327,7 +333,7 @@ export function buildFlakyEditRelevance(
         : [];
     }),
   );
-  const relevanceByActionId = new Map<string, EditRelevance>();
+  const relevanceByActionAndCommand = new Map<string, EditRelevance>();
   for (const action of actions) {
     if (
       action.kind !== "tool" ||
@@ -340,16 +346,26 @@ export function buildFlakyEditRelevance(
     ) {
       continue;
     }
-    const decisions = [...commands.values()].map((command) =>
-      evaluateTestRelevance(command, action.paths, testMap).relevant
-    );
-    if (decisions.some((decision) => decision === true)) {
-      relevanceByActionId.set(action.action_id, "related");
-    } else if (decisions.every((decision) => decision === false)) {
-      relevanceByActionId.set(action.action_id, "unrelated");
+    for (const command of commands.values()) {
+      const decision = evaluateTestRelevance(
+        command,
+        action.paths,
+        testMap,
+      ).relevant;
+      if (decision === true) {
+        relevanceByActionAndCommand.set(
+          flakyEditRelevanceKey(action.action_id, command.normalized),
+          "related",
+        );
+      } else if (decision === false) {
+        relevanceByActionAndCommand.set(
+          flakyEditRelevanceKey(action.action_id, command.normalized),
+          "unrelated",
+        );
+      }
     }
   }
-  return relevanceByActionId;
+  return relevanceByActionAndCommand;
 }
 
 function contributingIntervals(

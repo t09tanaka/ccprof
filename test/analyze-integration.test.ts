@@ -14,6 +14,7 @@ import {
   analyze,
   NoAnalyzableTimestampsError,
 } from "../src/core/analyze.js";
+import { parseExplicitTestMap } from "../src/analysis/test-map.js";
 import { runCommand } from "../src/git/client.js";
 import { ClaudeSessionSource } from "../src/sources/claude/discover.js";
 import {
@@ -335,6 +336,131 @@ test("rejects a matched session with only one valid timestamp", async () => {
         storePaths,
       }),
       NoAnalyzableTimestampsError,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("R008 excludes manifest build/check commands but keeps explicit custom tests", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-flaky-command-family-"));
+  try {
+    const repo = await makeRepository(root);
+    await write(
+      join(repo, "package.json"),
+      `${JSON.stringify({
+        private: true,
+        scripts: {
+          test: "node --test",
+          build: "tsc",
+          check: "tsc --noEmit",
+        },
+      }, null, 2)}\n`,
+    );
+    const projects = join(root, "claude-projects");
+    const commands = [
+      "npm run build",
+      "npm run check",
+      "make test",
+      "make test && touch generated.txt",
+    ];
+    const rows: object[] = [{
+      type: "user",
+      sessionId: "command-families",
+      uuid: "request",
+      timestamp: "2026-01-01T00:00:05.000Z",
+      cwd: repo,
+      gitBranch: "feature",
+      message: { content: "Validate the change." },
+    }];
+    let seconds = 10;
+    const timestamp = (): string =>
+      new Date(Date.parse("2026-01-01T00:00:00.000Z") + seconds * 1_000)
+        .toISOString();
+    for (const [index, command] of commands.entries()) {
+      for (const outcome of ["fail", "pass"] as const) {
+        const toolUseId = `${outcome}-${index}`;
+        rows.push({
+          type: "assistant",
+          sessionId: "command-families",
+          uuid: `assistant-${toolUseId}`,
+          timestamp: timestamp(),
+          cwd: repo,
+          gitBranch: "feature",
+          message: {
+            id: `message-${toolUseId}`,
+            content: [{
+              type: "tool_use",
+              id: toolUseId,
+              name: "Bash",
+              input: { command },
+            }],
+          },
+        });
+        seconds += 5;
+        rows.push({
+          type: "user",
+          sessionId: "command-families",
+          uuid: `result-${toolUseId}`,
+          timestamp: timestamp(),
+          cwd: repo,
+          gitBranch: "feature",
+          message: {
+            content: [{
+              type: "tool_result",
+              tool_use_id: toolUseId,
+              content: outcome === "fail" ? "1 failed" : "1 passed",
+              is_error: outcome === "fail",
+            }],
+          },
+        });
+      }
+    }
+    await write(
+      join(projects, "fixture", "command-families.jsonl"),
+      `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`,
+    );
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const explicitTestMap = parseExplicitTestMap({
+      mappings: [{
+        source: ["src/**"],
+        tests: ["test/**"],
+        commands: ["make test"],
+      }],
+    });
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      sessionSource: new ClaudeSessionSource(projects),
+      storePaths,
+      testMap: {
+        ...explicitTestMap,
+        mappings: [
+          ...explicitTestMap.mappings,
+          {
+            confidence: "high",
+            origin: "explicit",
+            caveat: "Unvalidated typed API input used by this regression.",
+            source: ["src/**"],
+            tests: ["test/**"],
+            commands: ["make test && touch generated.txt"],
+          },
+        ],
+      },
+    });
+
+    assert.deepEqual(
+      result.allFindings
+        .filter(({ rule_id }) => rule_id === "R008")
+        .flatMap(({ evidence }) =>
+          typeof evidence.command === "string" ? [evidence.command] : []
+        )
+        .sort(),
+      ["make test"],
     );
   } finally {
     await rm(root, { recursive: true, force: true });

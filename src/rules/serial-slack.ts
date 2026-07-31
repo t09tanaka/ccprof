@@ -67,6 +67,14 @@ function pathsFor(action: MatchedAction): string[] {
   );
 }
 
+function relevancePathsFor(action: MatchedAction): string[] {
+  return sortedUnique(
+    action.relevance_paths
+      .map(normalizedPath)
+      .filter((path) => path !== ""),
+  );
+}
+
 function pathsOverlap(left: string, right: string): boolean {
   return (
     left === right ||
@@ -105,12 +113,31 @@ function eligibleAction(action: MatchedAction): EligibleAction | null {
     return null;
   }
   const paths = pathsFor(action);
-  if (paths.length === 0) return null;
   const nativeRead =
     READ_TOOL_NAMES.has(normalizedToolName(action.tool_name)) &&
     (action.match === "safe_read" || action.match === "duplicate_read");
-  if (!nativeRead && !isReadOnlyCommand(action.command)) return null;
-  return { action, paths };
+  if (nativeRead || isReadOnlyCommand(action.command)) {
+    return paths.length === 0 ? null : { action, paths };
+  }
+  if (action.command === undefined) return null;
+  const descriptor = classifyCommand(action.command);
+  const mappedValidation =
+    descriptor.family === "other" &&
+    (action.match === "contributing_run" ||
+      action.match === "redundant_run") &&
+    action.normalized_command !== undefined &&
+    action.normalized_command !== "" &&
+    action.normalized_command === descriptor.normalized;
+  if (
+    descriptor.opaque ||
+    (descriptor.family === "other" && !mappedValidation)
+  ) {
+    return null;
+  }
+  const relevancePaths = relevancePathsFor(action);
+  return relevancePaths.length === 0
+    ? null
+    : { action, paths: relevancePaths };
 }
 
 function upperClaim(
@@ -240,7 +267,7 @@ export function detectSerialSlack(
         recoverable: claim,
         fix_recipe: {
           suggestion:
-            `Issue the independent read-only calls for ${target} together in one parallel tool batch.`,
+            `Batch the independent read or validation calls for ${target} into one parallel tool invocation.`,
           verify: "ccprof --json",
         },
         caveats: sortedUnique([
