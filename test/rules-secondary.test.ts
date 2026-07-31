@@ -3,10 +3,14 @@ import test from "node:test";
 
 import type {
   CompactionEvent,
+  Finding,
   MatchedAction,
   TimelineAction,
   ToolResultEvent,
 } from "../src/core/model.js";
+import { buildFlakyEditRelevance } from "../src/core/analyze.js";
+import { parseExplicitTestMap } from "../src/analysis/test-map.js";
+import type { AnalysisRecord } from "../src/store/analyses.js";
 import { detectContextBloat } from "../src/rules/context-bloat.js";
 import { detectFlakyTests } from "../src/rules/flaky-test.js";
 import { findingKey } from "../src/rules/shared.js";
@@ -43,6 +47,7 @@ function matchedAction(
     ...timelineAction(actionId, startMs, endMs),
     match,
     match_confidence: "high",
+    relevance_paths: [],
     target: actionId,
     caveats: [],
     ...overrides,
@@ -92,6 +97,61 @@ function compaction(
     ...eventBase(entryUuid, timestampMs, timestampMs),
     kind: "compaction",
     summary: "compacted",
+  };
+}
+
+function historyRecord(
+  analysisId: string,
+  prRef: string,
+  findings: readonly Finding[],
+): AnalysisRecord {
+  return {
+    schema_version: 1,
+    analysis_id: analysisId,
+    created_at_ms: Number(analysisId.replace(/\D/gu, "")) || 1,
+    unit: {
+      repo: "/repo",
+      pr_ref: prRef,
+      sessions: [`session-${analysisId}`],
+    },
+    summary: {
+      measured_min: 10,
+      idle_excluded_min: 0,
+      estimated_floor_min: 9,
+      recoverable_min: 1,
+      unexplained_min: 1,
+      baseline: null,
+    },
+    findings: [...findings],
+    metrics: {},
+    command_costs: [],
+  };
+}
+
+function storedFlakyFinding(
+  command: string,
+  durationMin: number,
+  sessionRef: string,
+): Finding {
+  return {
+    finding_key: findingKey("R008", command),
+    rule_id: "R008",
+    title: "Test failed then passed without a relevant edit",
+    classification: "repo",
+    cause: null,
+    scope: "separate_issue",
+    confidence: "high",
+    evidence: {
+      session_refs: [sessionRef],
+      interval_ids: ["R008:historical"],
+      command,
+    },
+    recoverable: { min: durationMin, bound: "point" },
+    fix_recipe: {
+      suggestion: "Fix or quarantine the flaky behavior.",
+      verify: command,
+    },
+    caveats: [],
   };
 }
 
@@ -351,6 +411,78 @@ test("R008 claims a definite unchanged fail-to-pass investigation as point time"
   assert.equal(finding.fix_recipe.verify, "npm test");
 });
 
+test("R008 connects current flakiness to prior PRs without adding historical time to the claim", () => {
+  const actions = [
+    matchedAction("failed", 0, 100, "contributing_run", {
+      tool_name: "Bash",
+      tool_use_id: "failed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("passed", 200, 260, "redundant_run", {
+      tool_name: "Bash",
+      tool_use_id: "passed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+  ];
+  const history = [
+    historyRecord("history-1", "main...old-a", [
+      storedFlakyFinding("npm   test", 1, "old-a#run-1"),
+    ]),
+    historyRecord("history-2", "main...old-a", [
+      storedFlakyFinding("npm test", 2, "old-a#run-2"),
+    ]),
+    historyRecord("history-3", "main...old-b", [
+      storedFlakyFinding("npm test", 0.5, "old-b#run"),
+    ]),
+    historyRecord("history-4", "main...old-c", [{
+      ...storedFlakyFinding("npm test", 8, "old-c#run"),
+      evidence: {
+        session_refs: [1],
+        interval_ids: [],
+        command: { malformed: true },
+      },
+    } as unknown as Finding]),
+  ];
+
+  const finding = detectFlakyTests(actions, {
+    toolResults: [
+      toolResult("failed", 100, "failure"),
+      toolResult("passed", 260, "success"),
+    ],
+    history,
+  })[0];
+
+  assert.ok(finding !== undefined);
+  assert.equal(finding.recoverable.estimated_ms, 100);
+  assert.deepEqual(finding.evidence.interval_ids, ["R008:failed"]);
+  assert.deepEqual(finding.evidence.historical_prs, [
+    "main...old-a",
+    "main...old-b",
+  ]);
+  assert.equal(finding.evidence.historical_duration_min, 2.5);
+  assert.deepEqual(finding.evidence.historical_session_refs, [
+    "old-a#run-1",
+    "old-a#run-2",
+    "old-b#run",
+  ]);
+  assert.match(finding.caveats.join("\n"), /2 prior PRs.*2.5 minutes/iu);
+});
+
+test("R008 never creates a current finding from history alone", () => {
+  const history = [
+    historyRecord("history-1", "main...old", [
+      storedFlakyFinding("npm test", 3, "old#run"),
+    ]),
+  ];
+
+  assert.deepEqual(
+    detectFlakyTests([], { toolResults: [], history }),
+    [],
+  );
+});
+
 test("R008 lowers confidence for proven unrelated edits and excludes them from ownership", () => {
   const actions = [
     matchedAction("failed", 0, 100, "contributing_run", {
@@ -585,4 +717,69 @@ test("R008 rejects unknown and relevant edits that overlap either causal-window 
       overlap.actionId,
     );
   }
+});
+
+test("R008 edit relevance wiring is conservative across current test commands", () => {
+  const testMap = parseExplicitTestMap({
+    mappings: [{
+      source: ["src/**"],
+      tests: ["test/**"],
+      commands: ["npm test", "cargo test"],
+    }],
+  });
+  const commands = [
+    matchedAction("npm-test", 0, 10, "contributing_run", {
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("cargo-test", 20, 30, "contributing_run", {
+      command: "cargo test",
+      normalized_command: "cargo test",
+    }),
+  ];
+  const relevance = buildFlakyEditRelevance([
+    ...commands,
+    matchedAction("related", 40, 50, "contributing_edit", {
+      paths: ["src/value.ts"],
+    }),
+    matchedAction("unrelated", 60, 70, "rework_edit", {
+      paths: ["docs/readme.md"],
+    }),
+    matchedAction("pathless", 80, 90, "contributing_edit"),
+  ], testMap);
+
+  assert.equal(relevance.get("related"), "related");
+  assert.equal(relevance.get("unrelated"), "unrelated");
+  assert.equal(relevance.has("pathless"), false);
+
+  const unknown = buildFlakyEditRelevance([
+    matchedAction("targeted-test", 0, 10, "contributing_run", {
+      command: "npm test -- -t widget",
+      normalized_command: "npm test -- -t widget",
+    }),
+    matchedAction("edit", 20, 30, "contributing_edit", {
+      paths: ["docs/readme.md"],
+    }),
+  ], testMap);
+  assert.equal(
+    unknown.has("edit"),
+    false,
+    "a non-path target keeps edit relevance unknown instead of allowing R008",
+  );
+
+  const opaque = buildFlakyEditRelevance([
+    ...commands,
+    matchedAction("opaque-test", 35, 38, "unexplained", {
+      command: "npm test && echo done",
+      normalized_command: "npm test && echo done",
+    }),
+    matchedAction("edit", 40, 50, "contributing_edit", {
+      paths: ["docs/readme.md"],
+    }),
+  ], testMap);
+  assert.equal(
+    opaque.has("edit"),
+    false,
+    "an opaque command keeps edit relevance unknown",
+  );
 });

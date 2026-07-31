@@ -1,6 +1,7 @@
 import {
   classifyCommand,
   classifyCommandResult,
+  normalizeCommand,
 } from "../analysis/command.js";
 import type {
   CommandResultClassification,
@@ -10,6 +11,7 @@ import type {
   MatchedAction,
   ToolResultEvent,
 } from "../core/model.js";
+import type { AnalysisRecord } from "../store/analyses.js";
 import {
   createFindingCandidate,
   minimumConfidence,
@@ -25,6 +27,7 @@ export interface FlakyTestOptions {
   toolResults: readonly ToolResultEvent[];
   editRelevanceByActionId?: ReadonlyMap<string, EditRelevance>;
   additionalTestCommands?: ReadonlySet<string>;
+  history?: readonly AnalysisRecord[];
 }
 
 interface RunSignal {
@@ -40,6 +43,17 @@ interface FlakyEpisode {
   passingRun: RunSignal;
   investigation: MatchedAction[];
   unrelatedEdits: MatchedAction[];
+}
+
+interface HistoricalFlakyEvidence {
+  prs: string[];
+  durationMin: number;
+  sessionRefs: string[];
+}
+
+interface HistoricalPrEvidence {
+  durationMin: number;
+  sessionRefs: Set<string>;
 }
 
 function runKey(
@@ -307,11 +321,95 @@ function downgradeForUnrelatedEdits(
   return "medium";
 }
 
+function historicalFlakyByCommand(
+  history: readonly AnalysisRecord[],
+): Map<string, HistoricalFlakyEvidence> {
+  const byCommandAndPr = new Map<
+    string,
+    Map<string, HistoricalPrEvidence>
+  >();
+  for (const record of history) {
+    const rawPrRef = record?.unit?.pr_ref;
+    if (typeof rawPrRef !== "string" || rawPrRef.trim() === "") continue;
+    const prRef = rawPrRef.trim();
+    if (!Array.isArray(record.findings)) continue;
+    for (const finding of record.findings) {
+      if (finding?.rule_id !== "R008") continue;
+      const evidence: unknown = finding.evidence;
+      if (
+        evidence === null ||
+        typeof evidence !== "object" ||
+        Array.isArray(evidence)
+      ) {
+        continue;
+      }
+      const rawCommand = Reflect.get(evidence, "command");
+      const rawSessionRefs = Reflect.get(evidence, "session_refs");
+      if (
+        typeof rawCommand !== "string" ||
+        !Array.isArray(rawSessionRefs) ||
+        rawSessionRefs.length === 0 ||
+        !rawSessionRefs.every(
+          (ref) => typeof ref === "string" && ref !== "",
+        )
+      ) {
+        continue;
+      }
+      const command = normalizeCommand(rawCommand);
+      const durationMin =
+        finding.recoverable !== null &&
+          typeof finding.recoverable === "object" &&
+          typeof finding.recoverable.min === "number" &&
+          Number.isFinite(finding.recoverable.min) &&
+          finding.recoverable.min >= 0
+          ? finding.recoverable.min
+          : null;
+      if (command === null || durationMin === null) continue;
+      let byPr = byCommandAndPr.get(command);
+      if (byPr === undefined) {
+        byPr = new Map();
+        byCommandAndPr.set(command, byPr);
+      }
+      const existing = byPr.get(prRef);
+      if (existing === undefined) {
+        byPr.set(prRef, {
+          durationMin,
+          sessionRefs: new Set(rawSessionRefs as string[]),
+        });
+      } else {
+        existing.durationMin = Math.max(existing.durationMin, durationMin);
+        for (const ref of rawSessionRefs) existing.sessionRefs.add(ref);
+      }
+    }
+  }
+
+  return new Map(
+    [...byCommandAndPr.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([command, byPr]) => {
+        const orderedPrs = [...byPr.entries()].sort(([left], [right]) =>
+          left.localeCompare(right)
+        );
+        return [command, {
+          prs: orderedPrs.map(([prRef]) => prRef),
+          durationMin: orderedPrs.reduce(
+            (total, [, evidence]) => total + evidence.durationMin,
+            0,
+          ),
+          sessionRefs: sortedUnique(
+            orderedPrs.flatMap(([, evidence]) => [...evidence.sessionRefs]),
+          ),
+        }] as const;
+      }),
+  );
+}
+
 export function detectFlakyTests(
   actions: readonly MatchedAction[],
   options: FlakyTestOptions,
 ) {
   const ordered = orderedActions(actions);
+  const historyByCommand = historicalFlakyByCommand(options.history ?? []);
   const groups = new Map<string, RunSignal[]>();
   for (const signal of runSignals(ordered, options)) {
     const key = [
@@ -389,6 +487,7 @@ export function detectFlakyTests(
           action.match_confidence,
         ]),
       ]);
+      const historical = historyByCommand.get(command);
       return createFindingCandidate({
         rule_id: "R008",
         title: "Test failed then passed without a relevant edit",
@@ -428,6 +527,13 @@ export function detectFlakyTests(
             ...failedRuns.map(({ classification }) => classification.source),
             ...passingRuns.map(({ classification }) => classification.source),
           ]),
+          ...(historical === undefined
+            ? {}
+            : {
+              historical_prs: historical.prs,
+              historical_duration_min: historical.durationMin,
+              historical_session_refs: historical.sessionRefs,
+            }),
         },
         recoverable,
         fix_recipe: {
@@ -443,6 +549,11 @@ export function detectFlakyTests(
           ...(recoverable.bound === "upper"
             ? ["The investigation overlapped another agent, so recoverable time is an upper bound."]
             : []),
+          ...(historical === undefined
+            ? []
+            : [
+              `The same normalized command was flaky in ${historical.prs.length} prior PR${historical.prs.length === 1 ? "" : "s"} (${historical.durationMin} minutes of historical investigation); historical time is evidence only and is not included in this PR's recoverable estimate.`,
+            ]),
         ]),
       });
     });

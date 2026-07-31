@@ -164,6 +164,7 @@ export type ActionMatch =
 export interface MatchedAction extends TimelineAction {
   match: ActionMatch;
   match_confidence: Confidence;
+  relevance_paths: string[];
   target: string;
   caveats: string[];
   normalized_command?: string;

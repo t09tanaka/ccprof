@@ -51,16 +51,40 @@ function isReworkEdit(action: MatchedAction): boolean {
 }
 
 function directlyCausedInference(
-  edit: MatchedAction,
+  tool: MatchedAction,
   action: MatchedAction | undefined,
 ): action is MatchedAction {
   return (
     action !== undefined &&
     action.kind === "inference" &&
-    action.match === "rework_edit" &&
-    edit.tool_use_id !== undefined &&
-    action.tool_use_id === edit.tool_use_id &&
-    action.interval.start_ms === edit.interval.end_ms
+    action.match === tool.match &&
+    tool.tool_use_id !== undefined &&
+    action.tool_use_id === tool.tool_use_id &&
+    action.interval.start_ms === tool.interval.end_ms
+  );
+}
+
+function isRelatedRun(
+  action: MatchedAction,
+  block: ReworkBlock,
+): boolean {
+  if (action.kind !== "tool" || action.match !== "contributing_run") {
+    return false;
+  }
+  const reworkPaths = new Set(
+    block.edits.flatMap((edit) => edit.paths),
+  );
+  return action.relevance_paths.some((path) => reworkPaths.has(path));
+}
+
+function isContinuous(
+  block: ReworkBlock,
+  action: MatchedAction,
+): boolean {
+  const previous = block.actions.at(-1);
+  return (
+    previous !== undefined &&
+    action.interval.start_ms <= previous.interval.end_ms
   );
 }
 
@@ -78,28 +102,44 @@ function reworkBlocks(actions: readonly MatchedAction[]): ReworkBlock[] {
     let current: ReworkBlock | undefined;
     for (let index = 0; index < agentActions.length; index += 1) {
       const action = agentActions[index];
-      if (action === undefined || !isReworkEdit(action)) {
-        if (current !== undefined) blocks.push(current);
-        current = undefined;
+      if (action === undefined) {
         continue;
       }
 
-      const previous = current?.actions.at(-1);
-      if (
-        current === undefined ||
-        previous === undefined ||
-        action.interval.start_ms > previous.interval.end_ms
-      ) {
-        if (current !== undefined) blocks.push(current);
-        current = { actions: [], edits: [] };
-      }
-      current.actions.push(action);
-      current.edits.push(action);
+      if (isReworkEdit(action)) {
+        if (current !== undefined && !isContinuous(current, action)) {
+          blocks.push(current);
+          current = undefined;
+        }
+        current ??= { actions: [], edits: [] };
+        current.actions.push(action);
+        current.edits.push(action);
 
-      const next = agentActions[index + 1];
-      if (directlyCausedInference(action, next)) {
-        current.actions.push(next);
-        index += 1;
+        const next = agentActions[index + 1];
+        if (directlyCausedInference(action, next)) {
+          current.actions.push(next);
+          index += 1;
+        }
+        continue;
+      }
+
+      if (
+        current !== undefined &&
+        isContinuous(current, action) &&
+        isRelatedRun(action, current)
+      ) {
+        current.actions.push(action);
+        const next = agentActions[index + 1];
+        if (directlyCausedInference(action, next)) {
+          current.actions.push(next);
+          index += 1;
+        }
+        continue;
+      }
+
+      if (current !== undefined) {
+        blocks.push(current);
+        current = undefined;
       }
     }
     if (current !== undefined) blocks.push(current);

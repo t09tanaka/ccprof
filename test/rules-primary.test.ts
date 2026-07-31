@@ -4,10 +4,12 @@ import test from "node:test";
 
 import type {
   AssistantEvent,
+  Finding,
   GenuineUserEvent,
   MatchedAction,
   TimelineAction,
 } from "../src/core/model.js";
+import type { AnalysisRecord } from "../src/store/analyses.js";
 import type { AttributedTimelineAction } from "../src/analysis/timeline.js";
 import {
   createFindingCandidate,
@@ -53,6 +55,7 @@ function matchedAction(
     ...timelineAction(actionId, startMs, endMs),
     match,
     match_confidence: "high",
+    relevance_paths: [],
     target: actionId,
     caveats: [],
     ...overrides,
@@ -97,6 +100,63 @@ function assistantEvent(
     ...eventBase(entryUuid, timestampMs, 0),
     kind: "assistant",
     text,
+  };
+}
+
+function historyRecord(
+  analysisId: string,
+  prRef: string,
+  createdAtMs: number,
+  findings: readonly Finding[],
+): AnalysisRecord {
+  return {
+    schema_version: 1,
+    analysis_id: analysisId,
+    created_at_ms: createdAtMs,
+    unit: {
+      repo: "/repo",
+      pr_ref: prRef,
+      sessions: [`session-${analysisId}`],
+    },
+    summary: {
+      measured_min: 10,
+      idle_excluded_min: 0,
+      estimated_floor_min: 9,
+      recoverable_min: 1,
+      unexplained_min: 1,
+      baseline: null,
+    },
+    findings: [...findings],
+    metrics: {},
+    command_costs: [],
+  };
+}
+
+function storedRediscoveryFinding(
+  path: string,
+  durationMin: number,
+  sessionRef: string,
+): Finding {
+  return {
+    finding_key: findingKey("R003", path),
+    rule_id: "R003",
+    title: "Repeated file rediscovery",
+    classification: "behavior",
+    cause: null,
+    scope: "claude_md",
+    confidence: "high",
+    evidence: {
+      session_refs: [sessionRef],
+      interval_ids: ["R003:historical"],
+      paths: [path],
+      duration_ms: durationMin * 60_000,
+    },
+    recoverable: { min: durationMin, bound: "point" },
+    fix_recipe: {
+      suggestion: "Record the context.",
+      verify: "git diff -- CLAUDE.md",
+    },
+    caveats: [],
   };
 }
 
@@ -240,6 +300,213 @@ test("R001 requires proven rework and keeps only directly adjacent causal infere
     ),
     [],
   );
+});
+
+test("R001 includes contiguous matcher-proven test and build runs in a rework block", () => {
+  const actions = [
+    matchedAction("01-edit-a", 100, 200, "rework_edit", {
+      paths: ["src/a.ts"],
+      target: "src/a.ts",
+      tool_use_id: "edit-a",
+      tool_name: "Edit",
+    }),
+    matchedAction("02-edit-a-inference", 200, 220, "rework_edit", {
+      kind: "inference",
+      paths: ["src/a.ts"],
+      target: "src/a.ts",
+      tool_use_id: "edit-a",
+      tool_name: "Edit",
+    }),
+    matchedAction("03-test-a", 220, 320, "contributing_run", {
+      paths: [],
+      relevance_paths: ["src/a.ts"],
+      target: "npm test",
+      tool_use_id: "test-a",
+      tool_name: "Bash",
+      command: "npm test",
+      normalized_command: "npm test",
+      caveats: ["Relevance uses an explicit test map."],
+    }),
+    matchedAction("04-test-a-inference", 320, 350, "contributing_run", {
+      kind: "inference",
+      paths: [],
+      relevance_paths: ["src/a.ts"],
+      target: "npm test",
+      tool_use_id: "test-a",
+      tool_name: "Bash",
+      command: "npm test",
+      normalized_command: "npm test",
+      caveats: ["Relevance uses an explicit test map."],
+    }),
+    matchedAction("05-edit-b", 350, 420, "rework_edit", {
+      paths: ["src/b.ts"],
+      target: "src/b.ts",
+      tool_use_id: "edit-b",
+      tool_name: "Edit",
+    }),
+    matchedAction("06-build-b", 420, 520, "contributing_run", {
+      relevance_paths: ["src/b.ts"],
+      target: "npm run build",
+      tool_use_id: "build-b",
+      tool_name: "Bash",
+      command: "npm run build",
+      normalized_command: "npm run build",
+      caveats: ["Relevance uses manifest conventions."],
+    }),
+    matchedAction("07-build-b-inference", 520, 550, "contributing_run", {
+      kind: "inference",
+      relevance_paths: ["src/b.ts"],
+      target: "npm run build",
+      tool_use_id: "build-b",
+      tool_name: "Bash",
+      command: "npm run build",
+      normalized_command: "npm run build",
+      caveats: ["Relevance uses manifest conventions."],
+    }),
+  ];
+
+  const finding = detectRework(actions, {
+    userEvents: [userEvent("Requirements changed: use this instead.", 90)],
+  })[0];
+
+  assert.ok(finding !== undefined);
+  assert.equal(finding.recoverable.estimated_ms, 450);
+  assert.deepEqual(finding.evidence.interval_ids, [
+    "R001:01-edit-a",
+    "R001:02-edit-a-inference",
+    "R001:03-test-a",
+    "R001:04-test-a-inference",
+    "R001:05-edit-b",
+    "R001:06-build-b",
+    "R001:07-build-b-inference",
+  ]);
+  assert.deepEqual(finding.evidence.paths, ["src/a.ts", "src/b.ts"]);
+  assert.equal(finding.evidence.edit_count, 2);
+  assert.ok(
+    (finding.evidence.session_refs as string[]).includes(
+      "s1#03-test-a-start",
+    ),
+  );
+  assert.ok(
+    (finding.evidence.session_refs as string[]).includes(
+      "s1#07-build-b-inference-end",
+    ),
+  );
+  assert.deepEqual(finding.caveats, [
+    "Relevance uses an explicit test map.",
+    "Relevance uses manifest conventions.",
+  ]);
+});
+
+test("R001 does not extend a block with unproven, unrelated, or non-contiguous work", () => {
+  const run = (
+    actionId: string,
+    startMs: number,
+    match: MatchedAction["match"],
+    overrides: Partial<MatchedAction> = {},
+  ) =>
+    matchedAction(actionId, startMs, startMs + 40, match, {
+      paths: [],
+      relevance_paths: ["src/a.ts"],
+      target: "npm test",
+      tool_use_id: actionId,
+      tool_name: "Bash",
+      command: "npm test",
+      normalized_command: "npm test",
+      ...overrides,
+    });
+  const cases = [
+    {
+      name: "a contributing run tied to another path",
+      action: run("unrelated", 200, "contributing_run", {
+        relevance_paths: ["src/other.ts"],
+      }),
+    },
+    {
+      name: "a contributing run without relation evidence",
+      action: run("unproven", 200, "contributing_run", {
+        relevance_paths: [],
+      }),
+    },
+    {
+      name: "an unknown run",
+      action: run("unknown", 200, "unexplained"),
+    },
+    {
+      name: "a redundant run",
+      action: run("redundant", 200, "redundant_run"),
+    },
+    {
+      name: "a safe read",
+      action: matchedAction("read", 200, 240, "safe_read", {
+        paths: ["src/a.ts"],
+        target: "src/a.ts",
+        tool_use_id: "read",
+        tool_name: "Read",
+      }),
+    },
+    {
+      name: "a non-contiguous related run",
+      action: run("late", 201, "contributing_run"),
+    },
+    {
+      name: "a related run in another agent",
+      action: run("other-agent", 200, "contributing_run", {
+        agent_id: "sidechain",
+      }),
+    },
+    {
+      name: "a related run in another session",
+      action: run("other-session", 200, "contributing_run", {
+        session_id: "s2",
+      }),
+    },
+  ] as const;
+
+  for (const { name, action } of cases) {
+    const finding = detectRework(
+      [
+        matchedAction("edit", 100, 200, "rework_edit", {
+          paths: ["src/a.ts"],
+          target: "src/a.ts",
+          tool_use_id: "edit",
+          tool_name: "Edit",
+        }),
+        action,
+        matchedAction(
+          `${action.action_id}-inference`,
+          action.interval.end_ms,
+          action.interval.end_ms + 20,
+          action.match,
+          {
+            kind: "inference",
+            paths: [...action.paths],
+            relevance_paths: [...action.relevance_paths],
+            target: action.target,
+            ...(action.tool_use_id === undefined
+              ? {}
+              : { tool_use_id: action.tool_use_id }),
+            ...(action.tool_name === undefined
+              ? {}
+              : { tool_name: action.tool_name }),
+            ...(action.command === undefined
+              ? {}
+              : { command: action.command }),
+            ...(action.normalized_command === undefined
+              ? {}
+              : { normalized_command: action.normalized_command }),
+            session_id: action.session_id,
+            agent_id: action.agent_id,
+          },
+        ),
+      ],
+      { userEvents: [userEvent("Wrong, redo it.", 90)] },
+    )[0];
+
+    assert.ok(finding !== undefined, name);
+    assert.equal(finding.recoverable.estimated_ms, 100, name);
+    assert.deepEqual(finding.evidence.interval_ids, ["R001:edit"], name);
+  }
 });
 
 test("R001 assigns only deterministic evidence-backed causes", () => {
@@ -410,6 +677,91 @@ test("R003 claims duplicate reads and only their directly caused post-result inf
   assert.equal(finding.recoverable.estimated_ms, 250);
   assert.notEqual(finding.fix_recipe.suggestion, "");
   assert.notEqual(finding.fix_recipe.verify, "");
+});
+
+test("R003 connects a current safe read to prior rediscovery by normalized path without claiming historical time", () => {
+  const currentRead = matchedAction("current-read", 0, 120, "safe_read", {
+    paths: ["src/a.ts"],
+    target: "src/a.ts",
+    tool_use_id: "current-read",
+    tool_name: "Read",
+  });
+  const prior = [
+    historyRecord("old-a-1", "main...old-a", 1, [
+      storedRediscoveryFinding("./src/a.ts", 1, "old-a#read-1"),
+    ]),
+    historyRecord("old-a-2", "main...old-a", 2, [
+      storedRediscoveryFinding("src\\a.ts", 2, "old-a#read-2"),
+    ]),
+    historyRecord("old-b", "main...old-b", 3, [
+      storedRediscoveryFinding("src/a.ts", 0.5, "old-b#read"),
+    ]),
+    historyRecord("other-path", "main...old-c", 4, [
+      storedRediscoveryFinding("src/b.ts", 9, "old-c#read"),
+    ]),
+    historyRecord("malformed", "main...old-d", 5, [{
+      ...storedRediscoveryFinding("src/a.ts", 8, "old-d#read"),
+      evidence: {
+        session_refs: "not-an-array",
+        interval_ids: [],
+        paths: [42],
+        duration_ms: "eight minutes",
+      },
+    } as unknown as Finding]),
+  ];
+
+  const finding = detectRediscovery([currentRead], { history: prior })[0];
+
+  assert.ok(finding !== undefined);
+  assert.equal(finding.finding_key, findingKey("R003", "src/a.ts"));
+  assert.equal(finding.recoverable.estimated_ms, 120);
+  assert.deepEqual(finding.evidence.interval_ids, ["R003:current-read"]);
+  assert.equal(finding.evidence.duplicate_count, 0);
+  assert.equal(finding.evidence.current_read_count, 1);
+  assert.deepEqual(finding.evidence.historical_prs, [
+    "main...old-a",
+    "main...old-b",
+  ]);
+  assert.equal(finding.evidence.historical_duration_min, 2.5);
+  assert.deepEqual(finding.evidence.historical_session_refs, [
+    "old-a#read-1",
+    "old-a#read-2",
+    "old-b#read",
+  ]);
+  assert.match(finding.caveats.join("\n"), /2 prior PRs/iu);
+});
+
+test("R003 does not double-claim a within-PR duplicate when history has the same path", () => {
+  const actions = [
+    matchedAction("first", 0, 50, "safe_read", {
+      paths: ["src/a.ts"],
+      target: "src/a.ts",
+      tool_use_id: "first",
+      tool_name: "Read",
+    }),
+    matchedAction("duplicate", 100, 200, "duplicate_read", {
+      paths: ["src/a.ts"],
+      target: "src/a.ts",
+      tool_use_id: "duplicate",
+      tool_name: "Read",
+    }),
+  ];
+  const history = [
+    historyRecord("old", "main...old", 1, [
+      storedRediscoveryFinding("src/a.ts", 1, "old#read"),
+    ]),
+  ];
+
+  const finding = detectRediscovery(actions, { history })[0];
+
+  assert.ok(finding !== undefined);
+  assert.equal(finding.recoverable.estimated_ms, 150);
+  assert.deepEqual(finding.evidence.interval_ids, [
+    "R003:duplicate",
+    "R003:first",
+  ]);
+  assert.equal(finding.evidence.duplicate_count, 1);
+  assert.equal(finding.evidence.current_read_count, 2);
 });
 
 test("R004 reports all active wait but claims only explicit or tightly phrased approvals", () => {

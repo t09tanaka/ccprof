@@ -89,9 +89,54 @@ async function makeClaudeProjects(
   );
   const fixture = await readFile(fixturePath, "utf8");
   const escapedRepo = JSON.stringify(repo).slice(1, -1);
+  const editRows = [
+    {
+      type: "assistant",
+      sessionId: "e2e-session",
+      uuid: "a5-unrelated-edit",
+      timestamp: "2026-01-01T00:02:42.000Z",
+      cwd: repo,
+      gitBranch: "feature",
+      message: {
+        id: "m5-unrelated-edit",
+        content: [{
+          type: "tool_use",
+          id: "edit-unrelated",
+          name: "Edit",
+          input: {
+            file_path: "docs/readme.md",
+            old_string: "",
+            new_string: "temporary unrelated documentation note",
+          },
+        }],
+        usage: { input_tokens: 10, output_tokens: 2 },
+      },
+    },
+    {
+      type: "user",
+      sessionId: "e2e-session",
+      uuid: "r5-unrelated-edit",
+      timestamp: "2026-01-01T00:02:48.000Z",
+      cwd: repo,
+      gitBranch: "feature",
+      message: {
+        content: [{
+          type: "tool_result",
+          tool_use_id: "edit-unrelated",
+          content: "updated",
+          is_error: false,
+        }],
+      },
+    },
+  ].map((row) => JSON.stringify(row));
   const rendered = fixture
     .replaceAll("__REPO_ROOT__", escapedRepo)
-    .replace("__LARGE_OUTPUT__", "x".repeat(200_004));
+    .replace("__LARGE_OUTPUT__", "x".repeat(200_004))
+    .split("\n")
+    .flatMap((line) =>
+      line.includes('"uuid":"a6"') ? [...editRows, line] : [line]
+    )
+    .join("\n");
   await write(join(projects, "fixture", "e2e-session.jsonl"), rendered);
   return projects;
 }
@@ -166,6 +211,12 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
           ?.evidence.max_estimated_tokens,
       ) > 50_000,
     );
+    const flaky = first.allFindings.find(({ rule_id }) => rule_id === "R008");
+    assert.equal(flaky?.confidence, "medium");
+    assert.equal(flaky?.evidence.unrelated_edit_count, 1);
+    assert.deepEqual(flaky?.evidence.unrelated_edit_paths, [
+      "docs/readme.md",
+    ]);
 
     const expectedTop = [...first.allFindings]
       .filter(({ recoverable }) => recoverable.min > 0)

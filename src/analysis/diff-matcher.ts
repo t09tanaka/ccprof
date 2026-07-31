@@ -491,6 +491,7 @@ function matchRun(
       target,
       [relevance.caveat],
       descriptor.normalized,
+      relevance.matchedPaths,
     );
   }
   if (relevance.relevant === false) {
@@ -510,6 +511,7 @@ function matchRun(
             : []),
         ],
         descriptor.normalized,
+        relevance.matchedPaths,
       );
     }
     if (descriptor.scope !== "targeted" && previous === undefined) {
@@ -523,6 +525,7 @@ function matchRun(
           "No prior completed successful equivalent full-suite run was available.",
         ],
         descriptor.normalized,
+        relevance.matchedPaths,
       );
     }
     return result(
@@ -532,6 +535,7 @@ function matchRun(
       target,
       [relevance.caveat],
       descriptor.normalized,
+      relevance.matchedPaths,
     );
   }
   return result(
@@ -541,6 +545,7 @@ function matchRun(
     target,
     [relevance.caveat, "Command relevance could not be determined."],
     descriptor.normalized,
+    relevance.matchedPaths,
   );
 }
 
@@ -805,6 +810,7 @@ function inheritToolClassification(
       action.confidence,
       source.match_confidence,
     ),
+    relevance_paths: [...source.relevance_paths],
     target: source.target,
     caveats: [...source.caveats],
     ...(source.normalized_command === undefined
@@ -820,11 +826,13 @@ function result(
   target: string,
   caveats: readonly string[],
   normalizedCommand?: string,
+  relevancePaths: readonly string[] = [],
 ): MatchedAction {
   return {
     ...action,
     match,
     match_confidence: confidence,
+    relevance_paths: stableRelevancePaths(relevancePaths),
     target,
     caveats: unique(caveats.filter((caveat) => caveat !== "")),
     ...(normalizedCommand === undefined
@@ -840,4 +848,14 @@ function lowerConfidence(left: Confidence, right: Confidence): Confidence {
 
 function unique(values: readonly string[]): string[] {
   return [...new Set(values)];
+}
+
+function stableRelevancePaths(paths: readonly string[]): string[] {
+  return unique(paths.flatMap((path) => {
+    try {
+      return [normalizeRepoPath(path)];
+    } catch {
+      return [];
+    }
+  })).sort((left, right) => left.localeCompare(right));
 }

@@ -25,12 +25,15 @@ import {
   matchTimelineActions,
   type ActionObservation,
 } from "../analysis/diff-matcher.js";
+import { classifyCommand } from "../analysis/command.js";
 import {
   buildTimeline,
   type TimelineResult,
 } from "../analysis/timeline.js";
 import {
   discoverManifestTestMap,
+  evaluateTestRelevance,
+  hasMappedCommand,
   loadExplicitTestMap,
   mergeTestMaps,
   type TestMap,
@@ -43,7 +46,10 @@ import {
 } from "../git/pr-context.js";
 import { detectChronicCost } from "../rules/chronic-cost.js";
 import { detectContextBloat } from "../rules/context-bloat.js";
-import { detectFlakyTests } from "../rules/flaky-test.js";
+import {
+  detectFlakyTests,
+  type EditRelevance,
+} from "../rules/flaky-test.js";
 import { detectHumanWait } from "../rules/human-wait.js";
 import { detectRediscovery } from "../rules/rediscovery.js";
 import { detectRedundantRuns } from "../rules/redundant-runs.js";
@@ -305,6 +311,47 @@ function mappedTestCommands(testMap: TestMap): ReadonlySet<string> {
   );
 }
 
+export function buildFlakyEditRelevance(
+  actions: readonly MatchedAction[],
+  testMap: TestMap,
+): ReadonlyMap<string, EditRelevance> {
+  const commands = new Map(
+    actions.flatMap((action) => {
+      const normalized = action.normalized_command;
+      if (normalized === undefined || normalized.trim() === "") return [];
+      const descriptor = classifyCommand(normalized);
+      return descriptor.opaque ||
+          descriptor.family === "test" ||
+          hasMappedCommand(descriptor, testMap)
+        ? [[descriptor.normalized, descriptor] as const]
+        : [];
+    }),
+  );
+  const relevanceByActionId = new Map<string, EditRelevance>();
+  for (const action of actions) {
+    if (
+      action.kind !== "tool" ||
+      (
+        action.match !== "contributing_edit" &&
+        action.match !== "rework_edit"
+      ) ||
+      action.paths.length === 0 ||
+      commands.size === 0
+    ) {
+      continue;
+    }
+    const decisions = [...commands.values()].map((command) =>
+      evaluateTestRelevance(command, action.paths, testMap).relevant
+    );
+    if (decisions.some((decision) => decision === true)) {
+      relevanceByActionId.set(action.action_id, "related");
+    } else if (decisions.every((decision) => decision === false)) {
+      relevanceByActionId.set(action.action_id, "unrelated");
+    }
+  }
+  return relevanceByActionId;
+}
+
 function contributingIntervals(
   actions: readonly MatchedAction[],
 ) {
@@ -465,6 +512,7 @@ function ruleCandidates(
     ...detectRedundantRuns(matched),
     ...detectRediscovery(matched, {
       estimatedTokensByToolUseId: tokenEstimates(events),
+      history,
     }),
     ...detectHumanWait(timeline.actions, { assistantEvents }),
     ...detectSerialSlack(matched),
@@ -476,6 +524,8 @@ function ruleCandidates(
     ...detectFlakyTests(matched, {
       toolResults,
       additionalTestCommands: mappedTestCommands(testMap),
+      editRelevanceByActionId: buildFlakyEditRelevance(matched, testMap),
+      history,
     }),
   ];
 }

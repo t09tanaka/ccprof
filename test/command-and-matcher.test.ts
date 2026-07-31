@@ -385,7 +385,10 @@ test("matches the first relevant full run and a repeated unchanged successful ru
     testMap: explicitMap,
   });
   assert.equal(matched[1]?.match, "contributing_run");
+  assert.deepEqual(matched[0]?.relevance_paths, []);
+  assert.deepEqual(matched[1]?.relevance_paths, ["src/widget.ts"]);
   assert.equal(matched[2]?.match, "redundant_run");
+  assert.deepEqual(matched[2]?.relevance_paths, []);
   assert.equal(matched[2]?.normalized_command, "npm test");
   assert.match(matched[2]?.caveats.join(" ") ?? "", /explicit/i);
 });
@@ -512,6 +515,8 @@ test("inherits a tool classification for its causal inference without creating a
     "contributing_run",
     "redundant_run",
   ]);
+  assert.deepEqual(matched[1]?.relevance_paths, ["src/widget.ts"]);
+  assert.deepEqual(matched[2]?.relevance_paths, ["src/widget.ts"]);
 });
 
 test("does not leak inherited tool evidence across session, agent, or tool identities", () => {
