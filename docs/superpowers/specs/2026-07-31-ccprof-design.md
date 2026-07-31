@@ -139,11 +139,17 @@ present, extracted paths, edit payload fragments when available, and the stable
 `<session-id>#<entry-uuid>` reference. Tool results carry success/failure,
 bounded output text, byte/token estimates, and the matching tool-use ID.
 
-For assistant snapshot rows, the parser groups only rows with a non-empty
-`message.id` and retains the last file-order snapshot. Rows without that ID are
-never deduplicated. Malformed lines, invalid timestamps, missing results, and
-unknown content blocks become warnings or low-confidence partial events rather
-than fatal errors.
+For assistant rows, the parser groups only rows with a non-empty `message.id`
+inside the containing transcript. Historical logs can contain cumulative
+snapshots, where the final snapshot is authoritative. Current logs can instead
+store distinct one-block fragments under one message ID. The parser therefore
+reconstructs one logical message: cumulative duplicates are replaced by their
+final form, while unique fragments are retained once in file order. Token input
+fields are taken once and output tokens use the final/maximum value; they are
+never summed across repeated rows. Rows without a message ID are never
+deduplicated. Malformed lines, invalid timestamps, missing results, and unknown
+content blocks become warnings or low-confidence partial events rather than
+fatal errors.
 
 ## Timeline and wall-clock model
 
