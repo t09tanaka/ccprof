@@ -5,6 +5,9 @@
   "bin": {
     "ccprof": "dist/cli.js"
   },
+  "files": [
+    "dist"
+  ],
   "engines": {
     "node": ">=20"
   },
