@@ -1,0 +1,310 @@
+import {
+  durationMs,
+  intersectIntervals,
+  roundMinutes,
+  subtractIntervals,
+  unionIntervals,
+} from "./intervals.js";
+import type {
+  AnalysisSummary,
+  BaselineComparison,
+  Bound,
+  Finding,
+  FindingCandidate,
+  Interval,
+  RuleId,
+} from "./model.js";
+
+const RULE_PRECEDENCE: Readonly<Record<RuleId, number>> = {
+  R008: 0,
+  R001: 1,
+  R002: 2,
+  R003: 3,
+  R007: 3,
+  R004: 4,
+  R005: 5,
+  R006: 5,
+};
+
+const MS_PER_HUNDREDTH_MINUTE = 600;
+
+export interface LedgerInput {
+  rawIntervals: readonly Interval[];
+  activeIntervals: readonly Interval[];
+  contributingIntervals: readonly Interval[];
+  candidates: readonly FindingCandidate[];
+  baseline?: BaselineComparison | null;
+}
+
+export interface LedgerAttribution {
+  finding_key: string;
+  rule_id: RuleId;
+  bound: Bound;
+  intervals: Interval[];
+  attributed_ms: number;
+  reported_ms: number;
+}
+
+export interface LedgerTotalsMs {
+  raw_observed: number;
+  measured: number;
+  idle_excluded: number;
+  normal: number;
+  recoverable: number;
+  unexplained: number;
+}
+
+export interface LedgerResult {
+  summary: AnalysisSummary;
+  findings: Finding[];
+  raw_observed_min: number;
+  normal_min: number;
+  totals_ms: LedgerTotalsMs;
+  pointRecoverableIntervals: Interval[];
+  normalIntervals: Interval[];
+  unexplainedIntervals: Interval[];
+  idleIntervals: Interval[];
+  attributions: LedgerAttribution[];
+}
+
+interface IndexedCandidate {
+  candidate: FindingCandidate;
+  index: number;
+}
+
+type PartitionName = "recoverable" | "normal" | "unexplained";
+
+function roundedHundredths(ms: number): number {
+  return ms > 0 ? Math.round(ms / MS_PER_HUNDREDTH_MINUTE) : 0;
+}
+
+function minutesFromHundredths(value: number): number {
+  return Math.max(0, value) / 100;
+}
+
+function apportionedMeasuredHundredths(
+  measuredMs: number,
+  partsMs: Readonly<Record<PartitionName, number>>,
+): Record<PartitionName, number> {
+  const names: readonly PartitionName[] = [
+    "recoverable",
+    "normal",
+    "unexplained",
+  ];
+  const units: Record<PartitionName, number> = {
+    recoverable: 0,
+    normal: 0,
+    unexplained: 0,
+  };
+  for (const name of names) {
+    units[name] = Math.floor(
+      Math.max(0, partsMs[name]) / MS_PER_HUNDREDTH_MINUTE,
+    );
+  }
+
+  let remaining =
+    roundedHundredths(measuredMs) -
+    names.reduce((total, name) => total + units[name], 0);
+  const byLargestRemainder = [...names].sort(
+    (left, right) =>
+      (partsMs[right] / MS_PER_HUNDREDTH_MINUTE) % 1 -
+        (partsMs[left] / MS_PER_HUNDREDTH_MINUTE) % 1 ||
+      names.indexOf(left) - names.indexOf(right),
+  );
+  for (let index = 0; remaining > 0; index += 1) {
+    const name = byLargestRemainder[index % byLargestRemainder.length];
+    if (name === undefined) break;
+    units[name] += 1;
+    remaining -= 1;
+  }
+  for (let index = byLargestRemainder.length - 1; remaining < 0; index -= 1) {
+    const name =
+      byLargestRemainder[
+        (index + byLargestRemainder.length) % byLargestRemainder.length
+      ];
+    if (name === undefined) break;
+    if (units[name] > 0) {
+      units[name] -= 1;
+      remaining += 1;
+    }
+  }
+  return units;
+}
+
+function intervalSignature(candidate: FindingCandidate): string {
+  return candidate.recoverable.intervals
+    .map((interval) =>
+      `${interval.start_ms}:${interval.end_ms}:${interval.interval_id}`
+    )
+    .sort()
+    .join("\0");
+}
+
+function candidateOrder(
+  left: IndexedCandidate,
+  right: IndexedCandidate,
+): number {
+  return (
+    RULE_PRECEDENCE[left.candidate.rule_id] -
+      RULE_PRECEDENCE[right.candidate.rule_id] ||
+    left.candidate.rule_id.localeCompare(right.candidate.rule_id) ||
+    left.candidate.finding_key.localeCompare(right.candidate.finding_key) ||
+    left.candidate.target.localeCompare(right.candidate.target) ||
+    intervalSignature(left.candidate).localeCompare(
+      intervalSignature(right.candidate),
+    ) ||
+    left.index - right.index
+  );
+}
+
+function upperEstimateMs(candidate: FindingCandidate): number {
+  const estimate = candidate.recoverable.estimated_ms;
+  return Number.isFinite(estimate) && estimate > 0 ? estimate : 0;
+}
+
+function publicFinding(
+  candidate: FindingCandidate,
+  reportedMs: number,
+): Finding {
+  const {
+    target: _target,
+    recoverable,
+    ...metadata
+  } = candidate;
+  return {
+    ...metadata,
+    recoverable: {
+      min: roundMinutes(reportedMs),
+      bound: recoverable.bound,
+    },
+  };
+}
+
+export function reconcileLedger(input: LedgerInput): LedgerResult {
+  const rawIntervals = unionIntervals(input.rawIntervals);
+  const activeIntervals = intersectIntervals(
+    input.activeIntervals,
+    rawIntervals,
+  );
+  const indexed = input.candidates.map((candidate, index) => ({
+    candidate,
+    index,
+  }));
+  const attributionsByIndex = new Map<number, LedgerAttribution>();
+  let pointRecoverableIntervals: Interval[] = [];
+
+  for (const { candidate, index } of [...indexed].sort(candidateOrder)) {
+    if (candidate.recoverable.bound === "upper") {
+      attributionsByIndex.set(index, {
+        finding_key: candidate.finding_key,
+        rule_id: candidate.rule_id,
+        bound: "upper",
+        intervals: [],
+        attributed_ms: 0,
+        reported_ms: upperEstimateMs(candidate),
+      });
+      continue;
+    }
+    const eligible = intersectIntervals(
+      candidate.recoverable.intervals,
+      activeIntervals,
+    );
+    const intervals = subtractIntervals(
+      eligible,
+      pointRecoverableIntervals,
+    );
+    pointRecoverableIntervals = unionIntervals([
+      ...pointRecoverableIntervals,
+      ...intervals,
+    ]);
+    const attributedMs = durationMs(intervals);
+    attributionsByIndex.set(index, {
+      finding_key: candidate.finding_key,
+      rule_id: candidate.rule_id,
+      bound: "point",
+      intervals,
+      attributed_ms: attributedMs,
+      reported_ms: attributedMs,
+    });
+  }
+
+  const contributingIntervals = intersectIntervals(
+    input.contributingIntervals,
+    activeIntervals,
+  );
+  const normalIntervals = subtractIntervals(
+    contributingIntervals,
+    pointRecoverableIntervals,
+  );
+  const unexplainedIntervals = subtractIntervals(activeIntervals, [
+    ...pointRecoverableIntervals,
+    ...normalIntervals,
+  ]);
+  const idleIntervals = subtractIntervals(rawIntervals, activeIntervals);
+
+  const totalsMs: LedgerTotalsMs = {
+    raw_observed: durationMs(rawIntervals),
+    measured: durationMs(activeIntervals),
+    idle_excluded: durationMs(idleIntervals),
+    normal: durationMs(normalIntervals),
+    recoverable: durationMs(pointRecoverableIntervals),
+    unexplained: durationMs(unexplainedIntervals),
+  };
+  const measuredHundredths = roundedHundredths(totalsMs.measured);
+  const partitionHundredths = apportionedMeasuredHundredths(
+    totalsMs.measured,
+    {
+      recoverable: totalsMs.recoverable,
+      normal: totalsMs.normal,
+      unexplained: totalsMs.unexplained,
+    },
+  );
+  const rawObservedHundredths = roundedHundredths(
+    totalsMs.raw_observed,
+  );
+  const idleHundredths = Math.max(
+    0,
+    rawObservedHundredths - measuredHundredths,
+  );
+  const recoverableHundredths = partitionHundredths.recoverable;
+
+  const attributions = indexed.map(({ candidate, index }) =>
+    attributionsByIndex.get(index) ?? {
+      finding_key: candidate.finding_key,
+      rule_id: candidate.rule_id,
+      bound: candidate.recoverable.bound,
+      intervals: [],
+      attributed_ms: 0,
+      reported_ms: 0,
+    }
+  );
+
+  return {
+    summary: {
+      measured_min: minutesFromHundredths(measuredHundredths),
+      idle_excluded_min: minutesFromHundredths(idleHundredths),
+      estimated_floor_min: minutesFromHundredths(
+        measuredHundredths - recoverableHundredths,
+      ),
+      recoverable_min: minutesFromHundredths(recoverableHundredths),
+      unexplained_min: minutesFromHundredths(
+        partitionHundredths.unexplained,
+      ),
+      baseline: input.baseline ?? null,
+    },
+    findings: indexed.map(({ candidate, index }) =>
+      publicFinding(
+        candidate,
+        attributionsByIndex.get(index)?.reported_ms ?? 0,
+      )
+    ),
+    raw_observed_min: minutesFromHundredths(rawObservedHundredths),
+    normal_min: minutesFromHundredths(partitionHundredths.normal),
+    totals_ms: totalsMs,
+    pointRecoverableIntervals,
+    normalIntervals,
+    unexplainedIntervals,
+    idleIntervals,
+    attributions,
+  };
+}
