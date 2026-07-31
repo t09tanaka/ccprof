@@ -180,52 +180,52 @@ export interface RecoverableClaim {
   intervals: RecoverableInterval[];
 }
 
-export interface FindingEvidence {
-  description: string;
+export interface FindingEvidence extends JsonObject {
   session_refs: string[];
   interval_ids: string[];
-  details: JsonObject;
 }
 
 export interface FixRecipe {
   suggestion: string;
-  verify_command: string;
+  verify: string;
 }
 
-interface FindingBase {
+interface FindingMetadata {
   finding_key: string;
   rule_id: RuleId;
   title: string;
-  target: string;
   classification: Classification;
+  cause: R001Cause | null;
   scope: Scope;
   confidence: Confidence;
-  evidence: FindingEvidence[];
-  fix: FixRecipe;
+  evidence: FindingEvidence;
+  fix_recipe: FixRecipe;
   caveats: string[];
-  cause?: R001Cause;
 }
 
-export interface FindingCandidate extends FindingBase {
+export interface FindingCandidate extends FindingMetadata {
+  target: string;
   recoverable: RecoverableClaim;
 }
 
-export interface Finding extends FindingBase {
-  recoverable_min: number;
+export interface FindingRecoverable {
+  min: number;
   bound: Bound;
 }
 
-export interface BaselineMetrics {
-  measured_min: number;
-  estimated_floor_min: number;
-  recoverable_min: number;
-  unexplained_min: number;
+export interface Finding extends FindingMetadata {
+  recoverable: FindingRecoverable;
+}
+
+export interface BaselineNotable {
+  metric: string;
+  value: number;
+  baseline: number;
 }
 
 export interface BaselineComparison {
-  sample_size: number;
-  median: BaselineMetrics;
-  delta: BaselineMetrics;
+  prs: number;
+  notable: BaselineNotable[];
 }
 
 export interface AnalysisSummary {
