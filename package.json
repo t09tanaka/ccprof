@@ -1,0 +1,23 @@
+{
+  "name": "ccprof",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "ccprof": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:test": "tsc -p tsconfig.test.json",
+    "typecheck": "tsc -p tsconfig.test.json --noEmit",
+    "test": "npm run build:test && node --test .test-dist/test/*.test.js",
+    "check": "npm run typecheck && npm test",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.9.2"
+  }
+}
