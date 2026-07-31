@@ -1,9 +1,9 @@
 import { durationMs } from "../core/intervals.js";
-import type { MatchedAction } from "../core/model.js";
+import type { Confidence, MatchedAction } from "../core/model.js";
 import { normalizeRepoPath } from "../analysis/test-map.js";
 import type { AnalysisRecord } from "../store/analyses.js";
 import {
-  createFindingCandidate,
+  createFindingCandidate, findingKey, normalizeFindingTarget,
   minimumConfidence,
   orderedActions,
   recoverableClaim,
@@ -13,6 +13,7 @@ import {
 export interface RediscoveryOptions {
   estimatedTokensByToolUseId?: ReadonlyMap<string, number>;
   history?: readonly AnalysisRecord[];
+  currentObjectIdsByPath?: ReadonlyMap<string, string>; crossPrEligibleReadKeys?: ReadonlySet<string>;
 }
 
 interface CurrentRead {
@@ -26,42 +27,21 @@ interface HistoricalRediscovery {
   prs: string[];
   durationMin: number;
   sessionRefs: string[];
+  confidence: Confidence;
 }
 
 interface HistoricalPrEvidence {
   durationMin: number;
   sessionRefs: Set<string>;
+  confidence: Confidence;
 }
 
-function hasHistoricalDuplicateEvidence(
-  finding: AnalysisRecord["findings"][number],
-  evidence: object,
-): boolean {
-  if (Reflect.has(evidence, "duplicate_count")) {
-    const duplicateCount = Reflect.get(evidence, "duplicate_count");
-    return Number.isSafeInteger(duplicateCount) && duplicateCount > 0;
-  }
-
-  const intervalIds = Reflect.get(evidence, "interval_ids");
-  return finding.recoverable !== null &&
-    typeof finding.recoverable === "object" &&
-    typeof finding.recoverable.min === "number" &&
-    Number.isFinite(finding.recoverable.min) &&
-    finding.recoverable.min > 0 &&
-    Array.isArray(intervalIds) &&
-    intervalIds.length > 0 &&
-    intervalIds.every(
-      (intervalId) =>
-        typeof intervalId === "string" &&
-        intervalId.startsWith("R003:") &&
-        intervalId.length > "R003:".length,
-    );
-}
+const OID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 
 function normalizedPath(value: unknown): string | null {
   if (typeof value !== "string") return null;
   try {
-    return normalizeRepoPath(value.normalize("NFC").trim());
+    return normalizeRepoPath(value.normalize("NFC"));
   } catch {
     return null;
   }
@@ -126,105 +106,62 @@ function currentReads(
 
 function historicalRediscoveryByPath(
   history: readonly AnalysisRecord[],
+  currentObjectIdsByPath: ReadonlyMap<string, string>,
 ): Map<string, HistoricalRediscovery> {
   const byPathAndPr = new Map<string, Map<string, HistoricalPrEvidence>>();
   for (const record of history) {
     const rawPrRef = record?.unit?.pr_ref;
     if (typeof rawPrRef !== "string" || rawPrRef.trim() === "") continue;
     const prRef = rawPrRef.trim();
-    if (!Array.isArray(record.findings)) continue;
-    for (const finding of record.findings) {
-      if (finding?.rule_id !== "R003") continue;
-      const evidence: unknown = finding.evidence;
+    if (!Array.isArray(record.read_observations)) continue;
+    for (const observation of record.read_observations) {
+      const path = normalizedPath(observation?.path);
+      const objectId = typeof observation?.object_id === "string" ? observation.object_id.toLowerCase() : "";
+      const currentObjectId = path === null ? undefined : currentObjectIdsByPath.get(path);
+      const confidence = observation.confidence ?? "low";
       if (
-        evidence === null ||
-        typeof evidence !== "object" ||
-        Array.isArray(evidence)
+        path === null || currentObjectId === undefined ||
+        !OID_PATTERN.test(objectId) || !OID_PATTERN.test(currentObjectId) ||
+        objectId !== currentObjectId.toLowerCase() ||
+        typeof observation.duration_min !== "number" || !Number.isFinite(observation.duration_min) || observation.duration_min < 0 ||
+        !Array.isArray(observation.session_refs) ||
+        observation.session_refs.length === 0 || !observation.session_refs.every((ref) => typeof ref === "string" && ref !== "")
       ) {
         continue;
       }
-      if (!hasHistoricalDuplicateEvidence(finding, evidence)) continue;
-      const rawPaths = Reflect.get(evidence, "paths");
-      const rawSessionRefs = Reflect.get(evidence, "session_refs");
-      if (
-        !Array.isArray(rawPaths) ||
-        rawPaths.length === 0 ||
-        !rawPaths.every((path) => typeof path === "string") ||
-        !Array.isArray(rawSessionRefs) ||
-        rawSessionRefs.length === 0 ||
-        !rawSessionRefs.every(
-          (ref) => typeof ref === "string" && ref !== "",
-        )
-      ) {
-        continue;
-      }
-      const paths = sortedUnique(
-        rawPaths.flatMap((path) => {
-          const normalized = normalizedPath(path);
-          return normalized === null ? [] : [normalized];
-        }),
-      );
-      if (paths.length === 0) continue;
-      const rawDurationMs = Reflect.get(evidence, "duration_ms");
-      const durationMin =
-        typeof rawDurationMs === "number" &&
-          Number.isFinite(rawDurationMs) &&
-          rawDurationMs >= 0
-          ? rawDurationMs / 60_000
-          : finding.recoverable !== null &&
-              typeof finding.recoverable === "object" &&
-              typeof finding.recoverable.min === "number" &&
-              Number.isFinite(finding.recoverable.min) &&
-              finding.recoverable.min >= 0
-          ? finding.recoverable.min
-          : null;
-      if (durationMin === null) continue;
-      for (const path of paths) {
-        let byPr = byPathAndPr.get(path);
-        if (byPr === undefined) {
-          byPr = new Map();
-          byPathAndPr.set(path, byPr);
-        }
-        const existing = byPr.get(prRef);
-        if (existing === undefined) {
-          byPr.set(prRef, {
-            durationMin,
-            sessionRefs: new Set(rawSessionRefs as string[]),
-          });
-        } else {
-          existing.durationMin = Math.max(existing.durationMin, durationMin);
-          for (const ref of rawSessionRefs) existing.sessionRefs.add(ref);
-        }
+      let byPr = byPathAndPr.get(path);
+      if (byPr === undefined) byPathAndPr.set(path, byPr = new Map());
+      const existing = byPr.get(prRef);
+      if (existing === undefined) {
+        byPr.set(prRef, { durationMin: observation.duration_min,
+          sessionRefs: new Set(observation.session_refs), confidence });
+      } else {
+        existing.durationMin = Math.max(existing.durationMin, observation.duration_min);
+        for (const ref of observation.session_refs) existing.sessionRefs.add(ref);
+        existing.confidence = minimumConfidence([existing.confidence, confidence]);
       }
     }
   }
 
-  return new Map(
-    [...byPathAndPr.entries()]
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([path, byPr]) => {
-        const orderedPrs = [...byPr.entries()].sort(([left], [right]) =>
-          left.localeCompare(right)
-        );
-        return [path, {
-          prs: orderedPrs.map(([prRef]) => prRef),
-          durationMin: orderedPrs.reduce(
-            (total, [, evidence]) => total + evidence.durationMin,
-            0,
-          ),
-          sessionRefs: sortedUnique(
-            orderedPrs.flatMap(([, evidence]) => [...evidence.sessionRefs]),
-          ),
-        }] as const;
-      }),
-  );
+  return new Map([...byPathAndPr.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([path, byPr]) => {
+      const prs = [...byPr.entries()].sort(([left], [right]) => left.localeCompare(right));
+      return [path, {
+        prs: prs.map(([prRef]) => prRef),
+        durationMin: prs.reduce((sum, [, value]) => sum + value.durationMin, 0),
+        sessionRefs: sortedUnique(prs.flatMap(([, value]) => [...value.sessionRefs])),
+        confidence: minimumConfidence(prs.map(([, value]) => value.confidence)),
+      }] as const;
+    }));
 }
 
-function readIdentity(read: CurrentRead): string {
+function readIdentity(read: Pick<CurrentRead, "read">, path?: string): string {
   return [
     read.read.session_id,
     read.read.agent_id,
     read.read.action_id,
+    ...(path === undefined ? [] : [path]),
   ].join("\0");
 }
 
@@ -233,21 +170,16 @@ export function detectRediscovery(
   options: RediscoveryOptions = {},
 ) {
   const reads = currentReads(actions);
-  const historyByPath = historicalRediscoveryByPath(options.history ?? []);
+  const historyByPath = historicalRediscoveryByPath(options.history ?? [], options.currentObjectIdsByPath ?? new Map());
   const byTarget = new Map<string, Map<string, CurrentRead>>();
   for (const read of reads) {
-    if (read.read.match !== "duplicate_read") continue;
-    const group = byTarget.get(read.target) ?? new Map();
+    const exact = (path: string) => historyByPath.has(path) && (options.crossPrEligibleReadKeys === undefined || options.crossPrEligibleReadKeys.has(readIdentity(read, path)));
+    const historicalPath = read.read.match === "duplicate_read" || read.paths.length === 1 ? read.paths.find(exact) : undefined;
+    const target = historicalPath ?? (read.read.match === "duplicate_read" ? read.target : undefined);
+    if (target === undefined) continue;
+    const group = byTarget.get(target) ?? new Map();
     group.set(readIdentity(read), read);
-    byTarget.set(read.target, group);
-  }
-  for (const [path] of historyByPath) {
-    for (const read of reads) {
-      if (read.paths.length !== 1 || read.paths[0] !== path) continue;
-      const group = byTarget.get(path) ?? new Map();
-      group.set(readIdentity(read), read);
-      byTarget.set(path, group);
-    }
+    byTarget.set(target, group);
   }
 
   return [...byTarget.entries()]
@@ -257,10 +189,14 @@ export function detectRediscovery(
       const duplicates = current.filter(
         ({ read }) => read.match === "duplicate_read",
       );
+      const eligible = ({ read, paths }: CurrentRead) => paths.includes(target) && (options.crossPrEligibleReadKeys === undefined || options.crossPrEligibleReadKeys.has(readIdentity({ read }, target)));
+      const historical = current.some(eligible) ? historyByPath.get(target) : undefined;
+      const claimedReads = current.filter((read) =>
+        read.read.match === "duplicate_read" || (historical !== undefined && eligible(read)));
       const evidenceActions = current.flatMap(({ read, inference }) =>
         inference === undefined ? [read] : [read, inference]
       );
-      const claimedActions = duplicates.flatMap(({ read, inference }) =>
+      const claimedActions = claimedReads.flatMap(({ read, inference }) =>
         inference === undefined ? [read] : [read, inference]
       );
       const recoverable = recoverableClaim(
@@ -268,10 +204,9 @@ export function detectRediscovery(
         target,
         claimedActions,
       );
-      const historical = historyByPath.get(target);
       if (recoverable.estimated_ms === 0 && historical === undefined) return [];
       const toolUseIds = sortedUnique(
-        duplicates.flatMap(({ read }) =>
+        claimedReads.flatMap(({ read }) =>
           read.tool_use_id === undefined ? [] : [read.tool_use_id]
         ),
       );
@@ -286,16 +221,16 @@ export function detectRediscovery(
             : 0);
       }, 0);
       const readDurationMs = durationMs(
-        duplicates.map(({ read }) => read.interval),
+        claimedReads.map(({ read }) => read.interval),
       );
       const inferenceDurationMs = durationMs(
-        duplicates.flatMap(({ inference }) =>
+        claimedReads.flatMap(({ inference }) =>
           inference === undefined ? [] : [inference.interval]
         ),
       );
       const confidenceActions =
         claimedActions.length === 0 ? evidenceActions : claimedActions;
-      return [createFindingCandidate({
+      return [{ ...createFindingCandidate({
         rule_id: "R003",
         title: "Repeated file rediscovery",
         classification: "behavior",
@@ -305,7 +240,7 @@ export function detectRediscovery(
           confidenceActions.flatMap((action) => [
             action.confidence,
             action.match_confidence,
-          ]),
+          ]).concat(historical?.confidence ?? []),
         ),
         target,
         evidence: {
@@ -349,9 +284,9 @@ export function detectRediscovery(
           ...(historical === undefined
             ? []
             : [
-              `The same path had rediscovery evidence in ${historical.prs.length} prior PR${historical.prs.length === 1 ? "" : "s"}; historical time is evidence only and is not included in this PR's recoverable estimate.`,
+              `The same path and blob were read in ${historical.prs.length} prior PR${historical.prs.length === 1 ? "" : "s"}; historical time is evidence only and is not included in this PR's recoverable estimate.`,
             ]),
         ]),
-      })];
+      }), finding_key: findingKey("R003", normalizeFindingTarget(target) === target && !/[\uD800-\uDFFF]/u.test(target) ? target : `\0path:${Buffer.from(target, "utf16le").toString("hex")}`) }];
     });
 }

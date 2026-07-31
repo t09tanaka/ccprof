@@ -85,6 +85,7 @@ export interface CliRuntime {
   cwd?: string;
   handlers?: CliHandlers;
   stdout?: (value: string) => void;
+  stdoutIsTTY?: boolean;
   stderr?: (value: string) => void;
 }
 
@@ -354,9 +355,12 @@ export async function runCli(
   args: readonly string[],
   runtime: CliRuntime = {},
 ): Promise<number> {
+  const usesDefaultStdout = runtime.stdout === undefined;
   const stdout = runtime.stdout ?? ((value: string) => {
     process.stdout.write(value);
   });
+  const stdoutIsTTY = runtime.stdoutIsTTY ??
+    (usesDefaultStdout && process.stdout.isTTY === true);
   const stderr = runtime.stderr ?? ((value: string) => {
     process.stderr.write(value);
   });
@@ -373,7 +377,8 @@ export async function runCli(
       result = await handlers.analyze({
         cwd,
         format: command.format,
-        color: command.color,
+        color: command.color ||
+          (command.format === "tty" && stdoutIsTTY),
         ...(command.pr === undefined ? {} : { pr: command.pr }),
         ...(command.idleThresholdMs === undefined
           ? {}

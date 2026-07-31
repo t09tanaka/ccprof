@@ -10,10 +10,12 @@ import {
 import { dirname, join } from "node:path";
 
 import { normalizeCommand } from "../analysis/command.js";
+import { normalizeRepoPath } from "../analysis/test-map.js";
 import type {
   AnalysisSummary,
   AnalysisUnit,
   BaselineComparison,
+  Confidence,
   Finding,
 } from "../core/model.js";
 import type { StorePaths } from "./paths.js";
@@ -30,6 +32,13 @@ export interface StoredCommandCost {
   session_refs: string[];
 }
 
+export interface StoredReadObservation {
+  path: string;
+  object_id: string;
+  duration_min: number;
+  session_refs: string[];
+  confidence?: Confidence;
+}
 export interface AnalysisRecordInput {
   analysis_id?: string;
   created_at_ms: number;
@@ -38,6 +47,7 @@ export interface AnalysisRecordInput {
   findings: readonly Finding[];
   metrics?: Readonly<Record<string, number>>;
   command_costs?: readonly StoredCommandCost[];
+  read_observations?: readonly StoredReadObservation[];
 }
 
 export interface AnalysisRecord {
@@ -49,6 +59,7 @@ export interface AnalysisRecord {
   findings: Finding[];
   metrics: Record<string, number>;
   command_costs: StoredCommandCost[];
+  read_observations?: StoredReadObservation[];
 }
 
 export interface AnalysisSaveResult {
@@ -124,6 +135,7 @@ const CLASSIFICATIONS = new Set(["repo", "config", "behavior"]);
 const SCOPES = new Set(["this_pr", "separate_issue", "claude_md"]);
 const CONFIDENCES = new Set(["low", "medium", "high"]);
 const BOUNDS = new Set(["point", "upper"]);
+const OID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 function isStoredFinding(value: unknown): value is Finding {
   if (!isObjectRecord(value)) return false;
@@ -232,6 +244,52 @@ function normalizedCommandCosts(
   );
 }
 
+type NormalizedReadObservation = StoredReadObservation & { confidence: Confidence };
+function normalizeReadObservation(value: unknown): NormalizedReadObservation {
+  if (!isObjectRecord(value)) throw new TypeError("read observation must be an object");
+  let path: string;
+  try { path = normalizeRepoPath(typeof value.path === "string"
+    ? value.path.normalize("NFC") : ""); }
+  catch { throw new TypeError("read observation path must be repository-relative"); }
+  const objectId = typeof value.object_id === "string" ? value.object_id.toLowerCase() : "";
+  if (!OID_PATTERN.test(objectId)) throw new TypeError("invalid read observation object_id");
+  if (!finiteNonnegative(value.duration_min)) throw new TypeError("invalid read observation duration_min");
+  if (!isStringArray(value.session_refs) || value.session_refs.some((ref) => ref === ""))
+    throw new TypeError("invalid read observation session_refs");
+  const confidence = value.confidence ?? "low";
+  if (typeof confidence !== "string" || !CONFIDENCES.has(confidence))
+    throw new TypeError("invalid read observation confidence");
+  return { path, object_id: objectId, duration_min: value.duration_min,
+    session_refs: sortedUnique(value.session_refs), confidence: confidence as Confidence };
+}
+function normalizedReadObservations(values: readonly StoredReadObservation[]) {
+  const byIdentity = new Map<string, NormalizedReadObservation>();
+  for (const raw of values) {
+    const value = normalizeReadObservation(raw);
+    const key = `${value.path}\0${value.object_id}`;
+    const prior = byIdentity.get(key);
+    byIdentity.set(key, prior === undefined ? value : {
+      ...value, duration_min: prior.duration_min + value.duration_min,
+      session_refs: sortedUnique([...prior.session_refs, ...value.session_refs]),
+      confidence: prior.confidence === "low" || value.confidence === "low"
+        ? "low" : prior.confidence === "medium" || value.confidence === "medium" ? "medium" : "high",
+    });
+  }
+  const result = [...byIdentity.values()].sort((left, right) => left.path.localeCompare(right.path) ||
+    left.object_id.localeCompare(right.object_id));
+  if (result.some(({ duration_min }) => !Number.isFinite(duration_min)))
+    throw new TypeError("invalid read observation duration_min total");
+  return result;
+}
+function isStoredReadObservation(value: unknown): boolean {
+  try {
+    const normalized = normalizeReadObservation(value);
+    const raw = value as StoredReadObservation;
+    return raw.path === normalized.path && raw.object_id === normalized.object_id &&
+      (raw.confidence === undefined || raw.confidence === normalized.confidence) &&
+      raw.session_refs.join("\0") === normalized.session_refs.join("\0");
+  } catch { return false; }
+}
 function validateInput(input: AnalysisRecordInput): void {
   if (
     !Number.isSafeInteger(input.created_at_ms) ||
@@ -277,6 +335,8 @@ export function makeAnalysisRecord(
     findings: cloneJson([...input.findings]),
     metrics,
     command_costs: costs,
+    ...(input.read_observations === undefined ? {} :
+      { read_observations: normalizedReadObservations(input.read_observations) }),
   };
   const generatedId = createHash("sha256")
     .update(stableStringify(content))
@@ -321,7 +381,10 @@ function isRecord(value: unknown): value is AnalysisRecord {
     record.metrics === undefined ||
     record.metrics === null ||
     !isObjectRecord(record.metrics) ||
-    !Array.isArray(record.command_costs)
+    !Array.isArray(record.command_costs) ||
+    (record.read_observations !== undefined &&
+      (!Array.isArray(record.read_observations) ||
+        !record.read_observations.every(isStoredReadObservation)))
   ) {
     return false;
   }

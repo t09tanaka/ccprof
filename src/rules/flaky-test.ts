@@ -140,16 +140,6 @@ function runSignals(
   });
 }
 
-function sameAgent(
-  action: Pick<MatchedAction, "agent_id" | "session_id">,
-  run: RunSignal,
-): boolean {
-  return (
-    action.session_id === run.action.session_id &&
-    action.agent_id === run.action.agent_id
-  );
-}
-
 function isEdit(action: MatchedAction): boolean {
   return (
     action.kind === "tool" &&
@@ -206,7 +196,7 @@ function temporalActionsIntersectingWindow(
   return actions.filter(
     (action) =>
       action.interval.start_ms < passing.action.interval.start_ms &&
-      action.interval.end_ms > failure.action.interval.end_ms,
+      action.interval.end_ms > failure.action.interval.start_ms,
   );
 }
 
@@ -224,27 +214,20 @@ function temporalActionsContainedInWindow(
 
 function investigationActions(
   between: readonly MatchedAction[],
-  failedRuns: readonly RunSignal[],
+  editRelevance: ReadonlyMap<string, EditRelevance> | undefined,
+  command: string,
 ): MatchedAction[] {
-  const failedIds = new Set(
-    failedRuns.map(({ action }) => action.action_id),
-  );
-  const failedToolUseIds = new Set(
-    failedRuns.flatMap(({ action }) =>
-      action.tool_use_id === undefined ? [] : [action.tool_use_id]
-    ),
-  );
   return between.filter((action) => {
-    if (failedIds.has(action.action_id)) return true;
     if (
-      action.kind === "inference" &&
-      action.tool_use_id !== undefined &&
-      failedToolUseIds.has(action.tool_use_id)
+      action.kind === "tool" &&
+      action.match === "rework_edit" &&
+      editRelevanceForCommand(editRelevance, action, command) === "unrelated"
     ) {
       return true;
     }
     return (
-      (action.kind === "tool" || action.kind === "inference") &&
+      action.kind === "tool" && !isEdit(action) &&
+      action.match !== "contributing_run" &&
       (
         action.match === "safe_read" ||
         action.match === "duplicate_read" ||
@@ -262,12 +245,13 @@ function episodeFor(
   actions: readonly MatchedAction[],
   editRelevance: ReadonlyMap<string, EditRelevance> | undefined,
 ): FlakyEpisode | null {
+  if (passing.action.interval.start_ms < failure.action.interval.end_ms) return null;
   const intersecting = temporalActionsIntersectingWindow(
     actions,
     failure,
     passing,
   );
-  if (intersecting.some(hasUnknownMutationRisk)) return null;
+  if (intersecting.some((action) => !allFailures.some(({ action: failed }) => runKey(action) === runKey(failed)) && hasUnknownMutationRisk(action))) return null;
   const edits = intersecting.filter(isEdit);
   if (
     edits.some(
@@ -290,11 +274,10 @@ function episodeFor(
     actions,
     failure,
     passing,
-  );
-  const between = contained.filter((action) => sameAgent(action, failure));
+  ).filter((action) => action !== passing.action);
   const investigation = [
-    failure.action,
-    ...investigationActions(between, failedRuns),
+    ...failedRuns.map(({ action }) => action),
+    ...investigationActions(contained, editRelevance, failure.command),
   ];
   const uniqueInvestigation = new Map(
     investigation.map((action) => [action.action_id, action] as const),
@@ -333,10 +316,10 @@ function episodesForGroup(
       );
       if (episode !== null) {
         episodes.push(episode);
+        failures = failures.filter(({ action }) => action.interval.end_ms > signal.action.interval.start_ms);
         break;
       }
     }
-    failures = [];
   }
   return episodes;
 }
@@ -440,13 +423,8 @@ export function detectFlakyTests(
   const historyByCommand = historicalFlakyByCommand(options.history ?? []);
   const groups = new Map<string, RunSignal[]>();
   for (const signal of runSignals(ordered, options)) {
-    const key = [
-      signal.action.session_id,
-      signal.action.agent_id,
-      signal.command,
-    ].join("\0");
-    const group = groups.get(key);
-    if (group === undefined) groups.set(key, [signal]);
+    const group = groups.get(signal.command);
+    if (group === undefined) groups.set(signal.command, [signal]);
     else group.push(signal);
   }
 

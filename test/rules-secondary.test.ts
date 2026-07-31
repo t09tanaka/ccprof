@@ -517,6 +517,13 @@ test("R008 claims a definite unchanged fail-to-pass investigation as point time"
       paths: ["src/a.ts"],
       target: "src/a.ts",
     }),
+    matchedAction("investigation-inference", 150, 170, "safe_read", {
+      kind: "inference",
+      tool_name: "Read",
+      tool_use_id: "investigation",
+      paths: ["src/a.ts"],
+      target: "src/a.ts",
+    }),
     matchedAction("passed", 200, 260, "redundant_run", {
       tool_name: "Bash",
       tool_use_id: "passed",
@@ -541,10 +548,9 @@ test("R008 claims a definite unchanged fail-to-pass investigation as point time"
   assert.equal(finding.target, "npm test");
   assert.equal(finding.finding_key, findingKey("R008", "npm test"));
   assert.equal(finding.recoverable.bound, "point");
-  assert.equal(finding.recoverable.estimated_ms, 150);
+  assert.equal(finding.recoverable.estimated_ms, 140);
   assert.deepEqual(finding.evidence.interval_ids, [
     "R008:failed",
-    "R008:failed-inference",
     "R008:investigation",
   ]);
   assert.deepEqual(
@@ -555,6 +561,425 @@ test("R008 claims a definite unchanged fail-to-pass investigation as point time"
   assert.equal(finding.evidence.episode_count, 1);
   assert.equal(finding.evidence.unrelated_edit_count, 0);
   assert.equal(finding.fix_recipe.verify, "npm test");
+});
+
+test("R008 does not treat an unexplained failed run as its own mutation", () => {
+  const actions = [
+    matchedAction("failed", 0, 100, "unexplained", {
+      tool_name: "Bash",
+      tool_use_id: "failed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("passed", 200, 260, "redundant_run", {
+      tool_name: "Bash",
+      tool_use_id: "passed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+  ];
+  const finding = detectFlakyTests(actions, {
+    toolResults: [
+      toolResult("failed", 100, "failure"),
+      toolResult("passed", 260, "success"),
+    ],
+  })[0];
+
+  assert.ok(finding !== undefined);
+  assert.equal(finding.recoverable.estimated_ms, 100);
+  assert.deepEqual(finding.evidence.interval_ids, ["R008:failed"]);
+  assert.equal(finding.evidence.failed_run_count, 1);
+  assert.equal(finding.evidence.episode_count, 1);
+});
+
+test("R008 does not treat a failed run's causal inference as a mutation", () => {
+  const actions = [
+    matchedAction("failed", 0, 100, "unexplained", {
+      tool_name: "Bash",
+      tool_use_id: "failed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("failed-inference", 100, 120, "unexplained", {
+      kind: "inference",
+      tool_name: "Bash",
+      tool_use_id: "failed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("passed", 200, 260, "redundant_run", {
+      tool_name: "Bash",
+      tool_use_id: "passed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+  ];
+  const finding = detectFlakyTests(actions, {
+    toolResults: [
+      toolResult("failed", 100, "failure"),
+      toolResult("passed", 260, "success"),
+    ],
+  })[0];
+
+  assert.ok(finding !== undefined);
+  assert.equal(finding.recoverable.estimated_ms, 100);
+  assert.deepEqual(finding.evidence.interval_ids, ["R008:failed"]);
+  assert.equal(finding.evidence.investigation_action_count, 1);
+});
+
+test("R008 does not treat another definite failed run as a mutation", () => {
+  const actions = [
+    matchedAction("failed-first", 0, 50, "contributing_run", {
+      tool_name: "Bash",
+      tool_use_id: "failed-first",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("failed-second", 50, 100, "unexplained", {
+      tool_name: "Bash",
+      tool_use_id: "failed-second",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("passed", 200, 260, "redundant_run", {
+      tool_name: "Bash",
+      tool_use_id: "passed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+  ];
+  const finding = detectFlakyTests(actions, {
+    toolResults: [
+      toolResult("failed-first", 50, "failure"),
+      toolResult("failed-second", 100, "failure"),
+      toolResult("passed", 260, "success"),
+    ],
+  })[0];
+
+  assert.ok(finding !== undefined);
+  assert.equal(finding.recoverable.estimated_ms, 100);
+  assert.deepEqual(finding.evidence.interval_ids, [
+    "R008:failed-first",
+    "R008:failed-second",
+  ]);
+  assert.equal(finding.evidence.failed_run_count, 2);
+  assert.equal(finding.evidence.investigation_action_count, 2);
+});
+
+test("R008 connects fail-to-pass episodes across sessions and agents", () => {
+  const actions = [
+    matchedAction("failed", 0, 100, "contributing_run", {
+      session_id: "s-fail",
+      agent_id: "root",
+      session_refs: ["s-fail#failed-start", "s-fail#failed-end"],
+      tool_name: "Bash",
+      tool_use_id: "failed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("investigation", 110, 140, "safe_read", {
+      session_id: "s-investigation",
+      agent_id: "reader",
+      session_refs: [
+        "s-investigation#read-start",
+        "s-investigation#read-end",
+      ],
+      tool_name: "Read",
+      tool_use_id: "investigation",
+      paths: ["test/a.test.ts"],
+    }),
+    matchedAction("passed", 200, 260, "redundant_run", {
+      session_id: "s-pass",
+      agent_id: "tester",
+      session_refs: ["s-pass#passed-start", "s-pass#passed-end"],
+      tool_name: "Bash",
+      tool_use_id: "passed",
+      command: "npm   test",
+      normalized_command: "npm test",
+    }),
+  ];
+  const finding = detectFlakyTests(actions, {
+    toolResults: [
+      toolResult("failed", 100, "failure", {
+        session_id: "s-fail",
+        agent_id: "root",
+        session_ref: "s-fail#result-failed",
+      }),
+      toolResult("passed", 260, "success", {
+        session_id: "s-pass",
+        agent_id: "tester",
+        session_ref: "s-pass#result-passed",
+      }),
+    ],
+  })[0];
+
+  assert.ok(finding !== undefined);
+  assert.equal(finding.recoverable.estimated_ms, 130);
+  assert.deepEqual(finding.evidence.interval_ids, [
+    "R008:failed",
+    "R008:investigation",
+  ]);
+  assert.deepEqual(finding.evidence.session_refs, [
+    "s-fail#failed-end",
+    "s-fail#failed-start",
+    "s-fail#result-failed",
+    "s-investigation#read-end",
+    "s-investigation#read-start",
+    "s-pass#passed-end",
+    "s-pass#passed-start",
+    "s-pass#result-passed",
+  ]);
+  assert.equal(finding.evidence.failed_run_count, 1);
+  assert.equal(finding.evidence.passing_run_count, 1);
+  assert.equal(finding.evidence.investigation_action_count, 2);
+});
+
+test("R008 owns every failed run even when failure intervals overlap", () => {
+  const actions = [
+    matchedAction("failed-a", 0, 100, "contributing_run", {
+      session_id: "s-a",
+      agent_id: "root",
+      tool_name: "Bash",
+      tool_use_id: "failed-a",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("failed-b", 80, 140, "contributing_run", {
+      session_id: "s-b",
+      agent_id: "worker",
+      tool_name: "Bash",
+      tool_use_id: "failed-b",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("passed", 200, 260, "redundant_run", {
+      session_id: "s-pass",
+      agent_id: "tester",
+      tool_name: "Bash",
+      tool_use_id: "passed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+  ];
+  const finding = detectFlakyTests(actions, {
+    toolResults: [
+      toolResult("failed-a", 100, "failure", {
+        session_id: "s-a",
+        agent_id: "root",
+      }),
+      toolResult("failed-b", 140, "failure", {
+        session_id: "s-b",
+        agent_id: "worker",
+      }),
+      toolResult("passed", 260, "success", {
+        session_id: "s-pass",
+        agent_id: "tester",
+      }),
+    ],
+  })[0];
+
+  assert.ok(finding !== undefined);
+  assert.equal(finding.recoverable.estimated_ms, 140);
+  assert.deepEqual(finding.evidence.interval_ids, [
+    "R008:failed-a",
+    "R008:failed-b",
+  ]);
+  assert.equal(finding.evidence.failed_run_count, 2);
+  assert.equal(finding.evidence.investigation_action_count, 2);
+});
+
+test("R008 rejects a passing run that starts before the failure ends", () => {
+  const actions = [
+    matchedAction("failed", 0, 150, "contributing_run", {
+      session_id: "s-fail",
+      agent_id: "root",
+      tool_name: "Bash",
+      tool_use_id: "failed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("passed", 100, 200, "redundant_run", {
+      session_id: "s-pass",
+      agent_id: "tester",
+      tool_name: "Bash",
+      tool_use_id: "passed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+  ];
+
+  assert.deepEqual(
+    detectFlakyTests(actions, {
+      toolResults: [
+        toolResult("failed", 150, "failure", {
+          session_id: "s-fail",
+          agent_id: "root",
+        }),
+        toolResult("passed", 200, "success", {
+          session_id: "s-pass",
+          agent_id: "tester",
+        }),
+      ],
+    }),
+    [],
+  );
+});
+
+test("R008 retains failures after an overlapping success for a later pass", () => {
+  const actions = [
+    matchedAction("failed", 0, 300, "contributing_run", {
+      session_id: "s-fail",
+      agent_id: "root",
+      tool_name: "Bash",
+      tool_use_id: "failed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("overlapping-pass", 100, 200, "redundant_run", {
+      session_id: "s-overlap",
+      agent_id: "tester-a",
+      tool_name: "Bash",
+      tool_use_id: "overlapping-pass",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("later-pass", 400, 500, "redundant_run", {
+      session_id: "s-later",
+      agent_id: "tester-b",
+      tool_name: "Bash",
+      tool_use_id: "later-pass",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+  ];
+  const finding = detectFlakyTests(actions, {
+    toolResults: [
+      toolResult("failed", 300, "failure", {
+        session_id: "s-fail",
+        agent_id: "root",
+      }),
+      toolResult("overlapping-pass", 200, "success", {
+        session_id: "s-overlap",
+        agent_id: "tester-a",
+      }),
+      toolResult("later-pass", 500, "success", {
+        session_id: "s-later",
+        agent_id: "tester-b",
+      }),
+    ],
+  })[0];
+
+  assert.ok(finding !== undefined);
+  assert.equal(finding.recoverable.estimated_ms, 300);
+  assert.deepEqual(finding.evidence.interval_ids, ["R008:failed"]);
+  assert.equal(finding.evidence.failed_run_count, 1);
+  assert.equal(finding.evidence.passing_run_count, 1);
+  assert.equal(finding.evidence.episode_count, 1);
+});
+
+test("R008 retains only unresolved failures after an accepted episode", () => {
+  const actions = [
+    matchedAction("failed-short", 0, 100, "contributing_run", {
+      session_id: "s-short",
+      agent_id: "root",
+      tool_name: "Bash",
+      tool_use_id: "failed-short",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("failed-long", 50, 300, "contributing_run", {
+      session_id: "s-long",
+      agent_id: "worker",
+      tool_name: "Bash",
+      tool_use_id: "failed-long",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("passed-first", 200, 250, "redundant_run", {
+      session_id: "s-first-pass",
+      agent_id: "tester-a",
+      tool_name: "Bash",
+      tool_use_id: "passed-first",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("passed-later", 400, 500, "redundant_run", {
+      session_id: "s-later-pass",
+      agent_id: "tester-b",
+      tool_name: "Bash",
+      tool_use_id: "passed-later",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+  ];
+  const finding = detectFlakyTests(actions, {
+    toolResults: [
+      toolResult("failed-short", 100, "failure", {
+        session_id: "s-short",
+        agent_id: "root",
+      }),
+      toolResult("failed-long", 300, "failure", {
+        session_id: "s-long",
+        agent_id: "worker",
+      }),
+      toolResult("passed-first", 250, "success", {
+        session_id: "s-first-pass",
+        agent_id: "tester-a",
+      }),
+      toolResult("passed-later", 500, "success", {
+        session_id: "s-later-pass",
+        agent_id: "tester-b",
+      }),
+    ],
+  })[0];
+
+  assert.ok(finding !== undefined);
+  assert.equal(finding.recoverable.estimated_ms, 300);
+  assert.deepEqual(finding.evidence.interval_ids, [
+    "R008:failed-long",
+    "R008:failed-short",
+  ]);
+  assert.equal(finding.evidence.failed_run_count, 2);
+  assert.equal(finding.evidence.passing_run_count, 2);
+  assert.equal(finding.evidence.investigation_action_count, 2);
+  assert.equal(finding.evidence.episode_count, 2);
+});
+
+test("R008 excludes a zero-duration passing action from investigation", () => {
+  const actions = [
+    matchedAction("failed", 0, 100, "contributing_run", {
+      tool_name: "Bash",
+      tool_use_id: "failed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("investigation", 110, 140, "safe_read", {
+      tool_name: "Read",
+      tool_use_id: "investigation",
+      paths: ["test/a.test.ts"],
+    }),
+    matchedAction("passed", 200, 200, "redundant_run", {
+      tool_name: "Bash",
+      tool_use_id: "passed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+  ];
+  const finding = detectFlakyTests(actions, {
+    toolResults: [
+      toolResult("failed", 100, "failure"),
+      toolResult("passed", 200, "success"),
+    ],
+  })[0];
+
+  assert.ok(finding !== undefined);
+  assert.equal(finding.recoverable.estimated_ms, 130);
+  assert.deepEqual(finding.evidence.interval_ids, [
+    "R008:failed",
+    "R008:investigation",
+  ]);
+  assert.equal(finding.evidence.investigation_action_count, 2);
+  assert.equal(finding.evidence.passing_run_count, 1);
 });
 
 test("R008 connects current flakiness to prior PRs without adding historical time to the claim", () => {
@@ -629,7 +1054,7 @@ test("R008 never creates a current finding from history alone", () => {
   );
 });
 
-test("R008 lowers confidence for proven unrelated edits and excludes them from ownership", () => {
+test("R008 claims only proven unrelated rework edits", () => {
   const actions = [
     matchedAction("failed", 0, 100, "contributing_run", {
       tool_name: "Bash",
@@ -637,10 +1062,15 @@ test("R008 lowers confidence for proven unrelated edits and excludes them from o
       command: "npm test",
       normalized_command: "npm test",
     }),
-    matchedAction("unrelated-edit", 110, 140, "contributing_edit", {
+    matchedAction("unrelated-contributing", 110, 140, "contributing_edit", {
       tool_name: "Edit",
-      tool_use_id: "unrelated-edit",
-      paths: ["docs/readme.md"],
+      tool_use_id: "unrelated-contributing",
+      paths: ["docs/final.md"],
+    }),
+    matchedAction("unrelated-rework", 140, 150, "rework_edit", {
+      tool_name: "Edit",
+      tool_use_id: "unrelated-rework",
+      paths: ["docs/scratch.md"],
     }),
     matchedAction("investigation", 150, 180, "safe_read", {
       tool_name: "Read",
@@ -660,21 +1090,94 @@ test("R008 lowers confidence for proven unrelated edits and excludes them from o
       toolResult("passed", 260, "success"),
     ],
     editRelevanceByActionId: new Map([
-      ["unrelated-edit", "unrelated"],
+      ["unrelated-contributing", "unrelated"],
+      ["unrelated-rework", "unrelated"],
     ]),
   })[0];
 
   assert.ok(finding !== undefined);
   assert.equal(finding.confidence, "medium");
-  assert.equal(finding.evidence.unrelated_edit_count, 1);
+  assert.equal(finding.recoverable.estimated_ms, 140);
+  assert.equal(finding.evidence.unrelated_edit_count, 2);
   assert.deepEqual(finding.evidence.interval_ids, [
     "R008:failed",
     "R008:investigation",
+    "R008:unrelated-rework",
   ]);
   assert.ok(
-    !finding.evidence.interval_ids.includes("R008:unrelated-edit"),
+    !finding.evidence.interval_ids.includes("R008:unrelated-contributing"),
   );
   assert.match(finding.caveats.join("\n"), /unrelated edit/iu);
+});
+
+test("R008 never claims contributing edits with read-only commands", () => {
+  const actions = [
+    matchedAction("failed", 0, 100, "contributing_run", {
+      tool_name: "Bash",
+      tool_use_id: "failed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("contributing-edit", 110, 140, "contributing_edit", {
+      tool_name: "Bash",
+      tool_use_id: "contributing-edit",
+      command: "git diff",
+      paths: ["src/a.ts"],
+    }),
+    matchedAction("passed", 200, 260, "redundant_run", {
+      tool_name: "Bash",
+      tool_use_id: "passed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+  ];
+  const finding = detectFlakyTests(actions, {
+    toolResults: [
+      toolResult("failed", 100, "failure"),
+      toolResult("passed", 260, "success"),
+    ],
+    editRelevanceByActionId: new Map([
+      ["contributing-edit", "unrelated"],
+    ]),
+  })[0];
+
+  assert.ok(finding !== undefined);
+  assert.equal(finding.recoverable.estimated_ms, 100);
+  assert.deepEqual(finding.evidence.interval_ids, ["R008:failed"]);
+  assert.equal(finding.evidence.unrelated_edit_count, 1);
+});
+
+test("R008 never claims non-failed contributing runs with read-only commands", () => {
+  const actions = [
+    matchedAction("failed", 0, 100, "contributing_run", {
+      tool_name: "Bash",
+      tool_use_id: "failed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("contributing-run", 110, 140, "contributing_run", {
+      tool_name: "Bash",
+      tool_use_id: "contributing-run",
+      command: "git diff",
+    }),
+    matchedAction("passed", 200, 260, "redundant_run", {
+      tool_name: "Bash",
+      tool_use_id: "passed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+  ];
+  const finding = detectFlakyTests(actions, {
+    toolResults: [
+      toolResult("failed", 100, "failure"),
+      toolResult("passed", 260, "success"),
+    ],
+  })[0];
+
+  assert.ok(finding !== undefined);
+  assert.equal(finding.recoverable.estimated_ms, 100);
+  assert.deepEqual(finding.evidence.interval_ids, ["R008:failed"]);
+  assert.equal(finding.evidence.investigation_action_count, 1);
 });
 
 test("R008 rejects related or unknown edit relevance and non-definite failures", () => {
@@ -863,6 +1366,57 @@ test("R008 rejects unknown and relevant edits that overlap either causal-window 
       overlap.actionId,
     );
   }
+});
+
+test("R008 rejects mutations during a failed run across contexts", () => {
+  const failed = matchedAction("failed", 0, 100, "contributing_run", {
+    tool_name: "Bash",
+    tool_use_id: "failed",
+    command: "npm test",
+    normalized_command: "npm test",
+  });
+  const passed = matchedAction("passed", 200, 260, "redundant_run", {
+    tool_name: "Bash",
+    tool_use_id: "passed",
+    command: "npm test",
+    normalized_command: "npm test",
+  });
+  const cases = [
+    {
+      blocker: matchedAction("related-edit", 50, 80, "contributing_edit", {
+        session_id: "s-related",
+        agent_id: "editor",
+        tool_name: "Edit",
+        paths: ["test/a.test.ts"],
+      }),
+      relevance: new Map([["related-edit", "related" as const]]),
+    },
+    {
+      blocker: matchedAction("unknown-mutation", 50, 80, "unexplained", {
+        session_id: "s-unknown",
+        agent_id: "mutator",
+        tool_name: "Bash",
+        command: "python fix_test.py",
+        paths: ["test/a.test.ts"],
+      }),
+    },
+  ];
+  const results = [
+    toolResult("failed", 100, "failure"),
+    toolResult("passed", 260, "success"),
+  ];
+
+  assert.deepEqual(
+    cases.map(({ blocker, relevance }) =>
+      detectFlakyTests([failed, blocker, passed], {
+        toolResults: results,
+        ...(relevance === undefined
+          ? {}
+          : { editRelevanceByActionId: relevance }),
+      }).length
+    ),
+    [0, 0],
+  );
 });
 
 test("R008 edit relevance wiring is conservative across current test commands", () => {

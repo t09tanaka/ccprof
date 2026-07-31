@@ -1,19 +1,42 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import {
+  mkdir,
+  mkdtemp,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
+import { analyze } from "../src/core/analyze.js";
 import type {
   AssistantEvent,
   Finding,
   GenuineUserEvent,
   MatchedAction,
+  Session,
   TimelineAction,
 } from "../src/core/model.js";
-import type { AnalysisRecord } from "../src/store/analyses.js";
+import {
+  runCommand,
+  type CommandRunner,
+} from "../src/git/client.js";
+import {
+  loadAnalyses,
+  makeAnalysisRecord,
+  saveAnalysis,
+  type AnalysisRecord,
+  type StoredReadObservation,
+} from "../src/store/analyses.js";
+import { resolveStorePaths } from "../src/store/paths.js";
 import type { AttributedTimelineAction } from "../src/analysis/timeline.js";
 import {
   createFindingCandidate,
   findingKey,
+  normalizeFindingTarget,
   recoverableClaim,
 } from "../src/rules/shared.js";
 import { detectRework } from "../src/rules/rework.js";
@@ -23,6 +46,10 @@ import {
   APPROVAL_PROMPT_PHRASES,
   detectHumanWait,
 } from "../src/rules/human-wait.js";
+
+const READ_OID_A = "a".repeat(40);
+const READ_OID_B = "b".repeat(40);
+const ANALYZE_NOW_MS = Date.parse("2026-08-01T00:00:00.000Z");
 
 function timelineAction(
   actionId: string,
@@ -108,6 +135,7 @@ function historyRecord(
   prRef: string,
   createdAtMs: number,
   findings: readonly Finding[],
+  readObservations?: readonly StoredReadObservation[],
 ): AnalysisRecord {
   return {
     schema_version: 1,
@@ -129,7 +157,26 @@ function historyRecord(
     findings: [...findings],
     metrics: {},
     command_costs: [],
+    ...(readObservations === undefined
+      ? {}
+      : { read_observations: [...readObservations] }),
   };
+}
+
+function storedRead(
+  path: string,
+  durationMin: number,
+  sessionRef: string,
+  objectId = READ_OID_A,
+  confidence: "low" | "medium" | "high" = "high",
+): StoredReadObservation {
+  return {
+    path,
+    object_id: objectId,
+    duration_min: durationMin,
+    session_refs: [sessionRef],
+    confidence,
+  } as StoredReadObservation;
 }
 
 function storedRediscoveryFinding(
@@ -159,6 +206,258 @@ function storedRediscoveryFinding(
     caveats: [],
   };
 }
+
+async function gitForReadTest(
+  cwd: string,
+  args: readonly string[],
+): Promise<string> {
+  const result = await runCommand("git", args, { cwd, timeoutMs: 10_000 });
+  assert.equal(result.code, 0, result.stderr);
+  return result.stdout.trim();
+}
+
+async function writeReadTestFile(
+  path: string,
+  content: string,
+): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, content, "utf8");
+}
+
+async function makeReadRepository(root: string): Promise<string> {
+  const repo = join(root, "repo");
+  await mkdir(repo);
+  await gitForReadTest(repo, ["init", "--initial-branch=main"]);
+  await gitForReadTest(repo, ["config", "user.name", "ccprof test"]);
+  await gitForReadTest(repo, [
+    "config",
+    "user.email",
+    "ccprof@example.invalid",
+  ]);
+  await writeReadTestFile(join(repo, "package.json"), "{\"private\":true}\n");
+  await writeReadTestFile(
+    join(repo, "src/ value.ts "),
+    "export const rootValue = 1;\n",
+  );
+  await writeReadTestFile(
+    join(repo, "pkg/src/ value.ts "),
+    "export const nestedValue = 1;\n",
+  );
+  await gitForReadTest(repo, ["add", "."]);
+  await gitForReadTest(repo, ["commit", "-m", "base"]);
+  for (const branch of ["feature-a", "feature-b", "feature-d", "feature-e"]) {
+    await gitForReadTest(repo, ["switch", "main"]);
+    await gitForReadTest(repo, ["switch", "-c", branch]);
+    await writeReadTestFile(join(repo, `docs/${branch}.md`), `${branch}\n`);
+    await gitForReadTest(repo, ["add", "."]);
+    await gitForReadTest(repo, ["commit", "-m", branch]);
+  }
+  await gitForReadTest(repo, ["switch", "main"]);
+  await gitForReadTest(repo, ["switch", "-c", "feature-c"]);
+  await writeReadTestFile(
+    join(repo, "pkg/src/ value.ts "),
+    "export const nestedValue = 2;\n",
+  );
+  await gitForReadTest(repo, ["add", "."]);
+  await gitForReadTest(repo, ["commit", "-m", "feature-c"]);
+  await gitForReadTest(repo, ["switch", "main"]);
+  await gitForReadTest(repo, ["switch", "-c", "feature-g"]);
+  await writeReadTestFile(
+    join(repo, "pkg/src/ value.ts "),
+    "export const nestedValue = 2;\n",
+  );
+  await gitForReadTest(repo, ["add", "."]);
+  await gitForReadTest(repo, ["commit", "-m", "feature-g"]);
+  return await realpath(repo);
+}
+
+function readSession(
+  sessionId: string,
+  repo: string,
+  confidence: Session["confidence"],
+): Session {
+  const absoluteRead = sessionId === "read-b";
+  const rawPath = absoluteRead
+    ? join(repo, "pkg/src/ value.ts ")
+    : "src/ value.ts ";
+  const cwd = absoluteRead ? undefined : join(repo, "pkg");
+  const eventBase = {
+    session_id: sessionId,
+    agent_id: "main",
+    is_sidechain: false,
+    confidence: "high" as const,
+  };
+  return {
+    session_id: sessionId,
+    source: "claude",
+    source_path: join(repo, `${sessionId}.jsonl`),
+    observed_cwds: [cwd ?? repo],
+    observed_branches: [],
+    started_at_ms: ANALYZE_NOW_MS - 120_000,
+    ended_at_ms: ANALYZE_NOW_MS - 60_000,
+    confidence,
+    warnings: [],
+    events: [
+      {
+        ...eventBase,
+        kind: "tool_use",
+        timestamp_ms: ANALYZE_NOW_MS - 120_000,
+        entry_uuid: `${sessionId}-use`,
+        session_ref: `${sessionId}#use`,
+        source_index: 0,
+        tool_use_id: `${sessionId}-read`,
+        tool_name: "Read",
+        input: { file_path: rawPath },
+        paths: [rawPath],
+        edit_fragments: [],
+        ...(cwd === undefined ? {} : { cwd }),
+      },
+      {
+        ...eventBase,
+        kind: "tool_result",
+        timestamp_ms: ANALYZE_NOW_MS - 60_000,
+        entry_uuid: `${sessionId}-result`,
+        session_ref: `${sessionId}#result`,
+        source_index: 1,
+        tool_use_id: `${sessionId}-read`,
+        status: "success",
+        output: "export const value = 1;",
+        output_bytes: 23,
+        estimated_tokens: 25,
+      },
+    ],
+  };
+}
+
+function readThenEditSession(
+  sessionId: string,
+  repo: string,
+): Session {
+  const session = readSession(sessionId, repo, "high");
+  const [readUse, readResult] = session.events;
+  assert.ok(readUse?.kind === "tool_use");
+  assert.ok(readResult?.kind === "tool_result");
+  const use = (
+    suffix: string,
+    timestamp_ms: number,
+    source_index: number,
+    tool_use_id: string,
+  ) => ({
+    ...readUse,
+    timestamp_ms,
+    source_index,
+    entry_uuid: `${sessionId}-${suffix}`,
+    session_ref: `${sessionId}#${suffix}`,
+    tool_use_id,
+  });
+  const result = (
+    suffix: string,
+    timestamp_ms: number,
+    source_index: number,
+    tool_use_id: string,
+  ) => ({
+    ...readResult,
+    timestamp_ms,
+    source_index,
+    entry_uuid: `${sessionId}-${suffix}`,
+    session_ref: `${sessionId}#${suffix}`,
+    tool_use_id,
+  });
+  return {
+    ...session,
+    started_at_ms: ANALYZE_NOW_MS - 300_000,
+    events: [
+      use("pre-use", ANALYZE_NOW_MS - 300_000, 0, "pre"),
+      result("pre-result", ANALYZE_NOW_MS - 240_000, 1, "pre"),
+      {
+        ...use("edit-use", ANALYZE_NOW_MS - 220_000, 2, "edit"),
+        tool_name: "Edit",
+        input: { file_path: "src/ value.ts " },
+        paths: ["src/ value.ts "],
+        edit_fragments: ["export const nestedValue = 2;"],
+      },
+      result("edit-result", ANALYZE_NOW_MS - 180_000, 3, "edit"),
+      use("post-use", ANALYZE_NOW_MS - 120_000, 4, "post"),
+      result("post-result", ANALYZE_NOW_MS - 60_000, 5, "post"),
+    ],
+  };
+}
+
+test("schema-v1 read observations normalize while legacy records remain loadable", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-read-store-"));
+  try {
+    const paths = await resolveStorePaths(join(root, "repo"), {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const observed = makeAnalysisRecord({
+      analysis_id: "observed",
+      created_at_ms: 1,
+      unit: {
+        repo: "/repo",
+        pr_ref: "main...observed",
+        sessions: ["observed"],
+      },
+      summary: {
+        measured_min: 1,
+        idle_excluded_min: 0,
+        estimated_floor_min: 1,
+        recoverable_min: 0,
+        unexplained_min: 0,
+        baseline: null,
+      },
+      findings: [],
+      metrics: {},
+      command_costs: [],
+      read_observations: [
+        {
+          path: "./src\\value.ts",
+          object_id: READ_OID_A.toUpperCase(),
+          duration_min: 2,
+          session_refs: ["s#2", "s#1"],
+        },
+        storedRead("src/value.ts", 1, "s#1"),
+        storedRead(" src/spaced.ts ", 0.5, "s#space", READ_OID_B),
+      ],
+    });
+    assert.deepEqual(observed.read_observations, [
+      {
+        path: " src/spaced.ts ",
+        object_id: READ_OID_B,
+        duration_min: 0.5,
+        session_refs: ["s#space"],
+        confidence: "high",
+      },
+      {
+        path: "src/value.ts",
+        object_id: READ_OID_A,
+        duration_min: 3,
+        session_refs: ["s#1", "s#2"],
+        confidence: "low",
+      },
+    ]);
+    assert.throws(
+      () =>
+        makeAnalysisRecord({
+          ...observed,
+          analysis_id: "invalid",
+          read_observations: [{
+            ...storedRead("src/value.ts", 1, "s#read"),
+            object_id: "not-an-object-id",
+          }],
+        }),
+      /object_id/iu,
+    );
+
+    const legacy = historyRecord("legacy", "main...legacy", 2, []);
+    assert.equal(legacy.read_observations, undefined);
+    await saveAnalysis(paths, legacy);
+    const loaded = await loadAnalyses(paths);
+    assert.equal(loaded.records.length, 1);
+    assert.equal(loaded.records[0]?.read_observations, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("shared finding construction hashes normalized targets and stabilizes evidence", () => {
   const action = timelineAction("run", 10, 30);
@@ -664,7 +963,10 @@ test("R003 claims duplicate reads and only their directly caused post-result inf
   assert.equal(finding.scope, "claude_md");
   assert.equal(finding.cause, null);
   assert.equal(finding.confidence, "medium");
-  assert.equal(finding.finding_key, findingKey("R003", "src/a.ts"));
+  assert.equal(
+    finding.finding_key,
+    findingKey("R003", "src/a.ts"),
+  );
   assert.equal(finding.evidence.duplicate_count, 2);
   assert.equal(finding.evidence.duration_ms, 250);
   assert.equal(finding.evidence.estimated_tokens, 200);
@@ -679,45 +981,54 @@ test("R003 claims duplicate reads and only their directly caused post-result inf
   assert.notEqual(finding.fix_recipe.verify, "");
 });
 
-test("R003 connects a current safe read to prior rediscovery by normalized path without claiming historical time", () => {
+test("R003 requires exact blob identity, aggregates analyses per PR, and claims current work", () => {
   const currentRead = matchedAction("current-read", 0, 120, "safe_read", {
-    paths: ["src/a.ts"],
-    target: "src/a.ts",
+    paths: ["pkg/src/a.ts"],
+    target: "pkg/src/a.ts",
     tool_use_id: "current-read",
     tool_name: "Read",
   });
   const prior = [
-    historyRecord("old-a-1", "main...old-a", 1, [
-      storedRediscoveryFinding("./src/a.ts", 1, "old-a#read-1"),
+    historyRecord("old-a-1", "main...old-a", 1, [], [
+      storedRead("pkg/src/a.ts", 1, "old-a#read-1"),
     ]),
-    historyRecord("old-a-2", "main...old-a", 2, [
-      storedRediscoveryFinding("src\\a.ts", 2, "old-a#read-2"),
+    historyRecord("old-a-2", "main...old-a", 2, [], [
+      storedRead("pkg/src/a.ts", 2, "old-a#read-2"),
     ]),
-    historyRecord("old-b", "main...old-b", 3, [
-      storedRediscoveryFinding("src/a.ts", 0.5, "old-b#read"),
+    historyRecord("old-b", "main...old-b", 3, [], [
+      storedRead("pkg/src/a.ts", 0.5, "old-b#read"),
     ]),
-    historyRecord("other-path", "main...old-c", 4, [
-      storedRediscoveryFinding("src/b.ts", 9, "old-c#read"),
+    historyRecord("root-path", "main...root", 4, [], [
+      storedRead("src/a.ts", 9, "root#read"),
     ]),
-    historyRecord("malformed", "main...old-d", 5, [{
-      ...storedRediscoveryFinding("src/a.ts", 8, "old-d#read"),
-      evidence: {
-        session_refs: "not-an-array",
-        interval_ids: [],
-        paths: [42],
-        duration_ms: "eight minutes",
-      },
-    } as unknown as Finding]),
+    historyRecord("changed", "main...old-d", 5, [], [
+      storedRead("pkg/src/a.ts", 8, "old-d#read", READ_OID_B),
+    ]),
+    historyRecord("legacy", "main...legacy", 6, [
+      storedRediscoveryFinding("src/a.ts", 10, "legacy#read"),
+    ]),
   ];
 
-  const finding = detectRediscovery([currentRead], { history: prior })[0];
+  const finding = detectRediscovery([currentRead], {
+    history: prior,
+    currentObjectIdsByPath: new Map([
+      ["pkg/src/a.ts", READ_OID_A],
+      ["src/a.ts", READ_OID_A],
+    ]),
+    estimatedTokensByToolUseId: new Map([["current-read", 250]]),
+  })[0];
 
   assert.ok(finding !== undefined);
-  assert.equal(finding.finding_key, findingKey("R003", "src/a.ts"));
-  assert.equal(finding.recoverable.estimated_ms, 0);
-  assert.deepEqual(finding.evidence.interval_ids, []);
+  assert.equal(finding.target, "pkg/src/a.ts");
+  assert.equal(
+    finding.finding_key,
+    findingKey("R003", "pkg/src/a.ts"),
+  );
+  assert.equal(finding.recoverable.estimated_ms, 120);
+  assert.deepEqual(finding.evidence.interval_ids, ["R003:current-read"]);
   assert.equal(finding.evidence.duplicate_count, 0);
   assert.equal(finding.evidence.current_read_count, 1);
+  assert.equal(finding.evidence.estimated_tokens, 250);
   assert.deepEqual(finding.evidence.historical_prs, [
     "main...old-a",
     "main...old-b",
@@ -729,55 +1040,170 @@ test("R003 connects a current safe read to prior rediscovery by normalized path 
     "old-b#read",
   ]);
   assert.match(finding.caveats.join("\n"), /2 prior PRs/iu);
+  assert.deepEqual(
+    detectRediscovery([currentRead], {
+      history: [
+        historyRecord("old-a", "main...old-a", 1, [], [
+          storedRead("pkg/src/a.ts", 1, "old-a#read"),
+        ]),
+      ],
+      currentObjectIdsByPath: new Map([["pkg/src/a.ts", READ_OID_B]]),
+    }),
+    [],
+  );
+
+  const absoluteRead = {
+    ...currentRead,
+    action_id: "absolute-read",
+    tool_use_id: "absolute-read",
+  };
+  assert.equal(
+    detectRediscovery([absoluteRead], {
+      history: prior,
+      currentObjectIdsByPath: new Map([["pkg/src/a.ts", READ_OID_A]]),
+    })[0]?.target,
+    "pkg/src/a.ts",
+  );
 });
 
-test("R003 does not reuse a zero-recoverable history trend as duplicate evidence", () => {
+test("R003 gives a multi-path duplicate one canonical verified-history group", () => {
+  const read = matchedAction("multi-read", 0, 50, "duplicate_read", {
+    paths: ["src/a.ts", "src/b.ts"],
+    target: "src/a.ts, src/b.ts",
+    tool_use_id: "multi-read",
+    tool_name: "Read",
+  });
+  const findings = detectRediscovery([read], {
+    history: [
+      historyRecord("old", "main...old", 1, [], [
+        storedRead("src/b.ts", 1, "old#read"),
+      ]),
+    ],
+    currentObjectIdsByPath: new Map([["src/b.ts", READ_OID_A]]),
+  });
+
+  assert.equal(findings.length, 1);
+  const finding = findings[0];
+  assert.ok(finding);
+  assert.equal(finding.target, "src/b.ts");
+  assert.equal(finding.recoverable.estimated_ms, 50);
+  assert.equal(finding.evidence.historical_duration_min, 1);
+});
+
+test("R003 never cross-PR claims a safe multi-path read", () => {
+  const read = matchedAction("safe-multi", 0, 50, "safe_read", {
+    paths: ["src/a.ts", "src/b.ts"],
+    target: "src/a.ts, src/b.ts",
+    tool_use_id: "safe-multi",
+    tool_name: "Read",
+  });
+  const eligible = (path: string) =>
+    ["s1", "root", "safe-multi", path].join("\0");
+  const currentObjectIdsByPath = new Map([
+    ["src/a.ts", READ_OID_A],
+    ["src/b.ts", READ_OID_A],
+  ]);
+  const onePathHistory = [historyRecord("old-a", "main...old-a", 1, [], [
+    storedRead("src/a.ts", 1, "old-a#read"),
+  ])];
+  assert.deepEqual(detectRediscovery([read], {
+    history: onePathHistory,
+    currentObjectIdsByPath,
+    crossPrEligibleReadKeys: new Set([eligible("src/a.ts")]),
+    estimatedTokensByToolUseId: new Map([["safe-multi", 300]]),
+  }), []);
+
+  const findings = detectRediscovery([read], {
+    history: [historyRecord("old-both", "main...old-both", 2, [], [
+      storedRead("src/a.ts", 1, "old-both#a"),
+      storedRead("src/b.ts", 1, "old-both#b"),
+    ])],
+    currentObjectIdsByPath,
+    crossPrEligibleReadKeys: new Set([
+      eligible("src/a.ts"),
+      eligible("src/b.ts"),
+    ]),
+    estimatedTokensByToolUseId: new Map([["safe-multi", 300]]),
+  });
+  assert.deepEqual(findings, []);
+});
+
+test("R003 finding keys preserve exact path whitespace deterministically", () => {
+  const paths = ["src/a b.ts", "src/a  b.ts", "src/trailing.ts "];
+  const keys = paths.map((path, index) => {
+    const finding = detectRediscovery([
+      matchedAction(`read-${index}`, index * 100, index * 100 + 50, "duplicate_read", {
+        paths: [path],
+        target: path,
+        tool_use_id: `read-${index}`,
+        tool_name: "Read",
+      }),
+    ])[0];
+    assert.ok(finding);
+    assert.equal(
+      finding.finding_key,
+      findingKey(
+        "R003",
+        normalizeFindingTarget(path) === path
+          ? path
+          : `\0path:${Buffer.from(path, "utf16le").toString("hex")}`,
+      ),
+    );
+    return finding.finding_key;
+  });
+  assert.equal(new Set(keys).size, paths.length);
+
+  const loneSurrogate = "src/a  \ud800.ts";
+  const finding = detectRediscovery([
+    matchedAction("surrogate", 400, 450, "duplicate_read", {
+      paths: [loneSurrogate],
+      target: loneSurrogate,
+      tool_use_id: "surrogate",
+      tool_name: "Read",
+    }),
+  ])[0];
+  assert.ok(finding);
+  assert.equal(
+    finding.finding_key,
+    findingKey(
+      "R003",
+      `\0path:${Buffer.from(loneSurrogate, "utf16le").toString("hex")}`,
+    ),
+  );
+
+  const unicodeKeys = ["src/\ud800.ts", "src/\ufffd.ts"].map((path, index) => {
+    const candidate = detectRediscovery([
+      matchedAction(`unicode-${index}`, 500 + index * 100, 550 + index * 100, "duplicate_read", {
+        paths: [path],
+        target: path,
+        tool_use_id: `unicode-${index}`,
+        tool_name: "Read",
+      }),
+    ])[0];
+    assert.ok(candidate);
+    return candidate.finding_key;
+  });
+  assert.equal(new Set(unicodeKeys).size, 2);
+});
+
+test("R003 ignores legacy positive findings without versioned read observations", () => {
   const firstSafeRead = matchedAction("first-safe", 0, 100, "safe_read", {
     paths: ["src/a.ts"],
     target: "src/a.ts",
     tool_use_id: "first-safe",
     tool_name: "Read",
   });
-  const trend = detectRediscovery([firstSafeRead], {
+  assert.deepEqual(detectRediscovery([firstSafeRead], {
     history: [
-      historyRecord("actual-duplicate", "main...actual", 1, [
-        storedRediscoveryFinding("src/a.ts", 1, "actual#duplicate"),
+      historyRecord("legacy", "main...legacy", 1, [
+        storedRediscoveryFinding("src/a.ts", 1, "legacy#duplicate"),
       ]),
     ],
-  })[0];
-  assert.ok(trend !== undefined);
-  assert.equal(trend.recoverable.estimated_ms, 0);
-  assert.equal(trend.evidence.duplicate_count, 0);
-
-  const {
-    target: _target,
-    recoverable,
-    ...storedTrendMetadata
-  } = trend;
-  const storedTrend: Finding = {
-    ...storedTrendMetadata,
-    recoverable: {
-      min: 0,
-      bound: recoverable.bound,
-    },
-  };
-  const nextSafeRead = matchedAction("next-safe", 200, 300, "safe_read", {
-    paths: ["src/a.ts"],
-    target: "src/a.ts",
-    tool_use_id: "next-safe",
-    tool_name: "Read",
-  });
-
-  const nextFindings = detectRediscovery([nextSafeRead], {
-    history: [
-      historyRecord("trend-only", "main...trend", 2, [storedTrend]),
-    ],
-  });
-
-  assert.deepEqual(nextFindings, []);
+    currentObjectIdsByPath: new Map([["src/a.ts", READ_OID_A]]),
+  }), []);
 });
 
-test("R003 does not double-claim a within-PR duplicate when history has the same path", () => {
+test("R003 claims an exact cross-PR read plus its within-PR duplicate once each", () => {
   const actions = [
     matchedAction("first", 0, 50, "safe_read", {
       paths: ["src/a.ts"],
@@ -793,21 +1219,27 @@ test("R003 does not double-claim a within-PR duplicate when history has the same
     }),
   ];
   const history = [
-    historyRecord("old", "main...old", 1, [
-      storedRediscoveryFinding("src/a.ts", 1, "old#read"),
+    historyRecord("old", "main...old", 1, [], [
+      storedRead("src/a.ts", 1, "old#read"),
     ]),
   ];
 
-  const finding = detectRediscovery(actions, { history })[0];
+  const finding = detectRediscovery(actions, {
+    history,
+    currentObjectIdsByPath: new Map([["src/a.ts", READ_OID_A]]),
+  })[0];
 
   assert.ok(finding !== undefined);
-  assert.equal(finding.recoverable.estimated_ms, 100);
-  assert.deepEqual(finding.evidence.interval_ids, ["R003:duplicate"]);
+  assert.equal(finding.recoverable.estimated_ms, 150);
+  assert.deepEqual(finding.evidence.interval_ids, [
+    "R003:duplicate",
+    "R003:first",
+  ]);
   assert.equal(finding.evidence.duplicate_count, 1);
   assert.equal(finding.evidence.current_read_count, 2);
 });
 
-test("R003 history never makes the current safe read or its inference recoverable", () => {
+test("R003 exact history claims current reads and inference but not historical time", () => {
   const actions = [
     matchedAction("first", 0, 50, "safe_read", {
       paths: ["src/a.ts"],
@@ -837,13 +1269,14 @@ test("R003 history never makes the current safe read or its inference recoverabl
     }),
   ];
   const history = [
-    historyRecord("old", "main...old", 1, [
-      storedRediscoveryFinding("src/a.ts", 1, "old#read"),
+    historyRecord("old", "main...old", 1, [], [
+      storedRead("src/a.ts", 1, "old#read"),
     ]),
   ];
 
   const finding = detectRediscovery(actions, {
     history,
+    currentObjectIdsByPath: new Map([["src/a.ts", READ_OID_A]]),
     estimatedTokensByToolUseId: new Map([
       ["first", 1_000],
       ["duplicate", 200],
@@ -851,16 +1284,197 @@ test("R003 history never makes the current safe read or its inference recoverabl
   })[0];
 
   assert.ok(finding !== undefined);
-  assert.equal(finding.recoverable.estimated_ms, 130);
+  assert.equal(finding.recoverable.estimated_ms, 220);
   assert.deepEqual(finding.evidence.interval_ids, [
     "R003:duplicate",
     "R003:duplicate-inference",
+    "R003:first",
+    "R003:first-inference",
   ]);
-  assert.equal(finding.evidence.duration_ms, 130);
-  assert.equal(finding.evidence.read_duration_ms, 100);
-  assert.equal(finding.evidence.post_result_inference_ms, 30);
-  assert.equal(finding.evidence.estimated_tokens, 200);
+  assert.equal(finding.evidence.duration_ms, 220);
+  assert.equal(finding.evidence.read_duration_ms, 150);
+  assert.equal(finding.evidence.post_result_inference_ms, 70);
+  assert.equal(finding.evidence.estimated_tokens, 1_200);
+  assert.equal(finding.evidence.historical_duration_min, 1);
   assert.deepEqual(finding.evidence.historical_prs, ["main...old"]);
+});
+
+test("R003 includes historical observation confidence in its minimum", () => {
+  const read = matchedAction("current", 0, 50, "safe_read", {
+    paths: ["src/a.ts"],
+    target: "src/a.ts",
+    tool_use_id: "current",
+    tool_name: "Read",
+  });
+  const finding = detectRediscovery([read], {
+    history: [historyRecord("old", "main...old", 1, [], [
+      storedRead("src/a.ts", 1, "old#read", READ_OID_A, "low"),
+    ])],
+    currentObjectIdsByPath: new Map([["src/a.ts", READ_OID_A]]),
+  })[0];
+  assert.ok(finding);
+  assert.equal(finding.confidence, "low");
+});
+
+test("analyze stores frozen-head reads, caps session confidence, and omits unverifiable identities", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-read-analysis-"));
+  try {
+    const repo = await makeReadRepository(root);
+    const paths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const analyzeBranch = async (
+      branch: string,
+      sessionId: string,
+      confidence: Session["confidence"],
+      runner?: CommandRunner,
+    ) =>
+      await analyze({
+        cwd: repo,
+        pr: `main...${branch}`,
+        nowMs: ANALYZE_NOW_MS,
+        storePaths: paths,
+        sessionSource: {
+          discover: async () => [readSession(sessionId, repo, confidence)],
+        },
+        ...(runner === undefined ? {} : { runner }),
+      });
+
+    const first = await analyzeBranch("feature-a", "read-a", "high");
+    const blobOid = await gitForReadTest(repo, [
+      "rev-parse",
+      "feature-a:pkg/src/ value.ts ",
+    ]);
+    assert.deepEqual(first.record.read_observations, [{
+      path: "pkg/src/ value.ts ",
+      object_id: blobOid,
+      duration_min: 1,
+      session_refs: ["read-a#result", "read-a#use"],
+      confidence: "high",
+    }]);
+    assert.equal(
+      first.record.read_observations?.some(
+        ({ path }) => path === "src/ value.ts ",
+      ),
+      false,
+    );
+
+    const second = await analyzeBranch("feature-b", "read-b", "medium");
+    const rediscovery = second.allFindings.find(
+      ({ rule_id }) => rule_id === "R003",
+    );
+    assert.ok(rediscovery);
+    assert.equal(rediscovery.confidence, "medium");
+    assert.equal(rediscovery.recoverable.min, 1);
+    assert.deepEqual(rediscovery.evidence.interval_ids, [
+      "R003:read-b#use:tool:read-b-read",
+    ]);
+
+    const changed = await analyzeBranch("feature-c", "read-c", "high");
+    assert.equal(
+      changed.allFindings.some(({ rule_id }) => rule_id === "R003"),
+      false,
+    );
+
+    const edited = await analyze({
+      cwd: repo,
+      pr: "main...feature-g",
+      nowMs: ANALYZE_NOW_MS,
+      storePaths: paths,
+      sessionSource: {
+        discover: async () => [readThenEditSession("edited", repo)],
+      },
+    });
+    assert.deepEqual(edited.record.read_observations, [{
+      path: "pkg/src/ value.ts ",
+      object_id: await gitForReadTest(repo, [
+        "rev-parse",
+        "feature-g:pkg/src/ value.ts ",
+      ]),
+      duration_min: 1,
+      session_refs: ["edited#post-result", "edited#post-use"],
+      confidence: "high",
+    }]);
+    assert.deepEqual(
+      edited.allFindings.find(({ rule_id }) => rule_id === "R003")
+        ?.evidence.interval_ids,
+      ["R003:edited#post-use:tool:post"],
+    );
+
+    const failed = await analyze({
+      cwd: repo,
+      pr: "main...feature-a",
+      nowMs: ANALYZE_NOW_MS,
+      storePaths: paths,
+      sessionSource: {
+        discover: async () => [{
+          ...readSession("failed", repo, "high"),
+          events: readSession("failed", repo, "high").events.map((event) =>
+            event.kind === "tool_result"
+              ? { ...event, status: "failure" as const }
+              : event
+          ),
+        }],
+      },
+    });
+    assert.deepEqual(failed.record.read_observations, []);
+
+    const malformedRunner: CommandRunner = async (command, args, options) => {
+      if (command === "git" && args.includes("ls-tree")) {
+        return {
+          code: 0,
+          stdout: "100644 blob truncated\tpkg/src/ value.ts \0",
+          stderr: "",
+        };
+      }
+      return await runCommand(command, args, options);
+    };
+    const malformed = await analyzeBranch(
+      "feature-d",
+      "read-d",
+      "high",
+      malformedRunner,
+    );
+    assert.deepEqual(malformed.record.read_observations, []);
+    assert.ok(
+      malformed.warnings.some(
+        ({ code }) => code === "read_observation_unavailable",
+      ),
+    );
+    assert.equal(
+      malformed.allFindings.some(({ rule_id }) => rule_id === "R003"),
+      false,
+    );
+
+    const symlinkRunner: CommandRunner = async (command, args, options) => {
+      if (command === "git" && args.includes("ls-tree")) {
+        return {
+          code: 0,
+          stdout: `120000 blob ${blobOid}\tpkg/src/ value.ts \0`,
+          stderr: "",
+        };
+      }
+      return await runCommand(command, args, options);
+    };
+    const symlink = await analyzeBranch(
+      "feature-e",
+      "read-e",
+      "high",
+      symlinkRunner,
+    );
+    assert.deepEqual(symlink.record.read_observations, []);
+    assert.ok(
+      symlink.warnings.some(
+        ({ code }) => code === "read_observation_unavailable",
+      ),
+    );
+    assert.equal(
+      symlink.allFindings.some(({ rule_id }) => rule_id === "R003"),
+      false,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("R004 reports all active wait but claims only explicit or tightly phrased approvals", () => {

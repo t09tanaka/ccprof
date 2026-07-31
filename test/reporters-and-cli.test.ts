@@ -408,6 +408,34 @@ test("CLI routes clean stdout, warnings to stderr, and returns success", async (
   assert.match(stderr, /fixture warning/u);
 });
 
+test("CLI enables default color only for human TTY output and honors explicit color", async () => {
+  const colors: Array<[string, boolean]> = [];
+  const scenarioHandlers = handlers(async (options) => {
+    colors.push([options.format, options.color]);
+    return { stdout: "ok", warnings: [] };
+  });
+  const output = (_value: string): void => undefined;
+  const plainRuntime = {
+    handlers: scenarioHandlers,
+    stdout: output,
+    stderr: output,
+  };
+  const ttyRuntime = { ...plainRuntime, stdoutIsTTY: true };
+  const forcedRuntime = { ...plainRuntime, stdoutIsTTY: false };
+
+  await runCli([], plainRuntime);
+  await runCli([], ttyRuntime);
+  await runCli(["--color"], forcedRuntime);
+  await runCli(["--json"], ttyRuntime);
+
+  assert.deepEqual(colors, [
+    ["tty", false],
+    ["tty", true],
+    ["tty", true],
+    ["json", false],
+  ]);
+});
+
 test("CLI sanitizes warnings and caught errors before writing stderr", async () => {
   const warningAttack = terminalAttack("WARNING");
   let warningStdout = "";

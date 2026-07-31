@@ -292,13 +292,16 @@ function observe(
     status?: ToolResultEvent["status"];
     cwd?: string;
     agentId?: string;
+    sessionId?: string;
     endAt?: number;
   } = {},
 ): ActionObservation {
   const paths = options.paths ?? [];
   const agentId = options.agentId ?? "root";
+  const sessionId = options.sessionId ?? "s1";
   const use = toolUse(id, name, {
     agent_id: agentId,
+    session_id: sessionId,
     paths,
     edit_fragments: options.fragments ?? [],
     ...(options.command === undefined ? {} : { command: options.command }),
@@ -311,6 +314,7 @@ function observe(
         end_ms: options.endAt ?? at + 100,
       },
       agent_id: agentId,
+      session_id: sessionId,
       paths,
       tool_use_id: id,
       tool_name: name,
@@ -320,6 +324,7 @@ function observe(
     toolResult: {
       ...toolResult(id, options.status),
       agent_id: agentId,
+      session_id: sessionId,
     },
   };
 }
@@ -613,6 +618,181 @@ test("uses surviving fragments as strong edit evidence", () => {
   assert.equal(matched[0]?.match_confidence, "high");
 });
 
+test("caps surviving truncated fragment evidence and discloses truncation", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("edit", 0, "Edit", {
+        paths: ["src/widget.ts"],
+        fragments: [
+          "export const finalWidget = true;\n[input truncated]",
+        ],
+      }),
+    ],
+    {
+      diff: diff([
+        file("src/widget.ts", {
+          addedLines: ["export const finalWidget = true;"],
+        }),
+      ]),
+      testMap: explicitMap,
+    },
+  );
+
+  assert.equal(matched[0]?.match, "contributing_edit");
+  assert.equal(matched[0]?.match_confidence, "medium");
+  assert.match(matched[0]?.caveats.join(" ") ?? "", /truncat/i);
+});
+
+test("never infers rework from an absent truncated fragment", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("edit", 0, "Edit", {
+        paths: ["src/widget.ts"],
+        fragments: [
+          "export const discardedApproach = makeLegacyWidget();\n[input truncated]",
+        ],
+      }),
+    ],
+    {
+      diff: diff([
+        file("src/widget.ts", {
+          addedLines: ["export const finalWidget = true;"],
+        }),
+      ]),
+      testMap: explicitMap,
+    },
+  );
+
+  assert.equal(matched[0]?.match, "unexplained");
+  assert.equal(matched[0]?.match_confidence, "low");
+  assert.match(matched[0]?.caveats.join(" ") ?? "", /truncat/i);
+});
+
+test("does not treat deletion-only patch text as edit fragment evidence", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("edit", 0, "apply_patch", {
+        paths: ["src/widget.ts"],
+        fragments: [
+          [
+            "*** Begin Patch",
+            "*** Update File: src/widget.ts",
+            "@@",
+            "-export const discardedApproach = makeLegacyWidget();",
+            " export const unchangedContext = true;",
+            "*** End Patch",
+          ].join("\n"),
+        ],
+      }),
+    ],
+    {
+      diff: diff([
+        file("src/widget.ts", {
+          addedLines: ["export const finalWidget = true;"],
+        }),
+      ]),
+      testMap: explicitMap,
+    },
+  );
+
+  assert.equal(matched[0]?.match, "contributing_edit");
+  assert.equal(matched[0]?.match_confidence, "low");
+  assert.match(matched[0]?.caveats.join(" ") ?? "", /path-only/i);
+});
+
+test("retains plus-prefixed source lines as strong patch evidence", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("edit", 0, "apply_patch", {
+        paths: ["src/widget.ts"],
+        fragments: [
+          [
+            "*** Begin Patch",
+            "*** Update File: src/widget.ts",
+            "@@",
+            "+++currentIndex;",
+            "*** End Patch",
+          ].join("\n"),
+        ],
+      }),
+    ],
+    {
+      diff: diff([
+        file("src/widget.ts", {
+          addedLines: ["++currentIndex;"],
+        }),
+      ]),
+      testMap: explicitMap,
+    },
+  );
+
+  assert.equal(matched[0]?.match, "contributing_edit");
+  assert.equal(matched[0]?.match_confidence, "high");
+});
+
+test("retains plus-prefixed source lines in an add-file patch without a hunk", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("edit", 0, "apply_patch", {
+        paths: ["src/widget.ts"],
+        fragments: [
+          [
+            "*** Begin Patch",
+            "*** Add File: src/widget.ts",
+            "+++currentIndex;",
+            "*** End Patch",
+          ].join("\n"),
+        ],
+      }),
+    ],
+    {
+      diff: diff([
+        file("src/widget.ts", {
+          addedLines: ["++currentIndex;"],
+        }),
+      ]),
+      testMap: explicitMap,
+    },
+  );
+
+  assert.equal(matched[0]?.match, "contributing_edit");
+  assert.equal(matched[0]?.match_confidence, "high");
+});
+
+test("ignores unified diff file headers when matching edit fragments", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("edit", 0, "apply_patch", {
+        paths: ["long/path.ts"],
+        fragments: [
+          [
+            "diff --git a/first.ts b/first.ts",
+            "--- a/first.ts",
+            "+++ b/first.ts",
+            "@@ -0,0 +1 @@",
+            "+x;",
+            "--- a/long/path.ts",
+            "+++ b/long/path.ts",
+            "@@ -1 +0,0 @@",
+            "-discarded",
+          ].join("\n"),
+        ],
+      }),
+    ],
+    {
+      diff: diff([
+        file("long/path.ts", {
+          addedLines: ["++ b/long/path.ts"],
+        }),
+      ]),
+      testMap: explicitMap,
+    },
+  );
+
+  assert.equal(matched[0]?.match, "contributing_edit");
+  assert.equal(matched[0]?.match_confidence, "low");
+});
+
 test("normalizes contained absolute Claude paths from cwd or explicit repo root", () => {
   const fromCwd = matchTimelineActions(
     [
@@ -731,6 +911,31 @@ test("does not use an out-of-repository cwd when repo root is known", () => {
   assert.match(relativeOutside[0]?.caveats.join(" ") ?? "", /repository-relative/i);
   assert.equal(contained[0]?.match, "contributing_edit");
   assert.equal(contained[0]?.target, "packages/widget/src/index.ts");
+});
+
+test("stores normalized paths on safe and duplicate multi-path reads", () => {
+  const paths = ["src/a.ts", "/repo/pkg/src/b.ts"];
+  const matched = matchTimelineActions(
+    [
+      observe("mixed-read-1", 0, "Read", { paths, cwd: "/repo/pkg" }),
+      observe("mixed-read-2", 200, "Read", { paths, cwd: "/repo/pkg" }),
+    ],
+    {
+      diff: diff([]),
+      testMap: explicitMap,
+      repoRoot: "/repo",
+    },
+  );
+
+  assert.deepEqual(matched.map(({ match }) => match), [
+    "safe_read",
+    "duplicate_read",
+  ]);
+  assert.deepEqual(matched[0]?.paths, [
+    "pkg/src/a.ts",
+    "pkg/src/b.ts",
+  ]);
+  assert.deepEqual(matched[1]?.paths, matched[0]?.paths);
 });
 
 test("uses strong fragment absence only with complete unambiguous text evidence", () => {
@@ -917,6 +1122,41 @@ test("detects successful duplicate reads but excludes a read after an edit", () 
   ]);
 });
 
+test("scopes duplicate reads to the same session and agent context", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("root-read", 0, "Read", { paths: ["src/widget.ts"] }),
+      observe("agent-first", 200, "Read", {
+        paths: ["src/widget.ts"],
+        agentId: "sidechain",
+      }),
+      observe("session-first", 400, "Read", {
+        paths: ["src/widget.ts"],
+        sessionId: "s2",
+      }),
+      observe("root-repeat", 600, "Read", {
+        paths: ["src/widget.ts"],
+      }),
+      observe("agent-repeat", 800, "Read", {
+        paths: ["src/widget.ts"],
+        agentId: "sidechain",
+      }),
+    ],
+    {
+      diff: diff([]),
+      testMap: explicitMap,
+    },
+  );
+
+  assert.deepEqual(matched.map((entry) => entry.match), [
+    "safe_read",
+    "safe_read",
+    "safe_read",
+    "duplicate_read",
+    "duplicate_read",
+  ]);
+});
+
 test("requires the first read to finish before a duplicate begins", () => {
   const matched = matchTimelineActions(
     [
@@ -961,7 +1201,11 @@ test("invalid-path edits and opaque shell actions invalidate duplicate-read stat
   ]);
 });
 
-test("does not call a second read duplicate when the first read failed", () => {
+test("failed or missing-result reads are unexplained and never seed duplicates", () => {
+  const missingResult = observe("read-missing", 400, "Read", {
+    paths: ["src/widget.ts"],
+  });
+  delete missingResult.toolResult;
   const matched = matchTimelineActions(
     [
       observe("read-1", 0, "Read", {
@@ -969,6 +1213,7 @@ test("does not call a second read duplicate when the first read failed", () => {
         status: "failure",
       }),
       observe("read-2", 200, "Read", { paths: ["src/widget.ts"] }),
+      missingResult,
     ],
     {
       diff: diff([]),
@@ -976,7 +1221,10 @@ test("does not call a second read duplicate when the first read failed", () => {
     },
   );
   assert.deepEqual(matched.map((entry) => entry.match), [
+    "unexplained",
     "safe_read",
-    "safe_read",
+    "unexplained",
   ]);
+  assert.equal(matched[0]?.match_confidence, "low");
+  assert.match(matched[0]?.caveats.join("\n") ?? "", /successful/iu);
 });

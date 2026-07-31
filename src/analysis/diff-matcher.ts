@@ -67,6 +67,7 @@ interface ObservedPaths {
   caveats: string[];
 }
 
+type MeaningfulFragments = { values: string[]; truncated: boolean };
 const EDIT_TOOLS = new Set([
   "apply_patch",
   "edit",
@@ -276,7 +277,7 @@ function matchEdit(
   paths: readonly string[],
   diff: DiffEvidence,
 ): MatchedAction {
-  const action = observation.action;
+  const action = { ...observation.action, paths: [...paths] };
   if (paths.length === 0) {
     return result(
       action,
@@ -287,22 +288,37 @@ function matchEdit(
     );
   }
   const target = paths.join(", ");
-  const fragments = meaningfulFragments(observation.toolUse?.edit_fragments ?? []);
+  const fragments = meaningfulFragments(observation.toolUse?.edit_fragments ?? [],
+    normalizedToolName(observation.toolUse?.tool_name ??
+      observation.action.tool_name ?? "") === "apply_patch");
   const matchedFiles = filesForPaths(paths, diff.files);
   if (
-    fragments.length > 0 &&
-    matchedFiles.some((file) => fragmentSurvives(fragments, file))
+    fragments.values.length > 0 &&
+    matchedFiles.some((file) => fragmentSurvives(fragments.values, file))
   ) {
     return result(
       action,
       "contributing_edit",
-      lowerConfidence(action.confidence, "high"),
+      lowerConfidence(action.confidence, fragments.truncated ? "medium" : "high"),
       target,
-      [],
+      fragments.truncated ? ["Edit input was truncated; surviving fragment evidence is incomplete."] : [],
     );
   }
 
-  if (fragments.length > 0) {
+  if (fragments.truncated) {
+    return result(
+      action,
+      "unexplained",
+      "low",
+      target,
+      unique([
+        "Edit input was truncated, so fragment absence cannot establish rework.",
+        ...diff.caveats,
+      ]),
+    );
+  }
+
+  if (fragments.values.length > 0) {
     const absenceIsComplete =
       !diff.truncated &&
       paths.every((path) => pathSupportsAbsence(path, diff));
@@ -380,11 +396,18 @@ function matchRead(
   uncertaintyOrdinal: number,
   successfulReads: Map<string, SuccessfulRead[]>,
 ): MatchedAction {
+  observation = { ...observation, action: { ...observation.action, paths: [...paths] } };
   const successful = resultWasDefinitelySuccessful(observation.toolResult);
+  if (!successful) {
+    return result(observation.action, "unexplained", "low",
+      targetFor(observation, paths),
+      ["Read completion was not definitely successful."]);
+  }
   const duplicate =
     paths.length > 0 &&
     paths.every((path) => {
-      const previous = successfulReads.get(path) ?? [];
+      const key = successfulReadKey(observation.action, path);
+      const previous = successfulReads.get(key) ?? [];
       return previous.some(
         (read) =>
           read.completedAtMs <= observation.action.interval.start_ms &&
@@ -392,16 +415,15 @@ function matchRead(
           read.uncertaintyOrdinal === uncertaintyOrdinal,
       );
     });
-  if (successful) {
-    for (const path of paths) {
-      const reads = successfulReads.get(path) ?? [];
-      reads.push({
-        pathRevision: pathRevisions.get(path) ?? 0,
-        uncertaintyOrdinal,
-        completedAtMs: observation.action.interval.end_ms,
-      });
-      successfulReads.set(path, reads);
-    }
+  for (const path of paths) {
+    const key = successfulReadKey(observation.action, path);
+    const reads = successfulReads.get(key) ?? [];
+    reads.push({
+      pathRevision: pathRevisions.get(path) ?? 0,
+      uncertaintyOrdinal,
+      completedAtMs: observation.action.interval.end_ms,
+    });
+    successfulReads.set(key, reads);
   }
   if (duplicate) {
     return result(
@@ -684,14 +706,42 @@ function normalizedToolName(value: string): string {
   return value.replaceAll("-", "_").toLowerCase();
 }
 
-function meaningfulFragments(fragments: readonly string[]): string[] {
-  return unique(fragments.flatMap((fragment) =>
-    fragment
+function meaningfulFragments(
+  fragments: readonly string[],
+  forcePatch: boolean,
+): MeaningfulFragments {
+  let truncated = false;
+  const values = fragments.flatMap((rawFragment) => {
+    let inHunk = false;
+    const suffix = "\n[input truncated]";
+    const fragment = rawFragment.endsWith(suffix)
+      ? rawFragment.slice(0, -suffix.length)
+      : rawFragment;
+    truncated ||= fragment !== rawFragment;
+    const patchLike = forcePatch ||
+      /^(?:\*\*\* (?:Begin Patch|Update File|Add File|Delete File)|diff --git |--- |\+\+\+ |@@)/mu.test(fragment);
+    return fragment
       .split(/\r?\n/u)
-      .map((line) => line.replace(/^[+ ]/u, ""))
+      .flatMap((line) => {
+        if (line.startsWith("diff --git ") || line.startsWith("--- ")) inHunk = false;
+        inHunk ||= line.startsWith("@@");
+        return patchLike
+          ? line.startsWith("+") && (inHunk || !line.startsWith("+++ "))
+            ? [line.slice(1)]
+            : []
+          : [line.replace(/^[+ ]/u, "")]
+      })
       .map(normalizeText)
-      .filter((line) => line.length >= 12 && /[A-Za-z0-9_\p{L}]{3}/u.test(line))
-  ));
+      .filter((line) => line.length >= 12 && /[A-Za-z0-9_\p{L}]{3}/u.test(line));
+  });
+  return { values: unique(values), truncated };
+}
+
+function successfulReadKey(
+  action: TimelineAction,
+  path: string,
+): string {
+  return [action.session_id, action.agent_id, path].join("\0");
 }
 
 function normalizeText(value: string): string {

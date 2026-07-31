@@ -38,7 +38,7 @@ import {
   mergeTestMaps,
   type TestMap,
 } from "../analysis/test-map.js";
-import type { CommandRunner } from "../git/client.js";
+import { runCommand, type CommandRunner } from "../git/client.js";
 import { collectDiffEvidence } from "../git/diff.js";
 import {
   resolvePrContext,
@@ -56,6 +56,7 @@ import { detectRediscovery } from "../rules/rediscovery.js";
 import { detectRedundantRuns } from "../rules/redundant-runs.js";
 import { detectRework } from "../rules/rework.js";
 import { detectSerialSlack } from "../rules/serial-slack.js";
+import { minimumConfidence } from "../rules/shared.js";
 import { ClaudeSessionSource } from "../sources/claude/discover.js";
 import type { SessionSource } from "../sources/session-source.js";
 import {
@@ -66,6 +67,7 @@ import {
   type AnalysisRecord,
   type StoreWarning,
   type StoredCommandCost,
+  type StoredReadObservation,
 } from "../store/analyses.js";
 import {
   applyDismissals,
@@ -196,7 +198,11 @@ function orderedSessions(sessions: readonly Session[]): Session[] {
     (left, right) =>
       left.source_path.localeCompare(right.source_path) ||
       left.session_id.localeCompare(right.session_id),
-  );
+  ).map((session) => ({
+    ...session,
+    events: session.events.map((event) => ({ ...event,
+      confidence: minimumConfidence([event.confidence, session.confidence]) })),
+  }));
 }
 
 function orderedEvents(sessions: readonly Session[]): NormalizedEvent[] {
@@ -420,6 +426,64 @@ function commandCosts(
     });
 }
 
+const READ_BLOB = /^(?:100644|100755) blob ([0-9a-f]{40}|[0-9a-f]{64})\t(.+)$/iu;
+const READ_ONLY_TOOL = /^(?:glob|grep|list|ls|read|search)$/u;
+async function readObservations(
+  actions: readonly MatchedAction[], context: PrContext,
+  runnerOption: CommandRunner | undefined, warnings: AnalyzeWarning[],
+): Promise<{ objects: Map<string, string>; observations: StoredReadObservation[]; eligibleReadKeys: Set<string> }> {
+  const byPath = new Map<string, MatchedAction[]>();
+  const eligibleReadKeys = new Set<string>();
+  for (const action of actions) {
+    if (action.kind !== "tool" || (action.match !== "safe_read" && action.match !== "duplicate_read")) continue;
+    for (const path of action.paths) {
+      if (actions.some((mutation) =>
+        mutation.kind === "tool" &&
+        mutation.interval.end_ms > action.interval.start_ms &&
+        (((mutation.match === "contributing_edit" ||
+          mutation.match === "rework_edit") && mutation.paths.includes(path)) ||
+          (mutation.match === "unexplained" &&
+            mutation.normalized_command === undefined &&
+            !READ_ONLY_TOOL.test((mutation.tool_name ?? "")
+              .replaceAll("-", "_").toLowerCase())))
+      )) continue;
+      byPath.set(path, [...(byPath.get(path) ?? []), action]);
+      eligibleReadKeys.add([action.session_id, action.agent_id, action.action_id, path].join("\0"));
+    }
+  }
+  const empty = { objects: new Map<string, string>(), observations: [] as StoredReadObservation[], eligibleReadKeys };
+  if (byPath.size === 0) return empty;
+  let result;
+  try {
+    result = await (runnerOption ?? runCommand)("git", [
+      "ls-tree", "-z", "--full-tree", context.head.oid, "--",
+      ...[...byPath.keys()].sort().map((path) => `:(top,literal)${path}`),
+    ], { cwd: context.repoRoot });
+  } catch {
+    result = { code: 1, stdout: "", stderr: "" };
+  }
+  const rows = result.stdout.split("\0");
+  const objects = new Map<string, string>();
+  const malformed = result.code !== 0 || result.stdoutTruncated === true ||
+    rows.pop() !== "" || rows.some((row) => {
+      const match = READ_BLOB.exec(row);
+      if (match === null || !byPath.has(match[2] ?? "") || objects.has(match[2] ?? "")) return true;
+      objects.set(match[2] ?? "", (match[1] ?? "").toLowerCase());
+      return false;
+    });
+  if (malformed) { warnings.push(textWarning("read_observation_unavailable",
+    "Frozen-head read object identities were unavailable or malformed.")); return empty; }
+  if (objects.size !== byPath.size)
+    warnings.push(textWarning("read_observation_unavailable", "At least one read path was not an exact blob at the frozen PR head."));
+  return { objects,
+    observations: [...objects].map(([path, object_id]) => ({
+      path, object_id,
+      duration_min: durationMs((byPath.get(path) ?? []).map(({ interval }) => interval)) / 60_000,
+      session_refs: uniqueSorted((byPath.get(path) ?? []).flatMap(({ session_refs }) => session_refs)),
+      confidence: minimumConfidence((byPath.get(path) ?? []).flatMap((action) =>
+        [action.confidence, action.match_confidence])),
+    })), eligibleReadKeys };
+}
 function analysisMetrics(
   timeline: TimelineResult,
 ): Record<string, number> {
@@ -510,6 +574,8 @@ function ruleCandidates(
   timeline: TimelineResult,
   events: readonly NormalizedEvent[],
   history: readonly AnalysisRecord[],
+  currentObjectIdsByPath: ReadonlyMap<string, string>,
+  crossPrEligibleReadKeys: ReadonlySet<string>,
   testMap: TestMap,
   externalToolNames: ReadonlySet<string> | undefined,
 ): FindingCandidate[] {
@@ -529,6 +595,8 @@ function ruleCandidates(
     ...detectRediscovery(matched, {
       estimatedTokensByToolUseId: tokenEstimates(events),
       history,
+      currentObjectIdsByPath,
+      crossPrEligibleReadKeys,
     }),
     ...detectHumanWait(timeline.actions, { assistantEvents }),
     ...detectSerialSlack(matched),
@@ -635,11 +703,14 @@ export async function analyze(
       repoRoot: context.repoRoot,
     },
   );
+  const reads = await readObservations(matched, context, options.runner, warnings);
   const candidates = ruleCandidates(
     matched,
     timeline,
     events,
     history,
+    reads.objects,
+    reads.eligibleReadKeys,
     testMap,
     options.externalToolNames,
   );
@@ -664,6 +735,7 @@ export async function analyze(
     findings: [...preliminaryLedger.findings].sort(findingOrder),
     metrics,
     command_costs: costs,
+    read_observations: reads.observations,
   });
   const baseline = computeBaseline(draftRecord, history);
   const ledger = baseline === null
@@ -677,6 +749,7 @@ export async function analyze(
     findings: allFindings,
     metrics,
     command_costs: costs,
+    read_observations: reads.observations,
   });
   const saveResult = await saveAnalysis(paths, record);
   warnings.push(...saveResult.warnings.map(storeWarning));
