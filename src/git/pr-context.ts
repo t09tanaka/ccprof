@@ -201,19 +201,22 @@ async function earliestUniqueCommit(
   headOid: string,
   warnings: string[],
 ): Promise<number | undefined> {
-  const args = ["rev-list", "--timestamp", `${baseOid}..${headOid}`];
+  // Author date (not committer date) survives rebase, so it remains a
+  // faithful lower bound for when work on these commits began even when the
+  // branch was rebased onto the base ref just before opening the PR.
+  const args = ["log", "--format=%at", `${baseOid}..${headOid}`];
   const result = await git(runner, cwd, args);
   if (result.code !== 0) throw commandFailure("git", args, result);
   if (result.stdoutTruncated === true) {
-    warnings.push("git rev-list output was truncated; earliest commit time is unavailable");
+    warnings.push("git log output was truncated; earliest commit time is unavailable");
     return undefined;
   }
   let earliest: number | undefined;
   for (const line of result.stdout.split(/\r?\n/).filter(Boolean)) {
-    const match = /^(\d+) ([0-9a-f]{40}|[0-9a-f]{64})$/i.exec(line);
+    const match = /^(\d+)$/.exec(line);
     const milliseconds = match === null ? Number.NaN : Number(match[1]) * 1_000;
     if (!Number.isSafeInteger(milliseconds)) {
-      warnings.push(`ignored malformed git rev-list row: ${JSON.stringify(line)}`);
+      warnings.push(`ignored malformed git log row: ${JSON.stringify(line)}`);
     } else {
       earliest = earliest === undefined ? milliseconds : Math.min(earliest, milliseconds);
     }

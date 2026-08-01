@@ -153,8 +153,8 @@ test("explicit range freezes refs, computes merge-base, and keeps time facts", a
       ],
       [["merge-base", BASE, HEAD].join("\0"), `${MERGE_BASE}\n`],
       [
-        ["rev-list", "--timestamp", `${BASE}..${HEAD}`].join("\0"),
-        `200 ${HEAD}\n100 ${"4".repeat(40)}\n`,
+        ["log", "--format=%at", `${BASE}..${HEAD}`].join("\0"),
+        `200\n100\n`,
       ],
     ]);
     const output = outputs.get(key);
@@ -202,7 +202,7 @@ test("explicit range freezes refs, computes merge-base, and keeps time facts", a
         "feature^{commit}",
       ],
       ["git", "merge-base", BASE, HEAD],
-      ["git", "rev-list", "--timestamp", `${BASE}..${HEAD}`],
+      ["git", "log", "--format=%at", `${BASE}..${HEAD}`],
     ],
   );
   assert.equal(fixture.calls.some(({ args }) => args.includes("fetch")), false);
@@ -234,8 +234,8 @@ test("PR URL uses exact gh metadata, disables prompts, and preserves creation", 
     if (args[0] === "merge-base") {
       return ok(`${MERGE_BASE}\n`);
     }
-    if (args[0] === "rev-list") {
-      return ok(`1782860000 ${HEAD}\n`);
+    if (args[0] === "log") {
+      return ok(`1782860000\n`);
     }
     return { code: 2, stdout: "", stderr: "unexpected" };
   });
@@ -366,7 +366,7 @@ test("implicit resolution falls back from gh to the remote default without fetch
       ],
       [["git", "merge-base", BASE, HEAD].join("\0"), ok(`${MERGE_BASE}\n`)],
       [
-        ["git", "rev-list", "--timestamp", `${BASE}..${HEAD}`].join("\0"),
+        ["git", "log", "--format=%at", `${BASE}..${HEAD}`].join("\0"),
         ok(""),
       ],
     ]);
@@ -420,7 +420,7 @@ test("name-status parser preserves arbitrary names and R/C path pairs", () => {
   ]);
 });
 
-test("truncated rev-list output cannot establish an earliest timestamp", async () => {
+test("truncated git log output cannot establish an earliest timestamp", async () => {
   const fixture = fakeRunner(({ args }) => {
     if (args[0] === "rev-parse" && args[1] === "--show-toplevel") {
       return ok("/repo\n");
@@ -429,8 +429,8 @@ test("truncated rev-list output cannot establish an earliest timestamp", async (
       return ok(`${args.at(-1)?.startsWith("main") ? BASE : HEAD}\n`);
     }
     if (args[0] === "merge-base") return ok(`${MERGE_BASE}\n`);
-    if (args[0] === "rev-list") {
-      return ok(`100 ${HEAD}\n`, { stdoutTruncated: true });
+    if (args[0] === "log") {
+      return ok(`100\n`, { stdoutTruncated: true });
     }
     return { code: 2, stdout: "", stderr: "unexpected" };
   });
@@ -443,7 +443,62 @@ test("truncated rev-list output cannot establish an earliest timestamp", async (
   });
 
   assert.equal(context.earliestUniqueCommitAtMs, undefined);
-  assert.match(context.warnings[0] ?? "", /rev-list.*truncated/i);
+  assert.match(context.warnings[0] ?? "", /git log.*truncated/i);
+});
+
+test("earliestUniqueCommit uses git log author timestamps and picks the minimum", async () => {
+  const fixture = fakeRunner(({ args }) => {
+    if (args[0] === "rev-parse" && args[1] === "--show-toplevel") {
+      return ok("/repo\n");
+    }
+    if (args[0] === "rev-parse" && args[1] === "--verify") {
+      return ok(`${args.at(-1)?.startsWith("main") ? BASE : HEAD}\n`);
+    }
+    if (args[0] === "merge-base") return ok(`${MERGE_BASE}\n`);
+    if (args[0] === "log") {
+      assert.deepEqual(args, ["log", "--format=%at", `${BASE}..${HEAD}`]);
+      return ok(`300\n100\n200\n`);
+    }
+    return { code: 2, stdout: "", stderr: "unexpected" };
+  });
+
+  const context = await resolvePrContext({
+    cwd: "/repo",
+    input: "main...topic",
+    runner: fixture.runner,
+    nowMs: 999_000,
+  });
+
+  assert.equal(context.earliestUniqueCommitAtMs, 100_000);
+  assert.deepEqual(context.warnings, []);
+});
+
+test("malformed git log rows are ignored and reported as warnings", async () => {
+  const fixture = fakeRunner(({ args }) => {
+    if (args[0] === "rev-parse" && args[1] === "--show-toplevel") {
+      return ok("/repo\n");
+    }
+    if (args[0] === "rev-parse" && args[1] === "--verify") {
+      return ok(`${args.at(-1)?.startsWith("main") ? BASE : HEAD}\n`);
+    }
+    if (args[0] === "merge-base") return ok(`${MERGE_BASE}\n`);
+    if (args[0] === "log") {
+      return ok(`200\nnot-a-timestamp\n100\n\n`);
+    }
+    return { code: 2, stdout: "", stderr: "unexpected" };
+  });
+
+  const context = await resolvePrContext({
+    cwd: "/repo",
+    input: "main...topic",
+    runner: fixture.runner,
+    nowMs: 999_000,
+  });
+
+  assert.equal(context.earliestUniqueCommitAtMs, 100_000);
+  assert.equal(context.warnings.length, 1);
+  assert.match(context.warnings[0] ?? "", /ignored malformed git log row/);
+  assert.match(context.warnings[0] ?? "", /not-a-timestamp/);
 });
 
 test("collectDiffEvidence pairs status with patch order and parses only hunk additions", async () => {
