@@ -329,10 +329,10 @@ function commandMatches(
   mappedCommand: string,
 ): boolean {
   const mapped = commandTokens(mappedCommand);
-  return (
-    !descriptor.opaque &&
-    mapped.length > 0 &&
-    mapped.every((token, index) => descriptor.tokens[index] === token)
+  if (descriptor.opaque || mapped.length === 0) return false;
+  const candidates = descriptor.segments ?? [descriptor.tokens];
+  return candidates.some((tokens) =>
+    mapped.every((token, index) => tokens[index] === token)
   );
 }
 

@@ -178,11 +178,18 @@ function rawIntervalsByAgent(
   return result;
 }
 
+function isUserQuestionTool(use: ToolUseEvent): boolean {
+  return (
+    use.tool_name.replaceAll("-", "_").toLowerCase() === "askuserquestion"
+  );
+}
+
 function toolAction(
   use: ToolUseEvent,
   result: ToolResultEvent | undefined,
   agentKey: string,
   validPair: boolean,
+  idleThresholdMs: number,
 ): InternalAction {
   const endMs =
     result !== undefined && validPair
@@ -192,9 +199,14 @@ function toolAction(
     result === undefined || !validPair
       ? "low"
       : actionConfidence(use, result);
+  const kind: AttributedTimelineAction["kind"] = isUserQuestionTool(use)
+    ? endMs - use.timestamp_ms > idleThresholdMs
+      ? "away"
+      : "human_wait"
+    : "tool";
   const action: AttributedTimelineAction = {
-    action_id: `${use.session_ref}:tool:${use.tool_use_id}`,
-    kind: "tool",
+    action_id: `${use.session_ref}:${kind}:${use.tool_use_id}`,
+    kind,
     interval: { start_ms: use.timestamp_ms, end_ms: endMs },
     session_id: use.session_id,
     agent_id: use.agent_id,
@@ -217,6 +229,7 @@ function toolAction(
 
 function pairTools(
   events: readonly OrderedEvent[],
+  idleThresholdMs: number,
   caveats: string[],
 ): {
   actions: InternalAction[];
@@ -314,7 +327,9 @@ function pairTools(
         );
       }
     }
-    actions.push(toolAction(use, result, orderedUse.agentKey, validPair));
+    actions.push(
+      toolAction(use, result, orderedUse.agentKey, validPair, idleThresholdMs),
+    );
   }
 
   for (const [key, candidates] of results) {
@@ -585,7 +600,7 @@ export function buildTimeline(
   const caveats: string[] = [];
   const events = collectEvents(sessions, caveats);
   const rawByAgent = rawIntervalsByAgent(events);
-  const tools = pairTools(events, caveats);
+  const tools = pairTools(events, idleThresholdMs, caveats);
   const internalActions = [
     ...tools.actions,
     ...causalActions(

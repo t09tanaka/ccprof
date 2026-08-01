@@ -91,6 +91,64 @@ const RUN_TOOLS = new Set([
   "run_command",
   "shell",
 ]);
+const RECORDING_TOOLS = new Set([
+  "enterplanmode",
+  "exitplanmode",
+  "pushnotification",
+  "schedulewakeup",
+  "sendmessage",
+  "skill",
+  "taskcreate",
+  "taskget",
+  "tasklist",
+  "taskupdate",
+  "todoread",
+  "todowrite",
+  "toolsearch",
+]);
+const DELEGATION_TOOLS = new Set([
+  "agent",
+  "dispatch_agent",
+  "task",
+]);
+const RESEARCH_TOOLS = new Set([
+  "webfetch",
+  "websearch",
+]);
+const COORDINATION_TOOLS = new Set([
+  ...RECORDING_TOOLS,
+  ...DELEGATION_TOOLS,
+  ...RESEARCH_TOOLS,
+]);
+
+/**
+ * Delegation tools may mutate the repository through a sub-agent, so their
+ * intervals must keep invalidating read observations even though their own
+ * time is classified as coordination.
+ */
+export function isDelegationToolName(value: string | undefined): boolean {
+  return value !== undefined && DELEGATION_TOOLS.has(normalizedToolName(value));
+}
+
+/**
+ * A command whose mutation scope cannot be bounded safely: opaque shell
+ * composition, unrecognized executables, and vcs commands (git or gh can
+ * rewrite the working tree, for example via checkout or merge).
+ */
+function commandHasUnknownMutationScope(
+  descriptor: CommandDescriptor,
+  testMap: TestMap,
+): boolean {
+  if (descriptor.opaque) return true;
+  if (
+    descriptor.redirectsOutput === true ||
+    descriptor.segmentFamilies?.includes("vcs") === true
+  ) {
+    return true;
+  }
+  if (hasMappedCommand(descriptor, testMap)) return false;
+  return descriptor.family === "vcs" || descriptor.family === "other";
+}
 
 export function matchTimelineActions(
   observations: readonly ActionObservation[],
@@ -194,11 +252,7 @@ export function matchTimelineActions(
       const descriptor = classifyCommand(
         observation.toolUse?.command ?? observation.action.command ?? "",
       );
-      const recognized =
-        !descriptor.opaque &&
-        (descriptor.family !== "other" ||
-          hasMappedCommand(descriptor, options.testMap));
-      if (!recognized) {
+      if (commandHasUnknownMutationScope(descriptor, options.testMap)) {
         readUncertaintyOrdinal += 1;
       }
       return rememberToolClassification(
@@ -210,6 +264,22 @@ export function matchTimelineActions(
           mutations,
           successfulRuns,
           options.testMap,
+        ),
+        toolClassifications,
+      );
+    }
+    if (COORDINATION_TOOLS.has(toolName)) {
+      if (DELEGATION_TOOLS.has(toolName)) {
+        readUncertaintyOrdinal += 1;
+      }
+      return rememberToolClassification(
+        observation,
+        result(
+          observation.action,
+          "coordination",
+          lowerConfidence(observation.action.confidence, "high"),
+          targetFor(observation, paths),
+          [],
         ),
         toolClassifications,
       );
@@ -251,18 +321,17 @@ function mutationRecordFor(
     const descriptor = classifyCommand(
       observation.toolUse?.command ?? observation.action.command ?? "",
     );
-    const recognized =
-      !descriptor.opaque &&
-      (descriptor.family !== "other" ||
-        hasMappedCommand(descriptor, options.testMap));
-    return recognized
-      ? null
-      : {
+    return commandHasUnknownMutationScope(descriptor, options.testMap)
+      ? {
           kind: "opaque",
           interval: observation.action.interval,
           paths: [],
           uncertain: true,
-        };
+        }
+      : null;
+  }
+  if (COORDINATION_TOOLS.has(toolName) && !DELEGATION_TOOLS.has(toolName)) {
+    return null;
   }
   return {
     kind: "opaque",
@@ -469,6 +538,19 @@ function matchRun(
         ...descriptor.caveats,
         "Command is not a safely recognized test, build, or check invocation.",
       ]),
+    );
+  }
+  if (
+    (descriptor.family === "vcs" || descriptor.family === "inspect") &&
+    !hasMappedCommand(descriptor, testMap)
+  ) {
+    return result(
+      observation.action,
+      "coordination",
+      lowerConfidence(observation.action.confidence, "high"),
+      target,
+      descriptor.caveats,
+      descriptor.normalized,
     );
   }
 

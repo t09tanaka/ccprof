@@ -1,6 +1,7 @@
 import {
   classifyCommand,
   classifyCommandResult,
+  commandMayMutateRepo,
   normalizeCommand,
 } from "../analysis/command.js";
 import type {
@@ -19,6 +20,7 @@ import {
   recoverableClaim,
   sortedUnique,
 } from "./shared.js";
+import { isDelegationToolName } from "../analysis/diff-matcher.js";
 import { isReadOnlyCommand } from "./serial-slack.js";
 
 export type EditRelevance = "related" | "unrelated";
@@ -163,10 +165,20 @@ function editRelevanceForCommand(
 }
 
 function hasUnknownMutationRisk(action: MatchedAction): boolean {
+  if (action.kind !== "tool" && action.kind !== "inference") {
+    return false;
+  }
   if (
-    action.match !== "unexplained" ||
-    (action.kind !== "tool" && action.kind !== "inference")
+    action.command !== undefined &&
+    commandMayMutateRepo(action.command) &&
+    !isReadOnlyCommand(action.command)
   ) {
+    return true;
+  }
+  if (action.match === "coordination") {
+    return isDelegationToolName(action.tool_name);
+  }
+  if (action.match !== "unexplained") {
     return false;
   }
   if (isReadOnlyCommand(action.command)) return false;
