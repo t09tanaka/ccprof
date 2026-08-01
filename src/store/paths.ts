@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, parse, resolve } from "node:path";
+import { basename, dirname, join, parse, resolve } from "node:path";
+
+import { commonGitDirectory } from "../git/common-dir.js";
 
 export interface StorePathOptions {
   env?: NodeJS.ProcessEnv;
@@ -29,16 +31,39 @@ function normalizedAbsolute(path: string): string {
 }
 
 /**
- * Resolves symlinks when the repository exists. A normalized absolute fallback
- * keeps error reporting and test injection deterministic for missing paths.
+ * Resolves symlinks for a path that is expected to exist. A normalized
+ * absolute fallback keeps error reporting and test injection deterministic
+ * for missing paths.
+ */
+async function realpathOrAbsolute(path: string): Promise<string> {
+  try {
+    return withoutTrailingSeparators(await realpath(path)).normalize("NFC");
+  } catch {
+    return normalizedAbsolute(path);
+  }
+}
+
+/**
+ * Resolves the canonical identity used to key the on-disk store. When
+ * `repoRoot` sits inside a git repository, the shared git common directory
+ * keys the store so that every linked `git worktree` shares one store with
+ * the main checkout, including separate-git-dir and bare layouts. The common
+ * directory maps to its parent for the conventional `<repo>/.git` layout so
+ * the stored identity stays the repository root. Non-git directories
+ * (including the temp dirs used in tests) fall back to a realpath of
+ * `repoRoot` itself.
  */
 export async function canonicalRepoPath(repoRoot: string): Promise<string> {
   const absolute = normalizedAbsolute(repoRoot);
-  try {
-    return withoutTrailingSeparators(await realpath(absolute)).normalize("NFC");
-  } catch {
-    return absolute;
+  const gitDirectory = await commonGitDirectory(absolute);
+  if (gitDirectory !== undefined) {
+    return realpathOrAbsolute(
+      basename(gitDirectory) === ".git"
+        ? dirname(gitDirectory)
+        : gitDirectory,
+    );
   }
+  return realpathOrAbsolute(absolute);
 }
 
 export function repoHash(canonicalRepo: string): string {

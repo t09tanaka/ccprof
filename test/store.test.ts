@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   mkdir,
@@ -128,6 +129,67 @@ async function temporaryStore(
     await rm(root, { recursive: true, force: true });
   }
 }
+
+function git(args: string[], cwd: string): void {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+  assert.equal(
+    result.status,
+    0,
+    `git ${args.join(" ")} failed: ${result.stderr}`,
+  );
+}
+
+test("canonicalRepoPath resolves a linked git worktree to the main worktree's repository root", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-worktree-canon-"));
+  try {
+    const mainRepo = join(root, "main");
+    await mkdir(mainRepo);
+    git(["init", "-q"], mainRepo);
+    git(["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "--allow-empty", "-q", "-m", "init"], mainRepo);
+
+    const worktreePath = join(root, "worktree");
+    git(["worktree", "add", "-q", "-b", "worktree-branch", worktreePath], mainRepo);
+
+    const expected = (await realpath(mainRepo)).normalize("NFC");
+    assert.equal(await canonicalRepoPath(mainRepo), expected);
+    assert.equal(await canonicalRepoPath(worktreePath), expected);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("canonicalRepoPath unifies worktrees of a separate-git-dir repository", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-separate-gitdir-canon-"));
+  try {
+    const mainRepo = join(root, "main");
+    const gitDir = join(root, "shared-git-dir");
+    await mkdir(mainRepo);
+    git(["init", "-q", `--separate-git-dir=${gitDir}`], mainRepo);
+    git(["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "--allow-empty", "-q", "-m", "init"], mainRepo);
+
+    const worktreePath = join(root, "worktree");
+    git(["worktree", "add", "-q", "-b", "separate-worktree-branch", worktreePath], mainRepo);
+
+    assert.equal(
+      await canonicalRepoPath(worktreePath),
+      await canonicalRepoPath(mainRepo),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("canonicalRepoPath falls back to a realpath when the directory is not a git repository", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-non-git-canon-"));
+  try {
+    const plain = join(root, "not-a-repo");
+    await mkdir(plain);
+    const expected = (await realpath(plain)).normalize("NFC");
+    assert.equal(await canonicalRepoPath(plain), expected);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("store paths hash the canonical repository and honor data-root precedence", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-path-test-"));

@@ -1,9 +1,4 @@
-import {
-  lstat,
-  readFile,
-  readdir,
-  realpath,
-} from "node:fs/promises";
+import { lstat, readdir, realpath } from "node:fs/promises";
 import {
   dirname,
   isAbsolute,
@@ -14,6 +9,11 @@ import {
 } from "node:path";
 
 import type { Confidence, Session, SourceWarning } from "../../core/model.js";
+import {
+  canonicalPath,
+  commonGitDirectory,
+  findGitMarker,
+} from "../../git/common-dir.js";
 import type {
   SessionQuery,
   SessionSource,
@@ -30,14 +30,6 @@ export class ClaudeDiscoveryError extends Error {
     super("Claude session discovery failed for one or more sources.");
     this.name = "ClaudeDiscoveryError";
     this.warnings = warnings;
-  }
-}
-
-async function canonicalPath(path: string): Promise<string> {
-  try {
-    return await realpath(path);
-  } catch {
-    return resolve(path);
   }
 }
 
@@ -141,76 +133,6 @@ function isWithin(root: string, candidate: string): boolean {
       !relation.startsWith(`..${sep}`) &&
       !isAbsolute(relation))
   );
-}
-
-async function findGitMarker(start: string): Promise<string | undefined> {
-  let current = start;
-  try {
-    if (!(await lstat(current)).isDirectory()) {
-      current = dirname(current);
-    }
-  } catch {
-    return undefined;
-  }
-
-  while (true) {
-    const marker = join(current, ".git");
-    try {
-      await lstat(marker);
-      return marker;
-    } catch {
-      const parent = dirname(current);
-      if (parent === current) {
-        return undefined;
-      }
-      current = parent;
-    }
-  }
-}
-
-async function commonGitDirectory(
-  start: string,
-): Promise<string | undefined> {
-  const marker = await findGitMarker(start);
-  if (marker === undefined) {
-    return undefined;
-  }
-  const markerStat = await lstat(marker);
-  if (markerStat.isDirectory()) {
-    return canonicalPath(marker);
-  }
-
-  let markerText: string;
-  try {
-    markerText = await readFile(marker, "utf8");
-  } catch {
-    return undefined;
-  }
-  const match = /^gitdir:\s*(.+?)\s*$/im.exec(markerText);
-  const gitDirText = match?.[1];
-  if (gitDirText === undefined) {
-    return undefined;
-  }
-  const gitDir = await canonicalPath(
-    isAbsolute(gitDirText)
-      ? gitDirText
-      : resolve(dirname(marker), gitDirText),
-  );
-
-  try {
-    const commonDirText = (await readFile(join(gitDir, "commondir"), "utf8"))
-      .trim();
-    if (commonDirText.length > 0) {
-      return canonicalPath(resolve(gitDir, commonDirText));
-    }
-  } catch {
-    // Older/synthetic worktrees can be identified from the standard layout.
-  }
-  const worktreesDirectory = dirname(gitDir);
-  if (worktreesDirectory.endsWith(`${sep}worktrees`)) {
-    return canonicalPath(dirname(worktreesDirectory));
-  }
-  return gitDir;
 }
 
 async function cwdMatchesRepository(
