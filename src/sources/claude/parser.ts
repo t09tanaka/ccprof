@@ -32,6 +32,26 @@ const PRESERVED_TOOL_INPUT_KEYS = new Set([
   "notebook_path",
   "path",
 ]);
+/**
+ * Row-level types Claude Code emits for bookkeeping/auxiliary purposes that
+ * never contribute to timeline reconstruction. These are recognized so we
+ * can skip the invalid_timestamp / missing_entry_uuid warnings they'd
+ * otherwise flood a report with, without changing whether they're ingested.
+ */
+const KNOWN_AUXILIARY_ROW_TYPES = new Set([
+  "attachment",
+  "queue-operation",
+  "last-prompt",
+  "custom-title",
+  "pr-link",
+  "ai-title",
+  "bridge-session",
+  "mode",
+  "permission-mode",
+  "file-history-snapshot",
+  "summary",
+  "progress",
+]);
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -587,32 +607,41 @@ function compactAssistantContent(value: unknown): CompactedContent {
   }
   let discardedPayload = false;
   let discardedPayloadBytes = 0;
-  const compacted = value.map((block) => {
+  const compacted: unknown[] = [];
+  for (const block of value) {
     if (!isRecord(block)) {
       discardedPayload = true;
       discardedPayloadBytes += blockPayloadBytes(block);
-      return null;
+      compacted.push(null);
+      continue;
+    }
+    if (block.type === "thinking" || block.type === "redacted_thinking") {
+      // Known reasoning content; intentionally omitted from the compacted
+      // representation since it does not affect timeline reconstruction.
+      continue;
     }
     if (block.type === "text") {
-      return {
+      compacted.push({
         type: "text",
         ...(typeof block.text === "string" ? { text: block.text } : {}),
-      };
+      });
+      continue;
     }
     if (block.type === "tool_use") {
-      return {
+      compacted.push({
         type: "tool_use",
         ...(block.id !== undefined ? { id: block.id } : {}),
         ...(block.name !== undefined ? { name: block.name } : {}),
         input: toJsonObject(block.input),
-      };
+      });
+      continue;
     }
     const compactedType = compactContentBlockType(block.type);
     discardedPayload = true;
     discardedPayloadBytes +=
       blockPayloadBytes(block) + compactedType.discardedPayloadBytes;
-    return { type: compactedType.value };
-  });
+    compacted.push({ type: compactedType.value });
+  }
   return {
     value: compacted,
     discardedPayload,
@@ -813,16 +842,22 @@ async function readRows(
       );
       continue;
     }
+    const rowType = nonEmptyString(parsed.type);
+    const isKnownAuxiliaryRow =
+      rowType !== undefined && KNOWN_AUXILIARY_ROW_TYPES.has(rowType);
+
     const timestampMs = parseTimestamp(parsed.timestamp);
     if (timestampMs === undefined) {
-      warnings.push(
-        warning(
-          sourcePath,
-          "invalid_timestamp",
-          "Ignored a row with an invalid timestamp.",
-          { line, sessionId },
-        ),
-      );
+      if (!isKnownAuxiliaryRow) {
+        warnings.push(
+          warning(
+            sourcePath,
+            "invalid_timestamp",
+            "Ignored a row with an invalid timestamp.",
+            { line, sessionId },
+          ),
+        );
+      }
       continue;
     }
 
@@ -862,7 +897,7 @@ async function readRows(
         ),
       );
     }
-    if (row.hasSyntheticUuid) {
+    if (row.hasSyntheticUuid && !isKnownAuxiliaryRow) {
       warnings.push(
         warning(
           sourcePath,
@@ -955,6 +990,10 @@ function parseAssistantBlocks(
           { row },
         ),
       );
+      continue;
+    }
+    if (rawBlock.type === "thinking" || rawBlock.type === "redacted_thinking") {
+      // Known reasoning content; skip quietly without counting as schema loss.
       continue;
     }
     if (rawBlock.type === "text" && typeof rawBlock.text === "string") {

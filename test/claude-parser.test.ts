@@ -814,6 +814,207 @@ test("compacts oversized unrecognized message content with byte evidence", async
   assert.equal(JSON.stringify(session).includes(payload), false);
 });
 
+test("silently skips thinking content blocks without warnings or schema loss", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "ccprof-thinking-"));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "thinking-block.jsonl");
+  const row = {
+    type: "assistant",
+    sessionId: "thinking-block",
+    uuid: "assistant-1",
+    timestamp: "2026-07-31T10:00:00.000Z",
+    isSidechain: false,
+    message: {
+      id: "msg-thinking",
+      role: "assistant",
+      content: [
+        {
+          type: "thinking",
+          thinking: "Let me reason about this privately.",
+          signature: "sig-abc",
+        },
+        { type: "text", text: "Here is my answer." },
+        {
+          type: "tool_use",
+          id: "tool-1",
+          name: "Bash",
+          input: { command: "echo hi" },
+        },
+      ],
+      usage: { input_tokens: 10, output_tokens: 5 },
+    },
+  };
+  await writeFile(path, `${JSON.stringify(row)}\n`);
+
+  const session = await parseClaudeSession(path);
+  assert.ok(session);
+  assert.equal(session.warnings.length, 0);
+  assert.equal(session.confidence, "high");
+
+  const assistant = session.events.find((event) => event.kind === "assistant");
+  assert.ok(assistant?.kind === "assistant");
+  assert.equal(assistant.text, "Here is my answer.");
+  assert.equal(assistant.confidence, "high");
+
+  const toolUse = session.events.find(
+    (event) => event.kind === "tool_use" && event.tool_use_id === "tool-1",
+  );
+  assert.ok(toolUse);
+});
+
+test("silently skips redacted_thinking content blocks without warnings or schema loss", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "ccprof-redacted-thinking-"));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "redacted-thinking-block.jsonl");
+  const row = {
+    type: "assistant",
+    sessionId: "redacted-thinking-block",
+    uuid: "assistant-1",
+    timestamp: "2026-07-31T10:00:00.000Z",
+    isSidechain: false,
+    message: {
+      id: "msg-redacted-thinking",
+      role: "assistant",
+      content: [
+        { type: "redacted_thinking", data: "opaque-redacted-payload" },
+        { type: "text", text: "Final answer." },
+      ],
+      usage: { input_tokens: 4, output_tokens: 2 },
+    },
+  };
+  await writeFile(path, `${JSON.stringify(row)}\n`);
+
+  const session = await parseClaudeSession(path);
+  assert.ok(session);
+  assert.equal(session.warnings.length, 0);
+  assert.equal(session.confidence, "high");
+
+  const assistant = session.events.find((event) => event.kind === "assistant");
+  assert.ok(assistant?.kind === "assistant");
+  assert.equal(assistant.text, "Final answer.");
+  assert.equal(assistant.confidence, "high");
+});
+
+test("still warns and marks schema loss for genuinely unknown content block types", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "ccprof-unknown-block-"));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "unknown-block.jsonl");
+  const row = {
+    type: "assistant",
+    sessionId: "unknown-block-type",
+    uuid: "assistant-1",
+    timestamp: "2026-07-31T10:00:00.000Z",
+    isSidechain: false,
+    message: {
+      id: "msg-unknown-block",
+      role: "assistant",
+      content: [
+        { type: "foo", data: "mystery" },
+        { type: "text", text: "Still works." },
+      ],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    },
+  };
+  await writeFile(path, `${JSON.stringify(row)}\n`);
+
+  const session = await parseClaudeSession(path);
+  assert.ok(session);
+  assert.ok(
+    session.warnings.some(
+      (warning) => warning.code === "unsupported_content_block",
+    ),
+  );
+  assert.equal(session.confidence, "low");
+
+  const assistant = session.events.find((event) => event.kind === "assistant");
+  assert.ok(assistant?.kind === "assistant");
+  assert.equal(assistant.text, "Still works.");
+  assert.equal(assistant.confidence, "low");
+});
+
+test("suppresses invalid_timestamp warnings for known auxiliary row types without a timestamp", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "ccprof-aux-timestamp-"));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "aux-timestamp.jsonl");
+  const rows = [
+    { type: "attachment", sessionId: "aux-types", note: "no timestamp here" },
+    {
+      type: "user",
+      sessionId: "aux-types",
+      uuid: "user-1",
+      timestamp: "2026-07-31T10:00:00.000Z",
+      isSidechain: false,
+      message: { role: "user", content: "Hello world" },
+    },
+  ];
+  await writeFile(path, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+
+  const session = await parseClaudeSession(path);
+  assert.ok(session);
+  assert.equal(
+    session.warnings.some((warning) => warning.code === "invalid_timestamp"),
+    false,
+  );
+});
+
+test("still warns invalid_timestamp for a non-auxiliary unknown row type without a timestamp", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "ccprof-unknown-row-"));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "unknown-row.jsonl");
+  const rows = [
+    {
+      type: "totally-unrecognized-row-type",
+      sessionId: "unknown-row-types",
+      note: "no timestamp here either",
+    },
+    {
+      type: "user",
+      sessionId: "unknown-row-types",
+      uuid: "user-1",
+      timestamp: "2026-07-31T10:00:00.000Z",
+      isSidechain: false,
+      message: { role: "user", content: "Hello world" },
+    },
+  ];
+  await writeFile(path, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+
+  const session = await parseClaudeSession(path);
+  assert.ok(session);
+  assert.ok(
+    session.warnings.some((warning) => warning.code === "invalid_timestamp"),
+  );
+});
+
+test("suppresses missing_entry_uuid warnings for known auxiliary row types while keeping timestamp-based ingestion", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "ccprof-aux-uuid-"));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "aux-uuid.jsonl");
+  const rows = [
+    {
+      type: "queue-operation",
+      sessionId: "aux-types-2",
+      timestamp: "2026-07-31T10:05:00.000Z",
+      operation: "enqueue",
+    },
+    {
+      type: "user",
+      sessionId: "aux-types-2",
+      uuid: "user-1",
+      timestamp: "2026-07-31T10:05:01.000Z",
+      isSidechain: false,
+      message: { role: "user", content: "Hi" },
+    },
+  ];
+  await writeFile(path, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+
+  const session = await parseClaudeSession(path);
+  assert.ok(session);
+  assert.equal(
+    session.warnings.some((warning) => warning.code === "missing_entry_uuid"),
+    false,
+  );
+});
+
 test("bounds unknown content block type strings and objects", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "ccprof-unknown-type-"));
   t.after(async () => rm(directory, { recursive: true, force: true }));
