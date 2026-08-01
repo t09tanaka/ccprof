@@ -745,6 +745,12 @@ test("R001 does not extend a block with unproven, unrelated, or non-contiguous w
       }),
     },
     {
+      name: "a contributing run whose relevance paths mix a rework path with an unrelated path",
+      action: run("mixed", 200, "contributing_run", {
+        relevance_paths: ["src/a.ts", "src/other.ts"],
+      }),
+    },
+    {
       name: "a non-contiguous related run",
       action: run("late", 201, "contributing_run"),
     },
@@ -811,9 +817,9 @@ test("R001 does not extend a block with unproven, unrelated, or non-contiguous w
 test("R001 assigns only deterministic evidence-backed causes", () => {
   const cases = [
     ["The task description was ambiguous; redo this.", "ambiguous_task", "claude_md"],
-    ["Requirements changed: use JSON instead.", "requirements_changed", "separate_issue"],
+    ["Requirements changed: use JSON instead.", "requirements_changed", "this_pr"],
     ["Missing context: this must run on Windows.", "missing_context", "claude_md"],
-    ["This was scope creep; remove it.", "scope_creep", "separate_issue"],
+    ["This was scope creep; remove it.", "scope_creep", "this_pr"],
     ["The tool failed, so revert that edit.", "tool_failure", "separate_issue"],
     ["Wrong, redo it.", "unknown", "separate_issue"],
   ] as const;

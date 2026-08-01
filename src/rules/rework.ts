@@ -74,7 +74,10 @@ function isRelatedRun(
   const reworkPaths = new Set(
     block.edits.flatMap((edit) => edit.paths),
   );
-  return action.relevance_paths.some((path) => reworkPaths.has(path));
+  return (
+    action.relevance_paths.length > 0 &&
+    action.relevance_paths.every((path) => reworkPaths.has(path))
+  );
 }
 
 function isContinuous(
@@ -254,7 +257,9 @@ export function detectRework(
       scope:
         cause === "ambiguous_task" || cause === "missing_context"
           ? "claude_md"
-          : "separate_issue",
+          : cause === "requirements_changed" || cause === "scope_creep"
+            ? "this_pr"
+            : "separate_issue",
       confidence,
       target,
       evidence: {
