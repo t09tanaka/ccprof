@@ -1,0 +1,9 @@
+{
+  "mappings": [
+    {
+      "source": ["app/**"],
+      "tests": ["spec/**"],
+      "commands": ["npm test", "npm run test:unit"]
+    }
+  ]
+}
