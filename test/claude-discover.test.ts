@@ -5,6 +5,7 @@ import {
   realpath,
   rm,
   symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
@@ -111,6 +112,57 @@ test("discovers recursively in lexical order and filters repo, branch, and time"
   assert.deepEqual(
     sessions.map((session) => session.session_id),
     ["session-a", "session-z"],
+  );
+});
+
+test("skips transcripts last written before the query window opens", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-mtime-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+
+  const projects = join(root, "projects");
+  const repo = join(root, "repo");
+  await Promise.all([
+    mkdir(projects, { recursive: true }),
+    mkdir(repo, { recursive: true }),
+  ]);
+
+  const stale = join(projects, "stale.jsonl");
+  const fresh = join(projects, "fresh.jsonl");
+  await Promise.all([
+    writeFile(
+      stale,
+      transcript({
+        sessionId: "stale",
+        cwd: repo,
+        branch: "feature/parser",
+      }),
+    ),
+    writeFile(
+      fresh,
+      transcript({
+        sessionId: "fresh",
+        cwd: repo,
+        branch: "feature/parser",
+      }),
+    ),
+  ]);
+  const staleMtime = new Date(Date.parse("2026-07-31T01:00:00.000Z"));
+  await utimes(stale, staleMtime, staleMtime);
+
+  const sessions = await discoverClaudeSessions(projects, {
+    repoRoot: repo,
+    headBranch: "feature/parser",
+    startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+  });
+
+  assert.deepEqual(
+    sessions.map((session) => session.session_id),
+    ["fresh"],
+  );
+  assert.deepEqual(
+    sessions.flatMap((session) => session.warnings),
+    [],
   );
 });
 

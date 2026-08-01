@@ -339,6 +339,16 @@ export async function discoverClaudeSessions(
       continue;
     }
     parsedPaths.add(file);
+    // A transcript's mtime is at or after its last event, so a file last
+    // written before the query window opened cannot intersect it. Skipping
+    // those files avoids parsing every historical transcript on each run.
+    try {
+      if ((await lstat(file)).mtimeMs < query.startedAtMs) {
+        continue;
+      }
+    } catch {
+      // Fall through to the parse path, which reports unreadable files.
+    }
     let parsed: ClaudeTranscriptParseResult;
     try {
       parsed = await parseClaudeTranscriptDetailed(file);
