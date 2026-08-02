@@ -161,7 +161,7 @@ Use a fresh wrapper for each deterministic rerun so query capture does not add s
 **Files:**
 - Verify the four implementation/test files plus this plan.
 
-- [ ] **Step 1: Run focused and full checks**
+- [x] **Step 1: Run focused and full checks**
 
 Run: `npm run build:test && node --test .test-dist/test/analysis-window.test.js .test-dist/test/analyze-integration.test.js`
 
@@ -171,10 +171,10 @@ Run: `npm run check`
 
 Expected: typecheck and the complete suite pass.
 
-- [ ] **Step 2: Review scope**
+- [x] **Step 2: Review scope**
 
 Confirm no CLI, README, source adapter, store, version, or package-lock changes; implementation remains below 300 lines and no more than five files changed.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 Commit as `fix: freeze analysis end at resolution time` with the Codex co-author trailer.

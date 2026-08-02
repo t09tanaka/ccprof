@@ -1529,6 +1529,45 @@ test("a hook-events.jsonl file with a matching, in-window Stop row is read witho
   }
 });
 
+test("hook Stop rows respect the frozen analysis end boundary", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-hook-events-end-boundary-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const analyzeStopAt = async (receivedAtMs: number, dataDir: string) => {
+      const storePaths = await resolveStorePaths(repo, {
+        env: { CCPROF_DATA_DIR: join(root, dataDir) },
+      });
+      const session = hookEventSession("hook-session", repo);
+      await write(
+        storePaths.hook_events_path,
+        `${JSON.stringify({
+          received_at_ms: receivedAtMs,
+          session_id: session.session_id,
+          hook_event_name: "Stop",
+        })}\n`,
+      );
+      return await analyze({
+        cwd: repo,
+        pr: "main...feature",
+        nowMs: NOW_MS,
+        storePaths,
+        sessionSource: { discover: async () => [session] },
+        persist: false,
+      });
+    };
+
+    const afterBoundary = await analyzeStopAt(NOW_MS + 1, "data-after");
+    assert.equal(afterBoundary.window.ended_at_ms, NOW_MS);
+    assert.equal(afterBoundary.ledger.totals_ms.measured, 60_000);
+
+    const atBoundary = await analyzeStopAt(NOW_MS, "data-at");
+    assert.equal(atBoundary.window.ended_at_ms, NOW_MS);
+    assert.equal(atBoundary.ledger.totals_ms.measured, 10 * 60_000);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a Stop row more than 30 minutes past ended_at_ms is read without a warning", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-hook-events-toolate-"));
   try {

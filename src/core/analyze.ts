@@ -888,7 +888,10 @@ export async function analyze(
     : options.storePaths;
   const hookEvents = await loadHookEvents(paths.hook_events_path);
   warnings.push(...hookEvents.warnings.map(storeWarning));
-  sessions = applyHookEvents(sessions, hookEvents.rows);
+  sessions = applyHookEvents(
+    sessions,
+    hookEvents.rows.filter((row) => row.received_at_ms <= window.ended_at_ms),
+  );
 
   const inapplicableRules = skippedRules(sessions);
   warnings.push(...inapplicableRules.map(skippedRuleWarning));
