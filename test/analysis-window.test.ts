@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   analyze,
+  deriveSessionBranchTransitionAtMs,
   InvalidAnalysisWindowError,
   resolveAnalysisWindow,
   type AnalyzeWarning,
@@ -50,6 +51,7 @@ test("explicit since takes precedence and produces a complete window", () => {
 
 test("an explicit start disables branch reflog probing", async () => {
   const calls: string[][] = [];
+  let discoveryStart: number | undefined;
   const runner: CommandRunner = async (_command, args) => {
     calls.push([...args]);
     if (args[0] === "rev-parse" && args[1] === "--show-toplevel")
@@ -71,15 +73,22 @@ test("an explicit start disables branch reflog probing", async () => {
     sinceMs: 700,
     nowMs: 1_000,
     runner,
-    sessionSource: { discover: async () => { throw stop; } },
+    sessionSource: { discover: async (query) => {
+      discoveryStart = query.startedAtMs;
+      throw stop;
+    } },
   }), (error) => error === stop);
+  assert.equal(discoveryStart, 700);
   assert.equal(calls.some((args) => args.includes("refs/heads/feature^{commit}")), false);
   assert.equal(calls.some((args) => args[0] === "reflog"), false);
 });
 
 test("a valid branch reflog start precedes the commit-anchor fallback", () => {
   assert.deepEqual(
-    resolveAnalysisWindow(context({ branchReflogStartedAtMs: 350 })),
+    resolveAnalysisWindow(
+      context({ branchReflogStartedAtMs: 350 }), {}, [],
+      { sessionBranchTransitionAtMs: 300 },
+    ),
     {
       started_at_ms: 350,
       ended_at_ms: 1_000,
@@ -92,8 +101,8 @@ test("a valid branch reflog start precedes the commit-anchor fallback", () => {
 
 test("untrusted branch reflog starts warn and use the commit fallback", () => {
   const cases = [
-    [1_001, "invalid_branch_reflog_start", "The branch reflog start followed analysis resolution; the commit anchor fallback was used."],
-    [401, "branch_reflog_after_commit_anchor", "The branch reflog start followed the earliest unique commit; the commit anchor fallback was used."],
+    [1_001, "invalid_branch_reflog_start", "The branch reflog start followed analysis resolution; it was ignored."],
+    [401, "branch_reflog_after_commit_anchor", "The branch reflog start followed the earliest unique commit; it was ignored."],
   ] as const;
   for (const [startedAtMs, code, message] of cases) {
     const warnings: AnalyzeWarning[] = [];
@@ -102,6 +111,91 @@ test("untrusted branch reflog starts warn and use the commit fallback", () => {
     ).started_at_ms, 400);
     assert.deepEqual(warnings, [{ code, message }]);
   }
+});
+
+test("a valid session transition precedes commit fallback after an ignored reflog", () => {
+  const warnings: AnalyzeWarning[] = [];
+  assert.deepEqual(resolveAnalysisWindow(
+    context({ branchReflogStartedAtMs: 1_001 }), {}, warnings,
+    { sessionBranchTransitionAtMs: 350 },
+  ), {
+    started_at_ms: 350,
+    ended_at_ms: 1_000,
+    start_source: "session_branch_transition",
+    end_source: "analysis_time",
+    completeness: "partial",
+  });
+  assert.deepEqual(warnings, [{ code: "invalid_branch_reflog_start",
+    message: "The branch reflog start followed analysis resolution; it was ignored." }]);
+});
+
+test("invalid session transition evidence warns and uses the commit fallback", () => {
+  const cases = [
+    [1_001, "invalid_session_branch_transition",
+      "The session branch transition followed analysis resolution; the evidence was ignored."],
+    [401, "session_branch_transition_after_commit_anchor",
+      "The session branch transition followed the earliest unique commit; the evidence was ignored."],
+  ] as const;
+  for (const [startedAtMs, code, message] of cases) {
+    const warnings: AnalyzeWarning[] = [];
+    assert.equal(resolveAnalysisWindow(
+      context(), {}, warnings, { sessionBranchTransitionAtMs: startedAtMs },
+    ).started_at_ms, 400);
+    assert.deepEqual(warnings, [{ code, message }]);
+  }
+});
+
+test("derives only a conservative earliest Claude branch transition", () => {
+  const event = (
+    id: string,
+    timestamp_ms: number,
+    overrides: Partial<GenuineUserEvent> = {},
+  ): GenuineUserEvent => ({
+    kind: "genuine_user", timestamp_ms, session_id: "s", entry_uuid: id,
+    session_ref: `s#${id}`, source_index: 0, agent_id: "main",
+    is_sidechain: false, confidence: "high", text: id, branch: "feature",
+    branch_epoch: 1, ...overrides,
+  });
+  const make = (
+    id: string,
+    source: Session["source"],
+    events: GenuineUserEvent[],
+  ): Session => ({
+    session_id: id, source, source_path: `/${id}.jsonl`, observed_cwds: [],
+    observed_branches: ["feature"], started_at_ms: 0, ended_at_ms: 1_000,
+    confidence: "high", events, warnings: [],
+  });
+  const branchless = (id: string, timestampMs: number): GenuineUserEvent => {
+    const value = event(id, timestampMs); delete value.branch;
+    delete value.branch_epoch; return value;
+  };
+  const candidate = make("candidate", "claude", [
+    event("later", 300, { agent_id: "side", is_sidechain: true }),
+    event("first", 200), event("future", 1_001),
+  ]);
+  const sameTime = make("same", "codex", [branchless("same-time", 200)]);
+  assert.equal(deriveSessionBranchTransitionAtMs(
+    [sameTime, candidate], "feature", 1_000, 400,
+  ), 200);
+  assert.equal(deriveSessionBranchTransitionAtMs([
+    make("epoch-zero", "claude", [event("zero", 100, { branch_epoch: 0 })]),
+  ], "feature", 1_000, 400), undefined);
+  for (const source of ["claude", "codex"] as const) {
+    const prior = make(`prior-${source}`, source, [
+      branchless("prior", 199),
+    ]);
+    assert.equal(deriveSessionBranchTransitionAtMs(
+      [candidate, prior], "feature", 1_000, 400,
+    ), undefined);
+  }
+  assert.equal(deriveSessionBranchTransitionAtMs([
+    make("reentry", "claude", [
+      event("initial", 100, { branch_epoch: 0 }), event("reentry", 200),
+    ]),
+  ], "feature", 1_000, 400), undefined);
+  assert.equal(deriveSessionBranchTransitionAtMs([
+    make("late", "claude", [event("after-anchor", 401)]),
+  ], "feature", 1_000, 400), undefined);
 });
 
 test("commit-anchor lookback is applied and clamped at the Unix epoch", () => {
@@ -174,6 +268,9 @@ test("invalid supplied analysis-window millisecond values throw", () => {
     () => resolveAnalysisWindow(context({
       branchReflogStartedAtMs: Number.MAX_SAFE_INTEGER + 1,
     })),
+    () => resolveAnalysisWindow(context(), {}, [], { sessionBranchTransitionAtMs: -1 }),
+    () => resolveAnalysisWindow(context(), {}, [], {
+      sessionBranchTransitionAtMs: Number.MAX_SAFE_INTEGER + 1 }),
   ];
   for (const resolve of invalid) {
     assert.throws(resolve, InvalidAnalysisWindowError);

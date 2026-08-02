@@ -143,6 +143,8 @@ export interface AnalyzeWarning {
   source?: string;
 }
 
+export interface AnalysisWindowEvidence { sessionBranchTransitionAtMs?: number; }
+
 export interface AnalyzeResult {
   report: ReportV2;
   window: AnalysisWindow;
@@ -652,10 +654,53 @@ function validWindowTimestamp(value: number, name: string): void {
   }
 }
 
+export function deriveSessionBranchTransitionAtMs(
+  sessions: readonly Session[],
+  headBranch: string,
+  endedAtMs: number,
+  earliestUniqueCommitAtMs?: number,
+): number | undefined {
+  let earliestEventAtMs: number | undefined;
+  let earliestCandidateAtMs: number | undefined;
+  for (const session of sessions) {
+    for (const event of session.events) {
+      const timestampMs = event.timestamp_ms;
+      if (
+        !Number.isSafeInteger(timestampMs) || timestampMs < 0 ||
+        timestampMs > endedAtMs
+      ) {
+        continue;
+      }
+      earliestEventAtMs = Math.min(
+        earliestEventAtMs ?? Number.POSITIVE_INFINITY,
+        timestampMs,
+      );
+      if (
+        session.source === "claude" &&
+        event.branch === headBranch &&
+        Number.isSafeInteger(event.branch_epoch) &&
+        (event.branch_epoch ?? 0) > 0 &&
+        (earliestUniqueCommitAtMs === undefined ||
+          timestampMs <= earliestUniqueCommitAtMs)
+      ) {
+        earliestCandidateAtMs = Math.min(
+          earliestCandidateAtMs ?? Number.POSITIVE_INFINITY,
+          timestampMs,
+        );
+      }
+    }
+  }
+  return earliestCandidateAtMs !== undefined &&
+      (earliestEventAtMs ?? earliestCandidateAtMs) >= earliestCandidateAtMs
+    ? earliestCandidateAtMs
+    : undefined;
+}
+
 export function resolveAnalysisWindow(
   context: PrContext,
   options: Pick<AnalyzeOptions, "sinceMs" | "commitAnchorLookbackMs"> = {},
   warnings: AnalyzeWarning[] = [],
+  evidence: AnalysisWindowEvidence = {},
 ): AnalysisWindow {
   validWindowTimestamp(context.resolvedAtMs, "analysis resolution");
   if (options.sinceMs !== undefined) {
@@ -677,6 +722,12 @@ export function resolveAnalysisWindow(
     validWindowTimestamp(
       context.branchReflogStartedAtMs,
       "branch reflog start",
+    );
+  }
+  if (evidence.sessionBranchTransitionAtMs !== undefined) {
+    validWindowTimestamp(
+      evidence.sessionBranchTransitionAtMs,
+      "session branch transition",
     );
   }
 
@@ -715,8 +766,32 @@ export function resolveAnalysisWindow(
         ? "invalid_branch_reflog_start"
         : "branch_reflog_after_commit_anchor",
       context.branchReflogStartedAtMs > endedAtMs
-        ? "The branch reflog start followed analysis resolution; the commit anchor fallback was used."
-        : "The branch reflog start followed the earliest unique commit; the commit anchor fallback was used.",
+        ? "The branch reflog start followed analysis resolution; it was ignored."
+        : "The branch reflog start followed the earliest unique commit; it was ignored.",
+    ));
+  }
+
+  const transitionAtMs = evidence.sessionBranchTransitionAtMs;
+  if (transitionAtMs !== undefined) {
+    if (
+      transitionAtMs <= endedAtMs &&
+      (anchor === undefined || transitionAtMs <= anchor)
+    ) {
+      return {
+        started_at_ms: transitionAtMs,
+        ended_at_ms: endedAtMs,
+        start_source: "session_branch_transition",
+        end_source: "analysis_time",
+        completeness: "partial",
+      };
+    }
+    warnings.push(textWarning(
+      transitionAtMs > endedAtMs
+        ? "invalid_session_branch_transition"
+        : "session_branch_transition_after_commit_anchor",
+      transitionAtMs > endedAtMs
+        ? "The session branch transition followed analysis resolution; the evidence was ignored."
+        : "The session branch transition followed the earliest unique commit; the evidence was ignored.",
     ));
   }
 
@@ -875,7 +950,7 @@ export async function analyze(
   const warnings: AnalyzeWarning[] = context.warnings.map((message) =>
     textWarning("pr_context", message)
   );
-  const window = resolveAnalysisWindow(context, options, warnings);
+  const provisionalWindow = resolveAnalysisWindow(context, options);
   // Only the default (Claude + Codex combined) source reports per-source
   // discovery failures this way; an injected sessionSource (tests, or a
   // future custom integration) keeps its original throw-propagates
@@ -886,9 +961,28 @@ export async function analyze(
   const discoveredSessions = await source.discover({
     repoRoot: context.repoRoot,
     headBranch: context.headBranch,
-    startedAtMs: window.started_at_ms,
-    endedAtMs: window.ended_at_ms,
+    startedAtMs: provisionalWindow.start_source === "commit_anchor_lookback"
+      ? 0
+      : provisionalWindow.started_at_ms,
+    endedAtMs: provisionalWindow.ended_at_ms,
   });
+  const transitionAtMs = provisionalWindow.start_source ===
+      "commit_anchor_lookback" && sourceErrors.length === 0
+    ? deriveSessionBranchTransitionAtMs(
+      discoveredSessions,
+      context.headBranch,
+      provisionalWindow.ended_at_ms,
+      context.earliestUniqueCommitAtMs,
+    )
+    : undefined;
+  const window = resolveAnalysisWindow(
+    context,
+    options,
+    warnings,
+    transitionAtMs === undefined
+      ? {}
+      : { sessionBranchTransitionAtMs: transitionAtMs },
+  );
   const discoveredSessionIdCounts = new Map<string, number>();
   for (const session of discoveredSessions) {
     discoveredSessionIdCounts.set(
@@ -896,20 +990,17 @@ export async function analyze(
       (discoveredSessionIdCounts.get(session.session_id) ?? 0) + 1,
     );
   }
-  if (discoveredSessions.length === 0) {
-    // Nothing was found at all: if a source failed, its error is almost
-    // certainly why, so surface it instead of the generic
-    // NoMatchingSessionsError (restores pre-combined-source diagnosability
-    // when the primary source is unreadable/misconfigured).
+  let sessions = orderedSessions(
+    sliceSessionsToAnalysisWindow(discoveredSessions, window),
+  );
+  if (sessions.length === 0) {
+    // If discovery failed, surface that cause instead of the generic empty
+    // result even when broad discovery returned only pre-window sessions.
     if (sourceErrors.length > 0) {
       throw sourceErrors[0];
     }
     throw new NoMatchingSessionsError();
   }
-  let sessions = orderedSessions(
-    sliceSessionsToAnalysisWindow(discoveredSessions, window),
-  );
-  if (sessions.length === 0) throw new NoMatchingSessionsError();
   if (sourceErrors.length > 0) {
     warnings.push(
       ...sourceErrors.map((error) =>
