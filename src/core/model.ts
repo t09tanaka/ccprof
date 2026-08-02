@@ -33,6 +33,31 @@ export type R001Cause =
   | "tool_failure"
   | "unknown";
 
+/**
+ * Optional data a session source can supply. `undefined` on `Session.capabilities`
+ * means "all of them" (full capabilities), matching existing single-source
+ * (Claude) behavior exactly. A source that cannot provide a capability (for
+ * example, Codex rollout logs lacking per-message token usage) declares a
+ * narrower list so rules that structurally depend on it can be skipped
+ * instead of misfiring.
+ */
+export type SessionCapability =
+  | "tool_timestamps"
+  | "token_usage"
+  | "sidechains"
+  | "branch_rows"
+  | "edit_fragments"
+  | "approvals";
+
+export const ALL_SESSION_CAPABILITIES: readonly SessionCapability[] = [
+  "tool_timestamps",
+  "token_usage",
+  "sidechains",
+  "branch_rows",
+  "edit_fragments",
+  "approvals",
+];
+
 export interface SourceWarning {
   code: string;
   message: string;
@@ -132,6 +157,11 @@ export interface Session {
   confidence: Confidence;
   events: NormalizedEvent[];
   warnings: SourceWarning[];
+  /**
+   * Data capabilities this session's source can supply. `undefined` means
+   * full capabilities (every existing constructor and test is unaffected).
+   */
+  capabilities?: readonly SessionCapability[];
 }
 
 export interface Interval {
