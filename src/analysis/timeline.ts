@@ -186,20 +186,31 @@ function rawIntervalsByAgent(
 }
 
 /**
- * One synthetic `"inference"` action per session whose `verified_ended_at_ms`
- * (a hook-recorded `Stop` wall clock, from `applyHookEvents`) lands after
- * that session's own last observed event. The action spans
- * `[lastEventTimestamp, verified_ended_at_ms]` so the verified tail counts
- * as measured time via `rawByAgent`/`activeByAgent` in `buildTimeline`
- * instead of silently vanishing past the log's last timestamp. Sessions
- * without `verified_ended_at_ms` - the overwhelming majority, since it's
- * only set when a hook row corroborated the end - are entirely unaffected,
- * which is what keeps the plain (unverified) "session end adds no tail"
- * behavior exactly as it was.
+ * One synthetic tail action per session whose `verified_ended_at_ms` (a
+ * hook-recorded `Stop` wall clock, from `applyHookEvents`) lands after that
+ * session's own last observed event. The action spans
+ * `[lastEventTimestamp, verified_ended_at_ms]` and is always folded into
+ * `rawByAgent` by the caller, so it's never silently dropped past the log's
+ * last timestamp - but its `kind` follows the same idle-threshold rule as
+ * every other gap in this module: a tail no longer than `idleThresholdMs`
+ * is `"inference"` (counts as active/measured time via `activeByAgent`); a
+ * tail that exceeds it is `"away"` (still raw, but excluded from active
+ * time through the existing `awayByAgent` subtraction, exactly like a
+ * turn-gap or tool-gap that runs past the idle threshold). Sessions without
+ * `verified_ended_at_ms` - the overwhelming majority, since it's only set
+ * when a hook row corroborated the end - are entirely unaffected, which is
+ * what keeps the plain (unverified) "session end adds no tail" behavior
+ * exactly as it was.
+ *
+ * Known limitation (accepted, not fixed here): hook rows are keyed only by
+ * `session_id`, so a session_id collision across sources/harnesses (e.g.
+ * Claude Code and Codex independently reusing the same id) would extend
+ * both sessions' tails from the same Stop row.
  */
 function verifiedTailActions(
   sessions: readonly Session[],
   events: readonly OrderedEvent[],
+  idleThresholdMs: number,
 ): InternalAction[] {
   const lastEventByLaneKey = new Map<string, OrderedEvent>();
   for (const ordered of events) {
@@ -227,10 +238,11 @@ function verifiedTailActions(
     if (last === undefined || verifiedEndedAtMs <= last.event.timestamp_ms) {
       continue;
     }
+    const tailDurationMs = verifiedEndedAtMs - last.event.timestamp_ms;
     actions.push({
       action: {
         action_id: `${last.event.session_ref}:verified_end`,
-        kind: "inference",
+        kind: tailDurationMs > idleThresholdMs ? "away" : "inference",
         interval: {
           start_ms: last.event.timestamp_ms,
           end_ms: verifiedEndedAtMs,
@@ -670,7 +682,7 @@ export function buildTimeline(
   const caveats: string[] = [];
   const events = collectEvents(sessions, caveats);
   const rawByAgent = rawIntervalsByAgent(events);
-  const tailActions = verifiedTailActions(sessions, events);
+  const tailActions = verifiedTailActions(sessions, events, idleThresholdMs);
   for (const tail of tailActions) {
     rawByAgent.set(
       tail.agentKey,

@@ -642,6 +642,55 @@ test("a verified_ended_at_ms that does not exceed the last event adds no tail", 
   assert.deepEqual(timeline.rawIntervals, [{ start_ms: 0, end_ms: 20 }]);
 });
 
+test("a verified tail exceeding a configured idle threshold becomes away: raw grows but active/measured does not", () => {
+  const fiveMinutes = 5 * 60_000;
+  const tenMinutes = 10 * 60_000;
+  const timeline = buildTimeline(
+    [session([user(0, 0), assistant(20, 1)], 20, tenMinutes)],
+    { idleThresholdMs: fiveMinutes },
+  );
+
+  const tail = timeline.actions.find((action) =>
+    action.action_id.endsWith(":verified_end")
+  );
+  assert.ok(tail, "a verified tail action must still be emitted");
+  assert.equal(tail?.kind, "away");
+  assert.deepEqual(tail?.interval, { start_ms: 20, end_ms: tenMinutes });
+  assert.equal(tail?.confidence, "low");
+
+  // Raw time picks up the full tail (it's still an observed span)...
+  assert.deepEqual(
+    timeline.rawIntervals,
+    [{ start_ms: 0, end_ms: tenMinutes }],
+  );
+  // ...but active/measured time does not grow past the real last event,
+  // matching how every other over-threshold gap in this module behaves;
+  // the excess lands in idleIntervals instead.
+  assert.deepEqual(timeline.activeIntervals, [{ start_ms: 0, end_ms: 20 }]);
+  assert.deepEqual(
+    timeline.idleIntervals,
+    [{ start_ms: 20, end_ms: tenMinutes }],
+  );
+});
+
+test("a verified tail exactly at a configured idle threshold stays inference (active)", () => {
+  const fiveMinutes = 5 * 60_000;
+  const timeline = buildTimeline(
+    [session([user(0, 0), assistant(20, 1)], 20, 20 + fiveMinutes)],
+    { idleThresholdMs: fiveMinutes },
+  );
+
+  const tail = timeline.actions.find((action) =>
+    action.action_id.endsWith(":verified_end")
+  );
+  assert.equal(tail?.kind, "inference");
+  assert.deepEqual(
+    timeline.activeIntervals,
+    [{ start_ms: 0, end_ms: 20 + fiveMinutes }],
+  );
+  assert.deepEqual(timeline.idleIntervals, []);
+});
+
 test("AskUserQuestion becomes human wait with tool metadata retained", () => {
   const timeline = buildTimeline([
     session([
