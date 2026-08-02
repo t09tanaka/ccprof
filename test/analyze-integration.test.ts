@@ -14,11 +14,15 @@ import test from "node:test";
 import {
   analyze,
   NoAnalyzableTimestampsError,
+  NoMatchingSessionsError,
 } from "../src/core/analyze.js";
 import type { Session } from "../src/core/model.js";
 import { parseExplicitTestMap } from "../src/analysis/test-map.js";
 import { runCommand } from "../src/git/client.js";
-import { ClaudeSessionSource } from "../src/sources/claude/discover.js";
+import {
+  ClaudeDiscoveryError,
+  ClaudeSessionSource,
+} from "../src/sources/claude/discover.js";
 import {
   loadAnalyses,
   saveAnalysis,
@@ -143,6 +147,55 @@ async function makeClaudeProjects(
     .join("\n");
   await write(join(projects, "fixture", "e2e-session.jsonl"), rendered);
   return projects;
+}
+
+/** A Claude projects directory whose only transcript is malformed, so
+ * `discoverClaudeSessions` finds zero sessions and throws
+ * `ClaudeDiscoveryError` - used to exercise `defaultSessionSource`'s
+ * per-source error surfacing without injecting a `sessionSource`. */
+async function makeMalformedClaudeProjects(root: string): Promise<string> {
+  const projects = join(root, "claude-projects-malformed");
+  await write(join(projects, "malformed.jsonl"), "{malformed\n");
+  return projects;
+}
+
+/** A Codex sessions directory with one valid rollout inside the repo, on
+ * `branch`, with two distinct event timestamps (a single-timestamp session
+ * cannot form an analyzable interval). */
+async function makeCodexSessions(
+  root: string,
+  repo: string,
+  branch: string,
+): Promise<string> {
+  const sessionsDir = join(root, "codex-sessions");
+  const dayDir = join(sessionsDir, "2026", "01", "01");
+  await mkdir(dayDir, { recursive: true });
+  const rows = [
+    JSON.stringify({
+      timestamp: "2026-01-01T00:02:00.000Z",
+      type: "session_meta",
+      payload: { id: "codex-integration", cwd: repo, git: { branch } },
+    }),
+    JSON.stringify({
+      timestamp: "2026-01-01T00:02:01.000Z",
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "user",
+        content: "codex integration check",
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-01-01T00:02:11.000Z",
+      type: "response_item",
+      payload: { type: "message", role: "assistant", content: "on it" },
+    }),
+  ];
+  await writeFile(
+    join(dayDir, "rollout-codex-integration.jsonl"),
+    `${rows.join("\n")}\n`,
+  );
+  return sessionsDir;
 }
 
 function seedSummary() {
@@ -553,7 +606,7 @@ function coordinationSession(
   };
 }
 
-test("coordination tools count as normal time while delegation still invalidates frozen-head reads", async () => {
+test("coordination tools (including unknown mcp__ tools) count as normal time while delegation still invalidates frozen-head reads and truly unknown tools stay unexplained", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-coordination-"));
   try {
     const repo = await realpath(await makeRepository(root));
@@ -584,7 +637,12 @@ test("coordination tools count as normal time while delegation still invalidates
     assert.equal(agent.ledger.totals_ms.normal, 120_000);
     assert.deepEqual(agent.record.read_observations, []);
 
-    const unknown = await analyzeWith("mcp__custom__tool", "mcp-session");
+    const mcp = await analyzeWith("mcp__custom__tool", "mcp-session");
+    assert.equal(mcp.ledger.totals_ms.normal, 120_000);
+    assert.equal(mcp.ledger.totals_ms.unexplained, 60_000);
+    assert.equal(mcp.record.read_observations?.length, 1);
+
+    const unknown = await analyzeWith("CustomUnknownTool", "unknown-session");
     assert.equal(unknown.ledger.totals_ms.normal, 60_000);
     assert.equal(unknown.ledger.totals_ms.unexplained, 120_000);
 
@@ -1103,6 +1161,187 @@ test("analyze detects and persists a CLAUDE.md adoption of a prior PR's suggesti
       third.adoptions.filter(({ finding_key }) => finding_key === priorFindingKey).length,
       1,
       "a rerun must not duplicate an already-recorded adoption",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("propagates the underlying source error, not NoMatchingSessionsError, when every source found nothing and one threw", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-source-error-empty-"));
+  try {
+    const repo = await makeRepository(root);
+    const claudeProjects = await makeMalformedClaudeProjects(root);
+    const emptyCodexSessions = join(root, "codex-sessions-empty");
+    await mkdir(emptyCodexSessions, { recursive: true });
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    // No sessionSource is injected here on purpose: this exercises
+    // defaultSessionSource's CombinedSessionSource([claude, codex]) wiring,
+    // with the Claude arm forced to fail and the Codex arm contributing
+    // nothing, so the combined result is empty.
+    await assert.rejects(
+      analyze({
+        cwd: repo,
+        pr: "main...feature",
+        nowMs: NOW_MS,
+        storePaths,
+        claudeProjectsDirectory: claudeProjects,
+        codexSessionsDirectory: emptyCodexSessions,
+      }),
+      (error: unknown) => {
+        assert.ok(
+          error instanceof ClaudeDiscoveryError,
+          "the underlying discovery error must propagate as-is, not be swallowed",
+        );
+        assert.ok(
+          !(error instanceof NoMatchingSessionsError),
+          "a real source failure must not be masked as NoMatchingSessionsError",
+        );
+        return true;
+      },
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("continues analysis with a session_source_error warning when sessions were found despite one source throwing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-source-error-partial-"));
+  try {
+    const repo = await makeRepository(root);
+    const claudeProjects = await makeMalformedClaudeProjects(root);
+    const codexSessions = await makeCodexSessions(root, repo, "feature");
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      claudeProjectsDirectory: claudeProjects,
+      codexSessionsDirectory: codexSessions,
+    });
+
+    assert.deepEqual(result.report.unit.sessions, ["codex-integration"]);
+    const sourceErrorWarning = result.warnings.find(
+      (warning) => warning.code === "session_source_error",
+    );
+    assert.ok(
+      sourceErrorWarning,
+      "the Claude source failure must surface as a session_source_error warning",
+    );
+    assert.ok(
+      sourceErrorWarning?.message.startsWith(
+        "Claude session discovery failed for one or more sources.",
+      ),
+      "the base message must be preserved",
+    );
+    assert.ok(
+      sourceErrorWarning?.message.includes(
+        join(claudeProjects, "malformed.jsonl"),
+      ),
+      "the failing source's path must be included so the warning is actionable",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("skips rules whose required capability is missing from a mixed Codex+Claude session set", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-skipped-rules-"));
+  try {
+    const repo = await makeRepository(root);
+    const claudeProjects = await makeClaudeProjects(root, repo);
+    const codexSessions = await makeCodexSessions(root, repo, "feature");
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      claudeProjectsDirectory: claudeProjects,
+      codexSessionsDirectory: codexSessions,
+    });
+
+    // Sanity check: both sources actually contributed a session, so the
+    // capability mix (full Claude session + tool_timestamps-only Codex
+    // session) is really in play below.
+    assert.deepEqual(result.report.unit.sessions, [
+      "codex-integration",
+      "e2e-session",
+    ]);
+
+    assert.ok(
+      !result.allFindings.some(({ rule_id }) => rule_id === "R001"),
+      "R001 requires edit_fragments, which the Codex session lacks",
+    );
+    assert.ok(
+      !result.allFindings.some(({ rule_id }) => rule_id === "R007"),
+      "R007 requires token_usage, which the Codex session lacks",
+    );
+    // R005 requires only tool_timestamps, which the Codex session does
+    // declare, so mixing in a Codex session must not skip it.
+    assert.ok(
+      result.report.skipped_rules?.every(
+        (entry) => entry.rule_id !== "R005",
+      ) ?? true,
+    );
+
+    assert.deepEqual(result.report.skipped_rules, [
+      { rule_id: "R001", missing: ["edit_fragments"] },
+      { rule_id: "R007", missing: ["token_usage"] },
+    ]);
+
+    const skipWarnings = result.warnings.filter(
+      (warning) => warning.code === "rule_skipped_missing_capability",
+    );
+    assert.deepEqual(
+      skipWarnings.map((warning) => warning.message).sort(),
+      [
+        "R001 skipped: session source lacks edit_fragments",
+        "R007 skipped: session source lacks token_usage",
+      ],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("full-capability (Claude-only) analyses omit skipped_rules and emit no capability-skip warnings", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-no-skipped-rules-"));
+  try {
+    const repo = await makeRepository(root);
+    const projects = await makeClaudeProjects(root, repo);
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      sessionSource: new ClaudeSessionSource(projects),
+      storePaths,
+    });
+
+    assert.equal(result.report.skipped_rules, undefined);
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(result.report, "skipped_rules"),
+      "skipped_rules must be entirely omitted, not present-but-empty",
+    );
+    assert.deepEqual(
+      result.warnings.filter(
+        (warning) => warning.code === "rule_skipped_missing_capability",
+      ),
+      [],
     );
   } finally {
     await rm(root, { recursive: true, force: true });

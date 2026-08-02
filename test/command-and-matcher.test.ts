@@ -1404,11 +1404,11 @@ test("a composite with multiple test or build segments keeps an unknown scope", 
   assert.deepEqual(doubled.targets, []);
 });
 
-test("classifies known coordination tools while unknown tools stay unexplained", () => {
+test("classifies known coordination tools while unknown non-MCP tools stay unexplained", () => {
   const matched = matchTimelineActions(
     [
       observe("todo", 0, "TodoWrite"),
-      observe("mcp", 200, "mcp__foo__bar"),
+      observe("unknown", 200, "SomeUnknownTool"),
       observe("fetch", 400, "WebFetch"),
       observe("agent", 600, "Agent"),
       observe("skill", 800, "Skill"),
@@ -1427,6 +1427,46 @@ test("classifies known coordination tools while unknown tools stay unexplained",
     matched[1]?.caveats.join("\n") ?? "",
     /not known well enough/iu,
   );
+});
+
+test("classifies an unrecognized mcp__ tool as coordination by server prefix", () => {
+  const matched = matchTimelineActions(
+    [observe("mcp", 0, "mcp__foo__bar")],
+    { diff: diff([]), testMap: explicitMap },
+  );
+  assert.equal(matched[0]?.match, "coordination");
+  assert.equal(matched[0]?.match_confidence, "low");
+  assert.match(
+    matched[0]?.caveats.join("\n") ?? "",
+    /MCP tool classified by server prefix\.$/u,
+  );
+});
+
+test("classifies an mcp__ tool whose server id starts with an underscore as coordination", () => {
+  const matched = matchTimelineActions(
+    [observe("mcp-underscore-server", 0, "mcp___hypothesi_tauri-mcp-server__driver_session")],
+    { diff: diff([]), testMap: explicitMap },
+  );
+  assert.equal(matched[0]?.match, "coordination");
+  assert.equal(matched[0]?.match_confidence, "low");
+  assert.match(
+    matched[0]?.caveats.join("\n") ?? "",
+    /MCP tool classified by server prefix\.$/u,
+  );
+});
+
+test("keeps a non-MCP unknown tool unexplained even with an mcp-like name shape", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("mcp-single-underscore", 0, "mcp_foo_bar"),
+      observe("mcp-no-suffix", 200, "mcp__"),
+    ],
+    { diff: diff([]), testMap: explicitMap },
+  );
+  assert.deepEqual(matched.map((entry) => entry.match), [
+    "unexplained",
+    "unexplained",
+  ]);
 });
 
 test("classifies single vcs and inspect commands as coordination but keeps unknown composition opaque", () => {

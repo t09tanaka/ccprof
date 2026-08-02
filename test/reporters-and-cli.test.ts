@@ -156,6 +156,45 @@ test("JSON reporter emits one stable v2 document with at most three findings", (
   assert.ok(output.indexOf('"findings"') < output.indexOf('"caveats"'));
 });
 
+test("JSON reporter carries skipped_rules through and omits it when absent", () => {
+  const withSkips = report();
+  withSkips.skipped_rules = [
+    { rule_id: "R001", missing: ["edit_fragments"] },
+    { rule_id: "R007", missing: ["token_usage"] },
+  ];
+  const parsedWithSkips = JSON.parse(renderJsonReport(withSkips)) as ReportV2;
+  assert.deepEqual(parsedWithSkips.skipped_rules, [
+    { rule_id: "R001", missing: ["edit_fragments"] },
+    { rule_id: "R007", missing: ["token_usage"] },
+  ]);
+
+  const withoutSkips = JSON.parse(renderJsonReport(report())) as ReportV2;
+  assert.equal(withoutSkips.skipped_rules, undefined);
+  assert.ok(
+    !Object.prototype.hasOwnProperty.call(withoutSkips, "skipped_rules"),
+  );
+});
+
+test("TTY and Markdown reporters show a skipped-rules line near caveats only when present", () => {
+  const withSkips = report();
+  withSkips.skipped_rules = [{ rule_id: "R007", missing: ["token_usage"] }];
+
+  const tty = renderTtyReport(withSkips, { color: false });
+  assert.match(
+    tty,
+    /Skipped rules \(source lacks required data\): R007 \(token_usage\)/u,
+  );
+  const markdown = renderMarkdownReport(withSkips);
+  assert.match(
+    markdown,
+    /Skipped rules \(source lacks required data\): R007 \(token_usage\)/u,
+  );
+
+  const withoutSkips = report();
+  assert.doesNotMatch(renderTtyReport(withoutSkips, { color: false }), /Skipped rules/u);
+  assert.doesNotMatch(renderMarkdownReport(withoutSkips), /Skipped rules/u);
+});
+
 test("TTY reporter is conclusion-first, compact, and colors only by opt-in", () => {
   const plain = renderTtyReport(report(), { color: false });
   const colored = renderTtyReport(report(), { color: true });

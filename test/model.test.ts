@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { makeSessionRef, type ReportV2 } from "../src/core/model.js";
+import {
+  ALL_SESSION_CAPABILITIES,
+  makeSessionRef,
+  type Session,
+  type SessionCapability,
+  type ReportV2,
+} from "../src/core/model.js";
+import {
+  ruleApplicability,
+  RULE_REQUIRED_CAPABILITIES,
+} from "../src/rules/capabilities.js";
 
 test("report v2 serializes the exact public wire contract", () => {
   assert.equal(makeSessionRef("s1", "u1"), "s1#u1");
@@ -88,5 +98,123 @@ test("report v2 serializes the exact public wire contract", () => {
       },
     ],
     caveats: [],
+  });
+});
+
+function makeSession(
+  sessionId: string,
+  capabilities?: readonly SessionCapability[],
+): Session {
+  return {
+    session_id: sessionId,
+    source: "claude",
+    source_path: `/repo/${sessionId}.jsonl`,
+    observed_cwds: ["/repo"],
+    observed_branches: ["main"],
+    started_at_ms: 0,
+    ended_at_ms: 1,
+    confidence: "high",
+    events: [],
+    warnings: [],
+    ...(capabilities === undefined ? {} : { capabilities }),
+  };
+}
+
+test("ruleApplicability: every rule is applicable when capabilities are unspecified (full compatibility)", () => {
+  const sessions = [makeSession("s1"), makeSession("s2")];
+  const results = ruleApplicability(sessions);
+
+  assert.deepEqual(
+    results.map((entry) => entry.rule_id).sort(),
+    Object.keys(RULE_REQUIRED_CAPABILITIES).sort(),
+  );
+  for (const entry of results) {
+    assert.equal(entry.applicable, true, `${entry.rule_id} should be applicable`);
+    assert.deepEqual(entry.missing, []);
+  }
+});
+
+test("ruleApplicability: a session missing token_usage makes only R007 inapplicable", () => {
+  const limitedCapabilities = ALL_SESSION_CAPABILITIES.filter(
+    (capability) => capability !== "token_usage",
+  );
+  const sessions = [
+    makeSession("full"),
+    makeSession("limited", limitedCapabilities),
+  ];
+  const results = ruleApplicability(sessions);
+
+  for (const entry of results) {
+    if (entry.rule_id === "R007") {
+      assert.equal(entry.applicable, false);
+      assert.deepEqual(entry.missing, ["token_usage"]);
+    } else {
+      assert.equal(entry.applicable, true, `${entry.rule_id} should stay applicable`);
+      assert.deepEqual(entry.missing, []);
+    }
+  }
+});
+
+test("ruleApplicability: a session missing edit_fragments makes only R001 inapplicable", () => {
+  const limitedCapabilities = ALL_SESSION_CAPABILITIES.filter(
+    (capability) => capability !== "edit_fragments",
+  );
+  const sessions = [makeSession("limited", limitedCapabilities)];
+  const results = ruleApplicability(sessions);
+
+  for (const entry of results) {
+    if (entry.rule_id === "R001") {
+      assert.equal(entry.applicable, false);
+      assert.deepEqual(entry.missing, ["edit_fragments"]);
+    } else {
+      assert.equal(entry.applicable, true);
+      assert.deepEqual(entry.missing, []);
+    }
+  }
+});
+
+test("ruleApplicability: a session missing tool_timestamps makes only R005 inapplicable", () => {
+  const limitedCapabilities = ALL_SESSION_CAPABILITIES.filter(
+    (capability) => capability !== "tool_timestamps",
+  );
+  const sessions = [makeSession("limited", limitedCapabilities)];
+  const results = ruleApplicability(sessions);
+
+  for (const entry of results) {
+    if (entry.rule_id === "R005") {
+      assert.equal(entry.applicable, false);
+      assert.deepEqual(entry.missing, ["tool_timestamps"]);
+    } else {
+      assert.equal(entry.applicable, true);
+      assert.deepEqual(entry.missing, []);
+    }
+  }
+});
+
+test("ruleApplicability: capability requirements are unaffected by session order", () => {
+  const limitedCapabilities = ALL_SESSION_CAPABILITIES.filter(
+    (capability) => capability !== "token_usage",
+  );
+  const forward = ruleApplicability([
+    makeSession("limited", limitedCapabilities),
+    makeSession("full"),
+  ]);
+  const backward = ruleApplicability([
+    makeSession("full"),
+    makeSession("limited", limitedCapabilities),
+  ]);
+  assert.deepEqual(forward, backward);
+});
+
+test("RULE_REQUIRED_CAPABILITIES declares the verified per-rule capability map", () => {
+  assert.deepEqual(RULE_REQUIRED_CAPABILITIES, {
+    R001: ["edit_fragments"],
+    R002: [],
+    R003: [],
+    R004: [],
+    R005: ["tool_timestamps"],
+    R006: [],
+    R007: ["token_usage"],
+    R008: [],
   });
 });

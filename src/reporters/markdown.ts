@@ -1,6 +1,6 @@
 import type { Finding, ReportV2 } from "../core/model.js";
 import { sanitizeHumanText } from "./sanitize.js";
-import { formatMinutes } from "./tty.js";
+import { formatMinutes, skippedRulesLine } from "./tty.js";
 
 const ANSI_PATTERN = /\u001B\[[0-?]*[ -/]*[@-~]/gu;
 
@@ -54,6 +54,10 @@ export function renderMarkdownReport(report: ReportV2): string {
     findings.forEach((finding, index) => {
       lines.push(...findingMarkdown(finding, index));
     });
+  }
+  const skippedLine = skippedRulesLine(report);
+  if (skippedLine !== null) {
+    lines.push("", skippedLine);
   }
   if (report.caveats.length > 0) {
     lines.push(

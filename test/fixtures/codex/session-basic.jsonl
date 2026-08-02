@@ -1,0 +1,14 @@
+{"timestamp":"2026-07-30T09:00:00.000Z","type":"session_meta","payload":{"id":"codex-session-basic","cwd":"/workspace/repo","git":{"commit_hash":"abc1234","branch":"feature/health-check","repository_url":"https://example.invalid/repo.git"},"cli_version":"0.9.0"}}
+{"timestamp":"2026-07-30T09:00:01.000Z","type":"turn_context","payload":{"cwd":"/workspace/repo","approval_policy":"never"}}
+{"timestamp":"2026-07-30T09:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Please add a health check endpoint."}]}}
+{"timestamp":"2026-07-30T09:00:03.000Z","type":"response_item","payload":{"type":"message","role":"user","content":"<user_instructions>Follow the repo style guide.</user_instructions>"}}
+{"timestamp":"2026-07-30T09:00:04.000Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Plan the endpoint."}]}}
+{"timestamp":"2026-07-30T09:00:05.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I'll add the"},{"type":"output_text","text":" health check endpoint now."}]}}
+{"timestamp":"2026-07-30T09:00:06.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"call-1","arguments":"{\"command\":[\"bash\",\"-lc\",\"go test ./...\"],\"workdir\":\"/workspace/repo\"}"}}
+{"timestamp":"2026-07-30T09:00:07.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"{\"output\":\"Process exited with code 0\\nok  \\tpkg/health\\t0.004s\",\"metadata\":{\"exit_code\":0}}"}}
+{"timestamp":"2026-07-30T09:00:08.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-2","arguments":"{\"cmd\":\"go vet ./...\",\"workdir\":\"/workspace/repo\"}"}}
+{"timestamp":"2026-07-30T09:00:09.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-2","output":"Process exited with code 1\nvet: pkg/health/health.go:12: undeclared name: Ping"}}
+{"timestamp":"2026-07-30T09:00:10.000Z","type":"event_msg","payload":{"type":"agent_message","message":"working on it"}}
+{"timestamp":"2026-07-30T09:00:11.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"call-3","arguments":"not-json"}}
+{this line is not valid json
+{"timestamp":"2026-07-30T09:00:12.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Fixed the failing check and re-ran the suite."}}

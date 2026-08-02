@@ -17,6 +17,7 @@ import type {
   NormalizedEvent,
   ReportV2,
   Session,
+  SkippedRule,
   SourceWarning,
   ToolResultEvent,
   ToolUseEvent,
@@ -53,6 +54,7 @@ import {
   resolvePrContext,
   type PrContext,
 } from "../git/pr-context.js";
+import { ruleApplicability } from "../rules/capabilities.js";
 import { detectChronicCost } from "../rules/chronic-cost.js";
 import { detectContextBloat } from "../rules/context-bloat.js";
 import {
@@ -66,7 +68,12 @@ import { detectRedundantRuns } from "../rules/redundant-runs.js";
 import { detectRework } from "../rules/rework.js";
 import { detectSerialSlack } from "../rules/serial-slack.js";
 import { minimumConfidence } from "../rules/shared.js";
-import { ClaudeSessionSource } from "../sources/claude/discover.js";
+import {
+  ClaudeDiscoveryError,
+  ClaudeSessionSource,
+} from "../sources/claude/discover.js";
+import { CodexSessionSource } from "../sources/codex/discover.js";
+import { CombinedSessionSource } from "../sources/combined.js";
 import type { SessionSource } from "../sources/session-source.js";
 import {
   computeBaseline,
@@ -105,6 +112,7 @@ export interface AnalyzeOptions {
   testMap?: TestMap;
   sessionSource?: SessionSource;
   claudeProjectsDirectory?: string;
+  codexSessionsDirectory?: string;
   storePaths?: StorePaths;
   runner?: CommandRunner;
   nowMs?: number;
@@ -200,6 +208,50 @@ function textWarning(
   message: string,
 ): AnalyzeWarning {
   return { code, message };
+}
+
+/**
+ * A `ClaudeDiscoveryError` carries per-file failure details in `warnings`
+ * (one `SourceWarning` per unreadable source); surface those paths so the
+ * resulting `session_source_error` warning says which files failed rather
+ * than just that discovery failed. Other errors keep a message-only summary.
+ */
+function sourceErrorMessage(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+  if (error instanceof ClaudeDiscoveryError && error.warnings.length > 0) {
+    const paths = [
+      ...new Set(error.warnings.map((warning) => warning.source_path)),
+    ];
+    return `${error.message} (${paths.join(", ")})`;
+  }
+  return error.message;
+}
+
+/**
+ * Rules a session's declared capabilities cannot support, derived from
+ * `ruleApplicability`. Sorted by rule_id and omitted entirely (empty array)
+ * when every session has full capabilities, so a Claude-only analysis is
+ * unaffected.
+ */
+function skippedRules(sessions: readonly Session[]): SkippedRule[] {
+  return ruleApplicability(sessions)
+    .filter((entry) => !entry.applicable)
+    .map((entry): SkippedRule => ({
+      rule_id: entry.rule_id,
+      missing: entry.missing,
+    }))
+    .sort((left, right) => left.rule_id.localeCompare(right.rule_id));
+}
+
+function skippedRuleWarning(skipped: SkippedRule): AnalyzeWarning {
+  return textWarning(
+    "rule_skipped_missing_capability",
+    `${skipped.rule_id} skipped: session source lacks ${
+      skipped.missing.join(", ")
+    }`,
+  );
 }
 
 function warningCaveat(warning: AnalyzeWarning): string {
@@ -547,12 +599,21 @@ async function resolveTestMap(
   return manifest;
 }
 
-function defaultSessionSource(options: AnalyzeOptions): SessionSource {
+function defaultSessionSource(
+  options: AnalyzeOptions,
+  onSourceError?: (error: unknown) => void,
+): SessionSource {
   const projectsDirectory =
     options.claudeProjectsDirectory ??
     process.env.CCPROF_CLAUDE_PROJECTS_DIR ??
     join(homedir(), ".claude", "projects");
-  return new ClaudeSessionSource(projectsDirectory);
+  const claudeSource = new ClaudeSessionSource(projectsDirectory);
+  const codexSource = new CodexSessionSource(
+    options.codexSessionsDirectory === undefined
+      ? undefined
+      : { sessionsDirectory: options.codexSessionsDirectory },
+  );
+  return new CombinedSessionSource([claudeSource, codexSource], onSourceError);
 }
 
 function contextWindow(
@@ -703,7 +764,13 @@ export async function analyze(
     textWarning("pr_context", message)
   );
   const window = contextWindow(context, warnings);
-  const source = options.sessionSource ?? defaultSessionSource(options);
+  // Only the default (Claude + Codex combined) source reports per-source
+  // discovery failures this way; an injected sessionSource (tests, or a
+  // future custom integration) keeps its original throw-propagates
+  // behavior untouched.
+  const sourceErrors: unknown[] = [];
+  const source = options.sessionSource ??
+    defaultSessionSource(options, (error) => sourceErrors.push(error));
   const sessions = orderedSessions(
     await source.discover({
       repoRoot: context.repoRoot,
@@ -712,11 +779,28 @@ export async function analyze(
     }),
   );
   if (sessions.length === 0) {
+    // Nothing was found at all: if a source failed, its error is almost
+    // certainly why, so surface it instead of the generic
+    // NoMatchingSessionsError (restores pre-combined-source diagnosability
+    // when the primary source is unreadable/misconfigured).
+    if (sourceErrors.length > 0) {
+      throw sourceErrors[0];
+    }
     throw new NoMatchingSessionsError();
+  }
+  if (sourceErrors.length > 0) {
+    warnings.push(
+      ...sourceErrors.map((error) =>
+        textWarning("session_source_error", sourceErrorMessage(error))
+      ),
+    );
   }
   warnings.push(
     ...sessions.flatMap((session) => session.warnings.map(sourceWarning)),
   );
+
+  const inapplicableRules = skippedRules(sessions);
+  warnings.push(...inapplicableRules.map(skippedRuleWarning));
 
   const timeline = buildTimeline(sessions, {
     ...(options.idleThresholdMs === undefined
@@ -790,6 +874,9 @@ export async function analyze(
     },
   );
   const reads = await readObservations(matched, context, options.runner, warnings);
+  const inapplicableRuleIds = new Set(
+    inapplicableRules.map((skipped) => skipped.rule_id),
+  );
   const candidates = ruleCandidates(
     matched,
     timeline,
@@ -799,7 +886,7 @@ export async function analyze(
     reads.eligibleReadKeys,
     testMap,
     options.externalToolNames,
-  );
+  ).filter((candidate) => !inapplicableRuleIds.has(candidate.rule_id));
   const unit = {
     repo: context.repoRoot,
     pr_ref: context.prRef,
@@ -863,6 +950,9 @@ export async function analyze(
       .sort(findingOrder)
       .slice(0, 3),
     caveats,
+    ...(inapplicableRules.length === 0
+      ? {}
+      : { skipped_rules: inapplicableRules }),
   };
   return {
     report,
