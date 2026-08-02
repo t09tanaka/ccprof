@@ -46,8 +46,8 @@ Added implementation and test code must stay at or below 285 lines, with 300 as 
 **Files:**
 - Modify: `test/store.test.ts`
 
-- [ ] Extend the local `record` fixture with an optional `CommandIdentity`; when present, copy it into the stored cost and matching finding evidence. Leave an explicit `undefined` path for legacy fixtures.
-- [ ] Update the existing R006 threshold test to use `packages/api` shell identity and assert:
+- [x] Extend the local `record` fixture with an optional `CommandIdentity`; when present, copy it into the stored cost and matching finding evidence. Leave an explicit `undefined` path for legacy fixtures.
+- [x] Update the existing R006 threshold test to use `packages/api` shell identity and assert:
 
 ```ts
 assert.equal(chronic.target, "packages/api :: npm test");
@@ -60,13 +60,13 @@ assert.equal(
 );
 ```
 
-- [ ] Add a focused test with API, Web, native API, and legacy costs sharing `npm test`. Make only API qualify, then assert its `cost_min`, `presence_count`, and refs contain no Web/native/legacy contribution.
-- [ ] Add exact API finding evidence plus same-command Web/native/legacy/malformed findings; assert only the exact API finding ref is added.
-- [ ] Add legacy-only qualifying-looking history and assert `detectChronicCost` returns `[]`; add two known presences plus one legacy presence and assert legacy cannot satisfy the minimum presence threshold.
-- [ ] Put fractional duplicate API costs (`0.1`, `0.2`, `0.3`) in one record and across histories; prove they sum cost while presence increases once. Reverse record and history order and assert byte-equivalent findings and numeric evidence.
-- [ ] Include a native qualifying case and assert target suffix, distinct key, copied argv including duplicate/empty elements, and exact identity evidence.
-- [ ] Preserve the malformed-finding boundary test, now with valid known costs, and assert malformed evidence is ignored rather than throwing.
-- [ ] Have a validation subagent run the focused test and record RED failures caused by command-only cost/ref grouping and legacy findings:
+- [x] Add a focused test with API, Web, native API, and legacy costs sharing `npm test`. Make only API qualify, then assert its `cost_min`, `presence_count`, and refs contain no Web/native/legacy contribution.
+- [x] Add exact API finding evidence plus same-command Web/native/legacy/malformed findings; assert only the exact API finding ref is added.
+- [x] Add legacy-only qualifying-looking history and assert `detectChronicCost` returns `[]`; add two known presences plus one legacy presence and assert legacy cannot satisfy the minimum presence threshold.
+- [x] Put fractional duplicate API costs (`0.1`, `0.2`, `0.3`) in one record and across histories; prove they sum cost while presence increases once. Reverse record and history order and assert byte-equivalent findings and numeric evidence.
+- [x] Include a native qualifying case and assert target suffix, distinct key, copied argv including duplicate/empty elements, and exact identity evidence.
+- [x] Preserve the malformed-finding boundary test, now with valid known costs, and assert malformed evidence is ignored rather than throwing.
+- [x] Have a validation subagent run the focused test and record RED failures caused by command-only cost/ref grouping and legacy findings:
 
 ```sh
 npm run build:test && node --test --test-name-pattern='R006' .test-dist/test/store.test.js
@@ -78,10 +78,10 @@ npm run build:test && node --test --test-name-pattern='R006' .test-dist/test/sto
 - Modify: `src/rules/chronic-cost.ts`
 - Test: `test/store.test.ts`
 
-- [ ] Import `commandIdentityKey`, `formatCommandIdentityTarget`, `CommandIdentity`, and `findingKey`. Remove `normalizeCommand` from `matchingFindingRefs`; command text remains only a display candidate.
-- [ ] Add a defensive private evidence reader that returns a copied `CommandIdentity` only when `repo_relative_cwd`, non-empty `normalized_argv` with non-empty executable, and executor are structurally valid. Missing/malformed identities return `undefined`.
-- [ ] Change `matchingFindingRefs(record, identityKey)` so it includes refs only when the evidence reader's `commandIdentityKey` exactly equals the requested key. Identity-less evidence is ignored and root is never inferred.
-- [ ] Replace per-record and cross-history command maps with tuple-keyed entries carrying copied identity, code-unit-smallest normalized display command, cost-term arrays, refs, and per-analysis presence:
+- [x] Import `commandIdentityKey`, `formatCommandIdentityTarget`, `CommandIdentity`, and `findingKey`. Remove `normalizeCommand` from `matchingFindingRefs`; command text remains only a display candidate.
+- [x] Add a defensive private evidence reader that returns a copied `CommandIdentity` only when `repo_relative_cwd`, non-empty `normalized_argv` with non-empty executable, and executor are structurally valid. Missing/malformed identities return `undefined`.
+- [x] Change `matchingFindingRefs(record, identityKey)` so it includes refs only when the evidence reader's `commandIdentityKey` exactly equals the requested key. Identity-less evidence is ignored and root is never inferred.
+- [x] Replace per-record and cross-history command maps with tuple-keyed entries carrying copied identity, code-unit-smallest normalized display command, cost-term arrays, refs, and per-analysis presence:
 
 ```ts
 if (cost.command_identity === undefined) continue;
@@ -89,13 +89,13 @@ const identityKey = commandIdentityKey(cost.command_identity);
 // Sum duplicate identity costs within this record; merge the record once globally.
 ```
 
-- [ ] Sort every per-record and cross-history cost-term array numerically before reducing. Build `measuredMin` from a numerically sorted array of valid measured values as well; never increment floating totals in caller input order.
-- [ ] Continue using all analyses for `history_count`, minimum-history validation, measured-time denominator, and per-history average. Legacy data may only make the ratio/estimate more conservative; it cannot add known cost, presence, or refs.
-- [ ] Build the target with `formatCommandIdentityTarget(identity, command)` and append ` [native-tool]` only for native execution. Add a copied `command_identity` to evidence.
-- [ ] Make `recipe(command, identity)` mention repository-relative CWD while keeping `verify: command`.
-- [ ] Override the generated finding key with the exact formula from Task 1. Do not migrate or alias the old command-only key.
-- [ ] Sort aggregates by `commandIdentityKey` with an explicit code-unit comparator and deep-copy argv in every emitted object.
-- [ ] Have the validation subagent rerun focused R006 tests and confirm GREEN before stats work starts.
+- [x] Sort every per-record and cross-history cost-term array numerically before reducing. Build `measuredMin` from a numerically sorted array of valid measured values as well; never increment floating totals in caller input order.
+- [x] Continue using all analyses for `history_count`, minimum-history validation, measured-time denominator, and per-history average. Legacy data may only make the ratio/estimate more conservative; it cannot add known cost, presence, or refs.
+- [x] Build the target with `formatCommandIdentityTarget(identity, command)` and append ` [native-tool]` only for native execution. Add a copied `command_identity` to evidence.
+- [x] Make `recipe(command, identity)` mention repository-relative CWD while keeping `verify: command`.
+- [x] Override the generated finding key with the exact formula from Task 1. Do not migrate or alias the old command-only key.
+- [x] Sort aggregates by `commandIdentityKey` with an explicit code-unit comparator and deep-copy argv in every emitted object.
+- [x] Have the validation subagent rerun focused R006 tests and confirm GREEN before stats work starts.
 
 ### Task 3: Preserve identity in stats while displaying readable targets
 
@@ -103,29 +103,29 @@ const identityKey = commandIdentityKey(cost.command_identity);
 - Modify: `src/reporters/stats.ts`
 - Modify: `test/reporters-and-cli.test.ts`
 
-- [ ] Add optional `command_identity?: CommandIdentity` to `StatsChronicCommand`; retain `command` as the normalized command for JSON compatibility, never as an aggregation key. This is optional only for existing manual consumers—new summarized R006 entries must always populate it.
-- [ ] Update stats history fixtures to store a known identity. Assert the primary command remains `npm test`, JSON contains a deep-copied identity, and TTY prints `packages/api :: npm test`.
-- [ ] Add API/Web/native histories producing multiple chronic entries; assert tuple-key ordering, native suffix, identity separation, and identical `chronic_commands` after reversing input records.
-- [ ] Add legacy-only stats history and assert `chronic_commands` is empty.
-- [ ] Keep the existing control-character/manual stats fixture identity-less and prove it still renders unchanged. Generated stats tests must separately prove JSON preserves structured identity values while TTY sanitizes only the display target.
-- [ ] Have a validation subagent run the focused stats tests and record the expected RED type/assertion failures:
+- [x] Add optional `command_identity?: CommandIdentity` to `StatsChronicCommand`; retain `command` as the normalized command for JSON compatibility, never as an aggregation key. This is optional only for existing manual consumers—new summarized R006 entries must always populate it.
+- [x] Update stats history fixtures to store a known identity. Assert the primary command remains `npm test`, JSON contains a deep-copied identity, and TTY prints `packages/api :: npm test`.
+- [x] Add API/Web/native histories producing multiple chronic entries; assert tuple-key ordering, native suffix, identity separation, and identical `chronic_commands` after reversing input records.
+- [x] Add legacy-only stats history and assert `chronic_commands` is empty.
+- [x] Keep the existing control-character/manual stats fixture identity-less and prove it still renders unchanged. Generated stats tests must separately prove JSON preserves structured identity values while TTY sanitizes only the display target.
+- [x] Have a validation subagent run the focused stats tests and record the expected RED type/assertion failures:
 
 ```sh
 npm run build:test && node --test --test-name-pattern='stats reports|chronic command|stats TTY removes' .test-dist/test/reporters-and-cli.test.js
 ```
 
-- [ ] In `summarizeStats`, copy `finding.evidence.command` and `finding.evidence.command_identity` into each stats entry, discard any impossible identity-less R006 candidate defensively, and sort entries by `commandIdentityKey` rather than command text.
-- [ ] In `renderStatsJson`, deep-copy `command_identity.normalized_argv` when present and preserve absence for legacy/manual entries. In TTY only, format known identities as `cwd :: command` with a native-tool suffix; render identity-less manual entries with the legacy command text.
-- [ ] Have the validation subagent run focused R006/stats tests and full `npm run check`; confirm GREEN.
+- [x] In `summarizeStats`, copy `finding.evidence.command` and `finding.evidence.command_identity` into each stats entry, discard any impossible identity-less R006 candidate defensively, and sort entries by `commandIdentityKey` rather than command text.
+- [x] In `renderStatsJson`, deep-copy `command_identity.normalized_argv` when present and preserve absence for legacy/manual entries. In TTY only, format known identities as `cwd :: command` with a native-tool suffix; render identity-less manual entries with the legacy command text.
+- [x] Have the validation subagent run focused R006/stats tests and full `npm run check`; confirm GREEN.
 
 ### Task 4: Review, verify, and deliver through worktree PR flow
 
 **Files:**
 - Modify: `docs/superpowers/plans/2026-08-03-r006-command-identity.md` (checkboxes only after evidence exists)
 
-- [ ] Run independent specification review, then independent code-quality review. Resolve and re-review only issues introduced by these five files.
-- [ ] Have a separate validation subagent run Node 20 `npm ci`, `npm run check`, focused R006/stats tests, determinism, build, and package smoke.
-- [ ] Run the repository's local GitHub Actions equivalent before push because rule and reporting logic change.
-- [ ] Confirm exactly five changed files, at most 285 added implementation+test lines, no store/schema/R008/dismissal/package/version/changelog diff, and no absolute CWD in output.
-- [ ] Commit without amend, push `feature/r006-command-identity`, open a PR against `main`, and wait for all required checks and reviews. Merge only under the user's standing authorization.
+- [x] Run independent specification review, then independent code-quality review. Resolve and re-review only issues introduced by these five files.
+- [x] Have a separate validation subagent run Node 20 `npm ci`, `npm run check`, focused R006/stats tests, determinism, build, and package smoke.
+- [x] Run the repository's local GitHub Actions equivalent before push because rule and reporting logic change.
+- [x] Confirm exactly five changed files, at most 285 added implementation+test lines, no store/schema/R008/dismissal/package/version/changelog diff, and no absolute CWD in output.
+- [x] Complete the pre-merge gate without amend: commit, rebase onto current `origin/main`, push `feature/r006-command-identity`, open a PR against `main`, and wait for all required checks plus absence of actionable feedback. Merge remains a post-gate action under the user's standing authorization.
 - [ ] After merged-commit verification, use guarded cleanup only for `/Users/tanakatakuto/Documents/GitHub/ccprof/.claude/worktrees/r006-command-identity` and its local branch.
