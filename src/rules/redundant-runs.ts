@@ -1,7 +1,15 @@
 import { classifyCommand } from "../analysis/command.js";
-import type { MatchedAction } from "../core/model.js";
+import {
+  commandIdentityKey,
+  formatCommandIdentityTarget,
+} from "../analysis/command-identity.js";
+import type {
+  CommandIdentity,
+  MatchedAction,
+} from "../core/model.js";
 import {
   createFindingCandidate,
+  findingKey,
   minimumConfidence,
   orderedActions,
   recoverableClaim,
@@ -19,7 +27,7 @@ function normalizedCommand(action: MatchedAction): string | undefined {
   return action.normalized_command;
 }
 
-function recipeFor(command: string) {
+function recipeFor(command: string, identity: CommandIdentity) {
   const descriptor = classifyCommand(command);
   const executable = descriptor.tokens[0] ?? "";
   const affected =
@@ -32,36 +40,59 @@ function recipeFor(command: string) {
           : "an affected-only or targeted command";
   return {
     suggestion:
-      `Use ${affected} for scoped edits, then keep \`${command}\` as the final full validation.`,
+      `Use ${affected} for scoped edits in repository-relative CWD \`${identity.repo_relative_cwd}\`, then keep \`${command}\` as the final full validation.`,
     verify: command,
   };
+}
+
+function r002FindingKey(identity: CommandIdentity): string {
+  const encoded = Buffer.from(commandIdentityKey(identity), "utf8").toString("hex");
+  return findingKey("R002", `command-identity:${encoded}`);
 }
 
 export function detectRedundantRuns(
   actions: readonly MatchedAction[],
 ) {
   const tools = orderedActions(actions).filter(
-    (action) => normalizedCommand(action) !== undefined,
+    (action) =>
+      normalizedCommand(action) !== undefined &&
+      action.command_identity !== undefined,
   );
-  const redundantByCommand = new Map<string, MatchedAction[]>();
+  const redundantByIdentity = new Map<
+    string,
+    { identity: CommandIdentity; redundant: MatchedAction[] }
+  >();
   for (const action of tools) {
-    const command = normalizedCommand(action);
-    if (command === undefined || action.match !== "redundant_run") continue;
-    const group = redundantByCommand.get(command);
-    if (group === undefined) redundantByCommand.set(command, [action]);
-    else group.push(action);
+    const identity = action.command_identity;
+    if (identity === undefined || action.match !== "redundant_run") continue;
+    const key = commandIdentityKey(identity);
+    const group = redundantByIdentity.get(key);
+    if (group === undefined) {
+      redundantByIdentity.set(key, { identity, redundant: [action] });
+    } else {
+      group.redundant.push(action);
+    }
   }
 
-  return [...redundantByCommand.entries()]
+  return [...redundantByIdentity.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
-    .flatMap(([command, redundant]) => {
+    .flatMap(([identityKey, { identity, redundant }]) => {
       const allRuns = tools.filter(
-        (action) => normalizedCommand(action) === command,
+        (action) =>
+          action.command_identity !== undefined &&
+          commandIdentityKey(action.command_identity) === identityKey,
       );
-      const recoverable = recoverableClaim("R002", command, redundant);
+      const firstRun = allRuns[0];
+      const command = firstRun === undefined ? undefined : normalizedCommand(firstRun);
+      if (command === undefined) return [];
+      const baseTarget = formatCommandIdentityTarget(identity, command);
+      const target = identity.executor === "native-tool"
+        ? `${baseTarget} [native-tool]`
+        : baseTarget;
+      const recoverable = recoverableClaim("R002", target, redundant);
       if (recoverable.estimated_ms === 0) return [];
       const descriptor = classifyCommand(command);
-      return [createFindingCandidate({
+      const candidate = createFindingCandidate({
         rule_id: "R002",
         title: "Redundant test or build runs",
         classification: "behavior",
@@ -73,7 +104,7 @@ export function detectRedundantRuns(
             action.match_confidence,
           ]),
         ),
-        target: command,
+        target,
         evidence: {
           session_refs: sortedUnique(
             allRuns.flatMap((action) => action.session_refs),
@@ -82,6 +113,11 @@ export function detectRedundantRuns(
             (interval) => interval.interval_id,
           ),
           command,
+          command_identity: {
+            repo_relative_cwd: identity.repo_relative_cwd,
+            normalized_argv: [...identity.normalized_argv],
+            executor: identity.executor,
+          },
           count: allRuns.length,
           irrelevant_count: redundant.length,
           duration_ms: recoverable.estimated_ms,
@@ -92,13 +128,14 @@ export function detectRedundantRuns(
           prior_success_basis: "matcher-classification",
         },
         recoverable,
-        fix_recipe: recipeFor(command),
+        fix_recipe: recipeFor(command, identity),
         caveats: sortedUnique([
           ...redundant.flatMap((action) => action.caveats),
           ...(recoverable.bound === "upper"
             ? ["At least one run overlapped another agent, so recoverable time is an upper bound."]
             : []),
         ]),
-      })];
+      });
+      return [{ ...candidate, finding_key: r002FindingKey(identity) }];
     });
 }

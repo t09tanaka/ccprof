@@ -14,12 +14,14 @@ import test from "node:test";
 import { analyze } from "../src/core/analyze.js";
 import type {
   AssistantEvent,
+  CommandIdentity,
   Finding,
   GenuineUserEvent,
   MatchedAction,
   Session,
   TimelineAction,
 } from "../src/core/model.js";
+import { commandIdentityKey } from "../src/analysis/command-identity.js";
 import {
   runCommand,
   type CommandRunner,
@@ -87,6 +89,23 @@ function matchedAction(
     caveats: [],
     ...overrides,
   };
+}
+
+function commandIdentity(
+  repoRelativeCwd: string,
+  normalizedArgv: string[] = ["npm", "test"],
+  executor: CommandIdentity["executor"] = "shell",
+): CommandIdentity {
+  return {
+    repo_relative_cwd: repoRelativeCwd,
+    normalized_argv: [...normalizedArgv],
+    executor,
+  };
+}
+
+function r002FindingKey(identity: CommandIdentity): string {
+  const encoded = Buffer.from(commandIdentityKey(identity), "utf8").toString("hex");
+  return findingKey("R002", `command-identity:${encoded}`);
 }
 
 function eventBase(
@@ -844,6 +863,10 @@ test("R001 assigns only deterministic evidence-backed causes", () => {
 });
 
 test("R002 groups proven redundant tool runs and retains prior-success relevance evidence", () => {
+  const identity = commandIdentity(
+    "packages/api",
+    ["npm", "test", "", "", "--flag"],
+  );
   const actions = [
     matchedAction("run-1", 0, 100, "contributing_run", {
       command: "npm test",
@@ -851,16 +874,18 @@ test("R002 groups proven redundant tool runs and retains prior-success relevance
       target: "npm test",
       tool_use_id: "run-1",
       tool_name: "Bash",
+      command_identity: identity,
     }),
     matchedAction("run-2", 200, 500, "redundant_run", {
       command: "npm   test",
-      normalized_command: "npm test",
+      normalized_command: "npm test --later-display",
       target: "npm test",
       paths: ["src/a.ts"],
       tool_use_id: "run-2",
       tool_name: "Bash",
       match_confidence: "high",
       caveats: ["Relevance uses an explicit test map."],
+      command_identity: identity,
     }),
     matchedAction("run-2-inference", 500, 700, "redundant_run", {
       kind: "inference",
@@ -869,6 +894,7 @@ test("R002 groups proven redundant tool runs and retains prior-success relevance
       target: "npm test",
       tool_use_id: "run-2",
       tool_name: "Bash",
+      command_identity: identity,
     }),
     matchedAction("run-3", 800, 1_000, "redundant_run", {
       command: "npm test",
@@ -879,6 +905,7 @@ test("R002 groups proven redundant tool runs and retains prior-success relevance
       tool_name: "Bash",
       match_confidence: "medium",
       caveats: ["Relevance uses manifest conventions."],
+      command_identity: identity,
     }),
   ];
 
@@ -889,8 +916,9 @@ test("R002 groups proven redundant tool runs and retains prior-success relevance
   assert.equal(finding.scope, "this_pr");
   assert.equal(finding.cause, null);
   assert.equal(finding.confidence, "medium");
-  assert.equal(finding.target, "npm test");
-  assert.equal(finding.finding_key, findingKey("R002", "npm test"));
+  assert.equal(finding.target, "packages/api :: npm test");
+  assert.equal(finding.finding_key, r002FindingKey(identity));
+  assert.notEqual(finding.finding_key, findingKey("R002", "npm test"));
   assert.equal(finding.evidence.count, 3);
   assert.equal(finding.evidence.irrelevant_count, 2);
   assert.equal(finding.evidence.duration_ms, 500);
@@ -899,6 +927,8 @@ test("R002 groups proven redundant tool runs and retains prior-success relevance
   assert.equal(finding.evidence.prior_success_proven, true);
   assert.equal(finding.evidence.prior_success_basis, "matcher-classification");
   assert.equal(finding.evidence.relevance, "irrelevant");
+  assert.equal(finding.evidence.command, "npm test");
+  assert.deepEqual(finding.evidence.command_identity, identity);
   assert.ok(
     (finding.evidence.session_refs as string[]).includes("s1#run-1-start"),
   );
@@ -908,12 +938,77 @@ test("R002 groups proven redundant tool runs and retains prior-success relevance
   ]);
   assert.equal(finding.recoverable.bound, "point");
   assert.equal(finding.recoverable.estimated_ms, 500);
-  assert.notEqual(finding.fix_recipe.suggestion, "");
-  assert.notEqual(finding.fix_recipe.verify, "");
+  assert.match(finding.fix_recipe.suggestion, /packages\/api/u);
+  assert.equal(finding.fix_recipe.verify, "npm test");
   assert.deepEqual(finding.caveats, [
     "Relevance uses an explicit test map.",
     "Relevance uses manifest conventions.",
   ]);
+});
+
+test("R002 isolates exact identities, excludes missing and inference actions, and is permutation-stable", () => {
+  const api = commandIdentity("packages/api");
+  const root = commandIdentity(".");
+  const native = commandIdentity("packages/api", undefined, "native-tool");
+  const argvVariant = commandIdentity("packages/api", ["npm", "test", "", "--flag", ""]);
+  const run = (
+    id: string,
+    start: number,
+    identity: CommandIdentity | undefined,
+    match: MatchedAction["match"] = "redundant_run",
+    overrides: Partial<MatchedAction> = {},
+  ) => matchedAction(id, start, start + 100, match, {
+    command: "npm test",
+    normalized_command: "npm test",
+    tool_use_id: id,
+    tool_name: "Bash",
+    ...(identity === undefined ? {} : { command_identity: identity }),
+    ...overrides,
+  });
+  const actions = [
+    run("api-success", 0, api, "contributing_run"),
+    run("api-redundant", 200, api, "redundant_run", { paths: ["src/api.ts"] }),
+    run("root-redundant", 400, root),
+    run("native-redundant", 600, native),
+    run("argv-redundant", 800, argvVariant),
+    run("missing-identity", 1_000, undefined),
+    run("api-inference", 1_200, api, "redundant_run", { kind: "inference" }),
+  ];
+
+  const findings = detectRedundantRuns(actions);
+  assert.deepEqual(findings, detectRedundantRuns([...actions].reverse()));
+  assert.equal(findings.length, 4);
+  assert.deepEqual(
+    findings.map(({ finding_key }) => finding_key).sort(),
+    [api, root, native, argvVariant].map(r002FindingKey).sort(),
+  );
+  const byKey = new Map(findings.map((finding) => [finding.finding_key, finding]));
+  const apiFinding = byKey.get(r002FindingKey(api));
+  const rootFinding = byKey.get(r002FindingKey(root));
+  const nativeFinding = byKey.get(r002FindingKey(native));
+  const argvFinding = byKey.get(r002FindingKey(argvVariant));
+  assert.ok(apiFinding && rootFinding && nativeFinding && argvFinding);
+  assert.equal(apiFinding.evidence.count, 2);
+  assert.equal(apiFinding.evidence.irrelevant_count, 1);
+  assert.deepEqual(apiFinding.evidence.paths, ["src/api.ts"]);
+  assert.deepEqual(apiFinding.evidence.interval_ids, ["R002:api-redundant"]);
+  assert.deepEqual(
+    apiFinding.evidence.session_refs,
+    [
+      "s1#api-success-start",
+      "s1#api-success-end",
+      "s1#api-redundant-start",
+      "s1#api-redundant-end",
+    ].sort(),
+  );
+  assert.equal(rootFinding.target, ". :: npm test");
+  assert.equal(
+    rootFinding.fix_recipe.suggestion,
+    "Use npm run test:affected for scoped edits in repository-relative CWD `.`, then keep `npm test` as the final full validation.",
+  );
+  assert.equal(nativeFinding.target, "packages/api :: npm test [native-tool]");
+  assert.equal(argvFinding.target, apiFinding.target);
+  assert.notEqual(argvFinding.finding_key, apiFinding.finding_key);
 });
 
 test("R003 claims duplicate reads and only their directly caused post-result inference", () => {
