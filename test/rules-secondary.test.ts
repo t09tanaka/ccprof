@@ -2,12 +2,18 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type {
+  CommandIdentity,
   CompactionEvent,
   Finding,
   MatchedAction,
   TimelineAction,
   ToolResultEvent,
 } from "../src/core/model.js";
+import { classifyCommand } from "../src/analysis/command.js";
+import {
+  buildCommandIdentity,
+  commandIdentityKey,
+} from "../src/analysis/command-identity.js";
 import { buildFlakyEditRelevance } from "../src/core/analyze.js";
 import { parseExplicitTestMap } from "../src/analysis/test-map.js";
 import type { AnalysisRecord } from "../src/store/analyses.js";
@@ -39,22 +45,52 @@ function timelineAction(
   };
 }
 
+type MatchedActionOverrides = Omit<Partial<MatchedAction>, "command_identity"> &
+  { command_identity?: CommandIdentity | undefined };
+
+function commandIdentity(
+  repoRelativeCwd: string,
+  normalizedArgv: string[] = ["npm", "test"],
+  executor: CommandIdentity["executor"] = "shell",
+): CommandIdentity {
+  return { repo_relative_cwd: repoRelativeCwd,
+    normalized_argv: [...normalizedArgv], executor };
+}
+
+function rootCommandIdentity(command: string): CommandIdentity {
+  const identity = buildCommandIdentity("/repo", "/repo", classifyCommand(command));
+  assert.ok(identity !== undefined);
+  return identity;
+}
+
+function r008FindingKey(identity: CommandIdentity): string {
+  return findingKey("R008", `command-identity:${
+    Buffer.from(commandIdentityKey(identity), "utf8").toString("hex")}`);
+}
+
 function matchedAction(
   actionId: string,
   startMs: number,
   endMs: number,
   match: MatchedAction["match"],
-  overrides: Partial<MatchedAction> = {},
+  overrides: MatchedActionOverrides = {},
 ): MatchedAction {
-  return {
+  const { command_identity: identityOverride, ...rest } = overrides;
+  const action: MatchedAction = {
     ...timelineAction(actionId, startMs, endMs),
     match,
     match_confidence: "high",
     relevance_paths: [],
     target: actionId,
     caveats: [],
-    ...overrides,
+    ...rest,
+    ...(identityOverride === undefined ? {} : { command_identity: identityOverride }),
   };
+  if (Object.hasOwn(overrides, "command_identity")) return action;
+  const command = action.normalized_command;
+  if (command === undefined) return action;
+  const identity = buildCommandIdentity("/repo", "/repo", classifyCommand(command));
+  return identity === undefined ? action : { ...action, command_identity: identity };
 }
 
 function eventBase(
@@ -136,9 +172,17 @@ function storedFlakyFinding(
   command: string,
   durationMin: number,
   sessionRef: string,
+  identity: CommandIdentity | "legacy" | "malformed" = rootCommandIdentity(command),
 ): Finding {
+  const identityEvidence = identity === "legacy" ? {} : {
+    command_identity: identity === "malformed"
+      ? { repo_relative_cwd: ".", normalized_argv: [1], executor: "shell" }
+      : commandIdentity(identity.repo_relative_cwd, identity.normalized_argv, identity.executor),
+  };
   return {
-    finding_key: findingKey("R008", command),
+    finding_key: typeof identity === "object"
+      ? r008FindingKey(identity)
+      : findingKey("R008", command),
     rule_id: "R008",
     title: "Test failed then passed without a relevant edit",
     classification: "repo",
@@ -149,7 +193,8 @@ function storedFlakyFinding(
       session_refs: [sessionRef],
       interval_ids: ["R008:historical"],
       command,
-    },
+      ...identityEvidence,
+    } as Finding["evidence"],
     recoverable: { min: durationMin, bound: "point" },
     fix_recipe: {
       suggestion: "Fix or quarantine the flaky behavior.",
@@ -496,12 +541,14 @@ test("R007 reports compaction without inventing latency when no large result pre
 });
 
 test("R008 claims a definite unchanged fail-to-pass investigation as point time", () => {
+  const identity = commandIdentity("packages/api");
   const actions = [
     matchedAction("failed", 0, 100, "contributing_run", {
       tool_name: "Bash",
       tool_use_id: "failed",
       command: "npm test",
       normalized_command: "npm test",
+      command_identity: identity,
       target: "npm test",
     }),
     matchedAction("failed-inference", 100, 110, "contributing_run", {
@@ -510,6 +557,7 @@ test("R008 claims a definite unchanged fail-to-pass investigation as point time"
       tool_use_id: "failed",
       command: "npm test",
       normalized_command: "npm test",
+      command_identity: identity,
       target: "npm test",
     }),
     matchedAction("investigation", 110, 150, "safe_read", {
@@ -530,6 +578,7 @@ test("R008 claims a definite unchanged fail-to-pass investigation as point time"
       tool_use_id: "passed",
       command: "npm   test",
       normalized_command: "npm test",
+      command_identity: identity,
       target: "npm test",
     }),
   ];
@@ -546,8 +595,8 @@ test("R008 claims a definite unchanged fail-to-pass investigation as point time"
   assert.equal(finding.scope, "separate_issue");
   assert.equal(finding.cause, null);
   assert.equal(finding.confidence, "high");
-  assert.equal(finding.target, "npm test");
-  assert.equal(finding.finding_key, findingKey("R008", "npm test"));
+  assert.equal(finding.target, "packages/api :: npm test");
+  assert.equal(finding.finding_key, r008FindingKey(identity));
   assert.equal(finding.recoverable.bound, "point");
   assert.equal(finding.recoverable.estimated_ms, 140);
   assert.deepEqual(finding.evidence.interval_ids, [
@@ -561,7 +610,100 @@ test("R008 claims a definite unchanged fail-to-pass investigation as point time"
   assert.equal(finding.evidence.failed_run_count, 1);
   assert.equal(finding.evidence.episode_count, 1);
   assert.equal(finding.evidence.unrelated_edit_count, 0);
+  assert.equal(finding.evidence.command, "npm test");
+  assert.deepEqual(finding.evidence.command_identity, identity);
+  assert.notStrictEqual(finding.evidence.command_identity, identity);
+  assert.match(finding.fix_recipe.suggestion, /packages\/api/u);
   assert.equal(finding.fix_recipe.verify, "npm test");
+});
+
+test("R008 isolates exact command-identity lanes deterministically", () => {
+  const lanes = [
+    { name: "api", start: 0, passingStart: 80,
+      identity: commandIdentity("packages/api",
+      ["npm", "test", "--", "", "unit", "unit"]) },
+    { name: "web", start: 20, passingStart: 40,
+      identity: commandIdentity("packages/web") },
+    { name: "argv", start: 100, passingStart: 120,
+      identity: commandIdentity("packages/api",
+      ["npm", "test", "--", "other"]) },
+    { name: "native", start: 200, passingStart: 220,
+      identity: commandIdentity("packages/api",
+      ["npm", "test", "--", "", "unit", "unit"], "native-tool") },
+  ];
+  const actions = lanes.flatMap(({ name, identity, start, passingStart }) => {
+    return [
+      matchedAction(`${name}-failed`, start, start + 10, "contributing_run", {
+        session_id: name, tool_name: "Bash", tool_use_id: `${name}-failed`,
+        session_refs: [`${name}#failed`], command: "npm test",
+        normalized_command: "npm test", command_identity: identity,
+      }),
+      matchedAction(`${name}-passed`, passingStart, passingStart + 10, "redundant_run", {
+        session_id: name, tool_name: "Bash", tool_use_id: `${name}-passed`,
+        session_refs: [`${name}#passed`], command: "npm test",
+        normalized_command: "npm test", command_identity: identity,
+      }),
+    ];
+  });
+  const legacyActions = [matchedAction("legacy-failed", 400, 410,
+    "contributing_run", { session_id: "legacy", tool_use_id: "legacy-failed",
+      normalized_command: "npm test", command_identity: undefined }),
+  matchedAction("legacy-passed", 420, 430, "redundant_run", {
+    session_id: "legacy", tool_use_id: "legacy-passed",
+    normalized_command: "npm test", command_identity: undefined })];
+  actions.push(...legacyActions);
+  const results = [...lanes, { name: "legacy", start: 400, passingStart: 420 }]
+    .flatMap(({ name, start, passingStart }) => [
+      toolResult(`${name}-failed`, start + 10, "failure",
+        { session_id: name, session_ref: `${name}#failed-result` }),
+      toolResult(`${name}-passed`, passingStart + 10, "success",
+        { session_id: name, session_ref: `${name}#passed-result` }),
+    ]);
+  const forward = detectFlakyTests(actions, { toolResults: results });
+  assert.deepEqual(detectFlakyTests([...actions].reverse(),
+    { toolResults: [...results].reverse() }), forward);
+  const expected = [...lanes].sort((left, right) => {
+    const leftKey = commandIdentityKey(left.identity), rightKey = commandIdentityKey(right.identity);
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
+  assert.deepEqual(
+    forward.map((finding, index) => ({ key: finding.finding_key,
+      target: finding.target, identity: finding.evidence.command_identity,
+      counts: [finding.evidence.episode_count, finding.evidence.failed_run_count,
+        finding.evidence.passing_run_count], isolated: (finding.evidence.session_refs as string[])
+          .every((ref) => ref.startsWith(`${expected[index]!.name}#`)) })),
+    expected.map(({ name: _name, identity }) => ({ key: r008FindingKey(identity),
+      target: `${identity.repo_relative_cwd} :: npm test${
+        identity.executor === "native-tool" ? " [native-tool]" : ""}`,
+      identity, counts: [1, 1, 1], isolated: true })),
+  );
+  const apiFinding = forward.find((finding) =>
+    finding.finding_key === r008FindingKey(lanes[0]!.identity));
+  const originalArgv = [...lanes[0]!.identity.normalized_argv];
+  lanes[0]!.identity.normalized_argv.push("mutated");
+  assert.deepEqual((apiFinding?.evidence.command_identity as unknown as CommandIdentity)
+    .normalized_argv, originalArgv);
+  assert.deepEqual(detectFlakyTests(legacyActions, {
+    toolResults: results.slice(-2),
+    history: [historyRecord("legacy-1", "main...legacy",
+      [storedFlakyFinding("npm test", 9, "legacy#old", "legacy")])],
+  }), []);
+
+  for (const cwd of ["..\\secret", "\\\\server\\share"]) {
+    const unsafe = commandIdentity(cwd);
+    const unsafeActions = [
+      matchedAction("unsafe-failed", 0, 10, "contributing_run", {
+        tool_use_id: "unsafe-failed", normalized_command: "npm test",
+        command_identity: unsafe }),
+      matchedAction("unsafe-passed", 20, 30, "redundant_run", {
+        tool_use_id: "unsafe-passed", normalized_command: "npm test",
+        command_identity: unsafe }),
+    ];
+    assert.deepEqual(detectFlakyTests(unsafeActions, { toolResults: [
+      toolResult("unsafe-failed", 10, "failure"),
+      toolResult("unsafe-passed", 30, "success"),
+    ] }), []);
+  }
 });
 
 test("R008 does not treat an unexplained failed run as its own mutation", () => {
@@ -1008,27 +1150,34 @@ test("R008 connects current flakiness to prior PRs without adding historical tim
     historyRecord("history-3", "main...old-b", [
       storedFlakyFinding("npm test", 0.5, "old-b#run"),
     ]),
-    historyRecord("history-4", "main...old-c", [{
-      ...storedFlakyFinding("npm test", 8, "old-c#run"),
-      evidence: {
-        session_refs: [1],
-        interval_ids: [],
-        command: { malformed: true },
-      },
-    } as unknown as Finding]),
+    historyRecord("history-4", "main...wrong-cwd", [storedFlakyFinding(
+      "npm test", 8, "wrong-cwd#run", commandIdentity("packages/web"))]),
+    historyRecord("history-5", "main...native", [storedFlakyFinding(
+      "npm test", 8, "native#run", commandIdentity(".", ["npm", "test"], "native-tool"))]),
+    historyRecord("history-6", "main...legacy", [storedFlakyFinding(
+      "npm test", 8, "legacy#run", "legacy")]),
+    historyRecord("history-7", "main...malformed", [storedFlakyFinding(
+      "npm test", 8, "malformed#run", "malformed")]),
+    historyRecord("history-8", "main...parent-cwd", [storedFlakyFinding(
+      "npm test", 8, "parent-cwd#run", commandIdentity("..\\secret"))]),
+    historyRecord("history-9", "main...unc-cwd", [storedFlakyFinding(
+      "npm test", 8, "unc-cwd#run", commandIdentity("\\\\server\\share"))]),
   ];
 
-  const finding = detectFlakyTests(actions, {
+  const detect = (records: readonly AnalysisRecord[]) => detectFlakyTests(actions, {
     toolResults: [
       toolResult("failed", 100, "failure"),
       toolResult("passed", 260, "success"),
     ],
-    history,
-  })[0];
+    history: records,
+  });
+  const finding = detect(history)[0];
 
   assert.ok(finding !== undefined);
+  assert.deepEqual(detect([...history].reverse()), [finding]);
   assert.equal(finding.recoverable.estimated_ms, 100);
   assert.deepEqual(finding.evidence.interval_ids, ["R008:failed"]);
+  assert.deepEqual(finding.evidence.command_identity, rootCommandIdentity("npm test"));
   assert.deepEqual(finding.evidence.historical_prs, [
     "main...old-a",
     "main...old-b",
@@ -1039,7 +1188,7 @@ test("R008 connects current flakiness to prior PRs without adding historical tim
     "old-a#run-2",
     "old-b#run",
   ]);
-  assert.match(finding.caveats.join("\n"), /2 prior PRs.*2.5 minutes/iu);
+  assert.match(finding.caveats.join("\n"), /same command identity.*2 prior PRs.*2.5 minutes/iu);
 });
 
 test("R008 never creates a current finding from history alone", () => {
@@ -1541,7 +1690,7 @@ test("R008 scopes edit relevance to the failing normalized command", () => {
   });
 
   assert.equal(findings.length, 1);
-  assert.equal(findings[0]?.target, "npm run test:a");
+  assert.equal(findings[0]?.target, ". :: npm run test:a");
   assert.equal(findings[0]?.evidence.unrelated_edit_count, 1);
 });
 
