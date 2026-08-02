@@ -27,6 +27,23 @@ test("documentation uses only the installed ccprof command", async () => {
   }
 });
 
+test("documentation is written in English", async () => {
+  const documents = await Promise.all(
+    DOCUMENT_PATHS.map(async (path) => ({
+      path,
+      text: await readDocument(path),
+    })),
+  );
+
+  for (const document of documents) {
+    assert.doesNotMatch(
+      document.text,
+      /[぀-ヿ㐀-䶿一-鿿]/u,
+      `${document.path} contains non-English text`,
+    );
+  }
+});
+
 test("README documents the complete direct CLI and analysis contract", async () => {
   const readme = await readDocument("README.md");
 
@@ -59,11 +76,11 @@ test("README documents the complete direct CLI and analysis contract", async () 
     assert.ok(readme.includes(expected), `README is missing ${expected}`);
   }
 
-  assert.match(readme, /ローカル.*(?:送信|アップロード).*しない/su);
-  assert.match(readme, /放置.*(?:除外|含めない)/su);
-  assert.match(readme, /タイムスタンプ.*(?:限界|厳密ではない)/su);
-  assert.match(readme, /14\s*日/u);
-  assert.match(readme, /2\s*[×倍]/u);
+  assert.match(readme, /locally.*never\s+sends?\s+or\s+uploads?/isu);
+  assert.match(readme, /away\s+time.*excluded/isu);
+  assert.match(readme, /timestamps\s+are\s+log\s+write\s+times.*not\s+the\s+exact/isu);
+  assert.match(readme, /14\s*days/iu);
+  assert.match(readme, /2×/u);
   assert.match(readme, /Phase\s*1/u);
 });
 
@@ -72,7 +89,7 @@ test("retro command fixes only this_pr findings and never creates issues automat
 
   assert.ok(retro.includes("ccprof --pr --json"));
   assert.ok(retro.includes("scope: this_pr"));
-  assert.match(retro, /自動作成しない/u);
+  assert.match(retro, /do\s+not\s+create\s+an\s+Issue\s+or\s+another\s+PR\s+automatically/isu);
   assert.match(retro, /separate_issue|claude_md/u);
 });
 
@@ -85,7 +102,7 @@ test("PR integration runs after creation and keeps Markdown posting opt-in", asy
   assert.ok(
     snippet.indexOf("gh pr create") < snippet.indexOf("ccprof --pr --json"),
   );
-  assert.match(snippet, /PR 作成成功後/u);
-  assert.match(snippet, /明示的.*オプトイン/su);
-  assert.match(snippet, /自動作成しない/u);
+  assert.match(snippet, /only\s+after\s+the\s+PR\s+has\s+been\s+created\s+successfully/isu);
+  assert.match(snippet, /\*\*explicit\s+opt-in\*\*/isu);
+  assert.match(snippet, /do\s+not\s+create\s+an\s+Issue\s+automatically/isu);
 });
