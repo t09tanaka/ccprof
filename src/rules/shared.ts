@@ -39,18 +39,18 @@ export function sortedUnique(values: readonly string[]): string[] {
   );
 }
 
-function canonicalJson(value: JsonValue): JsonValue {
+function canonicalJson(value: JsonValue, propertyName?: string): JsonValue {
   if (Array.isArray(value)) {
     if (value.every((entry) => typeof entry === "string")) {
-      return sortedUnique(value);
+      return propertyName === "normalized_argv" ? [...value] : sortedUnique(value);
     }
-    return value.map(canonicalJson);
+    return value.map((entry) => canonicalJson(entry));
   }
   if (value !== null && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value)
         .sort(([left], [right]) => left.localeCompare(right))
-        .map(([key, entry]) => [key, canonicalJson(entry)]),
+        .map(([key, entry]) => [key, canonicalJson(entry, key)]),
     );
   }
   return value;
