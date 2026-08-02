@@ -78,6 +78,8 @@ ccprof --pr [<number|url|base...head>] [--json|--md]
        [--idle-threshold <duration>] [--test-map <path>]
 ccprof stats [--json]
 ccprof dismiss <finding-key> [--reason <text>]
+ccprof hook-event [--notify]
+ccprof hooks install|uninstall [--global] [--yes]
 ccprof --version
 ```
 
@@ -144,6 +146,43 @@ The same key stays suppressed for 14 days and expires exactly at 14 days. Even
 within that window the finding reappears if its recoverable estimate becomes
 **strictly greater than 2×** the estimate at dismissal time, and the stored
 reason is surfaced as a caveat.
+
+### Hooks (automatic notifications)
+
+```sh
+ccprof hooks install
+ccprof hooks install --global
+ccprof hooks uninstall
+```
+
+`ccprof hooks install` registers a Claude Code Stop hook (`ccprof hook-event
+--notify`) that runs at the end of every agent turn. Installing is idempotent
+and preserves the surrounding `.claude/settings.json` verbatim, including key
+order; running it again when the entry already exists is a no-op. By default
+it edits the repository's `.claude/settings.json`; `--global` targets
+`~/.claude/settings.json` instead. Outside an interactive terminal, pass
+`--yes` to skip the confirmation prompt. `ccprof hooks uninstall` (with the
+same `--global`/`--yes` flags) removes only the ccprof-installed entry,
+leaving any other hooks untouched. Both actions report when there is nothing
+to do, and print the settings path they wrote to.
+
+The installed hook does two things on every Stop event:
+
+- It records the real end-of-turn wall-clock time to a per-repository
+  `hook-events.jsonl` log, and `ccprof --pr` uses it to extend a session's
+  measured end time (within a 30-minute window) whenever it postdates the log
+  timestamp. This improves on the log-write-time caveat below for session end
+  times specifically, and such hook-verified tails count as active time (not
+  idle) as long as they fall within the idle threshold.
+- Once per 10 minutes, it also runs a persist-free `ccprof --pr` analysis and
+  prints a short findings summary — a notification only. It never blocks the
+  agent, never writes an analysis record to the store, and any hook failure
+  (bad payload, no repo, an unwritable store) is designed to degrade to
+  silent success: the underlying `ccprof hook-event` command always exits 0.
+
+`ccprof hook-event` itself is the hook entrypoint invoked by Claude Code; it
+is not meant to be run manually, but is documented here for completeness.
+Without `--notify` it only appends the Stop event to the log.
 
 ## JSON v2
 
@@ -246,7 +285,10 @@ and end of a tool call or of inference. End times are never guessed for tools
 whose result is missing; those are treated as zero time with low confidence. Git
 itself has no branch creation time either, so when a PR creation time is
 unavailable the oldest head-only commit is used as the start boundary and a
-caveat is attached.
+caveat is attached. For session end times specifically, installing the Stop
+hook (see [Hooks (automatic notifications)](#hooks-automatic-notifications))
+narrows this gap by recording the real wall-clock end of each turn instead of
+relying on the last log write.
 
 Known coordination, delegation, and investigation tools that can be identified
 deterministically by name (TodoWrite / Agent / Skill / WebFetch and so on), and
