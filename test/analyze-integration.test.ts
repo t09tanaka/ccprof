@@ -18,7 +18,10 @@ import {
 } from "../src/core/analyze.js";
 import type { Session } from "../src/core/model.js";
 import { parseExplicitTestMap } from "../src/analysis/test-map.js";
-import { runCommand } from "../src/git/client.js";
+import {
+  runCommand,
+  type CommandRunner,
+} from "../src/git/client.js";
 import {
   ClaudeDiscoveryError,
   ClaudeSessionSource,
@@ -398,6 +401,101 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
       "dismissal filters only the displayed top findings",
     );
     assert.ok(dismissed.suppressedKeys.includes(approval.finding_key));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PR number, PR URL, and explicit range produce equivalent analysis semantics", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-selector-equivalence-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const [baseRefOid, headRefOid] = await Promise.all([
+      git(repo, ["rev-parse", "main"]),
+      git(repo, ["rev-parse", "feature"]),
+    ]);
+    const projects = await makeClaudeProjects(root, repo);
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const startedAtMs = Date.parse("2026-01-01T00:00:00.000Z");
+    const url = "https://github.com/example/ccprof/pull/17";
+    const interceptedSelectors: string[] = [];
+    const runner: CommandRunner = async (command, args, options) => {
+      const selector = args[2];
+      if (command === "gh" &&
+        args[0] === "pr" && args[1] === "view" &&
+        (selector === "17" || selector === url)
+      ) {
+        interceptedSelectors.push(selector);
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            number: 17,
+            url,
+            baseRefName: "main",
+            baseRefOid,
+            headRefName: "feature",
+            headRefOid,
+            isCrossRepository: false,
+            createdAt: "2026-01-01T00:00:00.000Z",
+          }),
+          stderr: "",
+        };
+      }
+      if (command === "gh") {
+        assert.fail(`unexpected gh command: gh ${args.join(" ")}`);
+      }
+      return await runCommand(command, args, options);
+    };
+    const testMap = { mappings: [], caveats: [] };
+    const run = async (pr: string) => await analyze({
+      cwd: repo,
+      pr,
+      sinceMs: startedAtMs,
+      nowMs: NOW_MS,
+      runner,
+      sessionSource: new ClaudeSessionSource(projects),
+      storePaths,
+      testMap,
+      persist: false,
+    });
+
+    const numberResult = await run("17");
+    const urlResult = await run(url);
+    const rangeResult = await run("main...feature");
+    const comparable = (result: Awaited<ReturnType<typeof analyze>>) => ({
+      window: result.window,
+      report: {
+        version: result.report.version,
+        unit: {
+          repo: result.report.unit.repo,
+          sessions: result.report.unit.sessions,
+        },
+        summary: result.report.summary,
+        findings: result.report.findings,
+        caveats: result.report.caveats,
+        skipped_rules: result.report.skipped_rules,
+      },
+      all_findings: result.allFindings,
+      ledger: result.ledger,
+      metrics: result.record.metrics,
+      command_costs: result.record.command_costs,
+      read_observations: result.record.read_observations,
+      warnings: result.warnings,
+      suppressed_keys: result.suppressedKeys,
+    });
+
+    assert.deepEqual(comparable(numberResult), comparable(rangeResult));
+    assert.deepEqual(comparable(urlResult), comparable(rangeResult));
+    assert.deepEqual(rangeResult.window, {
+      started_at_ms: startedAtMs,
+      ended_at_ms: NOW_MS,
+      start_source: "explicit",
+      end_source: "analysis_time",
+      completeness: "complete",
+    });
+    assert.deepEqual(interceptedSelectors, ["17", url]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
