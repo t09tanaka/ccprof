@@ -29,6 +29,7 @@ import {
   type StatsCommandOptions,
 } from "./commands/stats.js";
 import {
+  InvalidAnalysisWindowError,
   NoAnalyzableTimestampsError,
   NoMatchingSessionsError,
 } from "./core/analyze.js";
@@ -37,6 +38,7 @@ import { sanitizeHumanText } from "./reporters/sanitize.js";
 
 export const USAGE = `Usage: ccprof [--pr [<number|url|base...head>]] [--json|--md]
               [--idle-threshold <duration>] [--test-map <path>] [--color]
+              [--since <RFC3339>] [--commit-lookback <duration>]
        ccprof stats [--json]
        ccprof dismiss <finding-key> [--reason <text>]
        ccprof hook-event [--notify]
@@ -87,6 +89,8 @@ export interface ParsedAnalyzeCommand {
   format: AnalyzeOutputFormat;
   color: boolean;
   pr?: string;
+  sinceMs?: number;
+  commitAnchorLookbackMs?: number;
   idleThresholdMs?: number;
   testMapPath?: string;
 }
@@ -226,17 +230,81 @@ export function parseDurationMs(value: string): number {
   return milliseconds;
 }
 
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) {
+    const leap = year % 4 === 0 &&
+      (year % 100 !== 0 || year % 400 === 0);
+    return leap ? 29 : 28;
+  }
+  return [4, 6, 9, 11].includes(month) ? 30 : 31;
+}
+
+export function parseRfc3339Ms(value: string): number {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/iu
+    .exec(value);
+  const invalid = (): never => {
+    throw new CliUsageError(
+      "--since must be an RFC3339 date-time with an explicit timezone",
+    );
+  };
+  if (match === null) {
+    throw new CliUsageError(
+      "--since must be an RFC3339 date-time with an explicit timezone",
+    );
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const millisecond = Number((match[7] ?? "").slice(0, 3).padEnd(3, "0"));
+  const zone = match[8] as string;
+  const isZulu = zone.toUpperCase() === "Z";
+  const offsetHour = isZulu ? 0 : Number(zone.slice(1, 3));
+  const offsetMinute = isZulu ? 0 : Number(zone.slice(4, 6));
+  if (
+    month < 1 || month > 12 ||
+    day < 1 || day > daysInMonth(year, month) ||
+    hour > 23 || minute > 59 || second > 59 ||
+    offsetHour > 23 || offsetMinute > 59
+  ) {
+    invalid();
+  }
+
+  const local = new Date(0);
+  local.setUTCFullYear(year, month - 1, day);
+  local.setUTCHours(hour, minute, second, millisecond);
+  const offsetSign = zone.startsWith("-") ? -1 : 1;
+  const offsetMs = offsetSign *
+    (offsetHour * 60 + offsetMinute) * 60_000;
+  const timestamp = local.getTime() - offsetMs;
+  if (
+    !Number.isFinite(timestamp) ||
+    !Number.isSafeInteger(timestamp) ||
+    timestamp < 0
+  ) {
+    throw new CliUsageError("--since is outside the supported date range");
+  }
+  return timestamp;
+}
+
 function parseAnalyzeArgs(
   args: readonly string[],
 ): ParsedAnalyzeCommand {
   let format: AnalyzeOutputFormat = "tty";
   let color = false;
   let pr: string | undefined;
+  let sinceMs: number | undefined;
+  let commitAnchorLookbackMs: number | undefined;
   let idleThresholdMs: number | undefined;
   let testMapPath: string | undefined;
   let sawPr = false;
   let sawFormat = false;
   let sawColor = false;
+  let sawSince = false;
+  let sawCommitLookback = false;
   let sawIdle = false;
   let sawTestMap = false;
 
@@ -276,6 +344,48 @@ function parseAnalyzeArgs(
       if (sawPr) throw new CliUsageError("--pr was specified twice");
       sawPr = true;
       pr = inlinePr;
+      continue;
+    }
+    if (token === "--since") {
+      if (sawSince) throw new CliUsageError("--since was specified twice");
+      sawSince = true;
+      const selected = requiredOptionValue(args, index, "--since");
+      sinceMs = parseRfc3339Ms(selected.value);
+      index = selected.nextIndex;
+      continue;
+    }
+    const inlineSince = token.startsWith("--since=")
+      ? inlineOptionValue(token, "--since")
+      : null;
+    if (inlineSince !== null) {
+      if (sawSince) throw new CliUsageError("--since was specified twice");
+      sawSince = true;
+      sinceMs = parseRfc3339Ms(inlineSince);
+      continue;
+    }
+    if (token === "--commit-lookback") {
+      if (sawCommitLookback) {
+        throw new CliUsageError("--commit-lookback was specified twice");
+      }
+      sawCommitLookback = true;
+      const selected = requiredOptionValue(
+        args,
+        index,
+        "--commit-lookback",
+      );
+      commitAnchorLookbackMs = parseDurationMs(selected.value);
+      index = selected.nextIndex;
+      continue;
+    }
+    const inlineCommitLookback = token.startsWith("--commit-lookback=")
+      ? inlineOptionValue(token, "--commit-lookback")
+      : null;
+    if (inlineCommitLookback !== null) {
+      if (sawCommitLookback) {
+        throw new CliUsageError("--commit-lookback was specified twice");
+      }
+      sawCommitLookback = true;
+      commitAnchorLookbackMs = parseDurationMs(inlineCommitLookback);
       continue;
     }
     if (token === "--idle-threshold") {
@@ -331,6 +441,10 @@ function parseAnalyzeArgs(
     format,
     color,
     ...(pr === undefined ? {} : { pr }),
+    ...(sinceMs === undefined ? {} : { sinceMs }),
+    ...(commitAnchorLookbackMs === undefined
+      ? {}
+      : { commitAnchorLookbackMs }),
     ...(idleThresholdMs === undefined ? {} : { idleThresholdMs }),
     ...(testMapPath === undefined ? {} : { testMapPath }),
   };
@@ -454,6 +568,7 @@ function errorMessage(error: unknown): string {
 function exitCodeFor(error: unknown): number {
   if (
     error instanceof CliUsageError ||
+    error instanceof InvalidAnalysisWindowError ||
     error instanceof FindingNotFoundError ||
     error instanceof HooksConfirmationRequiredError
   ) {
@@ -553,6 +668,12 @@ export async function runCli(
         color: command.color ||
           (command.format === "tty" && stdoutIsTTY),
         ...(command.pr === undefined ? {} : { pr: command.pr }),
+        ...(command.sinceMs === undefined
+          ? {}
+          : { sinceMs: command.sinceMs }),
+        ...(command.commitAnchorLookbackMs === undefined
+          ? {}
+          : { commitAnchorLookbackMs: command.commitAnchorLookbackMs }),
         ...(command.idleThresholdMs === undefined
           ? {}
           : { idleThresholdMs: command.idleThresholdMs }),
@@ -593,7 +714,11 @@ export async function runCli(
   } catch (error) {
     const code = exitCodeFor(error);
     stderr(`ccprof: ${sanitizeHumanText(errorMessage(error))}\n`);
-    if (code === 2 && error instanceof CliUsageError) {
+    if (
+      code === 2 &&
+      (error instanceof CliUsageError ||
+        error instanceof InvalidAnalysisWindowError)
+    ) {
       stderr(USAGE);
     }
     return code;

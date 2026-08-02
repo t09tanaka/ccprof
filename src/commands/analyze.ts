@@ -17,6 +17,8 @@ export interface AnalyzeCommandOptions {
   format: AnalyzeOutputFormat;
   color: boolean;
   pr?: string;
+  sinceMs?: number;
+  commitAnchorLookbackMs?: number;
   idleThresholdMs?: number;
   testMapPath?: string;
 }
@@ -48,6 +50,10 @@ export async function runAnalyzeCommand(
   const result = await analyze({
     cwd: options.cwd,
     ...(options.pr === undefined ? {} : { pr: options.pr }),
+    ...(options.sinceMs === undefined ? {} : { sinceMs: options.sinceMs }),
+    ...(options.commitAnchorLookbackMs === undefined
+      ? {}
+      : { commitAnchorLookbackMs: options.commitAnchorLookbackMs }),
     ...(options.idleThresholdMs === undefined
       ? {}
       : { idleThresholdMs: options.idleThresholdMs }),
