@@ -1,4 +1,13 @@
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import {
+  appendFile,
+  mkdir,
+  open,
+  readFile,
+  rename,
+  stat,
+  unlink,
+} from "node:fs/promises";
 import { dirname } from "node:path";
 
 import {
@@ -16,6 +25,8 @@ import { resolveCurrentRepoRoot } from "./stats.js";
 
 const THROTTLE_WINDOW_MS = 10 * 60 * 1_000;
 const NOTIFIED_EVENT_NAME = "ccprof_notified";
+const MAX_HOOK_EVENTS_BYTES = 1024 * 1024;
+const RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 
 export interface HookEventCommandOptions {
   cwd: string;
@@ -88,6 +99,91 @@ async function appendEventRow(
 ): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   await appendFile(path, `${JSON.stringify(row)}\n`, "utf8");
+}
+
+/**
+ * Bounds the event log in place once an append pushes it past
+ * `MAX_HOOK_EVENTS_BYTES`. The common path costs a single `stat`; only an
+ * oversized log is read, filtered, and rewritten:
+ *
+ * 1. valid rows (per `isHookEventLogRow`) newer than `RETENTION_MS` are
+ *    kept, malformed lines are discarded;
+ * 2. if the retained rows still exceed the byte cap, only the newest
+ *    suffix that fits is kept (absolute upper bound), preserving the
+ *    original relative order;
+ * 3. the result replaces the log via temp file + fsync + rename (the same
+ *    lock-free atomic-write pattern as `writeJsonAtomically` in
+ *    `src/store/analyses.ts`).
+ *
+ * Like the throttle read below, this read-then-rename is a benign TOCTOU
+ * accepted by design: a concurrent Stop hook may append a row between the
+ * read and the rename, and that row is lost. Compaction only triggers at
+ * the 1 MiB boundary, so the race is rare and costs at most the last row
+ * or two - no lock is added. Any failure (unreadable log, unwritable
+ * directory) is swallowed: compaction is best-effort and must never fail
+ * the hook.
+ */
+async function maybeCompactHookEvents(
+  path: string,
+  nowMs: number,
+): Promise<void> {
+  try {
+    const info = await stat(path);
+    if (info.size <= MAX_HOOK_EVENTS_BYTES) return;
+
+    const text = await readFile(path, "utf8");
+    const cutoffMs = nowMs - RETENTION_MS;
+    const kept: string[] = [];
+    for (const line of text.split("\n")) {
+      if (line.trim() === "") continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue; // Malformed line: dropped by compaction.
+      }
+      if (!isHookEventLogRow(parsed)) continue;
+      if (parsed.received_at_ms < cutoffMs) continue;
+      kept.push(line);
+    }
+
+    // Absolute cap: walk from the newest side and keep the longest suffix
+    // that fits, so recent rows win over old ones while relative order is
+    // preserved.
+    let suffixStart = kept.length;
+    let suffixBytes = 0;
+    while (suffixStart > 0) {
+      const line = kept[suffixStart - 1];
+      if (line === undefined) break;
+      const lineBytes = Buffer.byteLength(line, "utf8") + 1;
+      if (suffixBytes + lineBytes > MAX_HOOK_EVENTS_BYTES) break;
+      suffixBytes += lineBytes;
+      suffixStart -= 1;
+    }
+    const output = kept
+      .slice(suffixStart)
+      .map((line) => `${line}\n`)
+      .join("");
+
+    const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      handle = await open(temporaryPath, "wx", 0o600);
+      await handle.writeFile(output, "utf8");
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      await rename(temporaryPath, path);
+    } catch (error) {
+      if (handle !== undefined) {
+        await handle.close().catch(() => undefined);
+      }
+      await unlink(temporaryPath).catch(() => undefined);
+      throw error;
+    }
+  } catch {
+    // Best-effort: an unbounded log is preferable to a failing hook.
+  }
 }
 
 /** Reads the throttle decision input. Any read/parse failure (including a
@@ -176,6 +272,7 @@ export async function runHookEventCommand(
       session_id: payload.session_id,
       hook_event_name: payload.hook_event_name,
     });
+    await maybeCompactHookEvents(paths.hook_events_path, nowMs);
 
     if (options.notify !== true) return SILENT_SUCCESS;
 
