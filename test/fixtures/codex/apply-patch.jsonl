@@ -1,0 +1,5 @@
+{"timestamp":"2026-07-31T09:00:00.000Z","type":"session_meta","payload":{"id":"codex-apply-patch","cwd":"/workspace/repo","git":{"branch":"feature/apply-patch"}}}
+{"timestamp":"2026-07-31T09:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"apply_patch","call_id":"call-ap-1","arguments":"{\"input\":\"*** Begin Patch\\n*** Update File: src/app/health.ts\\n@@\\n-export const ok = false;\\n+export const ok = true;\\n*** Add File: src/app/health.test.ts\\n+import { ok } from \\\"./health.js\\\";\\n*** Delete File: src/app/legacy.ts\\n*** End Patch\"}"}}
+{"timestamp":"2026-07-31T09:00:02.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-ap-1","output":"Done!"}}
+{"timestamp":"2026-07-31T09:00:03.000Z","type":"response_item","payload":{"type":"function_call","name":"apply_patch","call_id":"call-ap-2","arguments":"{\"input\":\"this is not a patch body\"}"}}
+{"timestamp":"2026-07-31T09:00:04.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-ap-2","output":"aborted"}}

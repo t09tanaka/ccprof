@@ -290,6 +290,83 @@ test("prefers metadata.exit_code over text scanning, even when the text does not
   assert.equal(result.output, "no matching phrase here");
 });
 
+test("extracts edit paths and fragments from apply_patch file headers", () => {
+  const session = parseCodexSession({
+    sourcePath: fixturePath("apply-patch.jsonl"),
+    raw: readFixture("apply-patch.jsonl"),
+  });
+  assert.ok(session);
+
+  const patchCall = session.events.find(
+    (event) => event.kind === "tool_use" && event.tool_use_id === "call-ap-1",
+  );
+  assert.ok(patchCall && patchCall.kind === "tool_use");
+  assert.equal(patchCall.tool_name, "apply_patch");
+  assert.deepEqual(patchCall.paths, [
+    "src/app/health.ts",
+    "src/app/health.test.ts",
+    "src/app/legacy.ts",
+  ]);
+  assert.equal(patchCall.edit_fragments.length, 1);
+  assert.match(patchCall.edit_fragments[0] ?? "", /^\*\*\* Begin Patch/u);
+  assert.match(patchCall.edit_fragments[0] ?? "", /\+export const ok = true;/u);
+  assert.equal(patchCall.confidence, "high");
+});
+
+test("warns and leaves paths empty when an apply_patch body has no file headers", () => {
+  const session = parseCodexSession({
+    sourcePath: fixturePath("apply-patch.jsonl"),
+    raw: readFixture("apply-patch.jsonl"),
+  });
+  assert.ok(session);
+
+  const patchCall = session.events.find(
+    (event) => event.kind === "tool_use" && event.tool_use_id === "call-ap-2",
+  );
+  assert.ok(patchCall && patchCall.kind === "tool_use");
+  assert.deepEqual(patchCall.paths, []);
+  assert.deepEqual(patchCall.edit_fragments, ["this is not a patch body"]);
+
+  const noPathWarnings = session.warnings.filter(
+    (warning) => warning.code === "codex_apply_patch_no_paths",
+  );
+  assert.equal(noPathWarnings.length, 1);
+  assert.equal(noPathWarnings[0]?.line, 4);
+});
+
+test("deduplicates and trims repeated apply_patch header paths", () => {
+  const patch = [
+    "*** Begin Patch",
+    "*** Update File: src/app/health.ts ",
+    "@@",
+    "+const first = 1;",
+    "*** Update File: src/app/health.ts",
+    "@@",
+    "+const second = 2;",
+    "*** End Patch",
+  ].join("\n");
+  const raw = [
+    '{"timestamp":"2026-07-31T10:00:00.000Z","type":"session_meta","payload":{"id":"apply-patch-dedupe","cwd":"/workspace/repo"}}',
+    JSON.stringify({
+      timestamp: "2026-07-31T10:00:01.000Z",
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "apply_patch",
+        call_id: "call-dupe",
+        arguments: JSON.stringify({ input: patch }),
+      },
+    }),
+  ].join("\n");
+
+  const session = parseCodexSession({ sourcePath: "apply-patch-dedupe.jsonl", raw });
+  assert.ok(session);
+
+  const patchCall = session.events.find((event) => event.kind === "tool_use");
+  assert.ok(patchCall && patchCall.kind === "tool_use");
+  assert.deepEqual(patchCall.paths, ["src/app/health.ts"]);
+});
+
 test("warns once per distinct unknown response_item subtype without affecting events", () => {
   const raw = [
     '{"timestamp":"2026-07-30T16:00:00.000Z","type":"session_meta","payload":{"id":"unknown-subtype-session","cwd":"/workspace/repo"}}',

@@ -37,6 +37,13 @@ const INJECTED_USER_TEXT_PREFIXES = [
 
 const EXIT_CODE_PATTERN = /^Process exited with code (\d+)/u;
 
+/**
+ * File headers in an apply_patch body. Content lines inside a patch are
+ * prefixed with `+`/`-`/` `, so anchoring on a bare `***` cannot collide
+ * with patched file content that itself mentions these markers.
+ */
+const APPLY_PATCH_FILE_HEADER = /^\*\*\* (?:Update|Add|Delete) File: (.+)$/u;
+
 /** response_item.payload.type subtypes that are intentionally dropped without a warning. */
 const IGNORED_RESPONSE_ITEM_SUBTYPES = new Set(["reasoning"]);
 
@@ -168,6 +175,17 @@ function extractMessageText(content: unknown): string {
     )
     .map((item) => item.text as string)
     .join("");
+}
+
+function applyPatchPaths(patchBody: string): string[] {
+  const paths: string[] = [];
+  for (const line of patchBody.split(/\r?\n/u)) {
+    const path = APPLY_PATCH_FILE_HEADER.exec(line)?.[1]?.trim();
+    if (path !== undefined && path.length > 0) {
+      paths.push(path);
+    }
+  }
+  return [...new Set(paths)];
 }
 
 function isInjectedUserText(text: string): boolean {
@@ -346,14 +364,36 @@ function buildFunctionCallEvent(
     }
   }
 
+  let paths: string[] = [];
+  let editFragments: string[] = [];
+  if (name === "apply_patch") {
+    const patchBody =
+      typeof input.input === "string" ? input.input : undefined;
+    if (patchBody !== undefined) {
+      editFragments = [patchBody];
+      paths = applyPatchPaths(patchBody);
+    }
+    if (paths.length === 0) {
+      warnings.push(
+        warn(
+          sourcePath,
+          row.line,
+          "codex_apply_patch_no_paths",
+          "apply_patch arguments contained no recognizable file headers; edit paths are unavailable.",
+          makeSessionRef(sessionId, `line-${row.line.toString(10)}`),
+        ),
+      );
+    }
+  }
+
   return {
     ...eventBase(row, sessionId, baseConfidence, hasSchemaLoss),
     kind: "tool_use",
     tool_use_id: callId,
     tool_name: name,
     input,
-    paths: [],
-    edit_fragments: [],
+    paths,
+    edit_fragments: editFragments,
     ...(command !== undefined ? { command } : {}),
     ...(cwd !== undefined ? { cwd } : {}),
   };
