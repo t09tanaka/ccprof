@@ -7,7 +7,12 @@ import {
 import type {
   CommandResultClassification,
 } from "../analysis/command.js";
+import {
+  commandIdentityKey,
+  formatCommandIdentityTarget,
+} from "../analysis/command-identity.js";
 import type {
+  CommandIdentity,
   Confidence,
   MatchedAction,
   ToolResultEvent,
@@ -15,6 +20,7 @@ import type {
 import type { AnalysisRecord } from "../store/analyses.js";
 import {
   createFindingCandidate,
+  findingKey,
   minimumConfidence,
   orderedActions,
   recoverableClaim,
@@ -53,10 +59,12 @@ interface RunSignal {
   result: ToolResultEvent;
   classification: CommandResultClassification;
   command: string;
+  identity: CommandIdentity;
 }
 
 interface FlakyEpisode {
   command: string;
+  identity: CommandIdentity;
   failedRuns: RunSignal[];
   passingRun: RunSignal;
   investigation: MatchedAction[];
@@ -72,6 +80,26 @@ interface HistoricalFlakyEvidence {
 interface HistoricalPrEvidence {
   durationMin: number;
   sessionRefs: Set<string>;
+}
+
+function readCommandIdentity(value: unknown): CommandIdentity | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const identity = value as Record<string, unknown>;
+  const cwd = identity.repo_relative_cwd;
+  const argv = identity.normalized_argv;
+  const executor = identity.executor;
+  if (
+    typeof cwd !== "string" ||
+    (cwd !== "." && (cwd === "" || cwd.includes("\0") || cwd.startsWith("/") ||
+      /^[A-Za-z]:[\\/]/u.test(cwd) || cwd.split("/").some((segment) =>
+        segment === "" || segment === "." || segment === ".."))) ||
+    !Array.isArray(argv) || argv.length === 0 || argv[0] === "" ||
+    argv.some((entry) => typeof entry !== "string") ||
+    (executor !== "shell" && executor !== "native-tool")
+  ) return undefined;
+  return { repo_relative_cwd: cwd, normalized_argv: [...argv] as string[], executor };
 }
 
 function runKey(
@@ -121,6 +149,8 @@ function runSignals(
     ) {
       return [];
     }
+    const identity = readCommandIdentity(action.command_identity);
+    if (identity === undefined) return [];
     const result = (results.get(runKey(action)) ?? []).find(
       (candidate) =>
         candidate.timestamp_ms >= action.interval.end_ms,
@@ -143,7 +173,7 @@ function runSignals(
     ) {
       return [];
     }
-    return [{ action, result, classification, command }];
+    return [{ action, result, classification, command, identity }];
   });
 }
 
@@ -301,6 +331,7 @@ function episodeFor(
   );
   return {
     command: failure.command,
+    identity: failure.identity,
     failedRuns,
     passingRun: passing,
     investigation: orderedActions([...uniqueInvestigation.values()]),
@@ -349,10 +380,10 @@ function downgradeForUnrelatedEdits(
   return "medium";
 }
 
-function historicalFlakyByCommand(
+function historicalFlakyByIdentity(
   history: readonly AnalysisRecord[],
 ): Map<string, HistoricalFlakyEvidence> {
-  const byCommandAndPr = new Map<
+  const byIdentityAndPr = new Map<
     string,
     Map<string, HistoricalPrEvidence>
   >();
@@ -371,10 +402,12 @@ function historicalFlakyByCommand(
       ) {
         continue;
       }
-      const rawCommand = Reflect.get(evidence, "command");
+      const identity = readCommandIdentity(
+        Reflect.get(evidence, "command_identity"),
+      );
       const rawSessionRefs = Reflect.get(evidence, "session_refs");
       if (
-        typeof rawCommand !== "string" ||
+        identity === undefined ||
         !Array.isArray(rawSessionRefs) ||
         rawSessionRefs.length === 0 ||
         !rawSessionRefs.every(
@@ -383,7 +416,6 @@ function historicalFlakyByCommand(
       ) {
         continue;
       }
-      const command = normalizeCommand(rawCommand);
       const durationMin =
         finding.recoverable !== null &&
           typeof finding.recoverable === "object" &&
@@ -392,11 +424,12 @@ function historicalFlakyByCommand(
           finding.recoverable.min >= 0
           ? finding.recoverable.min
           : null;
-      if (command === null || durationMin === null) continue;
-      let byPr = byCommandAndPr.get(command);
+      if (durationMin === null) continue;
+      const identityKey = commandIdentityKey(identity);
+      let byPr = byIdentityAndPr.get(identityKey);
       if (byPr === undefined) {
         byPr = new Map();
-        byCommandAndPr.set(command, byPr);
+        byIdentityAndPr.set(identityKey, byPr);
       }
       const existing = byPr.get(prRef);
       if (existing === undefined) {
@@ -412,13 +445,13 @@ function historicalFlakyByCommand(
   }
 
   return new Map(
-    [...byCommandAndPr.entries()]
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([command, byPr]) => {
+    [...byIdentityAndPr.entries()]
+      .sort(([left], [right]) => compareCodeUnits(left, right))
+      .map(([identityKey, byPr]) => {
         const orderedPrs = [...byPr.entries()].sort(([left], [right]) =>
-          left.localeCompare(right)
+          compareCodeUnits(left, right)
         );
-        return [command, {
+        return [identityKey, {
           prs: orderedPrs.map(([prRef]) => prRef),
           durationMin: orderedPrs.reduce(
             (total, [, evidence]) => total + evidence.durationMin,
@@ -437,11 +470,12 @@ export function detectFlakyTests(
   options: FlakyTestOptions,
 ) {
   const ordered = orderedActions(actions);
-  const historyByCommand = historicalFlakyByCommand(options.history ?? []);
+  const historyByIdentity = historicalFlakyByIdentity(options.history ?? []);
   const groups = new Map<string, RunSignal[]>();
   for (const signal of runSignals(ordered, options)) {
-    const group = groups.get(signal.command);
-    if (group === undefined) groups.set(signal.command, [signal]);
+    const key = commandIdentityKey(signal.identity);
+    const group = groups.get(key);
+    if (group === undefined) groups.set(key, [signal]);
     else group.push(signal);
   }
 
@@ -452,16 +486,17 @@ export function detectFlakyTests(
       options.editRelevanceByActionId,
     )
   );
-  const byCommand = new Map<string, FlakyEpisode[]>();
+  const byIdentity = new Map<string, FlakyEpisode[]>();
   for (const episode of episodes) {
-    const group = byCommand.get(episode.command);
-    if (group === undefined) byCommand.set(episode.command, [episode]);
+    const key = commandIdentityKey(episode.identity);
+    const group = byIdentity.get(key);
+    if (group === undefined) byIdentity.set(key, [episode]);
     else group.push(episode);
   }
 
-  return [...byCommand.entries()]
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([command, commandEpisodes]) => {
+  return [...byIdentity.entries()]
+    .sort(([left], [right]) => compareCodeUnits(left, right))
+    .map(([identityKey, commandEpisodes]) => {
       const investigation = orderedActions(
         [...new Map(
           commandEpisodes
@@ -508,9 +543,18 @@ export function detectFlakyTests(
       const failedTestsTruncated =
         extractions.some(({ truncated }) => truncated) ||
         distinctFailedTests.length > MAX_FAILED_TEST_NAMES;
+      const identity = {
+        ...commandEpisodes[0]!.identity,
+        normalized_argv: [...commandEpisodes[0]!.identity.normalized_argv],
+      };
+      const command = (groups.get(identityKey) ?? [])
+        .map((signal) => signal.command)
+        .sort(compareCodeUnits)[0]!;
+      const target = formatCommandIdentityTarget(identity, command) +
+        (identity.executor === "native-tool" ? " [native-tool]" : "");
       const recoverable = recoverableClaim(
         "R008",
-        command,
+        target,
         investigation,
       );
       const baseConfidence = minimumConfidence([
@@ -523,7 +567,7 @@ export function detectFlakyTests(
           action.match_confidence,
         ]),
       ]);
-      const historical = historyByCommand.get(command);
+      const historical = historyByIdentity.get(identityKey);
       const candidate = createFindingCandidate({
         rule_id: "R008",
         title: "Test failed then passed without a relevant edit",
@@ -534,7 +578,7 @@ export function detectFlakyTests(
           baseConfidence,
           unrelatedEdits.length > 0,
         ),
-        target: command,
+        target,
         evidence: {
           session_refs: sortedUnique([
             ...investigation.flatMap((action) => action.session_refs),
@@ -551,6 +595,10 @@ export function detectFlakyTests(
             (interval) => interval.interval_id,
           ),
           command,
+          command_identity: {
+            ...identity,
+            normalized_argv: [...identity.normalized_argv],
+          },
           failed_tests: failedTests,
           episode_count: commandEpisodes.length,
           failed_run_count: failedRuns.length,
@@ -575,7 +623,7 @@ export function detectFlakyTests(
         recoverable,
         fix_recipe: {
           suggestion:
-            `Fix or quarantine the flaky behavior exercised by \`${command}\` in a separate repository issue.${
+            `In \`${identity.repo_relative_cwd}\`, fix or quarantine the flaky behavior exercised by \`${command}\` in a separate repository issue.${
               failedTests.length === 0
                 ? ""
                 : ` Start with ${
@@ -603,13 +651,21 @@ export function detectFlakyTests(
           ...(historical === undefined
             ? []
             : [
-              `The same normalized command was flaky in ${historical.prs.length} prior PR${historical.prs.length === 1 ? "" : "s"} (${historical.durationMin} minutes of historical investigation); historical time is evidence only and is not included in this PR's recoverable estimate.`,
+              `The same command identity was flaky in ${historical.prs.length} prior PR${historical.prs.length === 1 ? "" : "s"} (${historical.durationMin} minutes of historical investigation); historical time is evidence only and is not included in this PR's recoverable estimate.`,
             ]),
         ]),
       });
       // canonicalEvidence re-sorts string arrays with localeCompare; restore
       // the deterministic code-unit ordering for extracted test names.
       candidate.evidence.failed_tests = [...failedTests];
-      return candidate;
+      return {
+        ...candidate,
+        finding_key: findingKey(
+          "R008",
+          `command-identity:${
+            Buffer.from(identityKey, "utf8").toString("hex")
+          }`,
+        ),
+      };
     });
 }
