@@ -367,8 +367,7 @@ function buildFunctionCallEvent(
   let paths: string[] = [];
   let editFragments: string[] = [];
   if (name === "apply_patch") {
-    const patchBody =
-      typeof input.input === "string" ? input.input : undefined;
+    const patchBody = nonEmptyString(input.input);
     if (patchBody !== undefined) {
       editFragments = [patchBody];
       paths = applyPatchPaths(patchBody);
@@ -552,6 +551,6 @@ export function parseCodexSession(
     confidence,
     events,
     warnings,
-    capabilities: ["tool_timestamps"],
+    capabilities: ["tool_timestamps", "edit_fragments"],
   };
 }

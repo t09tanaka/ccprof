@@ -1272,31 +1272,27 @@ test("skips rules whose required capability is missing from a mixed Codex+Claude
     });
 
     // Sanity check: both sources actually contributed a session, so the
-    // capability mix (full Claude session + tool_timestamps-only Codex
-    // session) is really in play below.
+    // capability mix (full Claude session + Codex session without
+    // token_usage) is really in play below.
     assert.deepEqual(result.report.unit.sessions, [
       "codex-integration",
       "e2e-session",
     ]);
 
     assert.ok(
-      !result.allFindings.some(({ rule_id }) => rule_id === "R001"),
-      "R001 requires edit_fragments, which the Codex session lacks",
-    );
-    assert.ok(
       !result.allFindings.some(({ rule_id }) => rule_id === "R007"),
       "R007 requires token_usage, which the Codex session lacks",
     );
-    // R005 requires only tool_timestamps, which the Codex session does
-    // declare, so mixing in a Codex session must not skip it.
+    // R005 (tool_timestamps) and R001 (edit_fragments) require only
+    // capabilities the Codex session does declare, so mixing in a Codex
+    // session must not skip either of them.
     assert.ok(
       result.report.skipped_rules?.every(
-        (entry) => entry.rule_id !== "R005",
+        (entry) => entry.rule_id !== "R005" && entry.rule_id !== "R001",
       ) ?? true,
     );
 
     assert.deepEqual(result.report.skipped_rules, [
-      { rule_id: "R001", missing: ["edit_fragments"] },
       { rule_id: "R007", missing: ["token_usage"] },
     ]);
 
@@ -1305,10 +1301,7 @@ test("skips rules whose required capability is missing from a mixed Codex+Claude
     );
     assert.deepEqual(
       skipWarnings.map((warning) => warning.message).sort(),
-      [
-        "R001 skipped: session source lacks edit_fragments",
-        "R007 skipped: session source lacks token_usage",
-      ],
+      ["R007 skipped: session source lacks token_usage"],
     );
   } finally {
     await rm(root, { recursive: true, force: true });

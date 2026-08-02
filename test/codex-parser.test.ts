@@ -40,7 +40,7 @@ test("normalizes a well-formed Codex rollout into a Session", () => {
   assert.ok(session);
   assert.equal(session.session_id, "codex-session-basic");
   assert.equal(session.source, "codex");
-  assert.deepEqual(session.capabilities, ["tool_timestamps"]);
+  assert.deepEqual(session.capabilities, ["tool_timestamps", "edit_fragments"]);
   assert.equal(session.confidence, "high");
   assert.deepEqual(session.observed_cwds, ["/workspace/repo"]);
   assert.deepEqual(session.observed_branches, ["feature/health-check"]);
