@@ -1,12 +1,31 @@
 {
   "name": "ccprof",
   "version": "0.1.0",
+  "description": "Deterministic local profiler that reconciles Claude Code session logs with the final Git diff to show where minutes can be recovered in a PR.",
+  "keywords": [
+    "claude-code",
+    "profiler",
+    "pull-request",
+    "developer-productivity",
+    "cli"
+  ],
+  "homepage": "https://github.com/t09tanaka/ccprof#readme",
+  "bugs": {
+    "url": "https://github.com/t09tanaka/ccprof/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/t09tanaka/ccprof.git"
+  },
+  "license": "MIT",
+  "author": "Takuto Tanaka",
   "type": "module",
   "bin": {
     "ccprof": "dist/cli.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=20"
