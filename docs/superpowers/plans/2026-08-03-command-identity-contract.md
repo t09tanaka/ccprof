@@ -99,10 +99,13 @@ required.
   matcher logic changes.
 - [x] Confirm exactly 7 changed files, fewer than 300 added source/test lines,
   clean diff, and no package/version/CHANGELOG change.
-- [ ] Commit, rebase onto current `origin/main`, revalidate, push, and create a
-  PR against `main`.
-- [ ] Complete required remote checks and review, then merge under the user's
-  authorization and clean up only this worktree/local branch.
+- [x] Commit on current `origin/main`, revalidate, push, and create a PR
+  against `main`.
+- [x] Complete the required pre-merge remote checks and review.
+
+Merge and cleanup follow only after this documentation commit also passes the
+required checks. The merged commit is then verified on `origin/main` before
+removing only this worktree and local branch.
 
 ## Explicit follow-ups
 
