@@ -95,5 +95,5 @@ npm run build:test && node --test --test-name-pattern='R008' .test-dist/test/rul
 - [x] Have a separate validation subagent run Node 20 `npm ci`, `npm run check`, focused R008 tests, determinism, build, and package smoke.
 - [x] Run the repository's local GitHub Actions equivalent before push because rule logic changes.
 - [x] Confirm exactly three changed files, at most 285 added implementation+test lines, no core/store/schema/R002/R006/result-status/reporter/dismissal/package/version/changelog diff, and no absolute CWD in output.
-- [ ] Commit without amend, rebase onto current `origin/main`, push `feature/r008-command-identity`, open a PR against `main`, and wait for all required checks plus absence of actionable feedback. Merge only under the user's standing authorization.
+- [x] Complete the pre-merge gate without amend: commit the implementation and review fixes, confirm the branch is based on current `origin/main`, push `feature/r008-command-identity`, use PR #36 against `main`, and wait for all required checks plus absence of actionable feedback. Merge remains a post-gate action under the user's standing authorization.
 - [ ] After merged-commit verification, use guarded cleanup only for `/Users/tanakatakuto/Documents/GitHub/ccprof/.claude/worktrees/r008-command-identity` and its local branch.
