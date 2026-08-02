@@ -33,6 +33,7 @@ import {
   matchTimelineActions,
   type ActionObservation,
 } from "../analysis/diff-matcher.js";
+import { sliceSessionsToAnalysisWindow } from "../analysis/window.js";
 import {
   classifyCommand,
   commandMayMutateRepo,
@@ -372,16 +373,18 @@ function observationFor(
     return { action };
   }
   const key = toolKey(action);
-  const toolUse = (index.uses.get(key) ?? []).find(
+  const uses = (index.uses.get(key) ?? []).filter(
     (event) =>
-      event.timestamp_ms === action.interval.start_ms ||
+      event.timestamp_ms === action.interval.start_ms &&
       action.session_refs.includes(event.session_ref),
   );
-  const toolResult = (index.results.get(key) ?? []).find(
+  const results = (index.results.get(key) ?? []).filter(
     (event) =>
       event.timestamp_ms === action.interval.end_ms &&
       action.session_refs.includes(event.session_ref),
   );
+  const toolUse = uses.length === 1 ? uses[0] : undefined;
+  const toolResult = results.length === 1 ? results[0] : undefined;
   return {
     action,
     ...(toolUse === undefined ? {} : { toolUse }),
@@ -880,15 +883,13 @@ export async function analyze(
   const sourceErrors: unknown[] = [];
   const source = options.sessionSource ??
     defaultSessionSource(options, (error) => sourceErrors.push(error));
-  let sessions = orderedSessions(
-    await source.discover({
-      repoRoot: context.repoRoot,
-      headBranch: context.headBranch,
-      startedAtMs: window.started_at_ms,
-      endedAtMs: window.ended_at_ms,
-    }),
-  );
-  if (sessions.length === 0) {
+  const discoveredSessions = await source.discover({
+    repoRoot: context.repoRoot,
+    headBranch: context.headBranch,
+    startedAtMs: window.started_at_ms,
+    endedAtMs: window.ended_at_ms,
+  });
+  if (discoveredSessions.length === 0) {
     // Nothing was found at all: if a source failed, its error is almost
     // certainly why, so surface it instead of the generic
     // NoMatchingSessionsError (restores pre-combined-source diagnosability
@@ -898,6 +899,10 @@ export async function analyze(
     }
     throw new NoMatchingSessionsError();
   }
+  let sessions = orderedSessions(
+    sliceSessionsToAnalysisWindow(discoveredSessions, window),
+  );
+  if (sessions.length === 0) throw new NoMatchingSessionsError();
   if (sourceErrors.length > 0) {
     warnings.push(
       ...sourceErrors.map((error) =>
