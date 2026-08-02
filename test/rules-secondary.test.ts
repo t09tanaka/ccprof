@@ -1757,3 +1757,73 @@ test("R008 treats a composite vcs coordination action as unknown mutation risk",
     [],
   );
 });
+
+test("R008 extracts failed test names from failing output into evidence", () => {
+  const actions = [
+    matchedAction("failed", 0, 100, "contributing_run", {
+      tool_name: "Bash",
+      tool_use_id: "failed",
+      command: "npm test",
+      normalized_command: "npm test",
+      target: "npm test",
+    }),
+    matchedAction("passed", 200, 260, "redundant_run", {
+      tool_name: "Bash",
+      tool_use_id: "passed",
+      command: "npm test",
+      normalized_command: "npm test",
+      target: "npm test",
+    }),
+  ];
+  const finding = detectFlakyTests(actions, {
+    toolResults: [
+      toolResult("failed", 100, "failure", {
+        output: [
+          "not ok 1 - flaky case",
+          "not ok 2 - other flaky case",
+          "ok 3 - stable case",
+        ].join("\n"),
+      }),
+      toolResult("passed", 260, "success", { output: "3 passed" }),
+    ],
+  })[0];
+
+  assert.ok(finding !== undefined);
+  assert.deepEqual(finding.evidence.failed_tests, [
+    "flaky case",
+    "other flaky case",
+  ]);
+  assert.match(finding.fix_recipe.suggestion, /`flaky case`/u);
+  assert.match(finding.fix_recipe.suggestion, /`other flaky case`/u);
+});
+
+test("R008 keeps an empty failed test list for unrecognized failure output", () => {
+  const actions = [
+    matchedAction("failed", 0, 100, "contributing_run", {
+      tool_name: "Bash",
+      tool_use_id: "failed",
+      command: "npm test",
+      normalized_command: "npm test",
+      target: "npm test",
+    }),
+    matchedAction("passed", 200, 260, "redundant_run", {
+      tool_name: "Bash",
+      tool_use_id: "passed",
+      command: "npm test",
+      normalized_command: "npm test",
+      target: "npm test",
+    }),
+  ];
+  const finding = detectFlakyTests(actions, {
+    toolResults: [
+      toolResult("failed", 100, "failure", {
+        output: "Error: unrecognizable framework output",
+      }),
+      toolResult("passed", 260, "success"),
+    ],
+  })[0];
+
+  assert.ok(finding !== undefined);
+  assert.deepEqual(finding.evidence.failed_tests, []);
+  assert.doesNotMatch(finding.fix_recipe.suggestion, /Start with/u);
+});
