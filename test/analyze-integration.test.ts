@@ -14,11 +14,15 @@ import test from "node:test";
 import {
   analyze,
   NoAnalyzableTimestampsError,
+  NoMatchingSessionsError,
 } from "../src/core/analyze.js";
 import type { Session } from "../src/core/model.js";
 import { parseExplicitTestMap } from "../src/analysis/test-map.js";
 import { runCommand } from "../src/git/client.js";
-import { ClaudeSessionSource } from "../src/sources/claude/discover.js";
+import {
+  ClaudeDiscoveryError,
+  ClaudeSessionSource,
+} from "../src/sources/claude/discover.js";
 import {
   loadAnalyses,
   saveAnalysis,
@@ -143,6 +147,55 @@ async function makeClaudeProjects(
     .join("\n");
   await write(join(projects, "fixture", "e2e-session.jsonl"), rendered);
   return projects;
+}
+
+/** A Claude projects directory whose only transcript is malformed, so
+ * `discoverClaudeSessions` finds zero sessions and throws
+ * `ClaudeDiscoveryError` - used to exercise `defaultSessionSource`'s
+ * per-source error surfacing without injecting a `sessionSource`. */
+async function makeMalformedClaudeProjects(root: string): Promise<string> {
+  const projects = join(root, "claude-projects-malformed");
+  await write(join(projects, "malformed.jsonl"), "{malformed\n");
+  return projects;
+}
+
+/** A Codex sessions directory with one valid rollout inside the repo, on
+ * `branch`, with two distinct event timestamps (a single-timestamp session
+ * cannot form an analyzable interval). */
+async function makeCodexSessions(
+  root: string,
+  repo: string,
+  branch: string,
+): Promise<string> {
+  const sessionsDir = join(root, "codex-sessions");
+  const dayDir = join(sessionsDir, "2026", "01", "01");
+  await mkdir(dayDir, { recursive: true });
+  const rows = [
+    JSON.stringify({
+      timestamp: "2026-01-01T00:02:00.000Z",
+      type: "session_meta",
+      payload: { id: "codex-integration", cwd: repo, git: { branch } },
+    }),
+    JSON.stringify({
+      timestamp: "2026-01-01T00:02:01.000Z",
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "user",
+        content: "codex integration check",
+      },
+    }),
+    JSON.stringify({
+      timestamp: "2026-01-01T00:02:11.000Z",
+      type: "response_item",
+      payload: { type: "message", role: "assistant", content: "on it" },
+    }),
+  ];
+  await writeFile(
+    join(dayDir, "rollout-codex-integration.jsonl"),
+    `${rows.join("\n")}\n`,
+  );
+  return sessionsDir;
 }
 
 function seedSummary() {
@@ -1103,6 +1156,83 @@ test("analyze detects and persists a CLAUDE.md adoption of a prior PR's suggesti
       third.adoptions.filter(({ finding_key }) => finding_key === priorFindingKey).length,
       1,
       "a rerun must not duplicate an already-recorded adoption",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("propagates the underlying source error, not NoMatchingSessionsError, when every source found nothing and one threw", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-source-error-empty-"));
+  try {
+    const repo = await makeRepository(root);
+    const claudeProjects = await makeMalformedClaudeProjects(root);
+    const emptyCodexSessions = join(root, "codex-sessions-empty");
+    await mkdir(emptyCodexSessions, { recursive: true });
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    // No sessionSource is injected here on purpose: this exercises
+    // defaultSessionSource's CombinedSessionSource([claude, codex]) wiring,
+    // with the Claude arm forced to fail and the Codex arm contributing
+    // nothing, so the combined result is empty.
+    await assert.rejects(
+      analyze({
+        cwd: repo,
+        pr: "main...feature",
+        nowMs: NOW_MS,
+        storePaths,
+        claudeProjectsDirectory: claudeProjects,
+        codexSessionsDirectory: emptyCodexSessions,
+      }),
+      (error: unknown) => {
+        assert.ok(
+          error instanceof ClaudeDiscoveryError,
+          "the underlying discovery error must propagate as-is, not be swallowed",
+        );
+        assert.ok(
+          !(error instanceof NoMatchingSessionsError),
+          "a real source failure must not be masked as NoMatchingSessionsError",
+        );
+        return true;
+      },
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("continues analysis with a session_source_error warning when sessions were found despite one source throwing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-source-error-partial-"));
+  try {
+    const repo = await makeRepository(root);
+    const claudeProjects = await makeMalformedClaudeProjects(root);
+    const codexSessions = await makeCodexSessions(root, repo, "feature");
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      claudeProjectsDirectory: claudeProjects,
+      codexSessionsDirectory: codexSessions,
+    });
+
+    assert.deepEqual(result.report.unit.sessions, ["codex-integration"]);
+    const sourceErrorWarning = result.warnings.find(
+      (warning) => warning.code === "session_source_error",
+    );
+    assert.ok(
+      sourceErrorWarning,
+      "the Claude source failure must surface as a session_source_error warning",
+    );
+    assert.equal(
+      sourceErrorWarning?.message,
+      "Claude session discovery failed for one or more sources.",
     );
   } finally {
     await rm(root, { recursive: true, force: true });

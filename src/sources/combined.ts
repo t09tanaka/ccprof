@@ -6,13 +6,25 @@ import type { SessionQuery, SessionSource } from "./session-source.js";
  * source that throws (a discovery failure, e.g. Claude's typed
  * `ClaudeDiscoveryError`) contributes an empty array rather than failing the
  * whole combined discovery, so one source's outage never loses another
- * source's sessions.
+ * source's sessions. `discover()` itself therefore never rejects because of
+ * a source failure.
+ *
+ * The thrown value is not simply dropped, though: when `onSourceError` is
+ * supplied, it is invoked with the raw thrown value for every source that
+ * fails, so a caller (e.g. `analyze()`'s default-source wiring) can decide
+ * how to surface it - propagate it when nothing else was found, or fold it
+ * into a warning when other sources still produced sessions.
  */
 export class CombinedSessionSource implements SessionSource {
   readonly #sources: readonly SessionSource[];
+  readonly #onSourceError: ((error: unknown) => void) | undefined;
 
-  constructor(sources: readonly SessionSource[]) {
+  constructor(
+    sources: readonly SessionSource[],
+    onSourceError?: (error: unknown) => void,
+  ) {
     this.#sources = sources;
+    this.#onSourceError = onSourceError;
   }
 
   async discover(query: SessionQuery): Promise<Session[]> {
@@ -20,7 +32,8 @@ export class CombinedSessionSource implements SessionSource {
       this.#sources.map(async (source) => {
         try {
           return await source.discover(query);
-        } catch {
+        } catch (error) {
+          this.#onSourceError?.(error);
           return [];
         }
       }),

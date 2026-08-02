@@ -550,7 +550,10 @@ async function resolveTestMap(
   return manifest;
 }
 
-function defaultSessionSource(options: AnalyzeOptions): SessionSource {
+function defaultSessionSource(
+  options: AnalyzeOptions,
+  onSourceError?: (error: unknown) => void,
+): SessionSource {
   const projectsDirectory =
     options.claudeProjectsDirectory ??
     process.env.CCPROF_CLAUDE_PROJECTS_DIR ??
@@ -561,7 +564,7 @@ function defaultSessionSource(options: AnalyzeOptions): SessionSource {
       ? undefined
       : { sessionsDirectory: options.codexSessionsDirectory },
   );
-  return new CombinedSessionSource([claudeSource, codexSource]);
+  return new CombinedSessionSource([claudeSource, codexSource], onSourceError);
 }
 
 function contextWindow(
@@ -712,7 +715,13 @@ export async function analyze(
     textWarning("pr_context", message)
   );
   const window = contextWindow(context, warnings);
-  const source = options.sessionSource ?? defaultSessionSource(options);
+  // Only the default (Claude + Codex combined) source reports per-source
+  // discovery failures this way; an injected sessionSource (tests, or a
+  // future custom integration) keeps its original throw-propagates
+  // behavior untouched.
+  const sourceErrors: unknown[] = [];
+  const source = options.sessionSource ??
+    defaultSessionSource(options, (error) => sourceErrors.push(error));
   const sessions = orderedSessions(
     await source.discover({
       repoRoot: context.repoRoot,
@@ -721,7 +730,24 @@ export async function analyze(
     }),
   );
   if (sessions.length === 0) {
+    // Nothing was found at all: if a source failed, its error is almost
+    // certainly why, so surface it instead of the generic
+    // NoMatchingSessionsError (restores pre-combined-source diagnosability
+    // when the primary source is unreadable/misconfigured).
+    if (sourceErrors.length > 0) {
+      throw sourceErrors[0];
+    }
     throw new NoMatchingSessionsError();
+  }
+  if (sourceErrors.length > 0) {
+    warnings.push(
+      ...sourceErrors.map((error) =>
+        textWarning(
+          "session_source_error",
+          error instanceof Error ? error.message : String(error),
+        )
+      ),
+    );
   }
   warnings.push(
     ...sessions.flatMap((session) => session.warnings.map(sourceWarning)),
