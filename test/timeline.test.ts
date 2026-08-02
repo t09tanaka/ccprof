@@ -640,3 +640,26 @@ test("an AskUserQuestion wait over the threshold becomes away and is idle-exclud
   assert.equal(action?.kind, "away");
   assert.equal(action?.tool_name, "AskUserQuestion");
 });
+
+test("does not pair tool uses and results across different source lanes", () => {
+  const useSession = {
+    ...session([toolUse("t1", 0, 0)]),
+    source_path: "/tmp/segment-0.jsonl",
+  };
+  const resultSession = {
+    ...session([toolResult("t1", 5_000, 1)]),
+    source_path: "/tmp/segment-1.jsonl",
+  };
+  const timeline = buildTimeline([useSession, resultSession]);
+
+  assert.deepEqual(timeline.toolIntervals, []);
+  const action = timeline.actions.find(
+    (candidate) => candidate.tool_use_id === "t1",
+  );
+  assert.deepEqual(action?.interval, { start_ms: 0, end_ms: 0 });
+  assert.equal(action?.confidence, "low");
+  assert.ok(
+    timeline.caveats.some((item) => item.includes("no matching result")),
+  );
+  assert.ok(timeline.caveats.some((item) => item.includes("no matching use")));
+});

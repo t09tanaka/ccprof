@@ -704,3 +704,301 @@ test("turn waits and AskUserQuestion waits land in human_wait_min instead of une
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("a multi-branch session only counts head-branch work and avoids false rework", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-branch-window-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const projects = join(root, "claude-projects");
+    const row = (value: Record<string, unknown>): string =>
+      JSON.stringify({ sessionId: "multi-branch", cwd: repo, ...value });
+    const rows = [
+      row({
+        type: "user",
+        uuid: "old-u0",
+        timestamp: "2026-01-01T00:01:00.000Z",
+        gitBranch: "feature/old",
+        message: { role: "user", content: "Work on the previous PR." },
+      }),
+      row({
+        type: "assistant",
+        uuid: "old-a1",
+        timestamp: "2026-01-01T00:01:10.000Z",
+        gitBranch: "feature/old",
+        message: {
+          id: "old-m1",
+          content: [{
+            type: "tool_use",
+            id: "edit-old",
+            name: "Edit",
+            input: {
+              file_path: "docs/note.md",
+              old_string: "",
+              new_string: "note that never reaches the current diff",
+            },
+          }],
+          usage: { input_tokens: 5, output_tokens: 2 },
+        },
+      }),
+      row({
+        type: "user",
+        uuid: "old-r1",
+        timestamp: "2026-01-01T00:01:30.000Z",
+        gitBranch: "feature/old",
+        message: {
+          content: [{
+            type: "tool_result",
+            tool_use_id: "edit-old",
+            content: "updated",
+            is_error: false,
+          }],
+        },
+      }),
+      row({
+        type: "user",
+        uuid: "new-u0",
+        timestamp: "2026-01-01T00:10:00.000Z",
+        gitBranch: "feature",
+        message: { role: "user", content: "Implement the current PR." },
+      }),
+      row({
+        type: "assistant",
+        uuid: "new-a1",
+        timestamp: "2026-01-01T00:10:10.000Z",
+        gitBranch: "feature",
+        message: {
+          id: "new-m1",
+          content: [{
+            type: "tool_use",
+            id: "read-1",
+            name: "Read",
+            input: { file_path: "src/value.ts" },
+          }],
+          usage: { input_tokens: 5, output_tokens: 2 },
+        },
+      }),
+      row({
+        type: "user",
+        uuid: "new-r1",
+        timestamp: "2026-01-01T00:10:40.000Z",
+        message: {
+          content: [{
+            type: "tool_result",
+            tool_use_id: "read-1",
+            content: "export const value = 2;",
+            is_error: false,
+          }],
+        },
+      }),
+    ];
+    await write(
+      join(projects, "fixture", "multi-branch.jsonl"),
+      `${rows.join("\n")}\n`,
+    );
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      sessionSource: new ClaudeSessionSource(projects),
+    });
+
+    assert.deepEqual(result.report.unit.sessions, ["multi-branch"]);
+    assert.equal(
+      result.allFindings.some(({ rule_id }) => rule_id === "R001"),
+      false,
+    );
+    assert.equal(result.ledger.totals_ms.measured, 40_000);
+    assert.ok(
+      result.warnings.some(({ code }) => code === "branch_scoped"),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("time between head-branch segments is not counted as the current PR", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-branch-gap-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const projects = join(root, "claude-projects");
+    const row = (
+      uuid: string,
+      at: string,
+      branch: string | undefined,
+      text: string,
+    ): string =>
+      JSON.stringify({
+        sessionId: "segmented",
+        cwd: repo,
+        type: "user",
+        uuid,
+        timestamp: at,
+        ...(branch === undefined ? {} : { gitBranch: branch }),
+        message: { role: "user", content: text },
+      });
+    const rows = [
+      row("h-1", "2026-01-01T00:05:00.000Z", "feature", "head work"),
+      row("h-2", "2026-01-01T00:05:30.000Z", undefined, "still head"),
+      row("o-1", "2026-01-01T00:06:00.000Z", "feature/other", "other pr"),
+      row("o-2", "2026-01-01T00:07:00.000Z", undefined, "still other"),
+      row("h-3", "2026-01-01T00:08:00.000Z", "feature", "back on head"),
+      row("h-4", "2026-01-01T00:08:20.000Z", undefined, "finishing"),
+    ];
+    await write(
+      join(projects, "fixture", "segmented.jsonl"),
+      `${rows.join("\n")}\n`,
+    );
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      sessionSource: new ClaudeSessionSource(projects),
+    });
+
+    assert.deepEqual(result.report.unit.sessions, ["segmented"]);
+    // 30s in the first head segment plus 20s in the second; the other-branch
+    // interlude (00:05:30 -> 00:08:00) must not bridge into measured time.
+    assert.equal(result.ledger.totals_ms.raw_observed, 50_000);
+    assert.equal(result.ledger.totals_ms.measured, 50_000);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a branch departure visible only on non-event rows still splits the segments", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-branch-epoch-gap-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const projects = join(root, "claude-projects");
+    const userRow = (
+      uuid: string,
+      at: string,
+      branch: string | undefined,
+      text: string,
+    ): string =>
+      JSON.stringify({
+        sessionId: "epoch-gap",
+        cwd: repo,
+        type: "user",
+        uuid,
+        timestamp: at,
+        ...(branch === undefined ? {} : { gitBranch: branch }),
+        message: { role: "user", content: text },
+      });
+    const rows = [
+      userRow("h-1", "2026-01-01T00:05:00.000Z", "feature", "head work"),
+      userRow("h-2", "2026-01-01T00:05:30.000Z", undefined, "still head"),
+      // The other-branch interlude is visible only on a non-event system row.
+      JSON.stringify({
+        sessionId: "epoch-gap",
+        cwd: repo,
+        type: "system",
+        uuid: "sys-other",
+        timestamp: "2026-01-01T00:06:00.000Z",
+        gitBranch: "feature/other",
+      }),
+      userRow("h-3", "2026-01-01T00:08:00.000Z", "feature", "back on head"),
+      userRow("h-4", "2026-01-01T00:08:20.000Z", undefined, "finishing"),
+    ];
+    await write(
+      join(projects, "fixture", "epoch-gap.jsonl"),
+      `${rows.join("\n")}\n`,
+    );
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      sessionSource: new ClaudeSessionSource(projects),
+    });
+
+    assert.deepEqual(result.report.unit.sessions, ["epoch-gap"]);
+    // 30s before and 20s after the departure; the 00:05:30 -> 00:08:00 span
+    // spent on the other branch must not be bridged into this PR.
+    assert.equal(result.ledger.totals_ms.raw_observed, 50_000);
+    assert.equal(result.ledger.totals_ms.measured, 50_000);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an other-branch sidechain does not split the main agent's head segment", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-branch-sidechain-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const projects = join(root, "claude-projects");
+    const mainRow = (
+      uuid: string,
+      at: string,
+      branch: string | undefined,
+      text: string,
+    ): string =>
+      JSON.stringify({
+        sessionId: "side-mix",
+        cwd: repo,
+        type: "user",
+        uuid,
+        timestamp: at,
+        ...(branch === undefined ? {} : { gitBranch: branch }),
+        message: { role: "user", content: text },
+      });
+    const sideRow = (uuid: string, at: string, branch?: string): string =>
+      JSON.stringify({
+        sessionId: "side-mix",
+        cwd: repo,
+        type: "user",
+        uuid,
+        timestamp: at,
+        isSidechain: true,
+        agentId: "side",
+        ...(branch === undefined ? {} : { gitBranch: branch }),
+        message: { role: "user", content: `sidechain ${uuid}` },
+      });
+    const rows = [
+      mainRow("m-1", "2026-01-01T00:05:00.000Z", "feature", "head work"),
+      mainRow("m-2", "2026-01-01T00:05:30.000Z", undefined, "continues"),
+      sideRow("s-1", "2026-01-01T00:06:00.000Z", "feature/other"),
+      sideRow("s-2", "2026-01-01T00:07:00.000Z"),
+      mainRow("m-3", "2026-01-01T00:08:00.000Z", undefined, "still head"),
+      mainRow("m-4", "2026-01-01T00:08:20.000Z", undefined, "finish"),
+    ];
+    await write(
+      join(projects, "fixture", "side-mix.jsonl"),
+      `${rows.join("\n")}\n`,
+    );
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      sessionSource: new ClaudeSessionSource(projects),
+    });
+
+    assert.deepEqual(result.report.unit.sessions, ["side-mix"]);
+    // The main agent stays on the head branch from 00:05:00 to 00:08:20, so
+    // its 200s span must stay whole; the sidechain's other-branch time is
+    // excluded and must add nothing.
+    assert.equal(result.ledger.totals_ms.raw_observed, 200_000);
+    assert.equal(result.ledger.totals_ms.measured, 200_000);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

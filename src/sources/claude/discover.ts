@@ -169,6 +169,101 @@ function lowerConfidence(confidence: Confidence): Confidence {
   return confidence === "high" ? "medium" : "low";
 }
 
+function branchScopedWarning(session: Session): SourceWarning {
+  const firstEvent = session.events[0];
+  return {
+    code: "branch_scoped",
+    message: "Multi-branch session was scoped to the head branch.",
+    source_path: session.source_path,
+    ...(firstEvent !== undefined
+      ? { session_ref: firstEvent.session_ref }
+      : {}),
+  };
+}
+
+/**
+ * Restricts a session that observed several branches to the events recorded
+ * on the queried head branch (the parser already stamps every event with its
+ * effective branch). Contiguous head-branch runs become separate segment
+ * sessions so the timeline never bridges the removed other-branch spans into
+ * inference or human-wait time. Sessions whose events carry no branch
+ * metadata at all are kept unchanged, conservatively.
+ */
+function scopeSessionToHeadBranch(
+  session: Session,
+  headBranch: string,
+): Session[] {
+  if (session.events.some((event) => event.branch === undefined)) {
+    return [session];
+  }
+  const byAgent = new Map<string, Session["events"]>();
+  for (const event of session.events) {
+    const group = byAgent.get(event.agent_id);
+    if (group === undefined) byAgent.set(event.agent_id, [event]);
+    else group.push(event);
+  }
+
+  const runs: { agentId: string; run: number; events: Session["events"] }[] =
+    [];
+  for (const [agentId, agentEvents] of byAgent) {
+    let current: Session["events"] = [];
+    let currentEpoch: number | undefined;
+    let run = 0;
+    const flush = (): void => {
+      if (current.length === 0) return;
+      runs.push({ agentId, run, events: current });
+      run += 1;
+      current = [];
+    };
+    for (const event of agentEvents) {
+      if (event.branch === headBranch) {
+        // Within one agent lane, an epoch change between two head-branch
+        // events proves a departure recorded only on rows without events.
+        if (current.length > 0 && event.branch_epoch !== currentEpoch) {
+          flush();
+        }
+        currentEpoch = event.branch_epoch;
+        current.push(event);
+      } else {
+        flush();
+        currentEpoch = undefined;
+      }
+    }
+    flush();
+  }
+  if (runs.length === 0) return [];
+  const includedCount = runs.reduce(
+    (total, entry) => total + entry.events.length,
+    0,
+  );
+  if (
+    includedCount === session.events.length &&
+    runs.length === byAgent.size
+  ) {
+    return [session];
+  }
+  return runs.map(({ agentId, run, events }, index) => {
+    const timestamps = events.map((event) => event.timestamp_ms);
+    const segment: Session = {
+      ...session,
+      // The timeline builds per-(source_path, session_id, agent_id) interval
+      // lanes, so segments need distinct source identities to stay disjoint
+      // while other agents' unbroken runs remain whole.
+      source_path: `${session.source_path}#branch-segment-${agentId}-${run.toString(10)}`,
+      events: [...events],
+      started_at_ms: Math.min(...timestamps),
+      ended_at_ms: Math.max(...timestamps),
+      warnings: [...session.warnings],
+    };
+    return index === 0
+      ? {
+          ...segment,
+          warnings: [...segment.warnings, branchScopedWarning(session)],
+        }
+      : segment;
+  });
+}
+
 function missingBranchWarning(session: Session): SourceWarning {
   const firstEvent = session.events[0];
   return {
@@ -390,27 +485,45 @@ export async function discoverClaudeSessions(
       ) {
         continue;
       }
-      const alignedSession = await alignSessionCwdsToRepository(
-        session,
-        repoRoot,
-      );
-
-      const key = `${session.session_id}\u0000${session.source_path}`;
-      if (seen.has(key)) {
-        continue;
+      let segments: Session[] = [session];
+      if (
+        hasBranch &&
+        session.observed_branches.some(
+          (branch) => branch !== query.headBranch,
+        )
+      ) {
+        segments = scopeSessionToHeadBranch(session, query.headBranch)
+          .filter((segment) => intersects(segment, query));
+        if (segments.length === 0) {
+          continue;
+        }
       }
-      seen.add(key);
-      if (hasBranch) {
-        sessions.push(alignedSession);
-      } else {
-        sessions.push({
-          ...alignedSession,
-          confidence: lowerConfidence(alignedSession.confidence),
-          warnings: [
-            ...alignedSession.warnings,
-            missingBranchWarning(alignedSession),
-          ],
-        });
+      for (const [segmentIndex, segment] of segments.entries()) {
+        const key = [
+          session.session_id,
+          session.source_path,
+          segmentIndex.toString(10),
+        ].join("\u0000");
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        const alignedSession = await alignSessionCwdsToRepository(
+          segment,
+          repoRoot,
+        );
+        if (hasBranch) {
+          sessions.push(alignedSession);
+        } else {
+          sessions.push({
+            ...alignedSession,
+            confidence: lowerConfidence(alignedSession.confidence),
+            warnings: [
+              ...alignedSession.warnings,
+              missingBranchWarning(alignedSession),
+            ],
+          });
+        }
       }
     }
   }

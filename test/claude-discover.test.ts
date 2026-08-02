@@ -460,3 +460,297 @@ test("throws a typed discovery error when malformed-only sources yield no sessio
       error.warnings.some((warning) => warning.code === "invalid_json"),
   );
 });
+
+function multiBranchRow(options: {
+  sessionId: string;
+  uuid: string;
+  at: string;
+  cwd: string;
+  branch?: string;
+  text?: string;
+}): string {
+  return JSON.stringify({
+    sessionId: options.sessionId,
+    type: "user",
+    uuid: options.uuid,
+    timestamp: options.at,
+    cwd: options.cwd,
+    ...(options.branch === undefined ? {} : { gitBranch: options.branch }),
+    message: { role: "user", content: options.text ?? options.uuid },
+  });
+}
+
+test("scopes a multi-branch session to the queried head branch", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-branch-scope-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+
+  const projects = join(root, "projects");
+  const repo = join(root, "repo");
+  await Promise.all([
+    mkdir(projects, { recursive: true }),
+    mkdir(repo, { recursive: true }),
+  ]);
+  const rows = [
+    multiBranchRow({
+      sessionId: "multi",
+      uuid: "a-1",
+      at: "2026-07-31T03:00:00.000Z",
+      cwd: repo,
+      branch: "feature/a",
+    }),
+    multiBranchRow({
+      sessionId: "multi",
+      uuid: "a-2",
+      at: "2026-07-31T03:01:00.000Z",
+      cwd: repo,
+      branch: "feature/a",
+    }),
+    multiBranchRow({
+      sessionId: "multi",
+      uuid: "b-1",
+      at: "2026-07-31T03:10:00.000Z",
+      cwd: repo,
+      branch: "feature/b",
+    }),
+    multiBranchRow({
+      sessionId: "multi",
+      uuid: "b-tail",
+      at: "2026-07-31T03:11:00.000Z",
+      cwd: repo,
+    }),
+  ];
+  await writeFile(
+    join(projects, "multi.jsonl"),
+    `${rows.join("\n")}\n`,
+  );
+  await writeFile(
+    join(projects, "lead.jsonl"),
+    `${[
+      multiBranchRow({
+        sessionId: "lead",
+        uuid: "lead-1",
+        at: "2026-07-31T03:05:00.000Z",
+        cwd: repo,
+      }),
+      multiBranchRow({
+        sessionId: "lead",
+        uuid: "lead-2",
+        at: "2026-07-31T03:06:00.000Z",
+        cwd: repo,
+        branch: "feature/b",
+      }),
+      multiBranchRow({
+        sessionId: "lead",
+        uuid: "lead-3",
+        at: "2026-07-31T03:07:00.000Z",
+        cwd: repo,
+        branch: "feature/a",
+      }),
+    ].join("\n")}\n`,
+  );
+
+  const query = {
+    repoRoot: repo,
+    startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+  };
+  const forB = await discoverClaudeSessions(projects, {
+    ...query,
+    headBranch: "feature/b",
+  });
+  const multiForB = forB.find((session) => session.session_id === "multi");
+  assert.ok(multiForB);
+  assert.deepEqual(
+    multiForB.events.map((event) => event.entry_uuid),
+    ["b-1", "b-tail"],
+  );
+  assert.equal(
+    multiForB.started_at_ms,
+    Date.parse("2026-07-31T03:10:00.000Z"),
+  );
+  assert.equal(
+    multiForB.ended_at_ms,
+    Date.parse("2026-07-31T03:11:00.000Z"),
+  );
+  assert.ok(
+    multiForB.warnings.some((warning) => warning.code === "branch_scoped"),
+  );
+  assert.equal(multiForB.confidence, "high");
+
+  const leadForB = forB.find((session) => session.session_id === "lead");
+  assert.ok(leadForB);
+  assert.deepEqual(
+    leadForB.events.map((event) => event.entry_uuid),
+    ["lead-1", "lead-2"],
+  );
+
+  const forA = await discoverClaudeSessions(projects, {
+    ...query,
+    headBranch: "feature/a",
+  });
+  const multiForA = forA.find((session) => session.session_id === "multi");
+  assert.ok(multiForA);
+  assert.deepEqual(
+    multiForA.events.map((event) => event.entry_uuid),
+    ["a-1", "a-2"],
+  );
+  assert.equal(
+    multiForA.ended_at_ms,
+    Date.parse("2026-07-31T03:01:00.000Z"),
+  );
+});
+
+test("keeps single-branch and branchless sessions unchanged", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-branch-single-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+
+  const projects = join(root, "projects");
+  const repo = join(root, "repo");
+  await Promise.all([
+    mkdir(projects, { recursive: true }),
+    mkdir(repo, { recursive: true }),
+  ]);
+  await writeFile(
+    join(projects, "single.jsonl"),
+    `${[
+      multiBranchRow({
+        sessionId: "single",
+        uuid: "s-1",
+        at: "2026-07-31T03:00:00.000Z",
+        cwd: repo,
+        branch: "feature/only",
+      }),
+      multiBranchRow({
+        sessionId: "single",
+        uuid: "s-2",
+        at: "2026-07-31T03:01:00.000Z",
+        cwd: repo,
+      }),
+    ].join("\n")}\n`,
+  );
+  await writeFile(
+    join(projects, "branchless.jsonl"),
+    `${[
+      multiBranchRow({
+        sessionId: "branchless",
+        uuid: "n-1",
+        at: "2026-07-31T03:00:00.000Z",
+        cwd: repo,
+      }),
+    ].join("\n")}\n`,
+  );
+
+  const sessions = await discoverClaudeSessions(projects, {
+    repoRoot: repo,
+    headBranch: "feature/only",
+    startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+  });
+  const single = sessions.find((session) => session.session_id === "single");
+  assert.ok(single);
+  assert.deepEqual(
+    single.events.map((event) => event.entry_uuid),
+    ["s-1", "s-2"],
+  );
+  assert.equal(
+    single.warnings.some((warning) => warning.code === "branch_scoped"),
+    false,
+  );
+  const branchless = sessions.find(
+    (session) => session.session_id === "branchless",
+  );
+  assert.ok(branchless);
+  assert.deepEqual(
+    branchless.events.map((event) => event.entry_uuid),
+    ["n-1"],
+  );
+});
+
+test("splits head-other-head sessions into separate segments", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-branch-split-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+
+  const projects = join(root, "projects");
+  const repo = join(root, "repo");
+  await Promise.all([
+    mkdir(projects, { recursive: true }),
+    mkdir(repo, { recursive: true }),
+  ]);
+  await writeFile(
+    join(projects, "split.jsonl"),
+    `${[
+      multiBranchRow({
+        sessionId: "split",
+        uuid: "h-1",
+        at: "2026-07-31T03:00:00.000Z",
+        cwd: repo,
+        branch: "feature/head",
+      }),
+      multiBranchRow({
+        sessionId: "split",
+        uuid: "h-2",
+        at: "2026-07-31T03:01:00.000Z",
+        cwd: repo,
+      }),
+      multiBranchRow({
+        sessionId: "split",
+        uuid: "o-1",
+        at: "2026-07-31T03:10:00.000Z",
+        cwd: repo,
+        branch: "feature/other",
+      }),
+      multiBranchRow({
+        sessionId: "split",
+        uuid: "o-2",
+        at: "2026-07-31T03:20:00.000Z",
+        cwd: repo,
+      }),
+      multiBranchRow({
+        sessionId: "split",
+        uuid: "h-3",
+        at: "2026-07-31T03:30:00.000Z",
+        cwd: repo,
+        branch: "feature/head",
+      }),
+      multiBranchRow({
+        sessionId: "split",
+        uuid: "h-4",
+        at: "2026-07-31T03:31:00.000Z",
+        cwd: repo,
+      }),
+    ].join("\n")}\n`,
+  );
+
+  const sessions = await discoverClaudeSessions(projects, {
+    repoRoot: repo,
+    headBranch: "feature/head",
+    startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+  });
+
+  assert.equal(sessions.length, 2);
+  assert.deepEqual(
+    sessions.map((session) => session.session_id),
+    ["split", "split"],
+  );
+  assert.deepEqual(
+    sessions.map((session) => session.events.map((event) => event.entry_uuid)),
+    [["h-1", "h-2"], ["h-3", "h-4"]],
+  );
+  assert.deepEqual(
+    sessions.map((session) => [session.started_at_ms, session.ended_at_ms]),
+    [
+      [
+        Date.parse("2026-07-31T03:00:00.000Z"),
+        Date.parse("2026-07-31T03:01:00.000Z"),
+      ],
+      [
+        Date.parse("2026-07-31T03:30:00.000Z"),
+        Date.parse("2026-07-31T03:31:00.000Z"),
+      ],
+    ],
+  );
+  // Segments must not collapse into one timeline lane, so their source
+  // identities must differ.
+  assert.notEqual(sessions[0]?.source_path, sessions[1]?.source_path);
+});

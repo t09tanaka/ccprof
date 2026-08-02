@@ -38,6 +38,12 @@ interface OrderedEvent {
   event: NormalizedEvent;
   inputIndex: number;
   agentKey: string;
+  /**
+   * Source lane identity (source path + session id). Tool uses and results
+   * pair only within one lane so branch-scoped session segments never stitch
+   * an excluded span back together as tool time.
+   */
+  laneKey: string;
 }
 
 interface InternalAction {
@@ -130,6 +136,7 @@ function collectEvents(
           event.session_id,
           event.agent_id,
         ].join("\0"),
+        laneKey: [session.source_path, event.session_id].join("\0"),
       });
     }
   }
@@ -244,7 +251,7 @@ function pairTools(
   for (const ordered of events) {
     const event = ordered.event;
     if (event.kind === "tool_use") {
-      const key = `${event.session_id}\0${event.tool_use_id}`;
+      const key = `${ordered.laneKey}\0${event.tool_use_id}`;
       if (uses.has(key)) {
         caveats.push(
           `ignored duplicate tool use ${event.tool_use_id} in ${event.session_id}`,
@@ -253,7 +260,7 @@ function pairTools(
         uses.set(key, ordered);
       }
     } else if (event.kind === "tool_result") {
-      const key = `${event.session_id}\0${event.tool_use_id}`;
+      const key = `${ordered.laneKey}\0${event.tool_use_id}`;
       const group = results.get(key);
       if (group === undefined) {
         results.set(key, [ordered]);
