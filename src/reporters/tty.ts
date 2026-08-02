@@ -1,3 +1,4 @@
+import type { AdvisoryText } from "../advisory/advisory.js";
 import type { Finding, ReportV2 } from "../core/model.js";
 import { sanitizeHumanText } from "./sanitize.js";
 
@@ -5,6 +6,7 @@ export const TTY_MAX_LINES = 18;
 
 export interface TtyReportOptions {
   color?: boolean;
+  advisory?: AdvisoryText;
 }
 
 const ANSI_PATTERN = /\u001B\[[0-?]*[ -/]*[@-~]/gu;
@@ -110,5 +112,19 @@ export function renderTtyReport(
   if (caveats.length > 0) {
     lines.push("Caveats:", ...caveats);
   }
-  return `${lines.slice(0, TTY_MAX_LINES).join("\n")}\n`;
+  const output = lines.slice(0, TTY_MAX_LINES);
+  // The advisory section is appended after the deterministic report is
+  // capped, so it can never displace a deterministic line and always
+  // renders as a clearly separated trailer.
+  const advisory = options.advisory;
+  if (advisory !== undefined) {
+    output.push(
+      "Advisory (LLM, opt-in — non-deterministic):",
+      ...advisory.text
+        .split(/\r?\n/u)
+        .map(plainLine)
+        .filter((value) => value !== ""),
+    );
+  }
+  return `${output.join("\n")}\n`;
 }

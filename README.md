@@ -4,13 +4,17 @@
 with the final Git diff, one PR at a time, and shows where minutes can be
 recovered — with evidence and a fix recipe attached. It uses only
 deterministic rules, so the same input always produces the same result. No LLM
-is involved in the analysis.
+is involved in the analysis; the opt-in `--advisory` flag can append a clearly
+separated LLM advisory section to the output, but the deterministic report
+itself never changes.
 
 ccprof measures wasted time in the working process; it does not measure
 whether the judgment behind the work was right — choice of approach,
 interpretation of requirements, or design quality are out of scope. This is a
 deliberate boundary, not an oversight: it is what keeps the analysis
-deterministic (no LLM, reproducible).
+deterministic (no LLM, reproducible). The explicitly opt-in advisory layer
+described below is the one exception, and its output stays outside the
+deterministic report.
 
 ## Requirements and installation
 
@@ -112,6 +116,18 @@ truncated deterministically. Leap seconds and timestamps before the Unix epoch
 are unsupported. `--commit-lookback` extends the inferred earliest-commit
 boundary by a duration using the same `s`, `m`, or `h` syntax. Both options may
 be provided; `--since` takes precedence over `--commit-lookback`.
+
+`--advisory` opts in to an additional LLM advisory section:
+the rendered report JSON is passed to the locally installed `claude` CLI
+(Claude Code, print mode), and up to three judgment-level suggestions come
+back in a section that is clearly separated from the deterministic findings.
+The deterministic report, the stored analysis record, the baseline, and the
+exit code never change; when the `claude` CLI is missing, fails, times out
+(60 seconds), or returns nothing, the report is printed unchanged with an
+`advisory unavailable` warning on stderr. In `--json` output the section is an
+optional top-level `advisory` field (`{ "source": "llm", "text": ... }`) that
+is omitted entirely without the flag, keeping the JSON byte-identical to
+previous releases.
 
 ```sh
 ccprof --pr --idle-threshold 45m
@@ -389,10 +405,11 @@ Sidechains and compaction are normalized as well.
 
 Markdown, baselines, and store-driven R006 were originally Phase 2 items, but
 they are included in this release. Framework-specific flaky test name
-extraction remains a future extension. An opt-in LLM advisory layer — offering
+extraction remains a future extension. The opt-in LLM advisory layer that was
+a candidate for 0.3 is now implemented as the `--advisory` flag — offering
 judgment-level suggestions alongside the deterministic findings above, clearly
-separated from them — is a candidate for 0.3. Deterministic analysis stays the
-default either way; nothing here changes without an explicit opt-in.
+separated from them. Deterministic analysis stays the default either way;
+nothing here changes without an explicit opt-in.
 
 ### Codex sessions and skipped rules
 
@@ -424,6 +441,13 @@ Analysis, diff reconciliation, and store writes all happen locally; by design
 ccprof never sends or uploads session contents or findings as telemetry.
 Resolving a PR number/URL or the current PR may make an installed `gh pr view`
 fetch metadata from GitHub. Pass `base...head` to avoid the network entirely.
+
+By default no LLM is contacted either. Only when `--advisory` is passed
+explicitly, the sanitized display-report JSON — the same document `--json`
+prints, which can include findings, command names, and file paths — is handed
+to the locally installed `claude` CLI, which sends it to its configured LLM
+provider. Raw session transcripts and logs are never sent; the advisory prompt
+contains nothing beyond fixed instructions and that report JSON.
 
 The store lives outside the repository, in a per-repository directory:
 

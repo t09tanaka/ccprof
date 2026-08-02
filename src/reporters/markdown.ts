@@ -1,6 +1,11 @@
+import type { AdvisoryText } from "../advisory/advisory.js";
 import type { Finding, ReportV2 } from "../core/model.js";
 import { sanitizeHumanText } from "./sanitize.js";
 import { formatMinutes, skippedRulesLine } from "./tty.js";
+
+export interface MarkdownReportOptions {
+  advisory?: AdvisoryText;
+}
 
 const ANSI_PATTERN = /\u001B\[[0-?]*[ -/]*[@-~]/gu;
 
@@ -29,7 +34,10 @@ function findingMarkdown(
   ];
 }
 
-export function renderMarkdownReport(report: ReportV2): string {
+export function renderMarkdownReport(
+  report: ReportV2,
+  options: MarkdownReportOptions = {},
+): string {
   const lines = [
     "## ccprof",
     "",
@@ -65,6 +73,20 @@ export function renderMarkdownReport(report: ReportV2): string {
       "### Caveats",
       "",
       ...report.caveats.map((caveat) => `- ${markdownText(caveat)}`),
+    );
+  }
+  const advisory = options.advisory;
+  if (advisory !== undefined) {
+    lines.push(
+      "",
+      "## Advisory (LLM)",
+      "",
+      "_This section is opt-in LLM output and is separate from the deterministic findings above._",
+      "",
+      ...advisory.text
+        .split(/\r?\n/u)
+        .map(markdownText)
+        .filter((value) => value !== ""),
     );
   }
   return `${lines.join("\n")}\n`;
