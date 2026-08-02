@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] - 2026-08-02
+
+### Changed
+
+- Exclude source maps and declaration maps from the published tarball. The
+  build still emits them for local development; they are only dropped from the
+  package. 152 files / 160 kB packed becomes 78 files / 94 kB packed (756 kB to
+  399 kB unpacked). Compiled JavaScript and `.d.ts` declarations are unchanged.
+
 ## [0.1.0] - 2026-08-02
 
 Initial release.
@@ -46,4 +55,5 @@ Initial release.
 - Stable exit codes (0 success, 2 usage, 3 unresolved context, 4 no analyzable
   session, 5 unrecoverable error), plus `--help` / `-h` and `--version` / `-v`.
 
+[0.1.1]: https://github.com/t09tanaka/ccprof/releases/tag/v0.1.1
 [0.1.0]: https://github.com/t09tanaka/ccprof/releases/tag/v0.1.0
