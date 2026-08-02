@@ -18,6 +18,7 @@ export interface StorePaths {
   analyses_dir: string;
   history_index_path: string;
   dismissals_path: string;
+  adoptions_path: string;
 }
 
 function withoutTrailingSeparators(path: string): string {
@@ -107,5 +108,6 @@ export async function resolveStorePaths(
     analyses_dir: join(repoDir, "analyses"),
     history_index_path: join(repoDir, "index.json"),
     dismissals_path: join(repoDir, "dismissals.json"),
+    adoptions_path: join(repoDir, "adoptions.json"),
   };
 }

@@ -600,6 +600,7 @@ const storePaths: StorePaths = {
   analyses_dir: "/data/hash/analyses",
   history_index_path: "/data/hash/index.json",
   dismissals_path: "/data/hash/dismissals.json",
+  adoptions_path: "/data/hash/adoptions.json",
 };
 
 test("dismiss rejects unknown finding keys before any write", async () => {
