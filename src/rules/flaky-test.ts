@@ -92,7 +92,8 @@ function readCommandIdentity(value: unknown): CommandIdentity | undefined {
   const executor = identity.executor;
   if (
     typeof cwd !== "string" ||
-    (cwd !== "." && (cwd === "" || cwd.includes("\0") || cwd.startsWith("/") ||
+    (cwd !== "." && (cwd === "" || cwd.includes("\0") || cwd.includes("\\") ||
+      cwd.startsWith("/") ||
       /^[A-Za-z]:[\\/]/u.test(cwd) || cwd.split("/").some((segment) =>
         segment === "" || segment === "." || segment === ".."))) ||
     !Array.isArray(argv) || argv.length === 0 || argv[0] === "" ||
@@ -263,8 +264,15 @@ function investigationActions(
   between: readonly MatchedAction[],
   editRelevance: ReadonlyMap<string, EditRelevance> | undefined,
   command: string,
+  identityKey: string,
 ): MatchedAction[] {
   return between.filter((action) => {
+    if (action.match === "redundant_run") {
+      const identity = readCommandIdentity(action.command_identity);
+      if (identity === undefined || commandIdentityKey(identity) !== identityKey) {
+        return false;
+      }
+    }
     if (
       action.kind === "tool" &&
       action.match === "rework_edit" &&
@@ -324,7 +332,12 @@ function episodeFor(
   ).filter((action) => action !== passing.action);
   const investigation = [
     ...failedRuns.map(({ action }) => action),
-    ...investigationActions(contained, editRelevance, failure.command),
+    ...investigationActions(
+      contained,
+      editRelevance,
+      failure.command,
+      commandIdentityKey(failure.identity),
+    ),
   ];
   const uniqueInvestigation = new Map(
     investigation.map((action) => [action.action_id, action] as const),

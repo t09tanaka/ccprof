@@ -45,10 +45,10 @@ Added implementation and test code must stay at or below 285 lines, with 300 as 
 **Files:**
 - Modify: `test/rules-secondary.test.ts`
 
-- [ ] Add a `CommandIdentity` fixture factory that copies argv and supports repository-relative CWD plus shell/native execution. Derive the default root fixture identity with the production command tokenizer/builder, while allowing an explicit `command_identity: undefined` legacy path.
-- [ ] Update the shared `matchedAction` fixture to attach a safe root identity only to eligible normalized command actions unless the test explicitly supplies or suppresses one. Opaque commands must remain identity-less, matching production.
-- [ ] Update `storedFlakyFinding` to emit copied identity evidence by default and permit explicit legacy/malformed/mismatched history fixtures.
-- [ ] Update the primary R008 assertion to require a nested-CWD target, copied identity evidence, CWD-aware recipe, unchanged normalized `command`/`verify`, and the exact key formula:
+- [x] Add a `CommandIdentity` fixture factory that copies argv and supports repository-relative CWD plus shell/native execution. Derive the default root fixture identity with the production command tokenizer/builder, while allowing an explicit `command_identity: undefined` legacy path.
+- [x] Update the shared `matchedAction` fixture to attach a safe root identity only to eligible normalized command actions unless the test explicitly supplies or suppresses one. Opaque commands must remain identity-less, matching production.
+- [x] Update `storedFlakyFinding` to emit copied identity evidence by default and permit explicit legacy/malformed/mismatched history fixtures.
+- [x] Update the primary R008 assertion to require a nested-CWD target, copied identity evidence, CWD-aware recipe, unchanged normalized `command`/`verify`, and the exact key formula:
 
 ```ts
 findingKey(
@@ -57,11 +57,11 @@ findingKey(
 )
 ```
 
-- [ ] Add a focused current-run lane test covering API, Web, native API, and identity-less runs with the same display command. Prove only exact failure/success identities connect, each emitted lane has isolated refs/counts/key/target, and argv duplicates/empty elements are copied.
-- [ ] Reverse the current action and result arrays and assert byte-equivalent findings and identity-key ordering.
-- [ ] Add a focused history test containing exact API history, another CWD, native execution, legacy, malformed identity, duplicate records for one PR, and a distinct PR. Assert only exact identity contributes, one-PR duration uses max, cross-PR duration sums, refs are isolated, and reversing history is byte-equivalent.
-- [ ] Mutate source argv after detection and prove the emitted evidence is unchanged; separately prove legacy-only current runs and history cannot create or enrich a finding.
-- [ ] Have a validation subagent run focused R008 tests and record RED failures caused by command-only current/history grouping, command-only targets/keys, and missing identity evidence:
+- [x] Add a focused current-run lane test covering API, Web, native API, and identity-less runs with the same display command. Prove only exact failure/success identities connect, each emitted lane has isolated refs/counts/key/target, and argv duplicates/empty elements are copied.
+- [x] Reverse the current action and result arrays and assert byte-equivalent findings and identity-key ordering.
+- [x] Add a focused history test containing exact API history, another CWD, native execution, legacy, malformed identity, duplicate records for one PR, and a distinct PR. Assert only exact identity contributes, one-PR duration uses max, cross-PR duration sums, refs are isolated, and reversing history is byte-equivalent.
+- [x] Mutate source argv after detection and prove the emitted evidence is unchanged; separately prove legacy-only current runs and history cannot create or enrich a finding.
+- [x] Have a validation subagent run focused R008 tests and record RED failures caused by command-only current/history grouping, command-only targets/keys, and missing identity evidence:
 
 ```sh
 npm run build:test && node --test --test-name-pattern='R008' .test-dist/test/rules-secondary.test.js
@@ -73,27 +73,27 @@ npm run build:test && node --test --test-name-pattern='R008' .test-dist/test/rul
 - Modify: `src/rules/flaky-test.ts`
 - Test: `test/rules-secondary.test.ts`
 
-- [ ] Import `commandIdentityKey`, `formatCommandIdentityTarget`, `CommandIdentity`, and `findingKey` without changing any exported signature.
-- [ ] Add a private defensive reader that returns a deep-copied identity only for a safe repository-relative CWD, non-empty argv with a non-empty executable, string arguments, and a valid executor. Missing/malformed identities return `undefined`; repository root is never inferred.
-- [ ] Extend private `RunSignal`/episode data with copied identity. Skip identity-less current actions, and group run signals and completed episodes by `commandIdentityKey` instead of normalized command text.
-- [ ] Keep result pairing by the exact action run key, then permit failure-to-success resolution only inside one identity group. Preserve all existing temporal and mutation guards.
-- [ ] Replace command-keyed historical aggregation with identity-keyed aggregation. Require valid `evidence.command_identity`, isolate CWD/argv/executor lanes, preserve same-PR max duration plus ref union, and sort tuple keys/PRs by explicit code-unit order.
-- [ ] Select the code-unit-smallest valid normalized command observed for an identity as display/verify text, independent of caller order.
-- [ ] Build the target with `formatCommandIdentityTarget(identity, command)`, append the native suffix only for native execution, and pass that target to `recoverableClaim`.
-- [ ] Add a deep-copied `command_identity` to evidence while retaining the existing normalized `command`. Lookup historical recurrence only by the exact identity key.
-- [ ] Make the suggestion name the repository-relative CWD, retain `verify: command`, and describe historical recurrence as the same command identity.
-- [ ] Override the generated finding key with the exact identity formula from Task 1. Do not migrate or alias the old command-only key.
-- [ ] Return findings in explicit identity-key order and deep-copy argv in every emitted object.
-- [ ] Have the validation subagent rerun focused R008 tests and confirm GREEN.
+- [x] Import `commandIdentityKey`, `formatCommandIdentityTarget`, `CommandIdentity`, and `findingKey` without changing any exported signature.
+- [x] Add a private defensive reader that returns a deep-copied identity only for a safe repository-relative CWD, non-empty argv with a non-empty executable, string arguments, and a valid executor. Missing/malformed identities return `undefined`; repository root is never inferred.
+- [x] Extend private `RunSignal`/episode data with copied identity. Skip identity-less current actions, and group run signals and completed episodes by `commandIdentityKey` instead of normalized command text.
+- [x] Keep result pairing by the exact action run key, then permit failure-to-success resolution only inside one identity group. Preserve all existing temporal and mutation guards.
+- [x] Replace command-keyed historical aggregation with identity-keyed aggregation. Require valid `evidence.command_identity`, isolate CWD/argv/executor lanes, preserve same-PR max duration plus ref union, and sort tuple keys/PRs by explicit code-unit order.
+- [x] Select the code-unit-smallest valid normalized command observed for an identity as display/verify text, independent of caller order.
+- [x] Build the target with `formatCommandIdentityTarget(identity, command)`, append the native suffix only for native execution, and pass that target to `recoverableClaim`.
+- [x] Add a deep-copied `command_identity` to evidence while retaining the existing normalized `command`. Lookup historical recurrence only by the exact identity key.
+- [x] Make the suggestion name the repository-relative CWD, retain `verify: command`, and describe historical recurrence as the same command identity.
+- [x] Override the generated finding key with the exact identity formula from Task 1. Do not migrate or alias the old command-only key.
+- [x] Return findings in explicit identity-key order and deep-copy argv in every emitted object.
+- [x] Have the validation subagent rerun focused R008 tests and confirm GREEN.
 
 ### Task 3: Review, verify, and deliver through worktree PR flow
 
 **Files:**
 - Modify: `docs/superpowers/plans/2026-08-03-r008-command-identity.md` (checkboxes only after evidence exists)
 
-- [ ] Run independent specification review, then independent code-quality review. Resolve and re-review only issues introduced by these three files.
-- [ ] Have a separate validation subagent run Node 20 `npm ci`, `npm run check`, focused R008 tests, determinism, build, and package smoke.
-- [ ] Run the repository's local GitHub Actions equivalent before push because rule logic changes.
-- [ ] Confirm exactly three changed files, at most 285 added implementation+test lines, no core/store/schema/R002/R006/result-status/reporter/dismissal/package/version/changelog diff, and no absolute CWD in output.
+- [x] Run independent specification review, then independent code-quality review. Resolve and re-review only issues introduced by these three files.
+- [x] Have a separate validation subagent run Node 20 `npm ci`, `npm run check`, focused R008 tests, determinism, build, and package smoke.
+- [x] Run the repository's local GitHub Actions equivalent before push because rule logic changes.
+- [x] Confirm exactly three changed files, at most 285 added implementation+test lines, no core/store/schema/R002/R006/result-status/reporter/dismissal/package/version/changelog diff, and no absolute CWD in output.
 - [ ] Commit without amend, rebase onto current `origin/main`, push `feature/r008-command-identity`, open a PR against `main`, and wait for all required checks plus absence of actionable feedback. Merge only under the user's standing authorization.
 - [ ] After merged-commit verification, use guarded cleanup only for `/Users/tanakatakuto/Documents/GitHub/ccprof/.claude/worktrees/r008-command-identity` and its local branch.

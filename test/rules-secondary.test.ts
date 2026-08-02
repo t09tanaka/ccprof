@@ -619,23 +619,26 @@ test("R008 claims a definite unchanged fail-to-pass investigation as point time"
 
 test("R008 isolates exact command-identity lanes deterministically", () => {
   const lanes = [
-    { name: "api", identity: commandIdentity("packages/api",
+    { name: "api", start: 0, passingStart: 80,
+      identity: commandIdentity("packages/api",
       ["npm", "test", "--", "", "unit", "unit"]) },
-    { name: "web", identity: commandIdentity("packages/web") },
-    { name: "argv", identity: commandIdentity("packages/api",
+    { name: "web", start: 20, passingStart: 40,
+      identity: commandIdentity("packages/web") },
+    { name: "argv", start: 100, passingStart: 120,
+      identity: commandIdentity("packages/api",
       ["npm", "test", "--", "other"]) },
-    { name: "native", identity: commandIdentity("packages/api",
+    { name: "native", start: 200, passingStart: 220,
+      identity: commandIdentity("packages/api",
       ["npm", "test", "--", "", "unit", "unit"], "native-tool") },
   ];
-  const actions = lanes.flatMap(({ name, identity }, index) => {
-    const start = index * 100;
+  const actions = lanes.flatMap(({ name, identity, start, passingStart }) => {
     return [
       matchedAction(`${name}-failed`, start, start + 10, "contributing_run", {
         session_id: name, tool_name: "Bash", tool_use_id: `${name}-failed`,
         session_refs: [`${name}#failed`], command: "npm test",
         normalized_command: "npm test", command_identity: identity,
       }),
-      matchedAction(`${name}-passed`, start + 20, start + 30, "redundant_run", {
+      matchedAction(`${name}-passed`, passingStart, passingStart + 10, "redundant_run", {
         session_id: name, tool_name: "Bash", tool_use_id: `${name}-passed`,
         session_refs: [`${name}#passed`], command: "npm test",
         normalized_command: "npm test", command_identity: identity,
@@ -649,11 +652,11 @@ test("R008 isolates exact command-identity lanes deterministically", () => {
     session_id: "legacy", tool_use_id: "legacy-passed",
     normalized_command: "npm test", command_identity: undefined })];
   actions.push(...legacyActions);
-  const results = [...lanes.map(({ name }, index) => ({ name, start: index * 100 })),
-    { name: "legacy", start: 400 }].flatMap(({ name, start }) => [
+  const results = [...lanes, { name: "legacy", start: 400, passingStart: 420 }]
+    .flatMap(({ name, start, passingStart }) => [
       toolResult(`${name}-failed`, start + 10, "failure",
         { session_id: name, session_ref: `${name}#failed-result` }),
-      toolResult(`${name}-passed`, start + 30, "success",
+      toolResult(`${name}-passed`, passingStart + 10, "success",
         { session_id: name, session_ref: `${name}#passed-result` }),
     ]);
   const forward = detectFlakyTests(actions, { toolResults: results });
@@ -685,6 +688,22 @@ test("R008 isolates exact command-identity lanes deterministically", () => {
     history: [historyRecord("legacy-1", "main...legacy",
       [storedFlakyFinding("npm test", 9, "legacy#old", "legacy")])],
   }), []);
+
+  for (const cwd of ["..\\secret", "\\\\server\\share"]) {
+    const unsafe = commandIdentity(cwd);
+    const unsafeActions = [
+      matchedAction("unsafe-failed", 0, 10, "contributing_run", {
+        tool_use_id: "unsafe-failed", normalized_command: "npm test",
+        command_identity: unsafe }),
+      matchedAction("unsafe-passed", 20, 30, "redundant_run", {
+        tool_use_id: "unsafe-passed", normalized_command: "npm test",
+        command_identity: unsafe }),
+    ];
+    assert.deepEqual(detectFlakyTests(unsafeActions, { toolResults: [
+      toolResult("unsafe-failed", 10, "failure"),
+      toolResult("unsafe-passed", 30, "success"),
+    ] }), []);
+  }
 });
 
 test("R008 does not treat an unexplained failed run as its own mutation", () => {
@@ -1139,6 +1158,10 @@ test("R008 connects current flakiness to prior PRs without adding historical tim
       "npm test", 8, "legacy#run", "legacy")]),
     historyRecord("history-7", "main...malformed", [storedFlakyFinding(
       "npm test", 8, "malformed#run", "malformed")]),
+    historyRecord("history-8", "main...parent-cwd", [storedFlakyFinding(
+      "npm test", 8, "parent-cwd#run", commandIdentity("..\\secret"))]),
+    historyRecord("history-9", "main...unc-cwd", [storedFlakyFinding(
+      "npm test", 8, "unc-cwd#run", commandIdentity("\\\\server\\share"))]),
   ];
 
   const detect = (records: readonly AnalysisRecord[]) => detectFlakyTests(actions, {
