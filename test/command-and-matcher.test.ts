@@ -1438,7 +1438,7 @@ test("classifies an unrecognized mcp__ tool as coordination by server prefix", (
   assert.equal(matched[0]?.match_confidence, "low");
   assert.match(
     matched[0]?.caveats.join("\n") ?? "",
-    /MCP tool classified by server prefix/u,
+    /MCP tool classified by server prefix\.$/u,
   );
 });
 
@@ -1451,7 +1451,7 @@ test("classifies an mcp__ tool whose server id starts with an underscore as coor
   assert.equal(matched[0]?.match_confidence, "low");
   assert.match(
     matched[0]?.caveats.join("\n") ?? "",
-    /MCP tool classified by server prefix/u,
+    /MCP tool classified by server prefix\.$/u,
   );
 });
 

@@ -294,7 +294,7 @@ export function matchTimelineActions(
             "coordination",
             "low",
             targetFor(observation, paths),
-            ["MCP tool classified by server prefix"],
+            ["MCP tool classified by server prefix."],
           )
         : result(
             observation.action,
