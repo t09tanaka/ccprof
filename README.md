@@ -377,12 +377,14 @@ sessions that lack it, rather than silently reporting a false zero:
 
 | Rule | Requires | Why it is skipped for Codex sessions |
 |---|---|---|
-| R001 (rework) | `edit_fragments` | Codex rollouts do not record surviving/absent edit fragments, so rework edits cannot be distinguished from ordinary ones. |
 | R007 (context-bloat) | `token_usage` | Codex rollouts do not record per-result token counts, so the large-result and compaction thresholds have nothing to measure against. |
 
-R005 (serial-slack) needs `tool_timestamps`, which Codex rollouts do provide,
-so R005 is **not** skipped for Codex sessions. The authoritative mapping is
-`RULE_REQUIRED_CAPABILITIES` in `src/rules/capabilities.ts`.
+R005 (serial-slack) needs `tool_timestamps` and R001 (rework) needs
+`edit_fragments`; Codex rollouts provide both (`apply_patch` patch bodies are
+carried as edit fragments, with file paths taken from their
+`*** Update/Add/Delete File:` headers), so neither rule is skipped for Codex
+sessions. The authoritative mapping is `RULE_REQUIRED_CAPABILITIES` in
+`src/rules/capabilities.ts`.
 
 A rollout with no recorded git branch is still accepted on working-directory
 match alone, at low confidence, rather than being dropped.
