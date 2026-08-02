@@ -30,7 +30,8 @@ Run a deterministic retrospective for the current repository.
 
 4. For `scope: separate_issue`, explain the proposed follow-up. For
    `scope: claude_md`, explain the suggested instruction change. Do not mix
-   either class into the feature PR, and Issue や別PRは自動作成しない。
+   either class into the feature PR, and do not create an Issue or another PR
+   automatically.
 
 5. After an applied `this_pr` fix passes its relevant checks, rerun
    `ccprof --pr --json` and report what changed. Do not dismiss a finding

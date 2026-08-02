@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
   mkdtemp,
+  readFile,
   rm,
   symlink,
 } from "node:fs/promises";
@@ -13,6 +14,7 @@ import {
   CliUsageError,
   parseCliArgs,
   parseDurationMs,
+  resolvePackageVersion,
   runCli,
   type CliHandlers,
 } from "../src/cli.js";
@@ -673,9 +675,60 @@ test("the built CLI runs through an npm-link-style symlink", async () => {
     });
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /^Usage: ccprof/u);
+
+    const version = spawnSync(process.execPath, [linkedCli, "--version"], {
+      cwd: root,
+      encoding: "utf8",
+    });
+    assert.equal(version.status, 0, version.stderr);
+    assert.equal(version.stdout, `ccprof ${await packageVersion()}\n`);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+async function packageVersion(): Promise<string> {
+  const manifest = await readFile(
+    resolve(process.cwd(), "package.json"),
+    "utf8",
+  );
+  return (JSON.parse(manifest) as { version: string }).version;
+}
+
+test("--version and -v report the package version and exit 0", async () => {
+  assert.deepEqual(parseCliArgs(["--version"]), { kind: "version" });
+  assert.deepEqual(parseCliArgs(["-v"]), { kind: "version" });
+
+  const expected = await packageVersion();
+  assert.equal(resolvePackageVersion(), expected);
+
+  for (const args of [["--version"], ["-v"], ["--pr", "--version"]]) {
+    let stdout = "";
+    let stderr = "";
+    const code = await runCli(args, {
+      stdout: (value) => {
+        stdout += value;
+      },
+      stderr: (value) => {
+        stderr += value;
+      },
+    });
+    assert.equal(code, 0, args.join(" "));
+    assert.equal(stdout, `ccprof ${expected}\n`);
+    assert.equal(stderr, "");
+  }
+});
+
+test("--help wins over --version when both are supplied", async () => {
+  let stdout = "";
+  const code = await runCli(["--version", "--help"], {
+    stdout: (value) => {
+      stdout += value;
+    },
+  });
+  assert.equal(code, 0);
+  assert.match(stdout, /^Usage: ccprof/u);
+  assert.match(stdout, /ccprof --version/u);
 });
 
 function recurringRecord(

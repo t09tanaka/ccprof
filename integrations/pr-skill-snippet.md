@@ -1,7 +1,7 @@
 # PR creation skill snippet
 
-既存の PR 作成スキルの最後に、次の薄い手順を追加します。解析は
-`gh pr create` による PR 作成成功後だけ実行してください。
+Append this thin procedure to the end of an existing PR creation skill. Run the
+analysis only after the PR has been created successfully with `gh pr create`.
 
 ```text
 1. Run the repository's required checks and create the PR with `gh pr create`.
@@ -14,22 +14,23 @@
 6. Post a Markdown PR comment only after the user explicitly opts in.
 ```
 
-主経路の解析コマンド:
+The primary analysis command:
 
 ```sh
 ccprof --pr --json
 ```
 
-`this_pr` の修正後は同じコマンドを再実行し、回収見積もりと finding の変化を
-確認します。`separate_issue` は別作業の候補、`claude_md` は作業指示の候補
-として提示するだけで、Issue は自動作成しないでください。
+After fixing a `this_pr` finding, rerun the same command and check how the
+recoverable estimate and the findings changed. Present `separate_issue` as a
+candidate for separate work and `claude_md` as a candidate instruction change —
+just present them; do not create an Issue automatically.
 
-Markdown コメントの投稿は**明示的なオプトイン**です。ユーザーが希望した
-場合だけ、次を実行します。
+Posting the Markdown comment is an **explicit opt-in**. Run the following only
+when the user asks for it.
 
 ```sh
 ccprof --pr --md | gh pr comment --body-file -
 ```
 
-JSON の警告は stderr、レポート本体は stdout です。JSON を加工するラッパー
-でも stdout に説明文を混ぜないでください。
+JSON warnings go to stderr and the report itself to stdout. A wrapper that
+post-processes the JSON must not mix explanatory text into stdout either.
