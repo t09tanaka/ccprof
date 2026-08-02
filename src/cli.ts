@@ -20,6 +20,11 @@ import {
   type HookEventCommandOptions,
 } from "./commands/hook-event.js";
 import {
+  HooksConfirmationRequiredError,
+  runHooksCommand,
+  type HooksCommandOptions,
+} from "./commands/hooks.js";
+import {
   runStatsCommand,
   type StatsCommandOptions,
 } from "./commands/stats.js";
@@ -35,6 +40,7 @@ export const USAGE = `Usage: ccprof [--pr [<number|url|base...head>]] [--json|--
        ccprof stats [--json]
        ccprof dismiss <finding-key> [--reason <text>]
        ccprof hook-event [--notify]
+       ccprof hooks install|uninstall [--global] [--yes]
        ccprof --version
 `;
 
@@ -101,6 +107,13 @@ export interface ParsedHookEventCommand {
   notify: boolean;
 }
 
+export interface ParsedHooksCommand {
+  kind: "hooks";
+  action: "install" | "uninstall";
+  global: boolean;
+  yes: boolean;
+}
+
 export interface ParsedHelpCommand {
   kind: "help";
 }
@@ -114,6 +127,7 @@ export type ParsedCliCommand =
   | ParsedStatsCommand
   | ParsedDismissCommand
   | ParsedHookEventCommand
+  | ParsedHooksCommand
   | ParsedHelpCommand
   | ParsedVersionCommand;
 
@@ -129,6 +143,9 @@ export interface CliHandlers {
   ) => Promise<CommandExecutionResult>;
   hookEvent: (
     options: HookEventCommandOptions,
+  ) => Promise<CommandExecutionResult>;
+  hooks: (
+    options: HooksCommandOptions,
   ) => Promise<CommandExecutionResult>;
 }
 
@@ -151,6 +168,7 @@ const defaultHandlers: CliHandlers = {
   stats: runStatsCommand,
   dismiss: runDismissCommand,
   hookEvent: runHookEventCommand,
+  hooks: runHooksCommand,
 };
 
 function requiredOptionValue(
@@ -386,6 +404,29 @@ function parseHookEventArgs(
   return { kind: "hook-event", notify };
 }
 
+function parseHooksArgs(args: readonly string[]): ParsedHooksCommand {
+  const action = args[0];
+  if (action !== "install" && action !== "uninstall") {
+    throw new CliUsageError("hooks requires an install or uninstall action");
+  }
+  let global = false;
+  let yes = false;
+  for (const token of args.slice(1)) {
+    if (token === "--global") {
+      if (global) throw new CliUsageError("--global was specified twice");
+      global = true;
+      continue;
+    }
+    if (token === "--yes") {
+      if (yes) throw new CliUsageError("--yes was specified twice");
+      yes = true;
+      continue;
+    }
+    throw new CliUsageError(`unknown hooks argument: ${token}`);
+  }
+  return { kind: "hooks", action, global, yes };
+}
+
 export function parseCliArgs(
   args: readonly string[],
 ): ParsedCliCommand {
@@ -398,6 +439,7 @@ export function parseCliArgs(
   if (args[0] === "stats") return parseStatsArgs(args.slice(1));
   if (args[0] === "dismiss") return parseDismissArgs(args.slice(1));
   if (args[0] === "hook-event") return parseHookEventArgs(args.slice(1));
+  if (args[0] === "hooks") return parseHooksArgs(args.slice(1));
   return parseAnalyzeArgs(args);
 }
 
@@ -412,7 +454,8 @@ function errorMessage(error: unknown): string {
 function exitCodeFor(error: unknown): number {
   if (
     error instanceof CliUsageError ||
-    error instanceof FindingNotFoundError
+    error instanceof FindingNotFoundError ||
+    error instanceof HooksConfirmationRequiredError
   ) {
     return 2;
   }
@@ -528,11 +571,18 @@ export async function runCli(
         findingKey: command.findingKey,
         ...(command.reason === undefined ? {} : { reason: command.reason }),
       });
+    } else if (command.kind === "hooks") {
+      result = await handlers.hooks({
+        cwd,
+        action: command.action,
+        global: command.global,
+        yes: command.yes,
+      });
     } else {
       // command.kind === "hook-event": runCli dispatches hook-event before
       // this try/catch (see below) so its always-exit-0 contract holds even
       // for CLI-level parse errors. Unreachable in practice; kept only so
-      // the analyze/stats/dismiss narrowing above stays exhaustive.
+      // the analyze/stats/dismiss/hooks narrowing above stays exhaustive.
       throw new CliUsageError("hook-event must be dispatched separately");
     }
     stdout(withTrailingNewline(result.stdout));

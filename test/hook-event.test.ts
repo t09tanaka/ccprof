@@ -102,7 +102,15 @@ test("broken JSON on stdin appends nothing and returns silent success", async ()
       resolveRepoRoot: async () => "/repo",
       resolveStorePaths: async () => paths,
     };
-    for (const stdinText of ["{not json", "\"just a string\"", "42", ""]) {
+    for (
+      const stdinText of [
+        "{not json",
+        "\"just a string\"",
+        "42",
+        "",
+        JSON.stringify([{ session_id: "s", hook_event_name: "Stop" }]),
+      ]
+    ) {
       const result = await runHookEventCommand(
         { cwd: "/repo", stdinText, nowMs: 1_000 },
         dependencies,
@@ -348,6 +356,7 @@ function handlers(overrides: Partial<CliHandlers> = {}): CliHandlers {
     stats: async () => ({ stdout: "{}\n", warnings: [] }),
     dismiss: async () => ({ stdout: "dismissed\n", warnings: [] }),
     hookEvent: async () => ({ stdout: "", warnings: [] }),
+    hooks: async () => ({ stdout: "", warnings: [] }),
     ...overrides,
   };
 }

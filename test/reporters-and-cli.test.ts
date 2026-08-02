@@ -447,6 +447,7 @@ function handlers(
     stats: async () => ({ stdout: "{}\n", warnings: [] }),
     dismiss: async () => ({ stdout: "dismissed\n", warnings: [] }),
     hookEvent: async () => ({ stdout: "", warnings: [] }),
+    hooks: async () => ({ stdout: "", warnings: [] }),
   };
 }
 

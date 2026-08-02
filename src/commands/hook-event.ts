@@ -56,7 +56,9 @@ function parsePayload(stdinText: string): HookPayload | undefined {
   } catch {
     return undefined;
   }
-  if (value === null || typeof value !== "object") return undefined;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
   const record = value as Record<string, unknown>;
   const sessionId = record.session_id;
   const hookEventName = record.hook_event_name;
