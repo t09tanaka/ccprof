@@ -175,11 +175,29 @@ function recurringFindings(
  * refreshed from the latest matching occurrence so renamed rule titles stay
  * current; when the finding never appears in history, the adoption's own
  * rule_id is used and the title is left blank.
+ *
+ * Re-analyzing the pre-adoption PR replays the same (immutable) session
+ * data and can re-surface the same finding_key without any new work having
+ * happened. Such origin-PR reruns must not count as recurrence: `origin
+ * PrRefs` collects every `unit.pr_ref` that already carried this
+ * finding_key at or before `detected_at_ms`, and any post-detection record
+ * sharing one of those refs is excluded from `analyses_after`,
+ * `recurrences_after`, and `minutes_after` (but still contributes to
+ * `minutes_before` if it predates detection, which is unaffected).
  */
 function adoptionOutcome(
   adoption: AdoptionRecord,
   ordered: readonly AnalysisRecord[],
 ): StatsAdoption {
+  const originPrRefs = new Set<string>();
+  for (const record of ordered) {
+    if (record.created_at_ms > adoption.detected_at_ms) continue;
+    const hasFinding = record.findings.some(
+      (finding) => finding.finding_key === adoption.finding_key,
+    );
+    if (hasFinding) originPrRefs.add(record.unit.pr_ref);
+  }
+
   let ruleId = adoption.rule_id;
   let title = "";
   let analysesAfter = 0;
@@ -200,6 +218,7 @@ function adoptionOutcome(
       0,
     );
     if (record.created_at_ms > adoption.detected_at_ms) {
+      if (originPrRefs.has(record.unit.pr_ref)) continue;
       analysesAfter += 1;
       minutesAfter += minutes;
       if (matches.length > 0) recurrencesAfter += 1;

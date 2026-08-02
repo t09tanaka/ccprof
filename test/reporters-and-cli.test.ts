@@ -918,11 +918,12 @@ function adoptionAnalysisRecord(
   id: string,
   createdAtMs: number,
   findings: Finding[],
+  prRef: string = `main...${id}`,
 ): AnalysisRecord {
   return makeAnalysisRecord({
     analysis_id: id,
     created_at_ms: createdAtMs,
-    unit: { repo: "/repo", pr_ref: `main...${id}`, sessions: [id] },
+    unit: { repo: "/repo", pr_ref: prRef, sessions: [id] },
     summary: { ...summary, baseline: null },
     findings,
     metrics: {},
@@ -1195,6 +1196,110 @@ test("stats marks an adoption with zero follow-up analyses as no_data", () => {
   assert.equal(stats.adoptions[0]?.recurrences_after, 0);
   assert.equal(stats.adoptions[0]?.minutes_before, 4);
   assert.equal(stats.adoptions[0]?.minutes_after, 0);
+});
+
+test("stats excludes origin-PR reruns from analyses_after/recurrences_after but still counts a genuine new-PR recurrence", () => {
+  const detectedAtMs = ADOPTION_DAY0_MS;
+  const records = [
+    adoptionAnalysisRecord("origin", detectedAtMs - 100_000, [
+      adoptionFinding("rerun-key", {
+        rule_id: "R007",
+        title: "Flaky rerun finding",
+        scope: "this_pr",
+        recoverable: { min: 6, bound: "point" },
+      }),
+    ]),
+    // Re-analyzing the pre-adoption PR replays the same immutable session
+    // data and resurfaces the same finding_key under the same pr_ref; this
+    // must not be treated as recurrence.
+    adoptionAnalysisRecord(
+      "origin-rerun",
+      detectedAtMs + 10_000,
+      [
+        adoptionFinding("rerun-key", {
+          rule_id: "R007",
+          title: "Flaky rerun finding",
+          scope: "this_pr",
+          recoverable: { min: 6, bound: "point" },
+        }),
+      ],
+      "main...origin",
+    ),
+    // A genuinely different PR reproduces the finding after adoption.
+    adoptionAnalysisRecord("fresh", detectedAtMs + 20_000, [
+      adoptionFinding("rerun-key", {
+        rule_id: "R007",
+        title: "Flaky rerun finding",
+        scope: "this_pr",
+        recoverable: { min: 3, bound: "point" },
+      }),
+    ]),
+  ];
+  const adoptions = [
+    adoptionRecordFixture({
+      finding_key: "rerun-key",
+      rule_id: "R007",
+      method: "claude_md_edit",
+      detected_at_ms: detectedAtMs,
+    }),
+  ];
+
+  const stats = summarizeStats(records, adoptions);
+  assert.equal(stats.adoptions.length, 1);
+  const [outcome] = stats.adoptions;
+  assert.equal(outcome?.analyses_after, 1);
+  assert.equal(outcome?.recurrences_after, 1);
+  assert.equal(outcome?.minutes_before, 6);
+  assert.equal(outcome?.minutes_after, 3);
+  assert.equal(outcome?.status, "recurred");
+});
+
+test("stats keeps status no_recurrence when the only post-adoption match is an origin-PR rerun", () => {
+  const detectedAtMs = ADOPTION_DAY0_MS;
+  const records = [
+    adoptionAnalysisRecord("origin2", detectedAtMs - 100_000, [
+      adoptionFinding("rerun-only-key", {
+        rule_id: "R007",
+        title: "Flaky rerun finding",
+        scope: "this_pr",
+        recoverable: { min: 6, bound: "point" },
+      }),
+    ]),
+    // Origin-PR rerun: excluded from both the numerator and denominator.
+    adoptionAnalysisRecord(
+      "origin2-rerun",
+      detectedAtMs + 10_000,
+      [
+        adoptionFinding("rerun-only-key", {
+          rule_id: "R007",
+          title: "Flaky rerun finding",
+          scope: "this_pr",
+          recoverable: { min: 6, bound: "point" },
+        }),
+      ],
+      "main...origin2",
+    ),
+    // An unrelated, genuine post-adoption analysis keeps analyses_after > 0
+    // so the status reflects "no recurrence" rather than "no data".
+    adoptionAnalysisRecord("other", detectedAtMs + 20_000, []),
+  ];
+  const adoptions = [
+    adoptionRecordFixture({
+      finding_key: "rerun-only-key",
+      rule_id: "R007",
+      method: "claude_md_edit",
+      detected_at_ms: detectedAtMs,
+    }),
+  ];
+
+  const stats = summarizeStats(records, adoptions);
+  assert.equal(stats.adoptions.length, 1);
+  const [outcome] = stats.adoptions;
+  assert.equal(outcome?.analyses_after, 1);
+  assert.equal(outcome?.recurrences_after, 0);
+  assert.equal(outcome?.minutes_before, 6);
+  assert.equal(outcome?.minutes_after, 0);
+  assert.equal(outcome?.status, "no_recurrence");
 });
 
 test("runStatsCommand loads adoptions and threads them into the summary", async () => {
