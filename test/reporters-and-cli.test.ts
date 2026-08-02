@@ -28,9 +28,11 @@ import {
 } from "../src/commands/dismiss.js";
 import type {
   AnalysisSummary,
+  CommandIdentity,
   Finding,
   ReportV2,
 } from "../src/core/model.js";
+import { commandIdentityKey } from "../src/analysis/command-identity.js";
 import {
   InvalidAnalysisWindowError,
   NoAnalyzableTimestampsError,
@@ -279,6 +281,7 @@ function historyRecord(
   index: number,
   options: {
     commandCost?: number;
+    commandIdentity?: CommandIdentity;
     baseline?: AnalysisSummary["baseline"];
   } = {},
 ): AnalysisRecord {
@@ -304,6 +307,10 @@ function historyRecord(
       ? []
       : [{
           command: "npm test",
+          ...(options.commandIdentity === undefined ? {} : {
+            command_identity: { ...options.commandIdentity,
+              normalized_argv: [...options.commandIdentity.normalized_argv] },
+          }),
           duration_min: options.commandCost,
           session_refs: [`s${index}#run`],
         }],
@@ -311,9 +318,12 @@ function historyRecord(
 }
 
 test("stats reports history, baseline, chronic commands, and rule minutes", () => {
+  const api = { repo_relative_cwd: "packages/api", normalized_argv: ["npm", "test"],
+    executor: "shell" } satisfies CommandIdentity;
   const records = Array.from({ length: 5 }, (_, index) =>
     historyRecord(index + 1, {
       ...(index < 3 ? { commandCost: 5 } : {}),
+      commandIdentity: api,
       ...(index === 4 ? { baseline: summary.baseline } : {}),
     })
   );
@@ -322,11 +332,48 @@ test("stats reports history, baseline, chronic commands, and rule minutes", () =
   assert.equal(stats.history_count, 5);
   assert.equal(stats.baseline_metrics[0]?.metric, "human_wait_ratio");
   assert.equal(stats.chronic_commands[0]?.command, "npm test");
+  assert.deepEqual(stats.chronic_commands[0]?.command_identity, api);
+  assert.notEqual(stats.chronic_commands[0]?.command_identity?.normalized_argv,
+    api.normalized_argv);
   assert.equal(stats.chronic_commands[0]?.cost_ratio, 0.3);
   assert.deepEqual(stats.rule_minutes, [{ rule_id: "R002", minutes: 10 }]);
   assert.deepEqual(JSON.parse(renderStatsJson(stats)), stats);
   assert.match(renderStatsTty(stats), /History: 5 analyses/u);
+  assert.match(renderStatsTty(stats), /packages\/api :: npm test/u);
   assert.match(renderStatsTty(stats), /R002: 10m/u);
+});
+
+test("stats chronic commands stay separated and ordered by exact identity", () => {
+  const identities: CommandIdentity[] = [
+    { repo_relative_cwd: "packages/api", normalized_argv: ["npm", "test"], executor: "shell" },
+    { repo_relative_cwd: "packages/web", normalized_argv: ["npm", "test"], executor: "shell" },
+    { repo_relative_cwd: "packages/api", normalized_argv: ["npm", "test"], executor: "native-tool" },
+  ];
+  const records = Array.from({ length: 5 }, (_, index) => ({
+    ...historyRecord(index + 20),
+    command_costs: index < 3 ? identities.map((identity, lane) => ({
+      command: "npm test", command_identity: identity, duration_min: 5,
+      session_refs: [`s${index}#lane-${lane}`],
+    })) : [],
+  }));
+  const forward = summarizeStats(records);
+  const reverse = summarizeStats([...records].reverse());
+  assert.deepEqual(forward.chronic_commands, reverse.chronic_commands);
+  assert.deepEqual(forward.chronic_commands.map(({ command_identity }) => command_identity),
+    [...identities].sort((left, right) => {
+      const leftKey = commandIdentityKey(left), rightKey = commandIdentityKey(right);
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    }));
+  assert.deepEqual(forward.chronic_commands.map(({ command }) => command),
+    ["npm test", "npm test", "npm test"]);
+  const tty = renderStatsTty(forward);
+  assert.match(tty, /packages\/api :: npm test \[native-tool\]/u);
+  assert.match(tty, /packages\/api :: npm test/u);
+  assert.match(tty, /packages\/web :: npm test/u);
+
+  const legacy = Array.from({ length: 5 }, (_, index) =>
+    historyRecord(index + 30, { commandCost: 5 }));
+  assert.deepEqual(summarizeStats(legacy).chronic_commands, []);
 });
 
 test("stats TTY removes stored control strings while stats JSON preserves values", () => {
@@ -374,6 +421,7 @@ test("stats TTY removes stored control strings while stats JSON preserves values
 
   const json = JSON.parse(renderStatsJson(stats)) as typeof stats;
   assert.equal(json.chronic_commands[0]?.command, command);
+  assert.equal("command_identity" in json.chronic_commands[0]!, false);
   assert.equal(json.baseline_metrics[0]?.metric, metric);
 });
 
