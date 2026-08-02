@@ -5,6 +5,8 @@ import {
   buildTimeline,
   DEFAULT_IDLE_THRESHOLD_MS,
 } from "../src/analysis/timeline.js";
+import { matchTimelineActions } from "../src/analysis/diff-matcher.js";
+import { sliceSessionsToAnalysisWindow } from "../src/analysis/window.js";
 import type {
   AssistantEvent,
   CompactionEvent,
@@ -362,6 +364,74 @@ test("marks an action concurrent with another agent's unclassified active interv
     timeline.actions.some((action) => action.agent_id === "side-1"),
     false,
   );
+});
+
+test("pairs tools per agent and leaves both window-crossing directions unknown", () => {
+  const shared = buildTimeline([session([
+    toolUse("shared", 10, 0, "agent-a"), toolUse("shared", 10, 1, "agent-b"),
+    toolResult("shared", 20, 2, "agent-a"), toolResult("shared", 20, 3, "agent-b"),
+  ])]);
+  assert.deepEqual(shared.actions.filter(({ kind }) => kind === "tool")
+    .map(({ agent_id, interval }) => [agent_id, interval]), [
+    ["agent-a", { start_ms: 10, end_ms: 20 }],
+    ["agent-b", { start_ms: 10, end_ms: 20 }],
+  ]);
+
+  const rightUse = toolUse("right", 18, 2, "main", {
+    tool_name: "Edit", paths: ["src/a.ts"], edit_fragments: ["kept"],
+  });
+  const sliced = sliceSessionsToAnalysisWindow([session([
+    toolUse("left", 9, 0), toolResult("left", 12, 1),
+    rightUse, toolResult("right", 21, 3),
+  ])], { started_at_ms: 10, ended_at_ms: 20, start_source: "explicit",
+    end_source: "analysis_time", completeness: "complete" });
+  const timeline = buildTimeline(sliced);
+  assert.deepEqual(timeline.toolIntervals, []);
+  const action = timeline.actions.find(({ tool_use_id }) => tool_use_id === "right");
+  assert.deepEqual(action?.interval, { start_ms: 18, end_ms: 18 });
+  assert.ok(timeline.caveats.some((value) => value.includes("left")));
+  assert.ok(action);
+  const missingRunUse = toolUse("run-missing", 30, 4, "main", {
+    tool_name: "Bash", paths: [], command: "npm test",
+  });
+  const completedRunUse = toolUse("run-complete", 40, 5, "main", {
+    tool_name: "Bash", paths: [], command: "npm test",
+  });
+  const completedRunResult = toolResult("run-complete", 50, 6);
+  const runTimeline = buildTimeline([session([
+    missingRunUse, completedRunUse, completedRunResult,
+  ])]);
+  const missingRunAction = runTimeline.actions.find(
+    ({ tool_use_id }) => tool_use_id === "run-missing",
+  );
+  const completedRunAction = runTimeline.actions.find(
+    ({ tool_use_id }) => tool_use_id === "run-complete",
+  );
+  assert.deepEqual(missingRunAction?.interval, { start_ms: 30, end_ms: 30 });
+  assert.ok(missingRunAction);
+  assert.ok(completedRunAction);
+  const [matched, missingRunMatched, completedRunMatched] = matchTimelineActions([
+    { action, toolUse: rightUse },
+    { action: missingRunAction, toolUse: missingRunUse },
+    { action: completedRunAction, toolUse: completedRunUse,
+      toolResult: completedRunResult },
+  ], {
+    diff: { files: [{ status: "M", path: "src/a.ts", addedLines: ["kept"],
+      binary: false, contentComplete: true }], changedPaths: ["src/a.ts"],
+      survivingPaths: ["src/a.ts"], renames: [], truncated: false, caveats: [],
+      commits: [], reverts: [] },
+    testMap: { mappings: [{ source: ["src/**"], tests: ["test/**"],
+      commands: ["npm test"], confidence: "high", origin: "explicit",
+      caveat: "explicit test map" }], caveats: [] },
+  });
+  assert.equal(matched?.match, "unexplained");
+  assert.equal(matched?.match_confidence, "low");
+  assert.match(matched?.caveats.join(" ") ?? "", /completion.*outside|identified uniquely/iu);
+  assert.equal(missingRunMatched?.match, "unexplained");
+  assert.equal(missingRunMatched?.match_confidence, "low");
+  assert.notEqual(completedRunMatched?.match, "redundant_run");
+  assert.equal(completedRunMatched?.match, "unexplained");
+  assert.match(completedRunMatched?.caveats.join(" ") ?? "", /unknown mutation scope/iu);
 });
 
 test("sidechain activity remains active inside a parent away interval", () => {

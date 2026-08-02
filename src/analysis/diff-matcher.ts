@@ -201,6 +201,24 @@ export function matchTimelineActions(
     const toolName = normalizedToolName(rawToolName);
     const observed = observedPaths(observation, options.repoRoot);
     const paths = observed.paths;
+    if (observation.toolResult === undefined) {
+      const mutation = mutationRecordFor(observation, options);
+      if (mutation?.uncertain === true) readUncertaintyOrdinal += 1;
+      return rememberToolClassification(
+        observation,
+        result(
+          observation.action,
+          "unexplained",
+          "low",
+          targetFor(observation, paths),
+          unique([
+            ...observed.caveats,
+            "Tool completion was outside the analysis window or could not be identified uniquely.",
+          ]),
+        ),
+        toolClassifications,
+      );
+    }
     if (EDIT_TOOLS.has(toolName)) {
       const editCaveats = unique([
         ...observed.caveats,
@@ -313,6 +331,14 @@ function mutationRecordFor(
   options: MatchActionsOptions,
 ): MutationRecord | null {
   if (observation.action.kind !== "tool") return null;
+  if (observation.toolResult === undefined) {
+    return {
+      kind: "opaque",
+      interval: observation.action.interval,
+      paths: [],
+      uncertain: true,
+    };
+  }
   const toolName = normalizedToolName(
     observation.toolUse?.tool_name ?? observation.action.tool_name ?? "",
   );

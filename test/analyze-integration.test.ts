@@ -1706,3 +1706,67 @@ test("a corrupt hook-events.jsonl line degrades to one aggregate warning instead
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("fixed-window analysis is invariant to high-impact events outside the snapshot", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-window-metamorphic-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const repo = await realpath(await makeRepository(root));
+  const startedAtMs = NOW_MS - 600_000;
+  const storePaths = await resolveStorePaths(repo, {
+    env: { CCPROF_DATA_DIR: join(root, "data") },
+  });
+  const stable = coordinationSession("window-session", repo, "Bash");
+  stable.events = stable.events.map((event) =>
+    event.kind === "tool_use" && event.tool_use_id === "coord-1"
+      ? { ...event, command: "npm test" }
+      : event
+  );
+  const common = { session_id: stable.session_id, agent_id: "main",
+    is_sidechain: false, confidence: "high" as const };
+  const outside: Session["events"] = [
+    { ...common, kind: "tool_use", timestamp_ms: startedAtMs - 20_000,
+      entry_uuid: "pre-command", session_ref: "window-session#pre-command",
+      source_index: -2, tool_use_id: "pre", tool_name: "Bash", input: {},
+      paths: [], edit_fragments: [], command: "npm test" },
+    { ...common, kind: "tool_result", timestamp_ms: startedAtMs - 10_000,
+      entry_uuid: "pre-result", session_ref: "window-session#pre-result",
+      source_index: -1, tool_use_id: "pre", status: "success",
+      output: "x".repeat(100_000), output_bytes: 100_000, estimated_tokens: 25_000 },
+    { ...common, kind: "compaction", timestamp_ms: NOW_MS + 1,
+      entry_uuid: "post-compact", session_ref: "window-session#post-compact",
+      source_index: 10, summary: "future compaction", estimated_tokens: 99_999 },
+    { ...common, kind: "tool_use", timestamp_ms: NOW_MS + 2,
+      entry_uuid: "post-edit", session_ref: "window-session#post-edit",
+      source_index: 11, tool_use_id: "post", tool_name: "Edit", input: {},
+      paths: ["src/value.ts"], edit_fragments: ["export const value = 999;"] },
+    { ...common, kind: "tool_result", timestamp_ms: NOW_MS + 3,
+      entry_uuid: "post-result", session_ref: "window-session#post-result",
+      source_index: 12, tool_use_id: "post", status: "success", output: "updated",
+      output_bytes: 7, estimated_tokens: 2 },
+    { ...common, kind: "assistant", timestamp_ms: NOW_MS + 4,
+      entry_uuid: "post-correction", session_ref: "window-session#post-correction",
+      source_index: 13, text: "Actually, rewrite everything." },
+  ];
+  const expanded: Session = { ...stable, started_at_ms: startedAtMs - 20_000,
+    ended_at_ms: NOW_MS + 4, verified_ended_at_ms: NOW_MS + 5,
+    events: [outside[0]!, outside[1]!, ...stable.events, ...outside.slice(2)] };
+  const run = async (session: Session) => await analyze({
+    cwd: repo, pr: "main...feature", sinceMs: startedAtMs, nowMs: NOW_MS,
+    storePaths, sessionSource: { discover: async () => [session] },
+    testMap: { mappings: [], caveats: [] }, persist: false,
+  });
+
+  const baseline = await run(stable);
+  const changed = await run(expanded);
+  const comparable = (value: typeof baseline) => ({ window: value.window,
+    report: value.report, findings: value.allFindings, ledger: value.ledger,
+    command_costs: value.record.command_costs,
+    read_observations: value.record.read_observations });
+  assert.deepEqual(comparable(changed), comparable(baseline));
+  const intervals = [changed.ledger.normalIntervals, changed.ledger.unexplainedIntervals,
+    changed.ledger.humanWaitIntervals, changed.ledger.idleIntervals,
+    ...changed.ledger.attributions.map(({ intervals }) => intervals)].flat();
+  assert.ok(intervals.every(({ start_ms, end_ms }) =>
+    start_ms >= startedAtMs && end_ms <= NOW_MS));
+  await assert.rejects(run({ ...stable, events: outside }), NoMatchingSessionsError);
+});

@@ -56,7 +56,7 @@ interface PendingAssistant {
   approval?: ApprovalRequest;
 }
 
-function eventIdentity(event: NormalizedEvent): string {
+function eventIdentity(event: NormalizedEvent, sourcePath: string): string {
   const discriminator =
     event.kind === "tool_use" || event.kind === "tool_result"
       ? event.tool_use_id
@@ -64,6 +64,8 @@ function eventIdentity(event: NormalizedEvent): string {
         ? (event.message_id ?? "")
         : "";
   return [
+    sourcePath,
+    event.agent_id,
     event.kind,
     event.session_ref,
     event.timestamp_ms,
@@ -122,7 +124,7 @@ function collectEvents(
         );
         continue;
       }
-      const identity = eventIdentity(event);
+      const identity = eventIdentity(event, session.source_path);
       if (identities.has(identity)) {
         caveats.push(`ignored duplicate event ${event.session_ref}`);
         continue;
@@ -321,12 +323,14 @@ function pairTools(
   useForResult: ReadonlyMap<ToolResultEvent, ToolUseEvent>;
 } {
   const uses = new Map<string, OrderedEvent>();
+  const laneToolUses = new Set<string>();
   const results = new Map<string, OrderedEvent[]>();
 
   for (const ordered of events) {
     const event = ordered.event;
     if (event.kind === "tool_use") {
-      const key = `${ordered.laneKey}\0${event.tool_use_id}`;
+      laneToolUses.add(`${ordered.laneKey}\0${event.tool_use_id}`);
+      const key = `${ordered.agentKey}\0${event.tool_use_id}`;
       if (uses.has(key)) {
         caveats.push(
           `ignored duplicate tool use ${event.tool_use_id} in ${event.session_id}`,
@@ -335,7 +339,7 @@ function pairTools(
         uses.set(key, ordered);
       }
     } else if (event.kind === "tool_result") {
-      const key = `${ordered.laneKey}\0${event.tool_use_id}`;
+      const key = `${ordered.agentKey}\0${event.tool_use_id}`;
       const group = results.get(key);
       if (group === undefined) {
         results.set(key, [ordered]);
@@ -418,8 +422,14 @@ function pairTools(
     if (uses.has(key)) {
       continue;
     }
-    const result = candidates[0]?.event;
-    if (result?.kind === "tool_result") {
+    const orderedResult = candidates[0];
+    const result = orderedResult?.event;
+    if (orderedResult !== undefined && result?.kind === "tool_result") {
+      if (laneToolUses.has(`${orderedResult.laneKey}\0${result.tool_use_id}`)) {
+        caveats.push(
+          `tool result ${result.tool_use_id} in ${result.session_id} was attributed to a different agent and has no matching use`,
+        );
+      }
       caveats.push(
         `tool result ${result.tool_use_id} in ${result.session_id} has no matching use`,
       );
