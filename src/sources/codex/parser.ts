@@ -35,7 +35,10 @@ const INJECTED_USER_TEXT_PREFIXES = [
   "<turn_context>",
 ];
 
-const EXIT_CODE_PATTERN = /Process exited with code (\d+)/;
+const EXIT_CODE_PATTERN = /^Process exited with code (\d+)/u;
+
+/** response_item.payload.type subtypes that are intentionally dropped without a warning. */
+const IGNORED_RESPONSE_ITEM_SUBTYPES = new Set(["reasoning"]);
 
 interface ParsedRow {
   type: string;
@@ -174,22 +177,35 @@ function isInjectedUserText(text: string): boolean {
   );
 }
 
+interface ResolvedOutput {
+  text: string;
+  metadataExitCode: number | undefined;
+}
+
 /**
  * `function_call_output.payload.output` is usually plain text, but may
  * itself be a JSON string wrapping `{"output": "...", "metadata": {...}}`.
  * When it parses as such, the inner `output` text is what should be scanned
- * for an exit code; otherwise the raw string is used as-is.
+ * for an exit code (unless a numeric `metadata.exit_code` is present, which
+ * takes priority over text scanning); otherwise the raw string is used as-is
+ * and there is no structured exit code.
  */
-function resolveOutputText(raw: string): string {
+function resolveOutput(raw: string): ResolvedOutput {
   try {
     const parsed: unknown = JSON.parse(raw);
-    if (isRecord(parsed) && typeof parsed.output === "string") {
-      return parsed.output;
+    if (isRecord(parsed)) {
+      const metadata = parsed.metadata;
+      const metadataExitCode =
+        isRecord(metadata) && typeof metadata.exit_code === "number"
+          ? metadata.exit_code
+          : undefined;
+      const text = typeof parsed.output === "string" ? parsed.output : raw;
+      return { text, metadataExitCode };
     }
   } catch {
     // Not JSON; fall through to the raw string.
   }
-  return raw;
+  return { text: raw, metadataExitCode: undefined };
 }
 
 interface EventBaseFields {
@@ -364,9 +380,10 @@ function buildFunctionCallOutputEvent(
     return undefined;
   }
 
-  const text = resolveOutputText(rawOutput);
+  const { text, metadataExitCode } = resolveOutput(rawOutput);
   const match = EXIT_CODE_PATTERN.exec(text);
-  const exitCode = match?.[1] !== undefined ? Number(match[1]) : undefined;
+  const textExitCode = match?.[1] !== undefined ? Number(match[1]) : undefined;
+  const exitCode = metadataExitCode ?? textExitCode;
   const status: ToolResultStatus =
     exitCode === undefined ? "unknown" : exitCode === 0 ? "success" : "failure";
 
@@ -418,6 +435,7 @@ export function parseCodexSession(
   }
 
   const events: NormalizedEvent[] = [];
+  const warnedUnknownSubtypes = new Set<string>();
   for (const row of rows) {
     if (row.type !== "response_item") {
       continue;
@@ -456,8 +474,24 @@ export function parseCodexSession(
       }
       continue;
     }
-    // "reasoning" and any other response_item subtypes are intentionally
-    // not converted to normalized events.
+    // Any other response_item subtype is intentionally not converted to a
+    // normalized event; warn once per distinct subtype unless ignored.
+    if (
+      payloadType !== undefined &&
+      !IGNORED_RESPONSE_ITEM_SUBTYPES.has(payloadType) &&
+      !warnedUnknownSubtypes.has(payloadType)
+    ) {
+      warnedUnknownSubtypes.add(payloadType);
+      warnings.push(
+        warn(
+          sourcePath,
+          row.line,
+          "codex_unknown_response_item",
+          `Ignored a response_item with an unhandled payload type "${payloadType}".`,
+          makeSessionRef(sessionId, `line-${row.line.toString(10)}`),
+        ),
+      );
+    }
   }
 
   if (events.length === 0) {

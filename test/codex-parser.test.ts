@@ -259,6 +259,58 @@ test("skips function_call rows missing call_id/name and function_call_output row
   assert.equal(invalidRowWarnings.length, 2);
 });
 
+test("does not fabricate an exit code from a quoted phrase mid-output", () => {
+  const raw = [
+    '{"timestamp":"2026-07-30T14:00:00.000Z","type":"session_meta","payload":{"id":"quoted-phrase-session","cwd":"/workspace/repo"}}',
+    '{"timestamp":"2026-07-30T14:00:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-quoted","output":"cat ci.log\\nsome earlier line\\nProcess exited with code 1\\nthat line was quoted from an old log, not this run status"}}',
+  ].join("\n");
+
+  const session = parseCodexSession({ sourcePath: "quoted-phrase.jsonl", raw });
+  assert.ok(session);
+
+  const result = session.events.find((event) => event.kind === "tool_result");
+  assert.ok(result && result.kind === "tool_result");
+  assert.equal(result.status, "unknown");
+  assert.equal(result.exit_code, undefined);
+});
+
+test("prefers metadata.exit_code over text scanning, even when the text does not match", () => {
+  const raw = [
+    '{"timestamp":"2026-07-30T15:00:00.000Z","type":"session_meta","payload":{"id":"metadata-exit-session","cwd":"/workspace/repo"}}',
+    '{"timestamp":"2026-07-30T15:00:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-meta","output":"{\\"output\\":\\"no matching phrase here\\",\\"metadata\\":{\\"exit_code\\":2}}"}}',
+  ].join("\n");
+
+  const session = parseCodexSession({ sourcePath: "metadata-exit.jsonl", raw });
+  assert.ok(session);
+
+  const result = session.events.find((event) => event.kind === "tool_result");
+  assert.ok(result && result.kind === "tool_result");
+  assert.equal(result.status, "failure");
+  assert.equal(result.exit_code, 2);
+  assert.equal(result.output, "no matching phrase here");
+});
+
+test("warns once per distinct unknown response_item subtype without affecting events", () => {
+  const raw = [
+    '{"timestamp":"2026-07-30T16:00:00.000Z","type":"session_meta","payload":{"id":"unknown-subtype-session","cwd":"/workspace/repo"}}',
+    '{"timestamp":"2026-07-30T16:00:01.000Z","type":"response_item","payload":{"type":"local_shell_call","call_id":"call-a","status":"completed"}}',
+    '{"timestamp":"2026-07-30T16:00:02.000Z","type":"response_item","payload":{"type":"local_shell_call","call_id":"call-b","status":"completed"}}',
+    '{"timestamp":"2026-07-30T16:00:03.000Z","type":"response_item","payload":{"type":"message","role":"user","content":"Keep the session alive."}}',
+  ].join("\n");
+
+  const session = parseCodexSession({ sourcePath: "unknown-subtype.jsonl", raw });
+  assert.ok(session);
+
+  assert.equal(session.events.length, 1);
+  assert.equal(session.events[0]?.kind, "genuine_user");
+
+  const unknownSubtypeWarnings = session.warnings.filter(
+    (warning) => warning.code === "codex_unknown_response_item",
+  );
+  assert.equal(unknownSubtypeWarnings.length, 1);
+  assert.match(unknownSubtypeWarnings[0]?.message ?? "", /local_shell_call/u);
+});
+
 test("returns null for a session with a valid session_meta but zero emitted events", () => {
   const raw = [
     '{"timestamp":"2026-07-30T13:00:00.000Z","type":"session_meta","payload":{"id":"empty-events-session","cwd":"/workspace/repo","git":{"branch":"main"}}}',
