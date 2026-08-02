@@ -436,3 +436,58 @@ test("freezes Codex rows after timestamp validation at an inclusive boundary", (
   assert.deepEqual(session.warnings.map(({ code, line }) => [code, line]),
     [["codex_row_invalid", 7], ["codex_row_invalid", 8]]);
 });
+
+test("prefers event workdir, then event cwd, then session metadata cwd", () => {
+  const call = (id: string, input: Record<string, unknown>): string =>
+    JSON.stringify({
+      timestamp: `2026-07-31T13:00:0${id}.000Z`,
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "exec_command",
+        call_id: `call-${id}`,
+        arguments: JSON.stringify(input),
+      },
+    });
+  const raw = [
+    '{"timestamp":"2026-07-31T13:00:00.000Z","type":"session_meta","payload":{"id":"cwd-priority","cwd":"/metadata/repo"}}',
+    call("1", { cmd: "pwd", workdir: "/event/workdir", cwd: "/event/cwd" }),
+    call("2", { cmd: "pwd", workdir: "  ", cwd: "/event/cwd" }),
+    call("3", { cmd: "pwd", workdir: "", cwd: "  " }),
+  ].join("\n");
+  const session = parseCodexSession({ sourcePath: "cwd-priority.jsonl", raw });
+  assert.ok(session);
+  const toolCwds = session.events
+    .filter((event) => event.kind === "tool_use")
+    .map((event) => event.kind === "tool_use" ? event.cwd : undefined);
+  assert.deepEqual(toolCwds, [
+    "/event/workdir",
+    "/event/cwd",
+    "/metadata/repo",
+  ]);
+  assert.deepEqual(session.observed_cwds, [
+    "/metadata/repo",
+    "/event/workdir",
+    "/event/cwd",
+  ]);
+});
+
+test("does not invent a cwd when event and session metadata omit it", () => {
+  const raw = JSON.stringify({
+    timestamp: "2026-07-31T14:00:00.000Z",
+    type: "response_item",
+    payload: {
+      type: "function_call",
+      name: "exec_command",
+      call_id: "call-missing-cwd",
+      arguments: JSON.stringify({ cmd: "pwd" }),
+    },
+  });
+
+  const session = parseCodexSession({ sourcePath: "missing-cwd.jsonl", raw });
+  assert.ok(session);
+  const tool = session.events.find((event) => event.kind === "tool_use");
+  assert.ok(tool?.kind === "tool_use");
+  assert.equal(tool.cwd, undefined);
+  assert.deepEqual(session.observed_cwds, []);
+});

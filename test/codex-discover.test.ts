@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   mkdir,
   mkdtemp,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -300,4 +301,54 @@ test("future Codex metadata cannot make an in-bound metadata-less rollout eligib
     endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
   });
   assert.deepEqual(sessions, []);
+});
+
+test("rebases a main-checkout Codex cwd into the queried linked worktree", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-codex-worktree-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+
+  const sessionsDir = join(root, "sessions");
+  const mainRepo = join(root, "main-repo");
+  const linkedRepo = join(root, "linked-repo");
+  const mainNested = join(mainRepo, "packages", "app");
+  const linkedNested = join(linkedRepo, "packages", "app");
+  const linkedGitDir = join(mainRepo, ".git", "worktrees", "linked");
+  await Promise.all([
+    mkdir(join(sessionsDir, "2026", "07", "31"), { recursive: true }),
+    mkdir(mainNested, { recursive: true }),
+    mkdir(linkedNested, { recursive: true }),
+    mkdir(linkedGitDir, { recursive: true }),
+  ]);
+  await writeFile(join(linkedRepo, ".git"), `gitdir: ${linkedGitDir}\n`);
+  await writeFile(
+    join(sessionsDir, "2026", "07", "31", "rollout-worktree.jsonl"),
+    sessionMeta({
+      id: "codex-worktree",
+      cwd: mainNested,
+      branch: "feature/codex",
+    }) + rolloutLine({
+      timestamp: "2026-07-31T03:00:01.000Z",
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "exec_command",
+        call_id: "call-worktree",
+        arguments: JSON.stringify({ cmd: "pwd", workdir: mainNested }),
+      },
+    }),
+  );
+
+  const sessions = await discoverCodexSessions(sessionsDir, {
+    repoRoot: linkedRepo,
+    headBranch: "feature/codex",
+    startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+  });
+
+  assert.equal(sessions.length, 1);
+  const expectedCwd = await realpath(linkedNested);
+  assert.deepEqual(sessions[0]?.observed_cwds, [expectedCwd]);
+  const tool = sessions[0]?.events.find((event) => event.kind === "tool_use");
+  assert.ok(tool?.kind === "tool_use");
+  assert.equal(tool.cwd, expectedCwd);
 });
