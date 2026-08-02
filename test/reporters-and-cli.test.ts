@@ -14,6 +14,7 @@ import {
   CliUsageError,
   parseCliArgs,
   parseDurationMs,
+  parseRfc3339Ms,
   resolvePackageVersion,
   runCli,
   type CliHandlers,
@@ -31,6 +32,7 @@ import type {
   ReportV2,
 } from "../src/core/model.js";
 import {
+  InvalidAnalysisWindowError,
   NoAnalyzableTimestampsError,
   NoMatchingSessionsError,
 } from "../src/core/analyze.js";
@@ -436,6 +438,90 @@ test("CLI parser accepts direct analyze, optional PR selectors, durations, stats
   );
 });
 
+test("analysis-window CLI options accept strict RFC3339 and duration forms", () => {
+  assert.equal(parseRfc3339Ms("1970-01-01T00:00:00Z"), 0);
+  assert.equal(
+    parseRfc3339Ms("2026-08-03T12:34:56.123+09:00"),
+    Date.UTC(2026, 7, 3, 3, 34, 56, 123),
+  );
+  assert.equal(
+    parseRfc3339Ms("2026-08-03t12:34:56.123456z"),
+    Date.UTC(2026, 7, 3, 12, 34, 56, 123),
+  );
+  assert.deepEqual(
+    parseCliArgs([
+      "--since",
+      "1970-01-01T00:00:00Z",
+      "--commit-lookback=2h",
+    ]),
+    {
+      kind: "analyze",
+      format: "tty",
+      color: false,
+      sinceMs: 0,
+      commitAnchorLookbackMs: 7_200_000,
+    },
+  );
+  assert.deepEqual(
+    parseCliArgs([
+      "--since=2026-08-03T12:34:56-04:30",
+      "--commit-lookback",
+      "90m",
+    ]),
+    {
+      kind: "analyze",
+      format: "tty",
+      color: false,
+      sinceMs: Date.UTC(2026, 7, 3, 17, 4, 56),
+      commitAnchorLookbackMs: 5_400_000,
+    },
+  );
+  assert.deepEqual(
+    parseCliArgs([
+      "--pr",
+      "--since=1970-01-01T00:00:00Z",
+      "--commit-lookback",
+      "0",
+    ]),
+    {
+      kind: "analyze",
+      format: "tty",
+      color: false,
+      sinceMs: 0,
+      commitAnchorLookbackMs: 0,
+    },
+  );
+});
+
+test("analysis-window CLI options reject ambiguous, impossible, missing, and duplicate values", () => {
+  for (const value of [
+    "2026-08-03",
+    "2026-08-03T12:34:56",
+    "yesterday",
+    "2026-02-30T12:34:56Z",
+    "2026-08-03T24:00:00Z",
+    "2026-08-03T12:34:60Z",
+    "2026-08-03T12:34:56+24:00",
+    "2026-08-03T12:34:56+09:60",
+  ]) {
+    assert.throws(() => parseRfc3339Ms(value), CliUsageError, value);
+  }
+  assert.throws(
+    () => parseRfc3339Ms("1969-12-31T23:59:59Z"),
+    /outside the supported date range/u,
+  );
+  for (const args of [
+    ["--since"],
+    ["--since="],
+    ["--commit-lookback"],
+    ["--commit-lookback="],
+    ["--since=2026-08-03T00:00:00Z", "--since", "2026-08-03T00:00:00Z"],
+    ["--commit-lookback=1h", "--commit-lookback", "2h"],
+  ]) {
+    assert.throws(() => parseCliArgs(args), CliUsageError, args.join(" "));
+  }
+});
+
 function handlers(
   analyze: CliHandlers["analyze"] = async () => ({
     stdout: renderJsonReport(report()),
@@ -469,6 +555,47 @@ test("CLI routes clean stdout, warnings to stderr, and returns success", async (
   assert.equal((JSON.parse(stdout) as ReportV2).version, 2);
   assert.doesNotMatch(stdout, /fixture warning/u);
   assert.match(stderr, /fixture warning/u);
+});
+
+test("CLI and analyze command forward analysis-window values including epoch zero", async () => {
+  let dispatchedSince: number | undefined;
+  let dispatchedLookback: number | undefined;
+  const code = await runCli(
+    ["--since", "1970-01-01T00:00:00Z", "--commit-lookback=5m"],
+    {
+      handlers: handlers(async (options) => {
+        dispatchedSince = options.sinceMs;
+        dispatchedLookback = options.commitAnchorLookbackMs;
+        return { stdout: "ok", warnings: [] };
+      }),
+      stdout: () => undefined,
+      stderr: () => undefined,
+    },
+  );
+  assert.equal(code, 0);
+  assert.equal(dispatchedSince, 0);
+  assert.equal(dispatchedLookback, 300_000);
+
+  let coreSince: number | undefined;
+  let coreLookback: number | undefined;
+  await runAnalyzeCommand(
+    {
+      cwd: "/repo",
+      format: "json",
+      color: false,
+      sinceMs: 0,
+      commitAnchorLookbackMs: 300_000,
+    },
+    {
+      analyze: async (options) => {
+        coreSince = options.sinceMs;
+        coreLookback = options.commitAnchorLookbackMs;
+        return { report: report(), warnings: [] };
+      },
+    },
+  );
+  assert.equal(coreSince, 0);
+  assert.equal(coreLookback, 300_000);
 });
 
 test("CLI enables default color only for human TTY output and honors explicit color", async () => {
@@ -593,6 +720,32 @@ test("CLI maps usage, git context, no-session, and unknown failures to 2/3/4/5",
     }),
     5,
   );
+});
+
+test("CLI maps an invalid analysis window to exit 2 and prints usage", async () => {
+  let stdout = "";
+  let stderr = "";
+  const code = await runCli([], {
+    handlers: handlers(async () => {
+      throw new InvalidAnalysisWindowError(
+        "explicit analysis start must not be after analysis resolution",
+      );
+    }),
+    stdout: (value) => {
+      stdout += value;
+    },
+    stderr: (value) => {
+      stderr += value;
+    },
+  });
+
+  assert.equal(code, 2);
+  assert.equal(stdout, "");
+  assert.match(
+    stderr,
+    /explicit analysis start must not be after analysis resolution/u,
+  );
+  assert.match(stderr, /^Usage: ccprof/mu);
 });
 
 test("CLI maps no analyzable timestamps to exit 4 with empty stdout", async () => {

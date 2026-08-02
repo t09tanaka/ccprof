@@ -82,6 +82,7 @@ ccprof --pr 123 --md | gh pr comment 123 --body-file -
 ccprof
 ccprof --pr [<number|url|base...head>] [--json|--md]
        [--idle-threshold <duration>] [--test-map <path>]
+       [--since <RFC3339>] [--commit-lookback <duration>]
 ccprof stats [--json]
 ccprof dismiss <finding-key> [--reason <text>]
 ccprof hook-event [--notify]
@@ -105,10 +106,19 @@ There are three output formats.
 `--json` and `--md` cannot be combined. `--idle-threshold` accepts a bare number
 (minutes) or a duration suffixed with `s`, `m`, or `h`.
 
+`--since` sets an explicit analysis start and requires an RFC3339 date-time with
+an explicit timezone (`Z`/`z` or `±HH:MM`). Sub-millisecond fractional digits are
+truncated deterministically. Leap seconds and timestamps before the Unix epoch
+are unsupported. `--commit-lookback` extends the inferred earliest-commit
+boundary by a duration using the same `s`, `m`, or `h` syntax. Both options may
+be provided; `--since` takes precedence over `--commit-lookback`.
+
 ```sh
 ccprof --pr --idle-threshold 45m
 ccprof --pr main...feature --idle-threshold 2h --json
 ccprof --pr 123 --test-map /absolute/path/to/ccprof-test-map.json --json
+ccprof --pr --since 2026-08-03T09:00:00+09:00 --json
+ccprof --pr --commit-lookback=2h --json
 ```
 
 PR resolution order is: an explicit `base...head` / `base..head`, an explicit PR

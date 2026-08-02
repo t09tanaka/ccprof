@@ -59,6 +59,10 @@ test("README documents the complete direct CLI and analysis contract", async () 
     "ccprof dismiss <finding-key>",
     "--idle-threshold",
     "--test-map",
+    "--since",
+    "--commit-lookback",
+    "RFC3339",
+    "explicit timezone",
     "\"version\": 2",
     "unexplained_min",
     "finding_key",
@@ -82,6 +86,10 @@ test("README documents the complete direct CLI and analysis contract", async () 
   assert.match(readme, /14\s*days/iu);
   assert.match(readme, /2×/u);
   assert.match(readme, /Phase\s*1/u);
+  assert.match(
+    readme,
+    /--since.*takes precedence.*--commit-lookback/isu,
+  );
 });
 
 test("retro command fixes only this_pr findings and never creates issues automatically", async () => {
