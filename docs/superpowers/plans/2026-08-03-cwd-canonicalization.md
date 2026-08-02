@@ -462,7 +462,7 @@ Dispatch a fresh reviewer with the requirements and the full `origin/main...HEAD
 
 After spec approval, dispatch a separate reviewer. Require attention to path-containment checks, Git common-directory equality, deterministic ordering/deduplication, parser snapshot bounds, source warnings, and any accidental behavior broadening. Send actionable findings back to the implementer and repeat both review gates after fixes.
 
-- [ ] **Step 3: Delegate full local validation on Node 20**
+- [x] **Step 3: Delegate full local validation on Node 20**
 
 The validation subagent runs:
 
@@ -482,7 +482,7 @@ git diff -- package.json package-lock.json CHANGELOG.md
 
 Expected: typecheck/lint-equivalent checks pass, the full test suite is green, build and package smoke tests pass, whitespace is clean, no version/package/changelog diff exists, no more than 7 files changed, and added source/test lines do not exceed 295.
 
-- [ ] **Step 4: Run the repository's local GitHub Actions workflow before push**
+- [x] **Step 4: Run the repository's local GitHub Actions workflow before push**
 
 Use `/run-github-actions-locally` because this PR changes logic. Fix only failures caused by this diff, create new commits rather than amending, and repeat until the local CI-equivalent is green.
 
