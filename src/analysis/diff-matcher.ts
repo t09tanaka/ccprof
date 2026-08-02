@@ -120,7 +120,7 @@ const COORDINATION_TOOLS = new Set([
   ...DELEGATION_TOOLS,
   ...RESEARCH_TOOLS,
 ]);
-const MCP_TOOL_PREFIX = /^mcp__[^_]/u;
+const MCP_TOOL_PREFIX = /^mcp__./u;
 
 /**
  * Delegation tools may mutate the repository through a sub-agent, so their

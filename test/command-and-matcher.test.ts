@@ -1442,6 +1442,19 @@ test("classifies an unrecognized mcp__ tool as coordination by server prefix", (
   );
 });
 
+test("classifies an mcp__ tool whose server id starts with an underscore as coordination", () => {
+  const matched = matchTimelineActions(
+    [observe("mcp-underscore-server", 0, "mcp___hypothesi_tauri-mcp-server__driver_session")],
+    { diff: diff([]), testMap: explicitMap },
+  );
+  assert.equal(matched[0]?.match, "coordination");
+  assert.equal(matched[0]?.match_confidence, "low");
+  assert.match(
+    matched[0]?.caveats.join("\n") ?? "",
+    /MCP tool classified by server prefix/u,
+  );
+});
+
 test("keeps a non-MCP unknown tool unexplained even with an mcp-like name shape", () => {
   const matched = matchTimelineActions(
     [
