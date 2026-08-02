@@ -75,4 +75,7 @@ The earliest candidate is rejected when any discovered event has an earlier vali
 - [x] Run the full repository check and local GitHub Actions equivalent in an independent subagent.
 - [x] Confirm `git diff --check`, at most 4 changed files, and fewer than 300 added source/test lines.
 - [x] Confirm package/version files are unchanged.
-- [ ] Commit, push, create the PR, complete CI/review, and merge.
+- [x] Commit, push, create the PR, and complete the pre-merge CI/review gate.
+
+Merge and worktree cleanup follow only after this documentation commit also
+passes the required remote checks.
