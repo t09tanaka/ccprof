@@ -6,6 +6,7 @@ import {
 } from "node:path";
 
 import type {
+  CommandIdentity,
   Confidence,
   MatchedAction,
   TimelineAction,
@@ -21,6 +22,11 @@ import {
   classifyCommandResult,
   type CommandDescriptor,
 } from "./command.js";
+import {
+  buildCommandIdentity,
+  commandIdentityKey,
+  formatCommandIdentityTarget,
+} from "./command-identity.js";
 import {
   evaluateTestRelevance,
   hasMappedCommand,
@@ -271,6 +277,12 @@ export function matchTimelineActions(
       const descriptor = classifyCommand(
         observation.toolUse?.command ?? observation.action.command ?? "",
       );
+      const commandIdentity = buildCommandIdentity(
+        options.repoRoot,
+        observation.toolUse?.cwd ?? observation.action.cwd ?? observation.cwd,
+        descriptor,
+        RUN_TOOLS.has(toolName) ? "shell" : "native-tool",
+      );
       if (commandHasUnknownMutationScope(descriptor, options.testMap)) {
         readUncertaintyOrdinal += 1;
       }
@@ -283,6 +295,7 @@ export function matchTimelineActions(
           mutations,
           successfulRuns,
           options.testMap,
+          commandIdentity,
         ),
         toolClassifications,
       );
@@ -556,10 +569,13 @@ function matchRun(
   mutations: readonly MutationRecord[],
   successfulRuns: Map<string, SuccessfulRun[]>,
   testMap: TestMap,
+  commandIdentity: CommandIdentity | undefined,
 ): MatchedAction {
-  const target = descriptor.normalized === ""
+  const target = commandIdentity === undefined
+    ? descriptor.normalized === ""
     ? targetFor(observation, paths)
-    : descriptor.normalized;
+    : descriptor.normalized
+    : formatCommandIdentityTarget(commandIdentity, descriptor.normalized);
   if (
     descriptor.opaque ||
     (descriptor.family === "other" && !hasMappedCommand(descriptor, testMap))
@@ -573,6 +589,9 @@ function matchRun(
         ...descriptor.caveats,
         "Command is not a safely recognized test, build, or check invocation.",
       ]),
+      undefined,
+      [],
+      commandIdentity,
     );
   }
   if (
@@ -586,11 +605,19 @@ function matchRun(
       target,
       descriptor.caveats,
       descriptor.normalized,
+      [],
+      commandIdentity,
     );
   }
 
+  const identityCaveats = commandIdentity === undefined
+    ? ["Command identity is unavailable because repository-relative CWD evidence was missing or unsafe; successful-run reuse is disabled."]
+    : [];
+  const runKey = commandIdentity === undefined
+    ? undefined
+    : commandIdentityKey(commandIdentity);
   const previous = latestCompletedRun(
-    successfulRuns.get(descriptor.normalized) ?? [],
+    runKey === undefined ? [] : successfulRuns.get(runKey) ?? [],
     observation.action.interval.start_ms,
   );
   const previousSnapshotMs =
@@ -613,13 +640,17 @@ function matchRun(
   );
   const relevance = evaluateTestRelevance(descriptor, editedPaths, testMap);
   const commandResult = classifyRunResult(descriptor, observation.toolResult);
-  if (commandResult.status === "success" && commandResult.definite) {
-    const runs = successfulRuns.get(descriptor.normalized) ?? [];
+  if (
+    runKey !== undefined &&
+    commandResult.status === "success" &&
+    commandResult.definite
+  ) {
+    const runs = successfulRuns.get(runKey) ?? [];
     runs.push({
       snapshotAtMs: observation.action.interval.start_ms,
       completedAtMs: observation.action.interval.end_ms,
     });
-    successfulRuns.set(descriptor.normalized, runs);
+    successfulRuns.set(runKey, runs);
   }
 
   if (relevance.relevant === true) {
@@ -628,9 +659,10 @@ function matchRun(
       "contributing_run",
       lowerConfidence(observation.action.confidence, relevance.confidence),
       target,
-      [relevance.caveat],
+      [relevance.caveat, ...identityCaveats],
       descriptor.normalized,
       relevance.matchedPaths,
+      commandIdentity,
     );
   }
   if (relevance.relevant === false) {
@@ -648,9 +680,11 @@ function matchRun(
           ...(hasInterveningUnknownMutation
             ? ["An intervening action had unknown mutation scope, so irrelevance is not proven."]
             : []),
+          ...identityCaveats,
         ],
         descriptor.normalized,
         relevance.matchedPaths,
+        commandIdentity,
       );
     }
     if (descriptor.scope !== "targeted" && previous === undefined) {
@@ -662,9 +696,11 @@ function matchRun(
         [
           relevance.caveat,
           "No prior completed successful equivalent full-suite run was available.",
+          ...identityCaveats,
         ],
         descriptor.normalized,
         relevance.matchedPaths,
+        commandIdentity,
       );
     }
     return result(
@@ -672,9 +708,10 @@ function matchRun(
       "redundant_run",
       lowerConfidence(observation.action.confidence, relevance.confidence),
       target,
-      [relevance.caveat],
+      [relevance.caveat, ...identityCaveats],
       descriptor.normalized,
       relevance.matchedPaths,
+      commandIdentity,
     );
   }
   return result(
@@ -682,9 +719,14 @@ function matchRun(
     "unexplained",
     "low",
     target,
-    [relevance.caveat, "Command relevance could not be determined."],
+    [
+      relevance.caveat,
+      "Command relevance could not be determined.",
+      ...identityCaveats,
+    ],
     descriptor.normalized,
     relevance.matchedPaths,
+    commandIdentity,
   );
 }
 
@@ -980,9 +1022,18 @@ function inheritToolClassification(
     relevance_paths: [...source.relevance_paths],
     target: source.target,
     caveats: [...source.caveats],
+    ...(source.cwd === undefined ? {} : { cwd: source.cwd }),
     ...(source.normalized_command === undefined
       ? {}
       : { normalized_command: source.normalized_command }),
+    ...(source.command_identity === undefined
+      ? {}
+      : {
+          command_identity: {
+            ...source.command_identity,
+            normalized_argv: [...source.command_identity.normalized_argv],
+          },
+        }),
   };
 }
 
@@ -994,6 +1045,7 @@ function result(
   caveats: readonly string[],
   normalizedCommand?: string,
   relevancePaths: readonly string[] = [],
+  commandIdentity?: CommandIdentity,
 ): MatchedAction {
   return {
     ...action,
@@ -1005,6 +1057,9 @@ function result(
     ...(normalizedCommand === undefined
       ? {}
       : { normalized_command: normalizedCommand }),
+    ...(commandIdentity === undefined
+      ? {}
+      : { command_identity: commandIdentity }),
   };
 }
 

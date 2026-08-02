@@ -163,6 +163,26 @@ test("pairs a tool use with its matching result", () => {
   );
 });
 
+test("copies canonical tool CWD evidence into tool and causal inference actions", () => {
+  const timeline = buildTimeline([
+    session([
+      toolUse("run", 10, 0, "main", {
+        tool_name: "Bash",
+        command: "npm test",
+        cwd: "/repo/packages/api",
+      }),
+      toolResult("run", 20, 1),
+      assistant(30, 2),
+    ]),
+  ]);
+
+  const actions = timeline.actions.filter(({ tool_use_id }) => tool_use_id === "run");
+  assert.deepEqual(actions.map(({ kind, cwd }) => ({ kind, cwd })), [
+    { kind: "tool", cwd: "/repo/packages/api" },
+    { kind: "inference", cwd: "/repo/packages/api" },
+  ]);
+});
+
 test("keeps unmatched tool evidence without inventing elapsed time", () => {
   const timeline = buildTimeline([
     session([toolUse("missing", 0, 0), toolResult("orphan", 10, 1)]),

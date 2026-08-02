@@ -6,6 +6,7 @@ import {
   classifyCommandResult,
   normalizeCommand,
 } from "../src/analysis/command.js";
+import { buildCommandIdentity, commandIdentityKey, deriveRepoRelativeCwd, formatCommandIdentityTarget } from "../src/analysis/command-identity.js";
 import {
   discoverManifestTestMap,
   evaluateTestRelevance,
@@ -24,6 +25,7 @@ import type {
   FileDiffEvidence,
 } from "../src/git/diff.js";
 import type {
+  CommandIdentity,
   TimelineAction,
   ToolResultEvent,
   ToolUseEvent,
@@ -52,6 +54,52 @@ test("tokenizes conservatively and treats shell composition as opaque", () => {
   const quoted = classifyCommand("npm test -- 'test/a b.test.ts'");
   assert.equal(quoted.opaque, false);
   assert.deepEqual(quoted.pathTargets, ["test/a b.test.ts"]);
+});
+
+test("derives safe repository-relative CWDs for POSIX and Windows paths", () => {
+  assert.equal(deriveRepoRelativeCwd("/repo", "/repo"), ".");
+  assert.equal(deriveRepoRelativeCwd("/repo", "/repo/packages/api"), "packages/api");
+  assert.equal(deriveRepoRelativeCwd("/repo", "/repo/packages\\api"), "packages\\api");
+  assert.equal(deriveRepoRelativeCwd("C:\\repo", "C:/repo/packages/api"), "packages/api");
+  assert.equal(deriveRepoRelativeCwd("\\\\server\\share\\repo", "\\\\server\\share\\repo\\api"), "api");
+});
+
+test("rejects missing, relative, outside, different-drive, and mixed CWD evidence", () => {
+  const cases: [string | undefined, string | undefined][] = [
+    [undefined, "/repo"],
+    ["/repo", undefined],
+    ["repo", "/repo"],
+    ["/repo", "packages/api"],
+    ["/repo", "/repo-other"],
+    ["C:\\repo", "D:\\repo"],
+    ["/repo", "C:\\repo"],
+    ["C:\\repo", "/repo"],
+    ["\\\\server\\share\\repo", "\\\\other\\share\\repo"],
+  ];
+  for (const [repoRoot, cwd] of cases) assert.equal(deriveRepoRelativeCwd(repoRoot, cwd), undefined);
+});
+
+test("builds argv-aware identities and stable collision-resistant tuple keys", () => {
+  const descriptor = classifyCommand(`npm test -- '' "test/a b.test.ts"`);
+  const identity = buildCommandIdentity("/repo", "/repo/packages/api", descriptor);
+  assert.deepEqual(identity, {
+    repo_relative_cwd: "packages/api",
+    normalized_argv: ["npm", "test", "--", "", "test/a b.test.ts"],
+    executor: "shell",
+  });
+  assert.equal(
+    formatCommandIdentityTarget(identity!, descriptor.normalized),
+    `packages/api :: npm test -- "" "test/a b.test.ts"`,
+  );
+  assert.equal(formatCommandIdentityTarget({ ...identity!, repo_relative_cwd: "." }, "npm test"), ". :: npm test");
+  assert.equal(buildCommandIdentity("/repo", "/repo", classifyCommand("")), undefined);
+  assert.equal(buildCommandIdentity("/repo", "/repo", classifyCommand("npm test && touch x")), undefined);
+
+  const collisionA: CommandIdentity = { repo_relative_cwd: "a|b", normalized_argv: ["c", ""], executor: "shell" };
+  const collisionB: CommandIdentity = { repo_relative_cwd: "a", normalized_argv: ["b|c", ""], executor: "shell" };
+  assert.notEqual(commandIdentityKey(collisionA), commandIdentityKey(collisionB));
+  assert.notEqual(commandIdentityKey(collisionA), commandIdentityKey({ ...collisionA, executor: "native-tool" }));
+  assert.deepEqual(JSON.parse(commandIdentityKey(collisionA)), ["a|b", ["c", ""], "shell"]);
 });
 
 test("recognizes required test, build, and check command families", () => {
@@ -319,6 +367,7 @@ function observe(
       tool_use_id: id,
       tool_name: name,
       ...(options.command === undefined ? {} : { command: options.command }),
+      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     }),
     toolUse: use,
     toolResult: {
@@ -380,14 +429,15 @@ test("matches the first relevant full run and a repeated unchanged successful ru
       paths: ["src/widget.ts"],
       fragments: ["export const widget = true;"],
     }),
-    observe("run-1", 200, "Bash", { command: "npm test" }),
-    observe("run-2", 400, "Bash", { command: "npm   test" }),
+    observe("run-1", 200, "Bash", { command: "npm test", cwd: "/repo" }),
+    observe("run-2", 400, "Bash", { command: "npm   test", cwd: "/repo" }),
   ];
   const matched = matchTimelineActions(observations, {
     diff: diff([
       file("src/widget.ts", { addedLines: ["export const widget = true;"] }),
     ]),
     testMap: explicitMap,
+    repoRoot: "/repo",
   });
   assert.equal(matched[1]?.match, "contributing_run");
   assert.deepEqual(matched[0]?.relevance_paths, []);
@@ -398,16 +448,57 @@ test("matches the first relevant full run and a repeated unchanged successful ru
   assert.match(matched[2]?.caveats.join(" ") ?? "", /explicit/i);
 });
 
+test("scopes successful-run reuse by command identity CWD and executor", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("api-1", 0, "Bash", { command: "npm test", cwd: "/repo/packages/api" }),
+      observe("api-native", 200, "NativeCommand", { command: "npm test", cwd: "/repo/packages/api" }),
+      observe("web", 400, "Bash", { command: "npm test", cwd: "/repo/packages/web" }),
+      observe("api-2", 600, "Bash", { command: "npm test", cwd: "/repo/packages/api" }),
+    ],
+    { diff: diff([]), testMap: explicitMap, repoRoot: "/repo" },
+  );
+  assert.deepEqual(matched.map(({ match }) => match), [
+    "unexplained",
+    "unexplained",
+    "unexplained",
+    "redundant_run",
+  ]);
+  assert.deepEqual(matched.map(({ target }) => target), [
+    "packages/api :: npm test",
+    "packages/api :: npm test",
+    "packages/web :: npm test",
+    "packages/api :: npm test",
+  ]);
+  assert.deepEqual(matched.map(({ command_identity }) => command_identity?.executor), ["shell", "native-tool", "shell", "shell"]);
+  assert.equal(matched[3]?.normalized_command, "npm test");
+  assert.equal(matched[3]?.command_identity?.repo_relative_cwd, "packages/api");
+});
+
+test("never shares successful-run state between identity-less commands", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("missing", 0, "Bash", { command: "npm test" }),
+      observe("relative", 200, "Bash", { command: "npm test", cwd: "packages/api" }),
+    ],
+    { diff: diff([]), testMap: explicitMap, repoRoot: "/repo" },
+  );
+  assert.deepEqual(matched.map(({ match }) => match), ["unexplained", "unexplained"]);
+  assert.deepEqual(matched.map(({ command_identity }) => command_identity), [undefined, undefined]);
+  assert.ok(matched.every(({ caveats }) => /identity.*unavailable/i.test(caveats.join(" "))));
+});
+
 test("does not call a first or overlapping full-suite run redundant", () => {
   const matched = matchTimelineActions(
     [
-      observe("run-1", 0, "Bash", { command: "npm test" }),
-      observe("run-overlap", 50, "Bash", { command: "npm test" }),
-      observe("run-after", 200, "Bash", { command: "npm test" }),
+      observe("run-1", 0, "Bash", { command: "npm test", cwd: "/repo" }),
+      observe("run-overlap", 50, "Bash", { command: "npm test", cwd: "/repo" }),
+      observe("run-after", 200, "Bash", { command: "npm test", cwd: "/repo" }),
     ],
     {
       diff: diff([]),
       testMap: explicitMap,
+      repoRoot: "/repo",
     },
   );
   assert.deepEqual(matched.map((entry) => entry.match), [
@@ -485,7 +576,10 @@ test("does not let an overlapping opaque mutation enter a successful run snapsho
 });
 
 test("inherits a tool classification for its causal inference without creating a duplicate run", () => {
-  const run = observe("run-1", 200, "Bash", { command: "npm test" });
+  const run = observe("run-1", 200, "Bash", {
+    command: "npm test",
+    cwd: "/repo/packages/api",
+  });
   const inference: ActionObservation = {
     action: action("inference", 310, {
       kind: "inference",
@@ -493,6 +587,7 @@ test("inherits a tool classification for its causal inference without creating a
       tool_use_id: "run-1",
       tool_name: "Bash",
       command: "npm test",
+      cwd: "/repo/packages/api",
     }),
     ...(run.toolUse === undefined ? {} : { toolUse: run.toolUse }),
     ...(run.toolResult === undefined ? {} : { toolResult: run.toolResult }),
@@ -505,13 +600,14 @@ test("inherits a tool classification for its causal inference without creating a
       }),
       run,
       inference,
-      observe("run-2", 500, "Bash", { command: "npm test" }),
+      observe("run-2", 500, "Bash", { command: "npm test", cwd: "/repo/packages/api" }),
     ],
     {
       diff: diff([
         file("src/widget.ts", { addedLines: ["export const widget = true;"] }),
       ]),
       testMap: explicitMap,
+      repoRoot: "/repo",
     },
   );
   assert.deepEqual(matched.map((entry) => entry.match), [
@@ -522,6 +618,10 @@ test("inherits a tool classification for its causal inference without creating a
   ]);
   assert.deepEqual(matched[1]?.relevance_paths, ["src/widget.ts"]);
   assert.deepEqual(matched[2]?.relevance_paths, ["src/widget.ts"]);
+  assert.equal(matched[2]?.cwd, "/repo/packages/api");
+  assert.deepEqual(matched[2]?.command_identity, matched[1]?.command_identity);
+  assert.equal(matched[2]?.target, "packages/api :: npm test");
+  assert.equal(matched[2]?.normalized_command, "npm test");
 });
 
 test("does not leak inherited tool evidence across session, agent, or tool identities", () => {
@@ -1469,24 +1569,30 @@ test("keeps a non-MCP unknown tool unexplained even with an mcp-like name shape"
   ]);
 });
 
-test("classifies single vcs and inspect commands as coordination but keeps unknown composition opaque", () => {
+test("classifies known commands and retains identity only for safe nonopaque commands", () => {
   const matched = matchTimelineActions(
     [
       observe("git", 0, "Bash", { command: "git status" }),
       observe("ls", 200, "Bash", { command: "ls -la" }),
-      observe("mix", 400, "Bash", { command: "git status && unknown-tool" }),
+      observe("mix", 400, "Bash", { command: "git status && unknown-tool", cwd: "/repo" }),
+      observe("other", 600, "NativeCommand", { command: "python script.py", cwd: "/repo" }),
     ],
-    { diff: diff([]), testMap: explicitMap },
+    { diff: diff([]), testMap: explicitMap, repoRoot: "/repo" },
   );
   assert.deepEqual(matched.map((entry) => entry.match), [
     "coordination",
     "coordination",
+    "unexplained",
     "unexplained",
   ]);
   assert.equal(matched[0]?.match_confidence, "high");
   assert.equal(matched[0]?.normalized_command, "git status");
   assert.equal(matched[1]?.normalized_command, "ls -la");
   assert.equal(matched[2]?.normalized_command, undefined);
+  assert.equal(matched[2]?.command_identity, undefined);
+  assert.equal(matched[3]?.normalized_command, undefined);
+  assert.equal(matched[3]?.command_identity?.executor, "native-tool");
+  assert.deepEqual(matched.slice(2).map(({ target }) => target), ['git status "&&" unknown-tool', ". :: python script.py"]);
 });
 
 test("classifies composite test runs so repeats become redundant", () => {
@@ -1496,14 +1602,15 @@ test("classifies composite test runs so repeats become redundant", () => {
         paths: ["src/widget.ts"],
         fragments: ["export const widget = true;"],
       }),
-      observe("run-1", 200, "Bash", { command: "cd backend && npm test" }),
-      observe("run-2", 400, "Bash", { command: "cd backend  &&  npm test" }),
+      observe("run-1", 200, "Bash", { command: "cd backend && npm test", cwd: "/repo" }),
+      observe("run-2", 400, "Bash", { command: "cd backend  &&  npm test", cwd: "/repo" }),
     ],
     {
       diff: diff([
         file("src/widget.ts", { addedLines: ["export const widget = true;"] }),
       ]),
       testMap: explicitMap,
+      repoRoot: "/repo",
     },
   );
   assert.deepEqual(matched.map((entry) => entry.match), [
@@ -1572,15 +1679,16 @@ test("a composite vcs mutation between runs still blocks redundancy", () => {
         paths: ["src/widget.ts"],
         fragments: ["export const widget = true;"],
       }),
-      observe("run-1", 200, "Bash", { command: "npm test" }),
+      observe("run-1", 200, "Bash", { command: "npm test", cwd: "/repo" }),
       observe("pull", 400, "Bash", { command: "git fetch && git merge" }),
-      observe("run-2", 600, "Bash", { command: "npm test" }),
+      observe("run-2", 600, "Bash", { command: "npm test", cwd: "/repo" }),
     ],
     {
       diff: diff([
         file("src/widget.ts", { addedLines: ["export const widget = true;"] }),
       ]),
       testMap: explicitMap,
+      repoRoot: "/repo",
     },
   );
   assert.equal(matched[2]?.match, "coordination");
@@ -1662,15 +1770,16 @@ test("a vcs command between runs still blocks redundancy conservatively", () => 
         paths: ["src/widget.ts"],
         fragments: ["export const widget = true;"],
       }),
-      observe("run-1", 200, "Bash", { command: "npm test" }),
+      observe("run-1", 200, "Bash", { command: "npm test", cwd: "/repo" }),
       observe("checkout", 400, "Bash", { command: "git checkout main" }),
-      observe("run-2", 600, "Bash", { command: "npm test" }),
+      observe("run-2", 600, "Bash", { command: "npm test", cwd: "/repo" }),
     ],
     {
       diff: diff([
         file("src/widget.ts", { addedLines: ["export const widget = true;"] }),
       ]),
       testMap: explicitMap,
+      repoRoot: "/repo",
     },
   );
   assert.equal(matched[1]?.match, "contributing_run");
