@@ -1106,7 +1106,100 @@ test("events carry the git branch recorded on their row", async () => {
     const session = await parseClaudeSession(path);
     assert.ok(session);
     assert.equal(session.events[0]?.branch, "feature/a");
-    assert.equal(session.events[1]?.branch, undefined);
+    // Branchless rows inherit the effective branch in file order.
+    assert.equal(session.events[1]?.branch, "feature/a");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("branchless events inherit the branch of non-event rows in row order", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ccprof-branch-effective-"));
+  try {
+    const path = join(directory, "effective.jsonl");
+    const rows = [
+      {
+        sessionId: "effective",
+        type: "user",
+        uuid: "u1",
+        timestamp: "2026-07-31T03:00:00.000Z",
+        cwd: "/repo",
+        gitBranch: "feature/a",
+        message: { role: "user", content: "on a" },
+      },
+      {
+        // Emits no normalized event but still advances the effective branch.
+        sessionId: "effective",
+        type: "system",
+        subtype: "api_error",
+        uuid: "sys1",
+        timestamp: "2026-07-31T03:00:30.000Z",
+        cwd: "/repo",
+        gitBranch: "feature/b",
+      },
+      {
+        sessionId: "effective",
+        type: "user",
+        uuid: "u2",
+        timestamp: "2026-07-31T03:01:00.000Z",
+        cwd: "/repo",
+        message: { role: "user", content: "after system row" },
+      },
+      {
+        // A leading-branch check: rows before the first branch row adopt it.
+        sessionId: "effective",
+        type: "user",
+        uuid: "u3",
+        timestamp: "2026-07-31T03:02:00.000Z",
+        cwd: "/repo",
+        gitBranch: "feature/c",
+        message: { role: "user", content: "on c" },
+      },
+    ];
+    await writeFile(path, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+
+    const session = await parseClaudeSession(path);
+    assert.ok(session);
+    const byUuid = new Map(
+      session.events.map((event) => [event.entry_uuid, event.branch]),
+    );
+    assert.equal(byUuid.get("u1"), "feature/a");
+    assert.equal(byUuid.get("u2"), "feature/b");
+    assert.equal(byUuid.get("u3"), "feature/c");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a branchless prefix adopts the first branch observed in the file", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ccprof-branch-prefix-"));
+  try {
+    const path = join(directory, "prefix.jsonl");
+    const rows = [
+      {
+        sessionId: "prefix",
+        type: "user",
+        uuid: "p1",
+        timestamp: "2026-07-31T03:00:00.000Z",
+        cwd: "/repo",
+        message: { role: "user", content: "before branch metadata" },
+      },
+      {
+        sessionId: "prefix",
+        type: "user",
+        uuid: "p2",
+        timestamp: "2026-07-31T03:01:00.000Z",
+        cwd: "/repo",
+        gitBranch: "feature/x",
+        message: { role: "user", content: "on x" },
+      },
+    ];
+    await writeFile(path, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+
+    const session = await parseClaudeSession(path);
+    assert.ok(session);
+    assert.equal(session.events[0]?.branch, "feature/x");
+    assert.equal(session.events[1]?.branch, "feature/x");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

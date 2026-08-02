@@ -183,46 +183,53 @@ function branchScopedWarning(session: Session): SourceWarning {
 
 /**
  * Restricts a session that observed several branches to the events recorded
- * on the queried head branch. Events without branch metadata inherit the
- * closest preceding branch-carrying event (or the first branch seen, for a
- * branchless prefix). Sessions whose events carry no branch metadata at all
- * are kept unchanged, conservatively.
+ * on the queried head branch (the parser already stamps every event with its
+ * effective branch). Contiguous head-branch runs become separate segment
+ * sessions so the timeline never bridges the removed other-branch spans into
+ * inference or human-wait time. Sessions whose events carry no branch
+ * metadata at all are kept unchanged, conservatively.
  */
 function scopeSessionToHeadBranch(
   session: Session,
   headBranch: string,
-): Session | null {
-  const firstBranch = session.events.find(
-    (event) => event.branch !== undefined,
-  )?.branch;
-  if (firstBranch === undefined) {
-    return session;
+): Session[] {
+  if (session.events.some((event) => event.branch === undefined)) {
+    return [session];
   }
-  let lastBranch: string | undefined;
-  const events = session.events.filter((event) => {
-    const effective = event.branch ?? lastBranch ?? firstBranch;
-    if (event.branch !== undefined) {
-      lastBranch = event.branch;
+  const segments: Session["events"][] = [];
+  let current: Session["events"] = [];
+  for (const event of session.events) {
+    if (event.branch === headBranch) {
+      current.push(event);
+    } else if (current.length > 0) {
+      segments.push(current);
+      current = [];
     }
-    return effective === headBranch;
+  }
+  if (current.length > 0) segments.push(current);
+  if (segments.length === 0) return [];
+  if (segments[0]?.length === session.events.length) {
+    return [session];
+  }
+  return segments.map((events, index) => {
+    const timestamps = events.map((event) => event.timestamp_ms);
+    const segment: Session = {
+      ...session,
+      // The timeline builds per-(source_path, session_id, agent_id) interval
+      // lanes, so segments need distinct source identities to stay disjoint.
+      source_path: `${session.source_path}#branch-segment-${index.toString(10)}`,
+      events: [...events],
+      started_at_ms: Math.min(...timestamps),
+      ended_at_ms: Math.max(...timestamps),
+      warnings: [...session.warnings],
+    };
+    return index === 0
+      ? {
+          ...segment,
+          warnings: [...segment.warnings, branchScopedWarning(session)],
+        }
+      : segment;
   });
-  if (events.length === 0) {
-    return null;
-  }
-  if (events.length === session.events.length) {
-    return session;
-  }
-  const timestamps = events.map((event) => event.timestamp_ms);
-  const scoped: Session = {
-    ...session,
-    events,
-    started_at_ms: Math.min(...timestamps),
-    ended_at_ms: Math.max(...timestamps),
-  };
-  return {
-    ...scoped,
-    warnings: [...scoped.warnings, branchScopedWarning(scoped)],
-  };
 }
 
 function missingBranchWarning(session: Session): SourceWarning {
@@ -429,7 +436,7 @@ export async function discoverClaudeSessions(
       );
     }
     for (const rawSession of parsed.sessions) {
-      let session = await canonicalizeSession(rawSession);
+      const session = await canonicalizeSession(rawSession);
       if (!intersects(session, query)) {
         continue;
       }
@@ -446,39 +453,45 @@ export async function discoverClaudeSessions(
       ) {
         continue;
       }
+      let segments: Session[] = [session];
       if (
         hasBranch &&
         session.observed_branches.some(
           (branch) => branch !== query.headBranch,
         )
       ) {
-        const scoped = scopeSessionToHeadBranch(session, query.headBranch);
-        if (scoped === null || !intersects(scoped, query)) {
+        segments = scopeSessionToHeadBranch(session, query.headBranch)
+          .filter((segment) => intersects(segment, query));
+        if (segments.length === 0) {
           continue;
         }
-        session = scoped;
       }
-      const alignedSession = await alignSessionCwdsToRepository(
-        session,
-        repoRoot,
-      );
-
-      const key = `${session.session_id}\u0000${session.source_path}`;
-      if (seen.has(key)) {
-        continue;
-      }
-      seen.add(key);
-      if (hasBranch) {
-        sessions.push(alignedSession);
-      } else {
-        sessions.push({
-          ...alignedSession,
-          confidence: lowerConfidence(alignedSession.confidence),
-          warnings: [
-            ...alignedSession.warnings,
-            missingBranchWarning(alignedSession),
-          ],
-        });
+      for (const [segmentIndex, segment] of segments.entries()) {
+        const key = [
+          session.session_id,
+          session.source_path,
+          segmentIndex.toString(10),
+        ].join("\u0000");
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        const alignedSession = await alignSessionCwdsToRepository(
+          segment,
+          repoRoot,
+        );
+        if (hasBranch) {
+          sessions.push(alignedSession);
+        } else {
+          sessions.push({
+            ...alignedSession,
+            confidence: lowerConfidence(alignedSession.confidence),
+            warnings: [
+              ...alignedSession.warnings,
+              missingBranchWarning(alignedSession),
+            ],
+          });
+        }
       }
     }
   }

@@ -1284,6 +1284,24 @@ function compactionEvent(
   };
 }
 
+/**
+ * Stamps every row with the effective branch in file order: the last
+ * observed non-empty gitBranch, with rows before the first branch-carrying
+ * row adopting that first branch. Rows that emit no events (system rows,
+ * meta users) still advance the effective branch for later rows.
+ */
+function stampEffectiveBranches(sessionRows: ParsedRow[]): void {
+  let effective = sessionRows.find((row) => row.branch !== undefined)?.branch;
+  if (effective === undefined) return;
+  for (const row of sessionRows) {
+    if (row.branch !== undefined) {
+      effective = row.branch;
+    } else {
+      row.branch = effective;
+    }
+  }
+}
+
 function normalizeSession(
   sourcePath: string,
   sessionRows: ParsedRow[],
@@ -1294,6 +1312,7 @@ function normalizeSession(
   if (first === undefined) {
     return undefined;
   }
+  stampEffectiveBranches(sessionRows);
   const sessionId = first.sessionId;
   const rowsByUuid = new Map<string, ParsedRow[]>();
   for (const row of sessionRows) {

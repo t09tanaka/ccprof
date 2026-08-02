@@ -665,3 +665,92 @@ test("keeps single-branch and branchless sessions unchanged", async (t) => {
     ["n-1"],
   );
 });
+
+test("splits head-other-head sessions into separate segments", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-branch-split-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+
+  const projects = join(root, "projects");
+  const repo = join(root, "repo");
+  await Promise.all([
+    mkdir(projects, { recursive: true }),
+    mkdir(repo, { recursive: true }),
+  ]);
+  await writeFile(
+    join(projects, "split.jsonl"),
+    `${[
+      multiBranchRow({
+        sessionId: "split",
+        uuid: "h-1",
+        at: "2026-07-31T03:00:00.000Z",
+        cwd: repo,
+        branch: "feature/head",
+      }),
+      multiBranchRow({
+        sessionId: "split",
+        uuid: "h-2",
+        at: "2026-07-31T03:01:00.000Z",
+        cwd: repo,
+      }),
+      multiBranchRow({
+        sessionId: "split",
+        uuid: "o-1",
+        at: "2026-07-31T03:10:00.000Z",
+        cwd: repo,
+        branch: "feature/other",
+      }),
+      multiBranchRow({
+        sessionId: "split",
+        uuid: "o-2",
+        at: "2026-07-31T03:20:00.000Z",
+        cwd: repo,
+      }),
+      multiBranchRow({
+        sessionId: "split",
+        uuid: "h-3",
+        at: "2026-07-31T03:30:00.000Z",
+        cwd: repo,
+        branch: "feature/head",
+      }),
+      multiBranchRow({
+        sessionId: "split",
+        uuid: "h-4",
+        at: "2026-07-31T03:31:00.000Z",
+        cwd: repo,
+      }),
+    ].join("\n")}\n`,
+  );
+
+  const sessions = await discoverClaudeSessions(projects, {
+    repoRoot: repo,
+    headBranch: "feature/head",
+    startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+  });
+
+  assert.equal(sessions.length, 2);
+  assert.deepEqual(
+    sessions.map((session) => session.session_id),
+    ["split", "split"],
+  );
+  assert.deepEqual(
+    sessions.map((session) => session.events.map((event) => event.entry_uuid)),
+    [["h-1", "h-2"], ["h-3", "h-4"]],
+  );
+  assert.deepEqual(
+    sessions.map((session) => [session.started_at_ms, session.ended_at_ms]),
+    [
+      [
+        Date.parse("2026-07-31T03:00:00.000Z"),
+        Date.parse("2026-07-31T03:01:00.000Z"),
+      ],
+      [
+        Date.parse("2026-07-31T03:30:00.000Z"),
+        Date.parse("2026-07-31T03:31:00.000Z"),
+      ],
+    ],
+  );
+  // Segments must not collapse into one timeline lane, so their source
+  // identities must differ.
+  assert.notEqual(sessions[0]?.source_path, sessions[1]?.source_path);
+});

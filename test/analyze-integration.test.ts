@@ -820,3 +820,57 @@ test("a multi-branch session only counts head-branch work and avoids false rewor
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("time between head-branch segments is not counted as the current PR", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-branch-gap-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const projects = join(root, "claude-projects");
+    const row = (
+      uuid: string,
+      at: string,
+      branch: string | undefined,
+      text: string,
+    ): string =>
+      JSON.stringify({
+        sessionId: "segmented",
+        cwd: repo,
+        type: "user",
+        uuid,
+        timestamp: at,
+        ...(branch === undefined ? {} : { gitBranch: branch }),
+        message: { role: "user", content: text },
+      });
+    const rows = [
+      row("h-1", "2026-01-01T00:05:00.000Z", "feature", "head work"),
+      row("h-2", "2026-01-01T00:05:30.000Z", undefined, "still head"),
+      row("o-1", "2026-01-01T00:06:00.000Z", "feature/other", "other pr"),
+      row("o-2", "2026-01-01T00:07:00.000Z", undefined, "still other"),
+      row("h-3", "2026-01-01T00:08:00.000Z", "feature", "back on head"),
+      row("h-4", "2026-01-01T00:08:20.000Z", undefined, "finishing"),
+    ];
+    await write(
+      join(projects, "fixture", "segmented.jsonl"),
+      `${rows.join("\n")}\n`,
+    );
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      sessionSource: new ClaudeSessionSource(projects),
+    });
+
+    assert.deepEqual(result.report.unit.sessions, ["segmented"]);
+    // 30s in the first head segment plus 20s in the second; the other-branch
+    // interlude (00:05:30 -> 00:08:00) must not bridge into measured time.
+    assert.equal(result.ledger.totals_ms.raw_observed, 50_000);
+    assert.equal(result.ledger.totals_ms.measured, 50_000);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
