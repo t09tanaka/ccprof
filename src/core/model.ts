@@ -285,12 +285,24 @@ export interface AnalysisUnit {
   sessions: string[];
 }
 
+export interface SkippedRule {
+  rule_id: RuleId;
+  missing: SessionCapability[];
+}
+
 export interface ReportV2 {
   version: 2;
   unit: AnalysisUnit;
   summary: AnalysisSummary;
   findings: Finding[];
   caveats: string[];
+  /**
+   * Rules that were not evaluated because at least one session in this
+   * analysis lacks a capability the rule structurally depends on (see
+   * `src/rules/capabilities.ts`). Additive and omitted entirely when empty,
+   * so existing full-capability (Claude-only) reports are byte-identical.
+   */
+  skipped_rules?: SkippedRule[];
 }
 
 export function makeSessionRef(

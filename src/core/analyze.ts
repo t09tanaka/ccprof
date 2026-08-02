@@ -17,6 +17,7 @@ import type {
   NormalizedEvent,
   ReportV2,
   Session,
+  SkippedRule,
   SourceWarning,
   ToolResultEvent,
   ToolUseEvent,
@@ -53,6 +54,7 @@ import {
   resolvePrContext,
   type PrContext,
 } from "../git/pr-context.js";
+import { ruleApplicability } from "../rules/capabilities.js";
 import { detectChronicCost } from "../rules/chronic-cost.js";
 import { detectContextBloat } from "../rules/context-bloat.js";
 import {
@@ -203,6 +205,31 @@ function textWarning(
   message: string,
 ): AnalyzeWarning {
   return { code, message };
+}
+
+/**
+ * Rules a session's declared capabilities cannot support, derived from
+ * `ruleApplicability`. Sorted by rule_id and omitted entirely (empty array)
+ * when every session has full capabilities, so a Claude-only analysis is
+ * unaffected.
+ */
+function skippedRules(sessions: readonly Session[]): SkippedRule[] {
+  return ruleApplicability(sessions)
+    .filter((entry) => !entry.applicable)
+    .map((entry): SkippedRule => ({
+      rule_id: entry.rule_id,
+      missing: entry.missing,
+    }))
+    .sort((left, right) => left.rule_id.localeCompare(right.rule_id));
+}
+
+function skippedRuleWarning(skipped: SkippedRule): AnalyzeWarning {
+  return textWarning(
+    "rule_skipped_missing_capability",
+    `${skipped.rule_id} skipped: session source lacks ${
+      skipped.missing.join(", ")
+    }`,
+  );
 }
 
 function warningCaveat(warning: AnalyzeWarning): string {
@@ -753,6 +780,9 @@ export async function analyze(
     ...sessions.flatMap((session) => session.warnings.map(sourceWarning)),
   );
 
+  const inapplicableRules = skippedRules(sessions);
+  warnings.push(...inapplicableRules.map(skippedRuleWarning));
+
   const timeline = buildTimeline(sessions, {
     ...(options.idleThresholdMs === undefined
       ? {}
@@ -825,6 +855,9 @@ export async function analyze(
     },
   );
   const reads = await readObservations(matched, context, options.runner, warnings);
+  const inapplicableRuleIds = new Set(
+    inapplicableRules.map((skipped) => skipped.rule_id),
+  );
   const candidates = ruleCandidates(
     matched,
     timeline,
@@ -834,7 +867,7 @@ export async function analyze(
     reads.eligibleReadKeys,
     testMap,
     options.externalToolNames,
-  );
+  ).filter((candidate) => !inapplicableRuleIds.has(candidate.rule_id));
   const unit = {
     repo: context.repoRoot,
     pr_ref: context.prRef,
@@ -898,6 +931,9 @@ export async function analyze(
       .sort(findingOrder)
       .slice(0, 3),
     caveats,
+    ...(inapplicableRules.length === 0
+      ? {}
+      : { skipped_rules: inapplicableRules }),
   };
   return {
     report,

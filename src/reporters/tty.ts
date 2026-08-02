@@ -53,6 +53,15 @@ function recipeLine(finding: Finding): string {
   return `   Fix: ${plainLine(finding.fix_recipe.suggestion)} Verify: ${plainLine(finding.fix_recipe.verify)}`;
 }
 
+export function skippedRulesLine(report: ReportV2): string | null {
+  const skipped = report.skipped_rules ?? [];
+  if (skipped.length === 0) return null;
+  const detail = skipped
+    .map((entry) => `${entry.rule_id} (${entry.missing.join(", ")})`)
+    .join(", ");
+  return `Skipped rules (source lacks required data): ${detail}`;
+}
+
 function caveatLines(report: ReportV2): string[] {
   const caveats = [
     ...report.caveats,
@@ -92,6 +101,10 @@ export function renderTtyReport(
     lines.push(
       `Baseline: ${baseline.prs} prior analyses; ${baseline.notable.length} comparable metrics.`,
     );
+  }
+  const skippedLine = skippedRulesLine(report);
+  if (skippedLine !== null) {
+    lines.push(skippedLine);
   }
   const caveats = caveatLines(report);
   if (caveats.length > 0) {

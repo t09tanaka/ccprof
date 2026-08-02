@@ -19,6 +19,14 @@ function reportForDisplay(report: ReportV2): ReportV2 {
     },
     findings: report.findings.slice(0, 3),
     caveats: [...report.caveats],
+    ...(report.skipped_rules === undefined
+      ? {}
+      : {
+        skipped_rules: report.skipped_rules.map((skipped) => ({
+          rule_id: skipped.rule_id,
+          missing: [...skipped.missing],
+        })),
+      }),
   };
 }
 

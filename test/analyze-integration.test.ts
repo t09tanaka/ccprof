@@ -1238,3 +1238,99 @@ test("continues analysis with a session_source_error warning when sessions were 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("skips rules whose required capability is missing from a mixed Codex+Claude session set", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-skipped-rules-"));
+  try {
+    const repo = await makeRepository(root);
+    const claudeProjects = await makeClaudeProjects(root, repo);
+    const codexSessions = await makeCodexSessions(root, repo, "feature");
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      claudeProjectsDirectory: claudeProjects,
+      codexSessionsDirectory: codexSessions,
+    });
+
+    // Sanity check: both sources actually contributed a session, so the
+    // capability mix (full Claude session + tool_timestamps-only Codex
+    // session) is really in play below.
+    assert.deepEqual(result.report.unit.sessions, [
+      "codex-integration",
+      "e2e-session",
+    ]);
+
+    assert.ok(
+      !result.allFindings.some(({ rule_id }) => rule_id === "R001"),
+      "R001 requires edit_fragments, which the Codex session lacks",
+    );
+    assert.ok(
+      !result.allFindings.some(({ rule_id }) => rule_id === "R007"),
+      "R007 requires token_usage, which the Codex session lacks",
+    );
+    // R005 requires only tool_timestamps, which the Codex session does
+    // declare, so mixing in a Codex session must not skip it.
+    assert.ok(
+      result.report.skipped_rules?.every(
+        (entry) => entry.rule_id !== "R005",
+      ) ?? true,
+    );
+
+    assert.deepEqual(result.report.skipped_rules, [
+      { rule_id: "R001", missing: ["edit_fragments"] },
+      { rule_id: "R007", missing: ["token_usage"] },
+    ]);
+
+    const skipWarnings = result.warnings.filter(
+      (warning) => warning.code === "rule_skipped_missing_capability",
+    );
+    assert.deepEqual(
+      skipWarnings.map((warning) => warning.message).sort(),
+      [
+        "R001 skipped: session source lacks edit_fragments",
+        "R007 skipped: session source lacks token_usage",
+      ],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("full-capability (Claude-only) analyses omit skipped_rules and emit no capability-skip warnings", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-no-skipped-rules-"));
+  try {
+    const repo = await makeRepository(root);
+    const projects = await makeClaudeProjects(root, repo);
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      sessionSource: new ClaudeSessionSource(projects),
+      storePaths,
+    });
+
+    assert.equal(result.report.skipped_rules, undefined);
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(result.report, "skipped_rules"),
+      "skipped_rules must be entirely omitted, not present-but-empty",
+    );
+    assert.deepEqual(
+      result.warnings.filter(
+        (warning) => warning.code === "rule_skipped_missing_capability",
+      ),
+      [],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
