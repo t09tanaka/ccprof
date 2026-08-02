@@ -204,26 +204,29 @@ function rawIntervalsByAgent(
  * what keeps the plain (unverified) "session end adds no tail" behavior
  * exactly as it was.
  *
- * Known limitation (accepted, not fixed here): hook rows are keyed only by
- * `session_id`, so a session_id collision across sources/harnesses (e.g.
- * Claude Code and Codex independently reusing the same id) would extend
- * both sessions' tails from the same Stop row.
+ * Verified tails are limited to Claude lanes with exactly one distinct
+ * non-sidechain agent. Sidechain events never select the tail's start.
  */
 function verifiedTailActions(
   sessions: readonly Session[],
   events: readonly OrderedEvent[],
   idleThresholdMs: number,
 ): InternalAction[] {
-  const lastEventByLaneKey = new Map<string, OrderedEvent>();
+  const mainAgentsByLaneKey = new Map<string, Set<string>>();
+  const lastMainEventByLaneKey = new Map<string, OrderedEvent>();
   for (const ordered of events) {
-    const current = lastEventByLaneKey.get(ordered.laneKey);
+    if (ordered.event.is_sidechain) continue;
+    const agents = mainAgentsByLaneKey.get(ordered.laneKey) ?? new Set<string>();
+    agents.add(ordered.event.agent_id);
+    mainAgentsByLaneKey.set(ordered.laneKey, agents);
+    const current = lastMainEventByLaneKey.get(ordered.laneKey);
     if (
       current === undefined ||
       ordered.event.timestamp_ms > current.event.timestamp_ms ||
       (ordered.event.timestamp_ms === current.event.timestamp_ms &&
         ordered.inputIndex > current.inputIndex)
     ) {
-      lastEventByLaneKey.set(ordered.laneKey, ordered);
+      lastMainEventByLaneKey.set(ordered.laneKey, ordered);
     }
   }
 
@@ -231,12 +234,14 @@ function verifiedTailActions(
   for (const session of sessions) {
     const verifiedEndedAtMs = session.verified_ended_at_ms;
     if (
+      session.source !== "claude" ||
       verifiedEndedAtMs === undefined || !Number.isFinite(verifiedEndedAtMs)
     ) {
       continue;
     }
     const laneKey = [session.source_path, session.session_id].join("\0");
-    const last = lastEventByLaneKey.get(laneKey);
+    if (mainAgentsByLaneKey.get(laneKey)?.size !== 1) continue;
+    const last = lastMainEventByLaneKey.get(laneKey);
     if (last === undefined || verifiedEndedAtMs <= last.event.timestamp_ms) {
       continue;
     }

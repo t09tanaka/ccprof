@@ -10,11 +10,25 @@ import {
   loadHookEvents,
   type HookEventRow,
 } from "../src/analysis/hook-events.js";
-import type { Session } from "../src/core/model.js";
+import type { AssistantEvent, Session } from "../src/core/model.js";
 
 async function write(path: string, content: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, content, "utf8");
+}
+
+function assistantEvent(
+  sessionId: string,
+  timestampMs: number,
+  agentId = "main",
+  isSidechain = false,
+): AssistantEvent {
+  return {
+    kind: "assistant", timestamp_ms: timestampMs, session_id: sessionId,
+    entry_uuid: `${agentId}-${timestampMs}`, session_ref: `${sessionId}#${agentId}`,
+    source_index: 0, agent_id: agentId, is_sidechain: isSidechain,
+    confidence: "high", text: "done",
+  };
 }
 
 function makeSession(
@@ -31,7 +45,7 @@ function makeSession(
     started_at_ms: endedAtMs - 60_000,
     ended_at_ms: endedAtMs,
     confidence: "high",
-    events: [],
+    events: [assistantEvent(sessionId, endedAtMs)],
     warnings: [],
     ...overrides,
   };
@@ -125,6 +139,38 @@ test("applyHookEvents does not mutate the input session or rows", () => {
   applyHookEvents([session], rows);
   assert.deepEqual(session, frozenSession);
   assert.deepEqual(rows, frozenRows);
+});
+
+test("applyHookEvents requires one unique eligible Claude main lane", () => {
+  const end = 1_000_000;
+  const eligible = makeSession("eligible", end);
+  const codex = makeSession("codex", end, { source: "codex" });
+  const collisionClaude = makeSession("collision", end);
+  const collisionCodex = makeSession("collision", end, {
+    source: "codex", source_path: "/tmp/collision-codex.jsonl",
+  });
+  const segmentA = makeSession("segmented", end, { source_path: "/tmp/a.jsonl" });
+  const segmentB = makeSession("segmented", end, { source_path: "/tmp/b.jsonl" });
+  const multiBranch = makeSession("branches", end, {
+    observed_branches: ["feature", "other"],
+  });
+  const sidechainOnly = makeSession("sidechain", end, {
+    events: [assistantEvent("sidechain", end, "side", true)],
+  });
+  const multiMain = makeSession("multi-main", end, { events: [
+    assistantEvent("multi-main", end - 1, "main-a"),
+    assistantEvent("multi-main", end, "main-b"),
+  ] });
+  const sessions = [eligible, codex, collisionClaude, collisionCodex,
+    segmentA, segmentB, multiBranch, sidechainOnly, multiMain];
+  const rows = [...new Set(sessions.map(({ session_id }) => session_id))]
+    .map((sessionId) => stopRow(sessionId, end + 500));
+
+  const results = applyHookEvents(sessions, rows);
+  assert.equal(results[0]?.verified_ended_at_ms, end + 500);
+  for (let index = 1; index < sessions.length; index += 1) {
+    assert.equal(results[index], sessions[index]);
+  }
 });
 
 // --- loadHookEvents ----------------------------------------------------

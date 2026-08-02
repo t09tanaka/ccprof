@@ -698,6 +698,34 @@ test("a verified_ended_at_ms past the last event adds a low-confidence inference
   assert.deepEqual(timeline.idleIntervals, []);
 });
 
+test("verified tails use one Claude main lane and ignore later sidechain events", () => {
+  const timeline = buildTimeline([session([
+    user(0, 0), assistant(20, 1), assistant(30, 2, "side"),
+  ], 40, 40)]);
+  const tail = timeline.actions.find(({ action_id }) =>
+    action_id.endsWith(":verified_end")
+  );
+  assert.deepEqual(tail?.interval, { start_ms: 20, end_ms: 40 });
+  assert.equal(tail?.agent_id, "main");
+
+  const rejected: Session[] = [
+    session([assistant(10, 0, "side")], 20, 20),
+    session([
+      assistant(0, 0),
+      { ...assistant(10, 1, "other-main"), is_sidechain: false },
+    ], 20, 20),
+    { ...session([user(0, 0), assistant(10, 1)], 20, 20), source: "codex" },
+  ];
+  for (const candidate of rejected) {
+    assert.equal(
+      buildTimeline([candidate]).actions.some(({ action_id }) =>
+        action_id.endsWith(":verified_end")
+      ),
+      false,
+    );
+  }
+});
+
 test("a verified_ended_at_ms that does not exceed the last event adds no tail", () => {
   const timeline = buildTimeline([
     session([user(0, 0), assistant(20, 1)], 20, 20),

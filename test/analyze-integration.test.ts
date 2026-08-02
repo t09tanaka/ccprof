@@ -1529,11 +1529,16 @@ test("a hook-events.jsonl file with a matching, in-window Stop row is read witho
   }
 });
 
-test("hook Stop rows respect the frozen analysis end boundary", async () => {
+test("hook Stop rows respect both frozen boundaries and unique session attribution", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-hook-events-end-boundary-"));
   try {
     const repo = await realpath(await makeRepository(root));
-    const analyzeStopAt = async (receivedAtMs: number, dataDir: string) => {
+    const windowStartMs = NOW_MS - 600_000;
+    const analyzeStopAt = async (
+      receivedAtMs: number,
+      dataDir: string,
+      discovered?: Session[],
+    ) => {
       const storePaths = await resolveStorePaths(repo, {
         env: { CCPROF_DATA_DIR: join(root, dataDir) },
       });
@@ -1549,9 +1554,10 @@ test("hook Stop rows respect the frozen analysis end boundary", async () => {
       return await analyze({
         cwd: repo,
         pr: "main...feature",
+        sinceMs: windowStartMs,
         nowMs: NOW_MS,
         storePaths,
-        sessionSource: { discover: async () => [session] },
+        sessionSource: { discover: async () => discovered ?? [session] },
         persist: false,
       });
     };
@@ -1560,9 +1566,35 @@ test("hook Stop rows respect the frozen analysis end boundary", async () => {
     assert.equal(afterBoundary.window.ended_at_ms, NOW_MS);
     assert.equal(afterBoundary.ledger.totals_ms.measured, 60_000);
 
+    const beforeBoundary = await analyzeStopAt(windowStartMs - 1, "data-before");
+    assert.equal(beforeBoundary.window.started_at_ms, windowStartMs);
+    assert.equal(beforeBoundary.ledger.totals_ms.measured, 60_000);
+
     const atBoundary = await analyzeStopAt(NOW_MS, "data-at");
     assert.equal(atBoundary.window.ended_at_ms, NOW_MS);
     assert.equal(atBoundary.ledger.totals_ms.measured, 10 * 60_000);
+
+    const claude = hookEventSession("hook-session", repo);
+    const collision = await analyzeStopAt(NOW_MS, "data-collision", [
+      claude,
+      { ...claude, source: "codex", source_path: join(repo, "codex.jsonl") },
+    ]);
+    assert.equal(collision.ledger.totals_ms.measured, 60_000);
+
+    const preStartCollision: Session = {
+      ...claude,
+      source: "codex",
+      source_path: join(repo, "codex-before.jsonl"),
+      started_at_ms: windowStartMs - 2,
+      ended_at_ms: windowStartMs - 1,
+      events: claude.events.map((event, index) => ({
+        ...event, timestamp_ms: windowStartMs - 2 + index,
+      })),
+    };
+    const slicedCollision = await analyzeStopAt(
+      NOW_MS, "data-sliced-collision", [claude, preStartCollision],
+    );
+    assert.equal(slicedCollision.ledger.totals_ms.measured, 60_000);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
