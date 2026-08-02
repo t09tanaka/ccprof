@@ -1,9 +1,9 @@
-import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 
-import { writeJsonAtomically } from "../store/analyses.js";
 import type { CommandExecutionResult } from "./analyze.js";
 import { resolveCurrentRepoRoot } from "./stats.js";
 
@@ -53,6 +53,44 @@ function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function describeType(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
+/**
+ * Atomic JSON write (temp file + fsync + rename) that preserves the
+ * input's own key order, unlike `store/analyses.ts`'s
+ * `writeJsonAtomically`, which recursively alphabetizes keys for
+ * ccprof's own hash-keyed store files. `.claude/settings.json` is a
+ * hand-maintained, often version-controlled user file, so silently
+ * reordering its keys on every install/uninstall would be a surprising
+ * side effect unrelated to the hook change being made.
+ */
+async function writeJsonPreservingKeyOrder(
+  targetPath: string,
+  value: unknown,
+): Promise<void> {
+  await mkdir(dirname(targetPath), { recursive: true });
+  const temporaryPath = `${targetPath}.${process.pid}.${randomUUID()}.tmp`;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(temporaryPath, "wx", 0o600);
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporaryPath, targetPath);
+  } catch (error) {
+    if (handle !== undefined) {
+      await handle.close().catch(() => undefined);
+    }
+    await unlink(temporaryPath).catch(() => undefined);
+    throw error;
+  }
 }
 
 async function resolveSettingsPath(
@@ -117,8 +155,41 @@ function hasMarkerEntry(settings: Record<string, unknown>): boolean {
   });
 }
 
+/**
+ * Rejects a settings file whose `hooks` or `hooks.Stop` shape isn't what
+ * ccprof can safely merge into. Silently replacing a malformed value
+ * (e.g. `hooks: "oops"` or `hooks.Stop: {}`) with fresh containers would
+ * discard whatever the user actually had there, so install treats this
+ * as a hard error (mirrors the corrupt-JSON case: no write, exit 5)
+ * instead. Uninstall does not call this - its own shape checks already
+ * no-op tolerantly on anything unexpected, per its "nothing to remove"
+ * contract.
+ */
+function assertInstallableShape(
+  settings: Record<string, unknown>,
+  settingsPath: string,
+): void {
+  const hooksValue = settings.hooks;
+  if (hooksValue === undefined) return;
+  if (!isRecord(hooksValue)) {
+    throw new HooksSettingsParseError(
+      `${settingsPath}: "hooks" must be a JSON object, found ` +
+        describeType(hooksValue),
+    );
+  }
+  const stopValue = hooksValue.Stop;
+  if (stopValue !== undefined && !Array.isArray(stopValue)) {
+    throw new HooksSettingsParseError(
+      `${settingsPath}: "hooks.Stop" must be a JSON array, found ` +
+        describeType(stopValue),
+    );
+  }
+}
+
 /** Appends a new Stop group carrying the ccprof entry, leaving every other
- * key and existing Stop group untouched. */
+ * key and existing Stop group untouched. Callers must call
+ * `assertInstallableShape` first so `hooks`/`hooks.Stop` are known to be
+ * either absent or the expected object/array shape. */
 function withInstalledEntry(
   settings: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -224,6 +295,7 @@ export async function runHooksCommand(
 
   if (options.action === "install") {
     const current = settings ?? {};
+    assertInstallableShape(current, settingsPath);
     if (hasMarkerEntry(current)) {
       return {
         stdout: "ccprof hook entries already installed\n",
@@ -237,7 +309,10 @@ export async function runHooksCommand(
     if (!confirmed) {
       return { stdout: "aborted\n", warnings: [] };
     }
-    await writeJsonAtomically(settingsPath, withInstalledEntry(current));
+    await writeJsonPreservingKeyOrder(
+      settingsPath,
+      withInstalledEntry(current),
+    );
     return {
       stdout: `Installed ccprof Stop hook into ${settingsPath}\n`,
       warnings: [],
@@ -258,7 +333,7 @@ export async function runHooksCommand(
   if (!confirmed) {
     return { stdout: "aborted\n", warnings: [] };
   }
-  await writeJsonAtomically(settingsPath, removal.settings);
+  await writeJsonPreservingKeyOrder(settingsPath, removal.settings);
   return {
     stdout: `Removed ccprof hook entries from ${settingsPath}\n`,
     warnings: [],

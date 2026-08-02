@@ -127,6 +127,58 @@ test("install preserves unrelated settings content", async () => {
   });
 });
 
+test("install preserves the file's own key order instead of alphabetizing", async () => {
+  await withTempRepo(async (repoRoot) => {
+    // Deliberately non-alphabetical at the top level and inside a nested
+    // object, so a naive "sort all keys" writer would visibly reorder
+    // this on write.
+    const existingText = JSON.stringify({
+      zeta: 1,
+      alpha: { zeta: "z", alpha: "a", middle: "m" },
+      env: { FOO: "bar" },
+    });
+    await mkdir(join(repoRoot, ".claude"), { recursive: true });
+    await writeFile(settingsPathFor(repoRoot), existingText, "utf8");
+
+    const dependencies: HooksCommandDependencies = {
+      resolveRepoRoot: async () => repoRoot,
+    };
+    await runHooksCommand(
+      { cwd: repoRoot, action: "install", global: false, yes: true },
+      dependencies,
+    );
+
+    const writtenText = await readFile(settingsPathFor(repoRoot), "utf8");
+    const topLevelKeys = Object.keys(
+      JSON.parse(writtenText) as Record<string, unknown>,
+    );
+    // "zeta" must still precede "alpha"/"env": order preserved, not
+    // alphabetized (which would put alpha, env, hooks, zeta).
+    assert.deepEqual(topLevelKeys, ["zeta", "alpha", "env", "hooks"]);
+    const nestedKeys = Object.keys(
+      (JSON.parse(writtenText) as { alpha: Record<string, unknown> }).alpha,
+    );
+    assert.deepEqual(nestedKeys, ["zeta", "alpha", "middle"]);
+
+    // Content-wise, still only the hook entry was added.
+    const parsed = JSON.parse(writtenText) as {
+      zeta: number;
+      alpha: unknown;
+      env: unknown;
+      hooks: {
+        Stop: { hooks: { type: string; command: string }[] }[];
+      };
+    };
+    assert.equal(parsed.zeta, 1);
+    assert.deepEqual(parsed.env, { FOO: "bar" });
+    assert.deepEqual(parsed.hooks.Stop, [
+      {
+        hooks: [{ type: "command", command: "ccprof hook-event --notify" }],
+      },
+    ]);
+  });
+});
+
 test("install is idempotent when the marker is already present", async () => {
   await withTempRepo(async (repoRoot) => {
     const dependencies: HooksCommandDependencies = {
@@ -185,6 +237,40 @@ test("uninstall removes only ccprof Stop entries and preserves the rest", async 
     assert.deepEqual(parsed.hooks.PreToolUse, existing.hooks.PreToolUse);
     assert.deepEqual(parsed.hooks.Stop, [
       { hooks: [{ type: "command", command: "other-tool" }] },
+    ]);
+  });
+});
+
+test("uninstall removes only the ccprof entry within a mixed Stop group", async () => {
+  await withTempRepo(async (repoRoot) => {
+    const existing = {
+      hooks: {
+        Stop: [
+          {
+            hooks: [
+              { type: "command", command: "foreign-tool --flag" },
+              { type: "command", command: "ccprof hook-event --notify" },
+            ],
+          },
+        ],
+      },
+    };
+    await writeSettings(repoRoot, existing);
+
+    const dependencies: HooksCommandDependencies = {
+      resolveRepoRoot: async () => repoRoot,
+    };
+    const result = await runHooksCommand(
+      { cwd: repoRoot, action: "uninstall", global: false, yes: true },
+      dependencies,
+    );
+    assert.match(result.stdout, /Removed ccprof hook entries from/u);
+
+    const parsed = JSON.parse(
+      await readFile(settingsPathFor(repoRoot), "utf8"),
+    ) as { hooks: { Stop: { hooks: { type: string; command: string }[] }[] } };
+    assert.deepEqual(parsed.hooks.Stop, [
+      { hooks: [{ type: "command", command: "foreign-tool --flag" }] },
     ]);
   });
 });
@@ -271,6 +357,58 @@ test("runCli exits 5 for corrupt settings JSON", async () => {
   await withTempRepo(async (repoRoot) => {
     await mkdir(join(repoRoot, ".claude"), { recursive: true });
     await writeFile(settingsPathFor(repoRoot), "{not valid json", "utf8");
+
+    const code = await runCli(["hooks", "install", "--yes"], {
+      cwd: repoRoot,
+      handlers: hooksHandlers({ resolveRepoRoot: async () => repoRoot }),
+      stdout: () => undefined,
+      stderr: () => undefined,
+    });
+    assert.equal(code, 5);
+  });
+});
+
+test("install rejects a non-array hooks.Stop without overwriting", async () => {
+  await withTempRepo(async (repoRoot) => {
+    await writeSettings(repoRoot, { hooks: { Stop: "not-an-array" } });
+    const before = await readFile(settingsPathFor(repoRoot), "utf8");
+
+    const dependencies: HooksCommandDependencies = {
+      resolveRepoRoot: async () => repoRoot,
+    };
+    await assert.rejects(
+      runHooksCommand(
+        { cwd: repoRoot, action: "install", global: false, yes: true },
+        dependencies,
+      ),
+    );
+    const after = await readFile(settingsPathFor(repoRoot), "utf8");
+    assert.equal(after, before);
+  });
+});
+
+test("install rejects a non-object hooks value without overwriting", async () => {
+  await withTempRepo(async (repoRoot) => {
+    await writeSettings(repoRoot, { hooks: "not-an-object" });
+    const before = await readFile(settingsPathFor(repoRoot), "utf8");
+
+    const dependencies: HooksCommandDependencies = {
+      resolveRepoRoot: async () => repoRoot,
+    };
+    await assert.rejects(
+      runHooksCommand(
+        { cwd: repoRoot, action: "install", global: false, yes: true },
+        dependencies,
+      ),
+    );
+    const after = await readFile(settingsPathFor(repoRoot), "utf8");
+    assert.equal(after, before);
+  });
+});
+
+test("runCli exits 5 for a malformed hooks.Stop shape on install", async () => {
+  await withTempRepo(async (repoRoot) => {
+    await writeSettings(repoRoot, { hooks: { Stop: "not-an-array" } });
 
     const code = await runCli(["hooks", "install", "--yes"], {
       cwd: repoRoot,
