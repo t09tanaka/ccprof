@@ -4,6 +4,46 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-08-03
+
+### Added
+
+- Adoption tracking: fix-recipe suggestions from past analyses are now
+  deterministically detected as adopted (CLAUDE.md keyword additions for
+  `claude_md`-scope findings, target-file commits for R008 /
+  `separate_issue` findings), persisted per repository, and reported in
+  `ccprof stats` with post-adoption recurrence, minutes before/after, and an
+  adoption-coverage line. Recurrence counting excludes re-analyses of the PR
+  that originally surfaced the finding. Observational only — absence of
+  recurrence does not prove causation, and the report says so.
+- Codex session source: rollout logs under `~/.codex/sessions` (override:
+  `CCPROF_CODEX_SESSIONS_DIR`) are discovered alongside Claude Code sessions,
+  filtered by repository working directory and branch. Sessions declare
+  capabilities, and rules whose required data a source lacks are skipped
+  explicitly — reported in `skipped_rules` (JSON v2, additive), as warnings,
+  and as a report line — instead of silently misfiring. Codex `apply_patch`
+  file paths are extracted so edits classify normally.
+- Claude Code hooks integration: `ccprof hooks install` idempotently registers
+  a Stop hook (`ccprof hook-event --notify`) that records real end-of-turn
+  wall-clock times and prints a dismissal-aware findings summary at most once
+  per 10 minutes without persisting analysis records. `ccprof hook-event`
+  always exits 0 so a hook failure can never break a session. Hook-recorded
+  Stop times extend session ends within a 30-minute window; the verified tail
+  counts as measured time and respects the idle threshold.
+- `Finding.target` is now carried into reports and stored records (additive).
+- Unknown `mcp__*` tools that would otherwise be unexplained are classified as
+  coordination with low confidence and an explicit caveat.
+
+### Changed
+
+- README states the positioning boundary explicitly: ccprof measures wasted
+  time in the working process and does not judge whether the work itself was
+  right. An opt-in LLM advisory layer is noted as a 0.3 candidate;
+  deterministic analysis stays the default.
+- Source discovery failures are no longer silent: if no sessions remain the
+  original error is rethrown, and partial failures surface as
+  `session_source_error` warnings with the failing paths.
+
 ## [0.1.1] - 2026-08-02
 
 ### Changed

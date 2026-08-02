@@ -1,6 +1,6 @@
 {
   "name": "ccprof",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Deterministic local profiler that reconciles Claude Code session logs with the final Git diff to show where minutes can be recovered in a PR.",
   "keywords": [
     "claude-code",
