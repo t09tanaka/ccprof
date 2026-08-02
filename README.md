@@ -145,7 +145,8 @@ JSON モードの標準出力は、余分なログを混ぜない単一の JSON 
     "idle_excluded_min": 35,
     "estimated_floor_min": 38,
     "recoverable_min": 14,
-    "unexplained_min": 6,
+    "human_wait_min": 4,
+    "unexplained_min": 2,
     "baseline": null
   },
   "findings": [
@@ -182,12 +183,16 @@ JSON モードの標準出力は、余分なログを混ぜない単一の JSON 
 
 ```text
 raw_observed = measured_min + idle_excluded_min
-measured_min = normal_min + point_recoverable_min + unexplained_min
+measured_min = normal_min + point_recoverable_min + human_wait_min + unexplained_min
 estimated_floor_min = measured_min - point_recoverable_min
 ```
 
-`unexplained_min` は、正常コストにも決定的な削減候補にも分類できなかった
-活動時間です。未知の無駄を正常コストへ黙って混ぜないために残します。
+`human_wait_min` は閾値以下の人間待ち（ターン間の応答待ちと
+AskUserQuestion の回答待ち）で、エージェントの非効率ではないため独立して
+表示します。承認起因として回収可能と証明できた待ちは従来どおり
+`recoverable_min` 側に入ります。`unexplained_min` は、正常コストにも
+決定的な削減候補にも分類できなかった活動時間です。未知の無駄を正常コスト
+へ黙って混ぜないために残します。
 `bound: "upper"` の finding は表示されますが、推定最短時間を減らしません。
 
 ### `scope` の扱い
@@ -208,8 +213,9 @@ estimated_floor_min = measured_min - point_recoverable_min
 
 人間待ちが idle threshold を**厳密に超える**場合は放置（away）として分離
 します。放置は生活時間なので `idle_excluded_min` に記録し、`measured_min`
-と回収可能時間から除外します。閾値以下の待ちは合計できますが、「放置」と
-「熟考」をログだけで区別することはできません。
+と回収可能時間から除外します。閾値以下の人間待ちは `human_wait_min` とし
+て unexplained から分離して表示します。閾値以下の待ちは合計できますが、
+「放置」と「熟考」をログだけで区別することはできません。
 
 タイムスタンプはログの書き込み時刻であり、ツールや推論の厳密な開始・終了
 時刻ではない、という既知の限界があります。結果が欠けたツールに終了時刻を
@@ -259,7 +265,7 @@ ccprof --pr --test-map /absolute/path/to/test-map.json --json
 | R001 | 最終 diff に残らない手戻り編集 | point | `this_pr` / `claude_md` / `separate_issue` |
 | R002 | 変更と無関係なテスト・ビルド実行 | point | `this_pr` |
 | R003 | 編集を挟まない同一ファイルの再読 | pointまたはupper | `claude_md` |
-| R004 | 放置を除いた承認・入力待ち | point | `separate_issue` |
+| R004 | 証明済み承認待ち（他の入力待ちは `human_wait_min` 側） | point | `separate_issue` |
 | R005 | 独立した読み取りの直列実行 | upper | `claude_md` |
 | R006 | 複数解析で恒常的なコマンドコスト | upper | `separate_issue` |
 | R007 | 50,000 token超の結果・compaction | upper | `claude_md` / `separate_issue` |

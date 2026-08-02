@@ -14,6 +14,7 @@ test("report v2 serializes the exact public wire contract", () => {
       idle_excluded_min: 0,
       estimated_floor_min: 1,
       recoverable_min: 0,
+      human_wait_min: 0,
       unexplained_min: 0,
       baseline: {
         prs: 3,
@@ -55,6 +56,7 @@ test("report v2 serializes the exact public wire contract", () => {
       idle_excluded_min: 0,
       estimated_floor_min: 1,
       recoverable_min: 0,
+      human_wait_min: 0,
       unexplained_min: 0,
       baseline: {
         prs: 3,

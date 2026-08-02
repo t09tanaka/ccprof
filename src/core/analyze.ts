@@ -732,6 +732,10 @@ export async function analyze(
     rawIntervals: timeline.rawIntervals,
     activeIntervals: timeline.activeIntervals,
     contributingIntervals: contributingIntervals(matched),
+    // Includes both turn-gap waits and AskUserQuestion waits: the timeline
+    // builds humanWaitIntervals from every action with kind "human_wait".
+    // Away time is excluded from activeIntervals, so it stays idle.
+    humanWaitIntervals: timeline.humanWaitIntervals,
     candidates,
   };
   const preliminaryLedger = reconcileLedger(ledgerInput);

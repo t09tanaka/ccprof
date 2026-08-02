@@ -13,6 +13,7 @@ function reportForDisplay(report: ReportV2): ReportV2 {
       idle_excluded_min: report.summary.idle_excluded_min,
       estimated_floor_min: report.summary.estimated_floor_min,
       recoverable_min: report.summary.recoverable_min,
+      human_wait_min: report.summary.human_wait_min,
       unexplained_min: report.summary.unexplained_min,
       baseline: report.summary.baseline,
     },

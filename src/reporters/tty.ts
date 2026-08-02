@@ -72,7 +72,7 @@ export function renderTtyReport(
 ): string {
   const color = options.color === true;
   const timing =
-    `${formatMinutes(report.summary.measured_min)} measured (${formatMinutes(report.summary.idle_excluded_min)} idle excluded); estimated floor ${formatMinutes(report.summary.estimated_floor_min)}; ${formatMinutes(report.summary.unexplained_min)} unexplained.`;
+    `${formatMinutes(report.summary.measured_min)} measured (${formatMinutes(report.summary.idle_excluded_min)} idle excluded); estimated floor ${formatMinutes(report.summary.estimated_floor_min)}; ${formatMinutes(report.summary.human_wait_min)} human wait; ${formatMinutes(report.summary.unexplained_min)} unexplained.`;
   const conclusion = report.summary.recoverable_min > 0
     ? `ccprof: ${formatMinutes(report.summary.recoverable_min)} recoverable from ${timing}`
     : `ccprof: no point-recoverable time found in ${timing}`;

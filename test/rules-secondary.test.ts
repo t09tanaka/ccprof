@@ -122,6 +122,7 @@ function historyRecord(
       idle_excluded_min: 0,
       estimated_floor_min: 9,
       recoverable_min: 1,
+      human_wait_min: 0,
       unexplained_min: 1,
       baseline: null,
     },

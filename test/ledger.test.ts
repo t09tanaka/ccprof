@@ -141,6 +141,7 @@ test("partitions wall-clock time with exclusive point precedence", () => {
     idle_excluded: 30_000,
     normal: 30_000,
     recoverable: 50_000,
+    human_wait: 0,
     unexplained: 10_000,
   });
 
@@ -151,6 +152,7 @@ test("partitions wall-clock time with exclusive point precedence", () => {
     idle_excluded_min: 0.5,
     estimated_floor_min: 0.67,
     recoverable_min: 0.83,
+    human_wait_min: 0,
     unexplained_min: 0.17,
     baseline: null,
   });
@@ -158,6 +160,7 @@ test("partitions wall-clock time with exclusive point precedence", () => {
     result.summary.measured_min,
     result.normal_min +
       result.summary.recoverable_min +
+      result.summary.human_wait_min +
       result.summary.unexplained_min,
   );
   assert.equal(
@@ -222,12 +225,14 @@ test("rounds a partition once without a negative residual", () => {
     idle_excluded: 600,
     normal: 400,
     recoverable: 400,
+    human_wait: 0,
     unexplained: 401,
   });
   assert.equal(
     result.summary.measured_min,
     result.normal_min +
       result.summary.recoverable_min +
+      result.summary.human_wait_min +
       result.summary.unexplained_min,
   );
   assert.equal(
@@ -248,4 +253,121 @@ test("rounds a partition once without a negative residual", () => {
     )?.recoverable.min,
     0.83,
   );
+});
+
+test("partitions human wait separately with recoverable precedence", () => {
+  const result = reconcileLedger({
+    rawIntervals: [{ start_ms: 0, end_ms: 120_000 }],
+    activeIntervals: [{ start_ms: 0, end_ms: 120_000 }],
+    contributingIntervals: [{ start_ms: 0, end_ms: 30_000 }],
+    humanWaitIntervals: [{ start_ms: 30_000, end_ms: 90_000 }],
+    candidates: [
+      candidate(
+        "R004",
+        "approval",
+        "point",
+        [{ start_ms: 60_000, end_ms: 90_000 }],
+      ),
+    ],
+  });
+
+  assert.deepEqual(result.pointRecoverableIntervals, [
+    { start_ms: 60_000, end_ms: 90_000 },
+  ]);
+  assert.deepEqual(result.humanWaitIntervals, [
+    { start_ms: 30_000, end_ms: 60_000 },
+  ]);
+  assert.deepEqual(result.normalIntervals, [
+    { start_ms: 0, end_ms: 30_000 },
+  ]);
+  assert.deepEqual(result.unexplainedIntervals, [
+    { start_ms: 90_000, end_ms: 120_000 },
+  ]);
+  assert.deepEqual(result.totals_ms, {
+    raw_observed: 120_000,
+    measured: 120_000,
+    idle_excluded: 0,
+    normal: 30_000,
+    recoverable: 30_000,
+    human_wait: 30_000,
+    unexplained: 30_000,
+  });
+  assert.deepEqual(result.summary, {
+    measured_min: 2,
+    idle_excluded_min: 0,
+    estimated_floor_min: 1.5,
+    recoverable_min: 0.5,
+    human_wait_min: 0.5,
+    unexplained_min: 0.5,
+    baseline: null,
+  });
+  assert.equal(result.normal_min, 0.5);
+});
+
+test("human wait overlapping contributing time wins over normal", () => {
+  const result = reconcileLedger({
+    rawIntervals: [{ start_ms: 0, end_ms: 60_000 }],
+    activeIntervals: [{ start_ms: 0, end_ms: 60_000 }],
+    contributingIntervals: [{ start_ms: 0, end_ms: 60_000 }],
+    humanWaitIntervals: [{ start_ms: 30_000, end_ms: 60_000 }],
+    candidates: [],
+  });
+
+  assert.deepEqual(result.humanWaitIntervals, [
+    { start_ms: 30_000, end_ms: 60_000 },
+  ]);
+  assert.deepEqual(result.normalIntervals, [
+    { start_ms: 0, end_ms: 30_000 },
+  ]);
+  assert.deepEqual(result.unexplainedIntervals, []);
+});
+
+test("the four-way partition identity holds after rounding", () => {
+  const result = reconcileLedger({
+    rawIntervals: [{ start_ms: 0, end_ms: 2_401 }],
+    activeIntervals: [{ start_ms: 0, end_ms: 2_401 }],
+    contributingIntervals: [{ start_ms: 1_002, end_ms: 1_803 }],
+    humanWaitIntervals: [{ start_ms: 401, end_ms: 1_002 }],
+    candidates: [
+      candidate(
+        "R001",
+        "tiny-rework",
+        "point",
+        [{ start_ms: 0, end_ms: 401 }],
+      ),
+    ],
+  });
+
+  assert.deepEqual(result.totals_ms, {
+    raw_observed: 2_401,
+    measured: 2_401,
+    idle_excluded: 0,
+    normal: 801,
+    recoverable: 401,
+    human_wait: 601,
+    unexplained: 598,
+  });
+  assert.equal(
+    result.summary.measured_min,
+    result.normal_min +
+      result.summary.recoverable_min +
+      result.summary.human_wait_min +
+      result.summary.unexplained_min,
+  );
+  assert.equal(
+    result.raw_observed_min,
+    result.summary.measured_min + result.summary.idle_excluded_min,
+  );
+  assert.equal(
+    result.summary.estimated_floor_min,
+    result.summary.measured_min - result.summary.recoverable_min,
+  );
+  for (const value of [
+    result.normal_min,
+    result.summary.recoverable_min,
+    result.summary.human_wait_min,
+    result.summary.unexplained_min,
+  ]) {
+    assert.ok(value >= 0);
+  }
 });
