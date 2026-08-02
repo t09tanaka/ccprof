@@ -66,4 +66,4 @@ The timeline must then use the last retained event of that unique non-sidechain 
 - [x] Run the full repository check and local GitHub Actions equivalent in an independent subagent.
 - [x] Confirm `git diff --check`, at most 7 changed files, and fewer than 300 added source/test lines.
 - [x] Confirm package/version files are unchanged.
-- [ ] Commit, push, create the PR, complete CI/review, and merge.
+- [x] Commit, push, create the PR, complete CI/review, and merge.
