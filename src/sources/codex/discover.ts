@@ -163,7 +163,11 @@ export async function discoverCodexSessions(
       continue;
     }
 
-    const parsed = parseCodexSession({ sourcePath: file, raw });
+    const parsed = parseCodexSession({
+      sourcePath: file,
+      raw,
+      endedAtMs: query.endedAtMs,
+    });
     if (parsed === null) {
       continue;
     }

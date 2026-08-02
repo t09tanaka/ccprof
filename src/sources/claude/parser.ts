@@ -126,6 +126,10 @@ export interface ClaudeParserInstrumentation {
   onAssistantPrefixProbe?(): void;
 }
 
+export interface ClaudeTranscriptParseOptions extends ClaudeParserInstrumentation {
+  endedAtMs?: number;
+}
+
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -793,6 +797,7 @@ function warning(
 
 async function readRows(
   sourcePath: string,
+  endedAtMs?: number,
 ): Promise<{ rows: ParsedRow[]; warnings: PendingWarning[] }> {
   const rows: ParsedRow[] = [];
   const warnings: PendingWarning[] = [];
@@ -831,25 +836,16 @@ async function readRows(
       continue;
     }
 
-    const sessionId = nonEmptyString(parsed.sessionId);
-    if (sessionId === undefined) {
-      warnings.push(
-        warning(
-          sourcePath,
-          "missing_session_id",
-          "Ignored a row without a sessionId.",
-          { line },
-        ),
-      );
-      continue;
-    }
-    const rowType = nonEmptyString(parsed.type);
-    const isKnownAuxiliaryRow =
-      rowType !== undefined && KNOWN_AUXILIARY_ROW_TYPES.has(rowType);
-
     const timestampMs = parseTimestamp(parsed.timestamp);
     if (timestampMs === undefined) {
-      if (!isKnownAuxiliaryRow) {
+      const sessionId = nonEmptyString(parsed.sessionId);
+      const rowType = nonEmptyString(parsed.type);
+      const isKnownAuxiliaryRow =
+        rowType !== undefined && KNOWN_AUXILIARY_ROW_TYPES.has(rowType);
+      if (sessionId === undefined) {
+        warnings.push(warning(sourcePath, "missing_session_id",
+          "Ignored a row without a sessionId.", { line }));
+      } else if (!isKnownAuxiliaryRow) {
         warnings.push(
           warning(
             sourcePath,
@@ -861,6 +857,17 @@ async function readRows(
       }
       continue;
     }
+    if (endedAtMs !== undefined && timestampMs > endedAtMs) continue;
+
+    const sessionId = nonEmptyString(parsed.sessionId);
+    if (sessionId === undefined) {
+      warnings.push(warning(sourcePath, "missing_session_id",
+        "Ignored a row without a sessionId.", { line }));
+      continue;
+    }
+    const rowType = nonEmptyString(parsed.type);
+    const isKnownAuxiliaryRow =
+      rowType !== undefined && KNOWN_AUXILIARY_ROW_TYPES.has(rowType);
 
     const sourceIndex = line - 1;
     const observedUuid = nonEmptyString(parsed.uuid);
@@ -1613,9 +1620,9 @@ function normalizeSession(
 
 export async function parseClaudeTranscriptDetailed(
   sourcePath: string,
-  instrumentation: ClaudeParserInstrumentation = {},
+  instrumentation: ClaudeTranscriptParseOptions = {},
 ): Promise<ClaudeTranscriptParseResult> {
-  const { rows, warnings } = await readRows(sourcePath);
+  const { rows, warnings } = await readRows(sourcePath, instrumentation.endedAtMs);
   const grouped = new Map<string, ParsedRow[]>();
   for (const row of rows) {
     const group = grouped.get(row.sessionId);

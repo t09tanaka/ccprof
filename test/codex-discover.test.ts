@@ -277,3 +277,27 @@ test("CodexSessionSource sessionsDirectory option takes priority over env", asyn
     ["codex-direct"],
   );
 });
+
+test("future Codex metadata cannot make an in-bound metadata-less rollout eligible", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-codex-end-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const sessionsDir = join(root, "sessions");
+  const repo = join(root, "repo");
+  await Promise.all([
+    mkdir(join(sessionsDir, "2026", "07", "31"), { recursive: true }),
+    mkdir(repo),
+  ]);
+  await writeFile(
+    join(sessionsDir, "2026", "07", "31", "rollout-future-meta.jsonl"),
+    userMessage("in boundary", "2026-07-31T03:00:00.000Z") +
+      sessionMeta({ id: "future", cwd: repo, branch: "feature/end",
+        at: "2026-07-31T05:00:00.000Z" }),
+  );
+
+  const sessions = await discoverCodexSessions(sessionsDir, {
+    repoRoot: repo, headBranch: "feature/end",
+    startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+  });
+  assert.deepEqual(sessions, []);
+});

@@ -446,7 +446,9 @@ export async function discoverClaudeSessions(
     }
     let parsed: ClaudeTranscriptParseResult;
     try {
-      parsed = await parseClaudeTranscriptDetailed(file);
+      parsed = await parseClaudeTranscriptDetailed(file, {
+        endedAtMs: query.endedAtMs,
+      });
     } catch {
       const readWarning = sourceWarning(
         "source_read_error",

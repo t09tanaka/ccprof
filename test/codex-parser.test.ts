@@ -399,3 +399,40 @@ test("returns null for a session with a valid session_meta but zero emitted even
     null,
   );
 });
+
+test("freezes Codex rows after timestamp validation at an inclusive boundary", () => {
+  const cutoff = Date.parse("2026-07-31T12:00:00.000Z");
+  const row = (timestamp: unknown, type?: unknown, payload?: unknown) =>
+    JSON.stringify({ timestamp: typeof timestamp === "number"
+      ? new Date(timestamp).toISOString() : timestamp,
+      ...(type === undefined ? {} : { type }),
+      ...(payload === undefined ? {} : { payload }) });
+  const raw = [
+    row(cutoff + 1, "session_meta", { id: "future", cwd: "/future",
+      git: { branch: "feature/future" } }),
+    row(cutoff - 2, "session_meta", { id: "frozen", cwd: "/frozen",
+      git: { branch: "feature/frozen" } }),
+    row(cutoff, "response_item", { type: "function_call", name: "shell",
+      call_id: "call", arguments: "{\"command\":\"true\"}" }),
+    row(cutoff + 2, "response_item", { type: "function_call_output",
+      call_id: "call", output: "future result" }),
+    row(cutoff + 3, undefined, { invalid: true }),
+    row(cutoff - 1, "response_item", { type: "message", role: "user",
+      content: "out of order" }),
+    row("invalid"),
+    JSON.stringify({ type: "response_item", payload: {} }),
+  ].join("\n");
+
+  const session = parseCodexSession({ sourcePath: "snapshot.jsonl", raw, endedAtMs: cutoff });
+  assert.ok(session);
+  assert.equal(session.session_id, "frozen");
+  assert.equal(session.confidence, "high");
+  assert.deepEqual(session.observed_cwds, ["/frozen"]);
+  assert.deepEqual(session.observed_branches, ["feature/frozen"]);
+  assert.equal(session.ended_at_ms, cutoff);
+  assert.deepEqual(session.events.map(({ kind, source_index }) => [kind, source_index]),
+    [["tool_use", 3], ["genuine_user", 6]]);
+  assert.equal(session.events.some((event) => event.kind === "tool_result"), false);
+  assert.deepEqual(session.warnings.map(({ code, line }) => [code, line]),
+    [["codex_row_invalid", 7], ["codex_row_invalid", 8]]);
+});
