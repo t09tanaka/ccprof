@@ -309,6 +309,7 @@ function toolAction(
     tool_use_id: use.tool_use_id,
     tool_name: use.tool_name,
     ...(use.command === undefined ? {} : { command: use.command }),
+    ...(use.cwd === undefined ? {} : { cwd: use.cwd }),
     ...(use.approval === undefined
       ? {}
       : { approval: { ...use.approval } }),
@@ -480,6 +481,7 @@ function causalAction(
           tool_use_id: use.tool_use_id,
           tool_name: use.tool_name,
           ...(use.command === undefined ? {} : { command: use.command }),
+          ...(use.cwd === undefined ? {} : { cwd: use.cwd }),
         }),
     ...(details?.approval === undefined
       ? {}

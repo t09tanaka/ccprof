@@ -14,6 +14,12 @@ export interface JsonObject {
 
 export type Confidence = "low" | "medium" | "high";
 export type Bound = "point" | "upper";
+export type CommandExecutor = "shell" | "native-tool";
+export interface CommandIdentity {
+  repo_relative_cwd: string;
+  normalized_argv: string[];
+  executor: CommandExecutor;
+}
 export type Classification = "repo" | "config" | "behavior";
 export type Scope = "this_pr" | "separate_issue" | "claude_md";
 export type RuleId =
@@ -211,6 +217,7 @@ export interface TimelineAction {
   tool_use_id?: string;
   tool_name?: string;
   command?: string;
+  cwd?: string;
 }
 
 export type ActionMatch =
@@ -230,6 +237,7 @@ export interface MatchedAction extends TimelineAction {
   target: string;
   caveats: string[];
   normalized_command?: string;
+  command_identity?: CommandIdentity;
 }
 
 export interface RecoverableInterval extends Interval {
