@@ -81,4 +81,4 @@
 - [x] Run the repository check and local GitHub Actions equivalent in a dedicated validation subagent.
 - [x] Confirm `git diff --check`, changed-file scope (at most 9 files), and added implementation/test lines below 300.
 - [x] Confirm package/version files are unchanged.
-- [ ] Commit, push, create the PR, and complete CI/review before merge.
+- [x] Commit, push, create the PR, and complete CI/review before merge.
