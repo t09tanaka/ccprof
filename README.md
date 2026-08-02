@@ -339,6 +339,9 @@ R005 (serial-slack) needs `tool_timestamps`, which Codex rollouts do provide,
 so R005 is **not** skipped for Codex sessions. The authoritative mapping is
 `RULE_REQUIRED_CAPABILITIES` in `src/rules/capabilities.ts`.
 
+A rollout with no recorded git branch is still accepted on working-directory
+match alone, at low confidence, rather than being dropped.
+
 When any analyzed session lacks a capability a rule requires, that rule is
 listed in `skipped_rules` in JSON v2 and summarized in the TTY and Markdown
 reports as `Skipped rules (source lacks required data): ...`.
