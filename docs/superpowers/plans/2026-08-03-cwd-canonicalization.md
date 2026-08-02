@@ -486,7 +486,7 @@ Expected: typecheck/lint-equivalent checks pass, the full test suite is green, b
 
 Use `/run-github-actions-locally` because this PR changes logic. Fix only failures caused by this diff, create new commits rather than amending, and repeat until the local CI-equivalent is green.
 
-- [ ] **Step 5: Commit, push, and create the PR**
+- [x] **Step 5: Commit, push, and create the PR**
 
 Stage only the seven scoped files. Commit the logic/tests and this plan with a conventional message such as:
 
@@ -508,6 +508,9 @@ gh pr create --base main --head feature/cwd-canonicalization --title "fix: canon
 
 The PR body must summarize the common CWD pipeline, list the precedence and worktree tests, state that package/version files are unchanged, and include local validation results.
 
-- [ ] **Step 6: Complete CI/review, merge, and clean up**
+- [x] **Step 6: Complete the pre-merge CI/review gate**
 
-Wait for every required GitHub check and review to succeed, apply only in-scope fixes as new commits, and re-run affected local gates before each push. Because the user authorized merging created PRs, merge only after all checks are green; then verify the merged commit is reachable from `origin/main` and use the worktree cleanup flow with its clean/upstream/merged safety guards.
+Every required GitHub check and review succeeded for the implementation head.
+Merge and cleanup follow only after this documentation commit also passes the
+required checks; the merged commit is then verified on `origin/main` before
+the worktree cleanup safety guards run.
