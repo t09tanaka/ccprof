@@ -169,6 +169,62 @@ function lowerConfidence(confidence: Confidence): Confidence {
   return confidence === "high" ? "medium" : "low";
 }
 
+function branchScopedWarning(session: Session): SourceWarning {
+  const firstEvent = session.events[0];
+  return {
+    code: "branch_scoped",
+    message: "Multi-branch session was scoped to the head branch.",
+    source_path: session.source_path,
+    ...(firstEvent !== undefined
+      ? { session_ref: firstEvent.session_ref }
+      : {}),
+  };
+}
+
+/**
+ * Restricts a session that observed several branches to the events recorded
+ * on the queried head branch. Events without branch metadata inherit the
+ * closest preceding branch-carrying event (or the first branch seen, for a
+ * branchless prefix). Sessions whose events carry no branch metadata at all
+ * are kept unchanged, conservatively.
+ */
+function scopeSessionToHeadBranch(
+  session: Session,
+  headBranch: string,
+): Session | null {
+  const firstBranch = session.events.find(
+    (event) => event.branch !== undefined,
+  )?.branch;
+  if (firstBranch === undefined) {
+    return session;
+  }
+  let lastBranch: string | undefined;
+  const events = session.events.filter((event) => {
+    const effective = event.branch ?? lastBranch ?? firstBranch;
+    if (event.branch !== undefined) {
+      lastBranch = event.branch;
+    }
+    return effective === headBranch;
+  });
+  if (events.length === 0) {
+    return null;
+  }
+  if (events.length === session.events.length) {
+    return session;
+  }
+  const timestamps = events.map((event) => event.timestamp_ms);
+  const scoped: Session = {
+    ...session,
+    events,
+    started_at_ms: Math.min(...timestamps),
+    ended_at_ms: Math.max(...timestamps),
+  };
+  return {
+    ...scoped,
+    warnings: [...scoped.warnings, branchScopedWarning(scoped)],
+  };
+}
+
 function missingBranchWarning(session: Session): SourceWarning {
   const firstEvent = session.events[0];
   return {
@@ -373,7 +429,7 @@ export async function discoverClaudeSessions(
       );
     }
     for (const rawSession of parsed.sessions) {
-      const session = await canonicalizeSession(rawSession);
+      let session = await canonicalizeSession(rawSession);
       if (!intersects(session, query)) {
         continue;
       }
@@ -389,6 +445,18 @@ export async function discoverClaudeSessions(
         !session.observed_branches.includes(query.headBranch)
       ) {
         continue;
+      }
+      if (
+        hasBranch &&
+        session.observed_branches.some(
+          (branch) => branch !== query.headBranch,
+        )
+      ) {
+        const scoped = scopeSessionToHeadBranch(session, query.headBranch);
+        if (scoped === null || !intersects(scoped, query)) {
+          continue;
+        }
+        session = scoped;
       }
       const alignedSession = await alignSessionCwdsToRepository(
         session,

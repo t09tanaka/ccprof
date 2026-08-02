@@ -51,6 +51,8 @@ interface NormalizedEventBase {
   is_sidechain: boolean;
   confidence: Confidence;
   parent_uuid?: string;
+  /** Git branch recorded on the source row, when the log provided one. */
+  branch?: string;
 }
 
 export interface GenuineUserEvent extends NormalizedEventBase {

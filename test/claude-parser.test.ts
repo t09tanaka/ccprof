@@ -1077,3 +1077,37 @@ test("bounds unknown content block type strings and objects", async (t) => {
   assert.equal(serialized.includes(hugeStringType), false);
   assert.equal(serialized.includes(hugeObjectPayload), false);
 });
+
+test("events carry the git branch recorded on their row", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ccprof-branch-events-"));
+  try {
+    const path = join(directory, "branches.jsonl");
+    const rows = [
+      {
+        sessionId: "branchy",
+        type: "user",
+        uuid: "u1",
+        timestamp: "2026-07-31T03:00:00.000Z",
+        cwd: "/repo",
+        gitBranch: "feature/a",
+        message: { role: "user", content: "start" },
+      },
+      {
+        sessionId: "branchy",
+        type: "user",
+        uuid: "u2",
+        timestamp: "2026-07-31T03:01:00.000Z",
+        cwd: "/repo",
+        message: { role: "user", content: "continue" },
+      },
+    ];
+    await writeFile(path, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+
+    const session = await parseClaudeSession(path);
+    assert.ok(session);
+    assert.equal(session.events[0]?.branch, "feature/a");
+    assert.equal(session.events[1]?.branch, undefined);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

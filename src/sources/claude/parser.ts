@@ -930,6 +930,7 @@ function eventBase(
   is_sidechain: boolean;
   confidence: Confidence;
   parent_uuid?: string;
+  branch?: string;
 } {
   return {
     timestamp_ms: row.timestampMs,
@@ -941,6 +942,7 @@ function eventBase(
     is_sidechain: row.isSidechain,
     confidence: row.hasSyntheticUuid || hasSchemaLoss ? "low" : "high",
     ...(row.parentUuid !== undefined ? { parent_uuid: row.parentUuid } : {}),
+    ...(row.branch !== undefined ? { branch: row.branch } : {}),
   };
 }
 
