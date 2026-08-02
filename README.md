@@ -443,7 +443,7 @@ Resolving a PR number/URL or the current PR may make an installed `gh pr view`
 fetch metadata from GitHub. Pass `base...head` to avoid the network entirely.
 
 By default no LLM is contacted either. Only when `--advisory` is passed
-explicitly, the sanitized display-report JSON — the same document `--json`
+explicitly, the display-report JSON — the same document `--json`
 prints, which can include findings, command names, and file paths — is handed
 to the locally installed `claude` CLI, which sends it to its configured LLM
 provider. Raw session transcripts and logs are never sent; the advisory prompt

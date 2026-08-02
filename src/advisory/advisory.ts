@@ -33,9 +33,10 @@ const ADVISORY_INSTRUCTIONS = [
 ].join(" ");
 
 /**
- * The prompt contains only the fixed instructions plus the sanitized
- * display-report JSON (`renderJsonReport` output). Raw session
- * transcripts and logs are deliberately never included.
+ * The prompt contains only the fixed instructions plus the display-report
+ * JSON (`renderJsonReport` output; JSON.stringify escaping only — the
+ * human-text sanitizer deliberately does not run on JSON output). Raw
+ * session transcripts and logs are deliberately never included.
  */
 export function buildAdvisoryPrompt(reportJson: string): string {
   return `${ADVISORY_INSTRUCTIONS}\n\n${reportJson}`;
@@ -67,9 +68,16 @@ export async function requestAdvisory(
   if (result.code !== 0) {
     return unavailable(`claude CLI exited with code ${result.code}`);
   }
-  const text = sanitizeHumanText(
-    result.stdout.slice(0, ADVISORY_MAX_TEXT_CHARS),
-  ).trim();
+  // Sanitize line by line: sanitizeHumanText folds C0 controls (including
+  // "\n") into spaces, which would collapse the advisory bullets into one
+  // long line in every reporter.
+  const text = result.stdout
+    .slice(0, ADVISORY_MAX_TEXT_CHARS)
+    .split(/\r?\n/u)
+    .map((line) => sanitizeHumanText(line).trim())
+    .filter((line) => line !== "")
+    .join("\n")
+    .trim();
   if (text === "") {
     return unavailable("claude CLI produced no output");
   }

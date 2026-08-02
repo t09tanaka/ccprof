@@ -19,6 +19,15 @@ function markdownText(value: string): string {
     .trim();
 }
 
+// Advisory lines come from LLM output and are inserted as top-level
+// Markdown lines, so a leading "#", ">", or list marker would otherwise
+// become real document structure instead of text.
+function escapeLeadingMarkdown(value: string): string {
+  return value
+    .replace(/^([#>*+-])/u, "\\$1")
+    .replace(/^(\d+)([.)])/u, "$1\\$2");
+}
+
 function findingMarkdown(
   finding: Finding,
   index: number,
@@ -85,7 +94,7 @@ export function renderMarkdownReport(
       "",
       ...advisory.text
         .split(/\r?\n/u)
-        .map(markdownText)
+        .map((value) => escapeLeadingMarkdown(markdownText(value)))
         .filter((value) => value !== ""),
     );
   }

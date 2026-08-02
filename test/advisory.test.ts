@@ -118,6 +118,20 @@ test("CLI parser accepts --advisory once and rejects duplicates", () => {
   assert.match(USAGE, /\[--advisory\]/u);
 });
 
+test("markdown neutralizes leading structural markers in advisory lines", async () => {
+  const llmOutput = [
+    "### Injected heading",
+    "> injected quote",
+    "1. injected item",
+  ].join("\n");
+  const markdown = await renderWith("markdown", fakeRunner({ stdout: llmOutput }));
+
+  assert.match(markdown.stdout, /^\\### Injected heading$/mu);
+  assert.match(markdown.stdout, /^\\> injected quote$/mu);
+  assert.match(markdown.stdout, /^1\\\. injected item$/mu);
+  assert.doesNotMatch(markdown.stdout, /^### Injected heading$/mu);
+});
+
 test("advisory sends only the display report JSON to claude -p with a 60s timeout", async () => {
   const calls: RunnerCall[] = [];
   await renderWith("json", fakeRunner({ stdout: "- fine" }, calls));
