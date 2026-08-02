@@ -118,6 +118,13 @@ export function applyHookEvents(
   sessions: readonly Session[],
   rows: readonly HookEventRow[],
 ): Session[] {
+  const sessionIdCounts = new Map<string, number>();
+  for (const session of sessions) {
+    sessionIdCounts.set(
+      session.session_id,
+      (sessionIdCounts.get(session.session_id) ?? 0) + 1,
+    );
+  }
   const stopTimesBySessionId = new Map<string, number[]>();
   for (const row of rows) {
     if (row.hook_event_name !== STOP_HOOK_EVENT_NAME) continue;
@@ -129,6 +136,19 @@ export function applyHookEvents(
     }
   }
   return sessions.map((session) => {
+    const mainAgents = new Set(
+      session.events
+        .filter((event) => !event.is_sidechain)
+        .map((event) => event.agent_id),
+    );
+    if (
+      session.source !== "claude" ||
+      sessionIdCounts.get(session.session_id) !== 1 ||
+      session.observed_branches.length > 1 ||
+      mainAgents.size !== 1
+    ) {
+      return session;
+    }
     const stopTimes = stopTimesBySessionId.get(session.session_id);
     if (stopTimes === undefined) return session;
     const inWindow = stopTimes.filter(

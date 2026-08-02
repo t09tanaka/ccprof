@@ -889,6 +889,13 @@ export async function analyze(
     startedAtMs: window.started_at_ms,
     endedAtMs: window.ended_at_ms,
   });
+  const discoveredSessionIdCounts = new Map<string, number>();
+  for (const session of discoveredSessions) {
+    discoveredSessionIdCounts.set(
+      session.session_id,
+      (discoveredSessionIdCounts.get(session.session_id) ?? 0) + 1,
+    );
+  }
   if (discoveredSessions.length === 0) {
     // Nothing was found at all: if a source failed, its error is almost
     // certainly why, so surface it instead of the generic
@@ -925,7 +932,11 @@ export async function analyze(
   warnings.push(...hookEvents.warnings.map(storeWarning));
   sessions = applyHookEvents(
     sessions,
-    hookEvents.rows.filter((row) => row.received_at_ms <= window.ended_at_ms),
+    hookEvents.rows.filter((row) =>
+      row.received_at_ms >= window.started_at_ms &&
+      row.received_at_ms <= window.ended_at_ms &&
+      discoveredSessionIdCounts.get(row.session_id) === 1
+    ),
   );
 
   const inapplicableRules = skippedRules(sessions);
