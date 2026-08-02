@@ -1235,9 +1235,17 @@ test("continues analysis with a session_source_error warning when sessions were 
       sourceErrorWarning,
       "the Claude source failure must surface as a session_source_error warning",
     );
-    assert.equal(
-      sourceErrorWarning?.message,
-      "Claude session discovery failed for one or more sources.",
+    assert.ok(
+      sourceErrorWarning?.message.startsWith(
+        "Claude session discovery failed for one or more sources.",
+      ),
+      "the base message must be preserved",
+    );
+    assert.ok(
+      sourceErrorWarning?.message.includes(
+        join(claudeProjects, "malformed.jsonl"),
+      ),
+      "the failing source's path must be included so the warning is actionable",
     );
   } finally {
     await rm(root, { recursive: true, force: true });

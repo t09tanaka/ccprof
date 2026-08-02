@@ -68,7 +68,10 @@ import { detectRedundantRuns } from "../rules/redundant-runs.js";
 import { detectRework } from "../rules/rework.js";
 import { detectSerialSlack } from "../rules/serial-slack.js";
 import { minimumConfidence } from "../rules/shared.js";
-import { ClaudeSessionSource } from "../sources/claude/discover.js";
+import {
+  ClaudeDiscoveryError,
+  ClaudeSessionSource,
+} from "../sources/claude/discover.js";
 import { CodexSessionSource } from "../sources/codex/discover.js";
 import { CombinedSessionSource } from "../sources/combined.js";
 import type { SessionSource } from "../sources/session-source.js";
@@ -205,6 +208,25 @@ function textWarning(
   message: string,
 ): AnalyzeWarning {
   return { code, message };
+}
+
+/**
+ * A `ClaudeDiscoveryError` carries per-file failure details in `warnings`
+ * (one `SourceWarning` per unreadable source); surface those paths so the
+ * resulting `session_source_error` warning says which files failed rather
+ * than just that discovery failed. Other errors keep a message-only summary.
+ */
+function sourceErrorMessage(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+  if (error instanceof ClaudeDiscoveryError && error.warnings.length > 0) {
+    const paths = [
+      ...new Set(error.warnings.map((warning) => warning.source_path)),
+    ];
+    return `${error.message} (${paths.join(", ")})`;
+  }
+  return error.message;
 }
 
 /**
@@ -769,10 +791,7 @@ export async function analyze(
   if (sourceErrors.length > 0) {
     warnings.push(
       ...sourceErrors.map((error) =>
-        textWarning(
-          "session_source_error",
-          error instanceof Error ? error.message : String(error),
-        )
+        textWarning("session_source_error", sourceErrorMessage(error))
       ),
     );
   }
