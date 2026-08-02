@@ -21,6 +21,11 @@ import {
   sortedUnique,
 } from "./shared.js";
 import { isDelegationToolName } from "../analysis/diff-matcher.js";
+import {
+  compareCodeUnits,
+  extractFailedTestNames,
+  MAX_FAILED_TEST_NAMES,
+} from "../analysis/test-output.js";
 import { isReadOnlyCommand } from "./serial-slack.js";
 
 export type EditRelevance = "related" | "unrelated";
@@ -490,6 +495,19 @@ export function detectFlakyTests(
             ] as const),
         ).values(),
       ];
+      const extractions = failedRuns.map(({ result }) =>
+        extractFailedTestNames(result.output)
+      );
+      const distinctFailedTests = [
+        ...new Set(extractions.flatMap(({ names }) => names)),
+      ].sort(compareCodeUnits);
+      const failedTests = distinctFailedTests.slice(
+        0,
+        MAX_FAILED_TEST_NAMES,
+      );
+      const failedTestsTruncated =
+        extractions.some(({ truncated }) => truncated) ||
+        distinctFailedTests.length > MAX_FAILED_TEST_NAMES;
       const recoverable = recoverableClaim(
         "R008",
         command,
@@ -506,7 +524,7 @@ export function detectFlakyTests(
         ]),
       ]);
       const historical = historyByCommand.get(command);
-      return createFindingCandidate({
+      const candidate = createFindingCandidate({
         rule_id: "R008",
         title: "Test failed then passed without a relevant edit",
         classification: "repo",
@@ -533,6 +551,7 @@ export function detectFlakyTests(
             (interval) => interval.interval_id,
           ),
           command,
+          failed_tests: failedTests,
           episode_count: commandEpisodes.length,
           failed_run_count: failedRuns.length,
           passing_run_count: passingRuns.length,
@@ -556,11 +575,25 @@ export function detectFlakyTests(
         recoverable,
         fix_recipe: {
           suggestion:
-            `Fix or quarantine the flaky behavior exercised by \`${command}\` in a separate repository issue.`,
+            `Fix or quarantine the flaky behavior exercised by \`${command}\` in a separate repository issue.${
+              failedTests.length === 0
+                ? ""
+                : ` Start with ${
+                  failedTests
+                    .slice(0, 3)
+                    .map((name) => `\`${name}\``)
+                    .join(", ")
+                }.`
+            }`,
           verify: command,
         },
         caveats: sortedUnique([
           ...investigation.flatMap((action) => action.caveats),
+          ...(failedTestsTruncated
+            ? [
+              `The failed test name list was truncated to ${MAX_FAILED_TEST_NAMES} entries.`,
+            ]
+            : []),
           ...(unrelatedEdits.length > 0
             ? ["Only proven unrelated edits occurred between failure and success, so confidence was lowered."]
             : []),
@@ -574,5 +607,9 @@ export function detectFlakyTests(
             ]),
         ]),
       });
+      // canonicalEvidence re-sorts string arrays with localeCompare; restore
+      // the deterministic code-unit ordering for extracted test names.
+      candidate.evidence.failed_tests = [...failedTests];
+      return candidate;
     });
 }

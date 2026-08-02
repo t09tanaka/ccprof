@@ -272,8 +272,9 @@ ccprof --pr --test-map /absolute/path/to/test-map.json --json
 | R008 | 関連編集なしの同一テスト fail→pass | pointまたはupper | `separate_issue` |
 
 R006 は少なくとも過去5解析、うち3解析以上での出現、全 measured time の30%
-以上を必要とします。R008 は Phase 1 ではテスト名ではなく、正規化コマンド
-単位で判定します。
+以上を必要とします。R008 の判定は Phase 1 ではテスト名ではなく正規化コマ
+ンド単位で行い、失敗テスト名は失敗実行の出力から決定的に抽出して evidence
+（`failed_tests`）に含めます（対応: TAP / jest / vitest / cargo / pytest）。
 
 ## 対応ソースとスキーマ変化
 
