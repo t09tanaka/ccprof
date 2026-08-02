@@ -112,8 +112,18 @@ number or URL, the current PR, and finally the remote default branch (then
 Shows the analysis history, baseline, per-rule time, and chronic command cost
 stored for the current repository. When the same `finding_key` appears in two or
 more analyses it is listed under Recurring findings with the trend between its
-first and latest recoverable estimate (improved / worsened / flat), so you can
-track the effect of an adopted suggestion.
+first and latest recoverable estimate (improved / worsened / flat).
+
+Adoption is detected deterministically: once a suggestion from a past analysis
+is acted on — a `CLAUDE.md` edit, or an edit to the finding's target file, that
+appears in git history after the finding was recorded — `stats` lists it under
+Adopted suggestions with its outcome: whether the finding recurred after
+adoption, the minutes recoverable before and after adoption, and `no_data` when
+no analysis has run since. This is **observational only: recurrence absence
+does not prove causation**. Findings whose adoption cannot be detected this way
+(no target file, or a target outside the repository) are counted separately in
+an adoption-coverage line, so the detection gap is visible rather than silently
+under-reported.
 
 ```sh
 ccprof stats
@@ -309,9 +319,8 @@ and lower confidence instead of taking analyzable sessions down with them.
 Sidechains and compaction are normalized as well.
 
 Markdown, baselines, and store-driven R006 were originally Phase 2 items, but
-they are included in this release. Framework-specific flaky test name extraction,
-tracking the effect of adopted suggestions, and a Codex parser are future
-extensions.
+they are included in this release. Framework-specific flaky test name
+extraction and a Codex parser are future extensions.
 
 ## Privacy and storage
 

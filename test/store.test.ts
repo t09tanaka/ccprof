@@ -21,6 +21,11 @@ import type {
 } from "../src/core/model.js";
 import { detectChronicCost } from "../src/rules/chronic-cost.js";
 import {
+  loadAdoptions,
+  saveAdoptions,
+  type AdoptionRecord,
+} from "../src/store/adoptions.js";
+import {
   computeBaseline,
   loadAnalyses,
   makeAnalysisRecord,
@@ -326,6 +331,7 @@ test("analysis write failures return warnings without throwing", async () => {
       analyses_dir: join(blockingFile, "analyses"),
       history_index_path: join(blockingFile, "index.json"),
       dismissals_path: join(blockingFile, "dismissals.json"),
+      adoptions_path: join(blockingFile, "adoptions.json"),
     };
     const result = await saveAnalysis(paths, record("write-failure", 100));
     assert.equal(result.record.analysis_id, "write-failure");
@@ -422,6 +428,72 @@ test("dismissals persist reasons and report write failures as warnings", async (
     });
     assert.ok(
       failed.warnings.some(({ code }) => code === "dismissal_write_failed"),
+    );
+  });
+});
+
+function adoption(
+  key: string,
+  overrides: Partial<AdoptionRecord> = {},
+): AdoptionRecord {
+  return {
+    finding_key: key,
+    rule_id: "R002",
+    scope: "this_pr",
+    fingerprint: `fp-${key}`,
+    method: "target_file_edit",
+    detected_at_ms: 1_000,
+    evidence: { commit: "a".repeat(40), path: "src/foo.ts" },
+    ...overrides,
+  };
+}
+
+test("adoptions round-trip through the store", async () => {
+  await temporaryStore(async (paths) => {
+    const warnings = await saveAdoptions(paths, [adoption("finding-a")]);
+    assert.deepEqual(warnings, []);
+    const loaded = await loadAdoptions(paths);
+    assert.deepEqual(loaded.warnings, []);
+    assert.deepEqual(loaded.records, [adoption("finding-a")]);
+  });
+});
+
+test("corrupt adoption files degrade to a warning and an empty result", async () => {
+  await temporaryStore(async (paths) => {
+    await mkdir(paths.repo_dir, { recursive: true });
+    await writeFile(paths.adoptions_path, "{not json", "utf8");
+    const loaded = await loadAdoptions(paths);
+    assert.deepEqual(loaded.records, []);
+    assert.ok(
+      loaded.warnings.some(({ code }) => code === "corrupt_adoptions"),
+    );
+  });
+});
+
+test("adoptions dedupe by finding_key, keeping the first entry", async () => {
+  await temporaryStore(async (paths) => {
+    await saveAdoptions(paths, [
+      adoption("finding-a", { method: "claude_md_edit" }),
+      adoption("finding-a", { method: "target_file_edit" }),
+    ]);
+    const loaded = await loadAdoptions(paths);
+    assert.equal(loaded.records.length, 1);
+    assert.equal(loaded.records[0]?.method, "claude_md_edit");
+  });
+});
+
+test("adoption write failures return warnings without throwing", async () => {
+  await temporaryStore(async (paths, root) => {
+    const blockingFile = join(root, "adoption-block");
+    await writeFile(blockingFile, "not a directory", "utf8");
+    const blocked: StorePaths = {
+      ...paths,
+      repo_dir: blockingFile,
+      adoptions_path: join(blockingFile, "adoptions.json"),
+    };
+    const warnings = await saveAdoptions(blocked, [adoption("finding-a")]);
+    assert.ok(
+      warnings.some(({ code }) => code === "adoption_write_failed"),
     );
   });
 });

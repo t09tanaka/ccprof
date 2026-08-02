@@ -22,6 +22,11 @@ import type {
   ToolUseEvent,
 } from "./model.js";
 import {
+  detectAdoptions,
+  detectability,
+  type AdoptionCandidateFinding,
+} from "../analysis/adoption.js";
+import {
   isDelegationToolName,
   matchTimelineActions,
   type ActionObservation,
@@ -78,6 +83,11 @@ import {
   loadDismissals,
 } from "../store/dismissals.js";
 import {
+  loadAdoptions,
+  saveAdoptions,
+  type AdoptionRecord,
+} from "../store/adoptions.js";
+import {
   resolveStorePaths,
   type StorePaths,
 } from "../store/paths.js";
@@ -114,6 +124,7 @@ export interface AnalyzeResult {
   warnings: AnalyzeWarning[];
   suppressedKeys: string[];
   ledger: LedgerResult;
+  adoptions: AdoptionRecord[];
 }
 
 export class NoMatchingSessionsError extends Error {
@@ -634,6 +645,51 @@ function priorRecords(
   );
 }
 
+/**
+ * Builds detectable adoption candidates from prior analysis history. Each
+ * finding_key is represented once, by the oldest record it appeared in
+ * (ties broken by analysis_id), so a candidate's recorded_at_ms reflects the
+ * first time the suggestion was surfaced. Finding_keys already present in
+ * the adoptions store, and candidates the detector cannot ever confirm, are
+ * excluded before the (possibly expensive) git-backed detection runs.
+ */
+function adoptionCandidates(
+  history: readonly AnalysisRecord[],
+  existingAdoptions: readonly AdoptionRecord[],
+): AdoptionCandidateFinding[] {
+  const existingKeys = new Set(
+    existingAdoptions.map((record) => record.finding_key),
+  );
+  const oldestByKey = new Map<
+    string,
+    { record: AnalysisRecord; finding: Finding }
+  >();
+  for (const record of history) {
+    for (const finding of record.findings) {
+      if (existingKeys.has(finding.finding_key)) continue;
+      const existing = oldestByKey.get(finding.finding_key);
+      if (
+        existing === undefined ||
+        record.created_at_ms < existing.record.created_at_ms ||
+        (record.created_at_ms === existing.record.created_at_ms &&
+          record.analysis_id.localeCompare(existing.record.analysis_id) < 0)
+      ) {
+        oldestByKey.set(finding.finding_key, { record, finding });
+      }
+    }
+  }
+  return [...oldestByKey.values()]
+    .map(({ record, finding }): AdoptionCandidateFinding => ({
+      finding_key: finding.finding_key,
+      rule_id: finding.rule_id,
+      scope: finding.scope,
+      ...(finding.target === undefined ? {} : { target: finding.target }),
+      suggestion: finding.fix_recipe.suggestion,
+      recorded_at_ms: record.created_at_ms,
+    }))
+    .filter((candidate) => detectability(candidate) !== "undetectable");
+}
+
 export async function analyze(
   options: AnalyzeOptions,
 ): Promise<AnalyzeResult> {
@@ -691,15 +747,36 @@ export async function analyze(
     ...testMap.caveats.map((message) => textWarning("test_map", message)),
   );
 
-  const [historyResult, dismissalResult] = await Promise.all([
+  const [historyResult, dismissalResult, adoptionResult] = await Promise.all([
     loadAnalyses(paths),
     loadDismissals(paths),
+    loadAdoptions(paths),
   ]);
   warnings.push(
     ...historyResult.warnings.map(storeWarning),
     ...dismissalResult.warnings.map(storeWarning),
+    ...adoptionResult.warnings.map(storeWarning),
   );
   const history = priorRecords(historyResult.records, context);
+
+  const adoptionDetection = await detectAdoptions({
+    repoRoot: context.repoRoot,
+    candidates: adoptionCandidates(history, adoptionResult.records),
+    detectedAtMs: context.resolvedAtMs,
+    ...(options.runner === undefined ? {} : { runner: options.runner }),
+  });
+  warnings.push(...adoptionDetection.warnings);
+  const mergedAdoptions = adoptionDetection.adoptions.length === 0
+    ? adoptionResult.records
+    : [...adoptionResult.records, ...adoptionDetection.adoptions];
+  if (adoptionDetection.adoptions.length > 0) {
+    const adoptionSaveWarnings = await saveAdoptions(paths, mergedAdoptions);
+    warnings.push(...adoptionSaveWarnings.map(storeWarning));
+  }
+  const adoptions = [...mergedAdoptions].sort(
+    (left, right) => left.finding_key.localeCompare(right.finding_key),
+  );
+
   const events = orderedEvents(sessions);
   const eventIndex = toolEventIndex(events);
   const matched = matchTimelineActions(
@@ -794,5 +871,6 @@ export async function analyze(
     warnings: normalizedWarnings,
     suppressedKeys: applied.suppressed_keys,
     ledger,
+    adoptions,
   };
 }

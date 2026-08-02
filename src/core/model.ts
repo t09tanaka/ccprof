@@ -224,6 +224,7 @@ export interface FindingRecoverable {
 }
 
 export interface Finding extends FindingMetadata {
+  target?: string;
   recoverable: FindingRecoverable;
 }
 

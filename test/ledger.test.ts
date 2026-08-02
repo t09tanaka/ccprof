@@ -197,6 +197,21 @@ test("partitions wall-clock time with exclusive point precedence", () => {
   });
 });
 
+test("public findings keep the candidate target", () => {
+  const result = reconcileLedger({
+    rawIntervals: [{ start_ms: 0, end_ms: 1_000 }],
+    activeIntervals: [{ start_ms: 0, end_ms: 1_000 }],
+    contributingIntervals: [{ start_ms: 0, end_ms: 500 }],
+    candidates: [
+      candidate("R001", "src/foo.ts", "point", [
+        { start_ms: 0, end_ms: 500 },
+      ]),
+    ],
+  });
+
+  assert.equal(result.findings[0]?.target, "src/foo.ts");
+});
+
 test("rounds a partition once without a negative residual", () => {
   const result = reconcileLedger({
     rawIntervals: [{ start_ms: 0, end_ms: 1_801 }],

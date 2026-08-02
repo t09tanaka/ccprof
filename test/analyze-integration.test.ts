@@ -23,6 +23,7 @@ import {
   loadAnalyses,
   saveAnalysis,
 } from "../src/store/analyses.js";
+import { loadAdoptions } from "../src/store/adoptions.js";
 import { saveDismissal } from "../src/store/dismissals.js";
 import { resolveStorePaths } from "../src/store/paths.js";
 
@@ -998,6 +999,111 @@ test("an other-branch sidechain does not split the main agent's head segment", a
     // excluded and must add nothing.
     assert.equal(result.ledger.totals_ms.raw_observed, 200_000);
     assert.equal(result.ledger.totals_ms.measured, 200_000);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("analyze detects and persists a CLAUDE.md adoption of a prior PR's suggestion", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-adoption-"));
+  try {
+    const repo = await makeRepository(root);
+    const projects = await makeClaudeProjects(root, repo);
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    // Seed a finding from a *different* PR so it counts as prior history:
+    // adoption tracking is a cross-PR signal, not an intra-PR rerun signal.
+    const priorFindingKey = "seed-r005-deploy-checklist";
+    const priorSuggestion = "Explain the deploy checklist steps in CLAUDE.md.";
+    await saveAnalysis(storePaths, {
+      analysis_id: "history-adoption-seed",
+      created_at_ms: NOW_MS - 5_000,
+      unit: {
+        repo,
+        pr_ref: "main...prior-pr",
+        sessions: ["prior-session"],
+      },
+      summary: seedSummary(),
+      findings: [{
+        finding_key: priorFindingKey,
+        rule_id: "R005",
+        title: "Independent tool calls ran serially",
+        classification: "behavior",
+        cause: null,
+        scope: "claude_md",
+        confidence: "medium",
+        evidence: { session_refs: ["prior-session#u0"], interval_ids: [] },
+        fix_recipe: { suggestion: priorSuggestion, verify: "ccprof --json" },
+        caveats: [],
+        recoverable: { min: 3, bound: "point" },
+      }],
+      metrics: {},
+      command_costs: [],
+    });
+
+    const options = {
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      sessionSource: new ClaudeSessionSource(projects),
+      storePaths,
+    } as const;
+
+    const first = await analyze(options);
+    assert.deepEqual(
+      first.adoptions,
+      [],
+      "no CLAUDE.md commit exists yet, so nothing can be adopted",
+    );
+    const storedBeforeFix = await loadAdoptions(storePaths);
+    assert.deepEqual(storedBeforeFix.records, []);
+
+    // Address the suggestion by editing CLAUDE.md after recorded_at_ms.
+    await write(
+      join(repo, "CLAUDE.md"),
+      "# Team notes\n\n## Deploy checklist\nFollow the steps before merging.\n",
+    );
+    await git(repo, ["add", "CLAUDE.md"]);
+    await git(repo, ["commit", "-m", "docs: add deploy checklist"], {
+      GIT_AUTHOR_DATE: "2026-01-01T00:59:58.000Z",
+      GIT_COMMITTER_DATE: "2026-01-01T00:59:58.000Z",
+    });
+    const fixCommit = await git(repo, ["rev-parse", "HEAD"]);
+
+    const second = await analyze(options);
+    const adopted = second.adoptions.find(
+      ({ finding_key }) => finding_key === priorFindingKey,
+    );
+    assert.ok(adopted, "the seeded suggestion must be reported as adopted");
+    assert.equal(adopted?.method, "claude_md_edit");
+    assert.equal(adopted?.evidence.path, "CLAUDE.md");
+    assert.equal(adopted?.evidence.commit, fixCommit);
+    assert.equal(adopted?.rule_id, "R005");
+    assert.equal(adopted?.scope, "claude_md");
+    assert.equal(adopted?.detected_at_ms, NOW_MS);
+    assert.deepEqual(
+      second.adoptions.map(({ finding_key }) => finding_key),
+      [...second.adoptions]
+        .map(({ finding_key }) => finding_key)
+        .sort((left, right) => left.localeCompare(right)),
+      "adoptions must be sorted by finding_key",
+    );
+
+    const storedAfterFix = await loadAdoptions(storePaths);
+    assert.deepEqual(
+      storedAfterFix.records.map(({ finding_key }) => finding_key),
+      [priorFindingKey],
+      "the adoption must be persisted to the adoptions store",
+    );
+
+    const third = await analyze(options);
+    assert.equal(
+      third.adoptions.filter(({ finding_key }) => finding_key === priorFindingKey).length,
+      1,
+      "a rerun must not duplicate an already-recorded adoption",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
