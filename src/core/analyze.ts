@@ -38,6 +38,7 @@ import {
   classifyCommand,
   commandMayMutateRepo,
 } from "../analysis/command.js";
+import { commandIdentityKey } from "../analysis/command-identity.js";
 import {
   applyHookEvents,
   loadHookEvents,
@@ -489,35 +490,49 @@ function commandCosts(
   actions: readonly MatchedAction[],
 ): StoredCommandCost[] {
   const byCommand = new Map<string, {
+    command: string;
+    identity: NonNullable<MatchedAction["command_identity"]>;
     intervals: MatchedAction["interval"][];
     sessionRefs: string[];
   }>();
   for (const action of actions) {
     if (
       action.kind !== "tool" ||
-      action.normalized_command === undefined
+      action.normalized_command === undefined ||
+      action.normalized_command.trim() === "" ||
+      action.command_identity === undefined
     ) {
       continue;
     }
-    const existing = byCommand.get(action.normalized_command);
+    const key = commandIdentityKey(action.command_identity);
+    const existing = byCommand.get(key);
     if (existing === undefined) {
-      byCommand.set(action.normalized_command, {
+      byCommand.set(key, {
+        command: action.normalized_command,
+        identity: {
+          ...action.command_identity,
+          normalized_argv: [...action.command_identity.normalized_argv],
+        },
         intervals: [action.interval],
         sessionRefs: [...action.session_refs],
       });
     } else {
+      if (action.normalized_command < existing.command) {
+        existing.command = action.normalized_command;
+      }
       existing.intervals.push(action.interval);
       existing.sessionRefs.push(...action.session_refs);
     }
   }
   return [...byCommand.entries()]
-    .sort(([left], [right]) => left.localeCompare(right))
-    .flatMap(([command, observations]) => {
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .flatMap(([, observations]) => {
       const elapsed = durationMs(observations.intervals);
       return elapsed <= 0
         ? []
         : [{
-            command,
+            command: observations.command,
+            command_identity: observations.identity,
             duration_min: elapsed / 60_000,
             session_refs: uniqueSorted(observations.sessionRefs),
           }];
