@@ -44,6 +44,6 @@ Initial release.
   snippet that auto-fix only `scope: this_pr` findings and never create Issues
   or extra PRs automatically.
 - Stable exit codes (0 success, 2 usage, 3 unresolved context, 4 no analyzable
-  session, 5 unrecoverable error).
+  session, 5 unrecoverable error), plus `--help` / `-h` and `--version` / `-v`.
 
 [0.1.0]: https://github.com/t09tanaka/ccprof/releases/tag/v0.1.0

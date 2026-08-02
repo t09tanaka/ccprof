@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFileSync, realpathSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -30,7 +30,39 @@ export const USAGE = `Usage: ccprof [--pr [<number|url|base...head>]] [--json|--
               [--idle-threshold <duration>] [--test-map <path>] [--color]
        ccprof stats [--json]
        ccprof dismiss <finding-key> [--reason <text>]
+       ccprof --version
 `;
+
+/**
+ * Resolve the package version from the nearest package.json above this module.
+ * Walking up keeps `dist/cli.js` and the test build layout on the same path.
+ */
+export function resolvePackageVersion(): string {
+  let directory = dirname(fileURLToPath(import.meta.url));
+  for (;;) {
+    const manifest = resolve(directory, "package.json");
+    const version = readVersionField(manifest);
+    if (version !== null) return version;
+    const parent = dirname(directory);
+    if (parent === directory) {
+      throw new Error("package.json with a version field was not found");
+    }
+    directory = parent;
+  }
+}
+
+function readVersionField(path: string): string | null {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+  const parsed: unknown = JSON.parse(raw);
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const version = (parsed as { version?: unknown }).version;
+  return typeof version === "string" && version !== "" ? version : null;
+}
 
 export class CliUsageError extends Error {
   constructor(message: string) {
@@ -63,11 +95,16 @@ export interface ParsedHelpCommand {
   kind: "help";
 }
 
+export interface ParsedVersionCommand {
+  kind: "version";
+}
+
 export type ParsedCliCommand =
   | ParsedAnalyzeCommand
   | ParsedStatsCommand
   | ParsedDismissCommand
-  | ParsedHelpCommand;
+  | ParsedHelpCommand
+  | ParsedVersionCommand;
 
 export interface CliHandlers {
   analyze: (
@@ -321,6 +358,9 @@ export function parseCliArgs(
   if (args.includes("--help") || args.includes("-h")) {
     return { kind: "help" };
   }
+  if (args.includes("--version") || args.includes("-v")) {
+    return { kind: "version" };
+  }
   if (args[0] === "stats") return parseStatsArgs(args.slice(1));
   if (args[0] === "dismiss") return parseDismissArgs(args.slice(1));
   return parseAnalyzeArgs(args);
@@ -370,6 +410,10 @@ export async function runCli(
     const command = parseCliArgs(args);
     if (command.kind === "help") {
       stdout(USAGE);
+      return 0;
+    }
+    if (command.kind === "version") {
+      stdout(`ccprof ${resolvePackageVersion()}\n`);
       return 0;
     }
     let result: CommandExecutionResult;

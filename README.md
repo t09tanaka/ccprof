@@ -78,7 +78,11 @@ ccprof --pr [<number|url|base...head>] [--json|--md]
        [--idle-threshold <duration>] [--test-map <path>]
 ccprof stats [--json]
 ccprof dismiss <finding-key> [--reason <text>]
+ccprof --version
 ```
+
+`--version` (or `-v`) prints `ccprof <version>` and exits 0; `--help` (or `-h`)
+prints the usage above. When both are given, `--help` wins.
 
 ### Analysis
 
