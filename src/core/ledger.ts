@@ -172,11 +172,7 @@ function publicFinding(
   candidate: FindingCandidate,
   reportedMs: number,
 ): Finding {
-  const {
-    target: _target,
-    recoverable,
-    ...metadata
-  } = candidate;
+  const { recoverable, ...metadata } = candidate;
   return {
     ...metadata,
     recoverable: {
