@@ -10,6 +10,7 @@ import {
   type LedgerResult,
 } from "./ledger.js";
 import type {
+  AnalysisWindow,
   AssistantEvent,
   Finding,
   FindingCandidate,
@@ -111,6 +112,8 @@ const KNOWN_LIMITATIONS = [
 export interface AnalyzeOptions {
   cwd: string;
   pr?: string;
+  sinceMs?: number;
+  commitAnchorLookbackMs?: number;
   idleThresholdMs?: number;
   testMapPath?: string;
   testMap?: TestMap;
@@ -141,6 +144,7 @@ export interface AnalyzeWarning {
 
 export interface AnalyzeResult {
   report: ReportV2;
+  window: AnalysisWindow;
   allFindings: Finding[];
   record: AnalysisRecord;
   warnings: AnalyzeWarning[];
@@ -162,6 +166,13 @@ export class NoAnalyzableTimestampsError extends Error {
       "Matching sessions did not contain enough valid timestamps to form an analyzable interval.",
     );
     this.name = "NoAnalyzableTimestampsError";
+  }
+}
+
+export class InvalidAnalysisWindowError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidAnalysisWindowError";
   }
 }
 
@@ -630,38 +641,92 @@ function defaultSessionSource(
   return new CombinedSessionSource([claudeSource, codexSource], onSourceError);
 }
 
-function contextWindow(
+function validWindowTimestamp(value: number, name: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new InvalidAnalysisWindowError(
+      `${name} must be a nonnegative safe integer`,
+    );
+  }
+}
+
+export function resolveAnalysisWindow(
   context: PrContext,
-  warnings: AnalyzeWarning[],
-): { startedAtMs: number; endedAtMs: number } {
-  const startedAtMs = context.earliestUniqueCommitAtMs ?? 0;
-  if (context.earliestUniqueCommitAtMs === undefined) {
+  options: Pick<AnalyzeOptions, "sinceMs" | "commitAnchorLookbackMs"> = {},
+  warnings: AnalyzeWarning[] = [],
+): AnalysisWindow {
+  validWindowTimestamp(context.resolvedAtMs, "analysis resolution");
+  if (options.sinceMs !== undefined) {
+    validWindowTimestamp(options.sinceMs, "explicit analysis start");
+  }
+  if (options.commitAnchorLookbackMs !== undefined) {
+    validWindowTimestamp(
+      options.commitAnchorLookbackMs,
+      "commit anchor lookback",
+    );
+  }
+  if (context.earliestUniqueCommitAtMs !== undefined) {
+    validWindowTimestamp(
+      context.earliestUniqueCommitAtMs,
+      "earliest unique commit time",
+    );
+  }
+
+  const endedAtMs = context.resolvedAtMs;
+  if (options.sinceMs !== undefined) {
+    if (options.sinceMs > endedAtMs) {
+      throw new InvalidAnalysisWindowError(
+        "explicit analysis start must not be after analysis resolution",
+      );
+    }
+    return {
+      started_at_ms: options.sinceMs,
+      ended_at_ms: endedAtMs,
+      start_source: "explicit",
+      end_source: "analysis_time",
+      completeness: "complete",
+    };
+  }
+
+  const lookbackMs = options.commitAnchorLookbackMs ?? 0;
+  const anchor = context.earliestUniqueCommitAtMs;
+  if (anchor === undefined) {
     warnings.push(
       textWarning(
         "pr_start_fallback",
         "The earliest unique commit time was unavailable; session discovery used an unbounded start.",
       ),
     );
+    return {
+      started_at_ms: 0,
+      ended_at_ms: endedAtMs,
+      start_source: "commit_anchor_lookback",
+      end_source: "analysis_time",
+      completeness: "partial",
+    };
   }
-  let endedAtMs = context.createdAtMs ?? context.resolvedAtMs;
-  if (context.createdAtMs === undefined) {
-    warnings.push(
-      textWarning(
-        "pr_end_fallback",
-        "PR creation time was unavailable; analysis resolution time was used as the end bound.",
-      ),
-    );
-  }
-  if (endedAtMs < startedAtMs) {
-    endedAtMs = context.resolvedAtMs;
+  const startedAtMs = Math.max(0, anchor - lookbackMs);
+  if (startedAtMs > endedAtMs) {
     warnings.push(
       textWarning(
         "invalid_pr_window",
-        "The PR creation time preceded the branch start; analysis resolution time was used instead.",
+        "The commit-derived start followed analysis resolution; session discovery used an unbounded start.",
       ),
     );
+    return {
+      started_at_ms: 0,
+      ended_at_ms: endedAtMs,
+      start_source: "commit_anchor_lookback",
+      end_source: "analysis_time",
+      completeness: "partial",
+    };
   }
-  return { startedAtMs, endedAtMs };
+  return {
+    started_at_ms: startedAtMs,
+    ended_at_ms: endedAtMs,
+    start_source: "commit_anchor_lookback",
+    end_source: "analysis_time",
+    completeness: "partial",
+  };
 }
 
 function ruleCandidates(
@@ -777,7 +842,7 @@ export async function analyze(
   const warnings: AnalyzeWarning[] = context.warnings.map((message) =>
     textWarning("pr_context", message)
   );
-  const window = contextWindow(context, warnings);
+  const window = resolveAnalysisWindow(context, options, warnings);
   // Only the default (Claude + Codex combined) source reports per-source
   // discovery failures this way; an injected sessionSource (tests, or a
   // future custom integration) keeps its original throw-propagates
@@ -789,7 +854,8 @@ export async function analyze(
     await source.discover({
       repoRoot: context.repoRoot,
       headBranch: context.headBranch,
-      ...window,
+      startedAtMs: window.started_at_ms,
+      endedAtMs: window.ended_at_ms,
     }),
   );
   if (sessions.length === 0) {
@@ -987,6 +1053,7 @@ export async function analyze(
   };
   return {
     report,
+    window,
     allFindings,
     record: saveResult.record,
     warnings: normalizedWarnings,

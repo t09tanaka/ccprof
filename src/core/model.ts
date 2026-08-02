@@ -180,6 +180,18 @@ export interface Interval {
   end_ms: number;
 }
 
+export interface AnalysisWindow {
+  started_at_ms: number;
+  ended_at_ms: number;
+  start_source:
+    | "explicit"
+    | "branch_reflog"
+    | "session_branch_transition"
+    | "commit_anchor_lookback";
+  end_source: "explicit" | "analysis_time";
+  completeness: "complete" | "partial";
+}
+
 export type TimelineActionKind =
   | "tool"
   | "inference"

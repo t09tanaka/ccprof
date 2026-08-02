@@ -23,6 +23,7 @@ import {
   ClaudeDiscoveryError,
   ClaudeSessionSource,
 } from "../src/sources/claude/discover.js";
+import type { SessionQuery, SessionSource } from "../src/sources/session-source.js";
 import {
   loadAnalyses,
   saveAnalysis,
@@ -149,6 +150,23 @@ async function makeClaudeProjects(
   return projects;
 }
 
+function queryCapturingClaudeSource(projects: string): {
+  source: SessionSource;
+  queries: SessionQuery[];
+} {
+  const source = new ClaudeSessionSource(projects);
+  const queries: SessionQuery[] = [];
+  return {
+    source: {
+      discover: async (query) => {
+        queries.push({ ...query });
+        return await source.discover(query);
+      },
+    },
+    queries,
+  };
+}
+
 /** A Claude projects directory whose only transcript is malformed, so
  * `discoverClaudeSessions` finds zero sessions and throws
  * `ClaudeDiscoveryError` - used to exercise `defaultSessionSource`'s
@@ -241,11 +259,34 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
       sessionSource: new ClaudeSessionSource(projects),
       storePaths,
     } as const;
-    const first = await analyze(options);
-    const second = await analyze(options);
+    const firstSource = queryCapturingClaudeSource(projects);
+    const first = await analyze({
+      ...options,
+      sessionSource: firstSource.source,
+    });
+    const secondSource = queryCapturingClaudeSource(projects);
+    const second = await analyze({
+      ...options,
+      sessionSource: secondSource.source,
+    });
 
     assert.deepEqual(second.report, first.report);
     assert.deepEqual(second.allFindings, first.allFindings);
+    assert.deepEqual(first.window, {
+      started_at_ms: Date.parse(FEATURE_COMMIT_DATE),
+      ended_at_ms: NOW_MS,
+      start_source: "commit_anchor_lookback",
+      end_source: "analysis_time",
+      completeness: "partial",
+    });
+    assert.equal(
+      firstSource.queries[0]?.startedAtMs,
+      first.window.started_at_ms,
+    );
+    assert.equal(
+      firstSource.queries[0]?.endedAtMs,
+      first.window.ended_at_ms,
+    );
     assert.deepEqual(first.report.unit.sessions, ["e2e-session"]);
     assert.equal(first.report.summary.baseline?.prs, 3);
     assert.ok(
