@@ -1,0 +1,2 @@
+{"timestamp":"2026-07-30T10:00:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Add a retry to the fetch helper."}]}}
+{"timestamp":"2026-07-30T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":"Added exponential backoff to the fetch helper."}}
