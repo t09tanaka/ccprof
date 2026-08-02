@@ -17,8 +17,10 @@ import test from "node:test";
 
 import type {
   AnalysisSummary,
+  CommandIdentity,
   Finding,
 } from "../src/core/model.js";
+import { commandIdentityKey } from "../src/analysis/command-identity.js";
 import { detectChronicCost } from "../src/rules/chronic-cost.js";
 import {
   loadAdoptions,
@@ -54,6 +56,14 @@ const summary: AnalysisSummary = {
   unexplained_min: 5,
   baseline: null,
 };
+
+function commandIdentity(
+  cwd: string,
+  argv: string[] = ["npm", "test"],
+  executor: CommandIdentity["executor"] = "shell",
+): CommandIdentity {
+  return { repo_relative_cwd: cwd, normalized_argv: [...argv], executor };
+}
 
 function finding(
   key: string,
@@ -316,6 +326,121 @@ test("corrupt indexes rebuild from immutable records and corrupt records are ski
       3,
     );
   });
+});
+
+test("schema-v1 command costs aggregate by identity while legacy costs stay isolated", () => {
+  const argv = ["npm", "test", "", "", "--flag"];
+  const api = commandIdentity("packages/api", argv);
+  const web = commandIdentity("packages/web", argv);
+  const nativeApi = commandIdentity("packages/api", argv, "native-tool");
+  const costs = [
+    { command: "npm test", command_identity: api, duration_min: 1, session_refs: ["s#1"] },
+    { command: "npm test --later-display", command_identity: api, duration_min: 2, session_refs: ["s#2"] },
+    { command: "npm test", command_identity: web, duration_min: 3, session_refs: ["s#3"] },
+    { command: "npm test", command_identity: nativeApi, duration_min: 4, session_refs: ["s#4"] },
+    { command: "npm test", duration_min: 5, session_refs: ["legacy#1"] },
+  ];
+  const make = (command_costs: typeof costs) => makeAnalysisRecord({
+    created_at_ms: 1,
+    unit: { repo: "/repo", pr_ref: "main...feature", sessions: ["s"] },
+    summary,
+    findings: [],
+    command_costs,
+  });
+  const forward = make(costs);
+  const reversed = make([...costs].reverse());
+  assert.equal(forward.schema_version, 1);
+  assert.equal(forward.command_costs.length, 4);
+  assert.deepEqual(forward.command_costs, reversed.command_costs);
+  assert.equal(forward.analysis_id, reversed.analysis_id);
+  const decimals = [0.1, 0.2, 0.3].map((duration_min, index) => ({
+    command: "npm test", command_identity: api, duration_min, session_refs: [`s#${index}`],
+  }));
+  assert.deepEqual(make(decimals).command_costs, make([...decimals].reverse()).command_costs);
+  assert.equal(make(decimals).analysis_id, make([...decimals].reverse()).analysis_id);
+  const literalCwd = commandIdentity("packages/*-api");
+  assert.deepEqual(make([{ command: "npm test", command_identity: literalCwd,
+    duration_min: 1, session_refs: [] }]).command_costs[0]?.command_identity, literalCwd);
+  const known = (identity: CommandIdentity) => forward.command_costs.find(
+    (cost) => cost.command_identity !== undefined &&
+      commandIdentityKey(cost.command_identity) === commandIdentityKey(identity),
+  );
+  const apiCost = known(api);
+  assert.equal(apiCost?.command, "npm test");
+  assert.equal(apiCost?.duration_min, 3);
+  assert.deepEqual(apiCost?.session_refs, ["s#1", "s#2"]);
+  assert.deepEqual(apiCost?.command_identity?.normalized_argv, argv);
+  assert.notEqual(apiCost?.command_identity, api);
+  assert.notEqual(apiCost?.command_identity?.normalized_argv, api.normalized_argv);
+  assert.equal(known(web)?.duration_min, 3);
+  assert.equal(known(nativeApi)?.duration_min, 4);
+  const legacy = forward.command_costs.find((cost) => cost.command_identity === undefined);
+  assert.equal(legacy?.duration_min, 5);
+  assert.equal(legacy === undefined ? true : "command_identity" in legacy, false);
+  api.normalized_argv[0] = "mutated";
+  assert.deepEqual(apiCost?.command_identity?.normalized_argv, argv);
+});
+
+test("command costs reject malformed present identities in input and persisted records", async () => {
+  const base = commandIdentity("packages/api");
+  const invalid = [
+    { ...base, repo_relative_cwd: "/repo" },
+    { ...base, repo_relative_cwd: "../api" },
+    { ...base, normalized_argv: [] },
+    { ...base, normalized_argv: ["", "test"] },
+    { ...base, normalized_argv: ["npm", 1] },
+    { ...base, executor: "process" },
+  ];
+  for (const identity of invalid) {
+    assert.throws(() => makeAnalysisRecord({
+      ...record("invalid-input", 1),
+      command_costs: [{ command: "npm test", command_identity: identity as CommandIdentity,
+        duration_min: 1, session_refs: ["s#1"] }],
+    }), /identity/iu);
+  }
+  assert.throws(() => makeAnalysisRecord({
+    ...record("skipped-invalid", 1), command_costs: [{ command: " ",
+      command_identity: invalid[0] as CommandIdentity, duration_min: 0, session_refs: [] }],
+  }), /identity/iu);
+  await temporaryStore(async (paths) => {
+    await mkdir(paths.analyses_dir, { recursive: true });
+    for (const [index, identity] of invalid.entries()) {
+      await writeFile(join(paths.analyses_dir, `invalid-${index}.json`), JSON.stringify({
+        ...record(`invalid-${index}`, index + 1),
+        command_costs: [{ command: "npm test", command_identity: identity,
+          duration_min: 1, session_refs: ["s#1"] }],
+      }), "utf8");
+    }
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded.records, []);
+    assert.equal(loaded.warnings.filter(({ code }) =>
+      code === "corrupt_analysis_record").length, invalid.length);
+  });
+});
+
+test("command costs preserve finding identities without inferring legacy identity", () => {
+  const root = commandIdentity(".");
+  const known = finding("known");
+  known.evidence.command_identity = {
+    repo_relative_cwd: root.repo_relative_cwd,
+    normalized_argv: [...root.normalized_argv],
+    executor: root.executor,
+  };
+  const { command_costs: _legacyCosts, ...fallbackInput } = record("finding-costs", 1);
+  const skipped = finding("skipped");
+  skipped.evidence.duration_ms = 0;
+  skipped.evidence.command_identity = { ...root, repo_relative_cwd: "/repo" };
+  assert.throws(() => makeAnalysisRecord({ ...fallbackInput, findings: [skipped] }), /identity/iu);
+  const result = makeAnalysisRecord({
+    ...fallbackInput,
+    findings: [known, finding("legacy")],
+  });
+  assert.equal(result.command_costs.length, 2);
+  const identityCost = result.command_costs.find((cost) => cost.command_identity !== undefined);
+  const legacyCost = result.command_costs.find((cost) => cost.command_identity === undefined);
+  assert.deepEqual(identityCost?.command_identity, root);
+  assert.notEqual(identityCost?.command_identity, root);
+  assert.equal(legacyCost === undefined ? true : "command_identity" in legacyCost, false);
 });
 
 test("analysis write failures return warnings without throwing", async () => {
@@ -593,7 +718,7 @@ test("loads a legacy analysis record without human_wait_min and no warnings", as
       },
       findings: [],
       metrics: { measured_min: 10 },
-      command_costs: [],
+      command_costs: [{ command: "npm test", duration_min: 2, session_refs: ["legacy#run"] }],
     };
     await mkdir(paths.analyses_dir, { recursive: true });
     await writeFile(
@@ -606,6 +731,8 @@ test("loads a legacy analysis record without human_wait_min and no warnings", as
     assert.deepEqual(loaded.warnings, []);
     assert.equal(loaded.records.length, 1);
     assert.equal(loaded.records[0]?.analysis_id, "legacy-record");
+    assert.deepEqual(loaded.records[0]?.command_costs, legacy.command_costs);
+    assert.equal("command_identity" in loaded.records[0]!.command_costs[0]!, false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

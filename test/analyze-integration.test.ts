@@ -370,12 +370,19 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
       first.allFindings.map(({ finding_key }) => finding_key),
     );
     assert.equal(current.summary.baseline?.prs, 3);
+    const npmTestCost = current.command_costs.find(
+      ({ command }) => command === "npm test",
+    );
     assert.equal(
-      current.command_costs.find(({ command }) => command === "npm test")
-        ?.duration_min,
+      npmTestCost?.duration_min,
       1,
       "overlapping runs of the same normalized command use wall-clock union",
     );
+    assert.deepEqual(npmTestCost?.command_identity, {
+      repo_relative_cwd: ".",
+      normalized_argv: ["npm", "test"],
+      executor: "shell",
+    });
 
     const approval = first.allFindings.find(
       ({ rule_id }) => rule_id === "R004",
@@ -824,7 +831,7 @@ function coordinationSession(
         input: {},
         paths: [],
         edit_fragments: [],
-        ...(toolName === "Bash" ? { command: "git status" } : {}),
+        ...(toolName === "Bash" ? { command: "git status", cwd: repo } : {}),
       },
       {
         ...shared,
@@ -892,6 +899,63 @@ test("coordination tools (including unknown mcp__ tools) count as normal time wh
         duration_min,
       })),
       [{ command: "git status", duration_min: 1 }],
+    );
+    assert.deepEqual(vcs.record.command_costs[0]?.command_identity, {
+      repo_relative_cwd: ".",
+      normalized_argv: ["git", "status"],
+      executor: "shell",
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("command costs separate cwd identities, exclude missing identities, and stay deterministic", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-command-costs-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const commandSession = (sessionId: string, cwd?: string): Session => {
+      const session = coordinationSession(sessionId, repo, "Bash");
+      const command = session.events.find(
+        (event) => event.kind === "tool_use" && event.tool_use_id === "coord-1",
+      );
+      assert.equal(command?.kind, "tool_use");
+      if (cwd === undefined) delete command.cwd;
+      else command.cwd = cwd;
+      return session;
+    };
+    const sessions = [
+      commandSession("api-cost", join(repo, "packages/api")),
+      commandSession("web-cost", join(repo, "packages/web")),
+      commandSession("missing-cost"),
+    ];
+    const analyzeSessions = async (ordered: Session[]) => await analyze({
+      cwd: repo, pr: "main...feature", nowMs: NOW_MS, storePaths,
+      sessionSource: { discover: async () => ordered }, persist: false,
+    });
+
+    const forward = await analyzeSessions(sessions);
+    const reverse = await analyzeSessions([...sessions].reverse());
+    assert.equal(reverse.record.analysis_id, forward.record.analysis_id);
+    assert.deepEqual(reverse.record.command_costs, forward.record.command_costs);
+    assert.deepEqual(
+      forward.record.command_costs.map((cost) => ({
+        command: cost.command,
+        command_identity: cost.command_identity,
+        duration_min: cost.duration_min,
+      })),
+      ["api", "web"].map((name) => ({
+        command: "git status",
+        command_identity: {
+          repo_relative_cwd: `packages/${name}`,
+          normalized_argv: ["git", "status"],
+          executor: "shell",
+        },
+        duration_min: 1,
+      })),
     );
   } finally {
     await rm(root, { recursive: true, force: true });

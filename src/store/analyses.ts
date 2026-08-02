@@ -10,11 +10,13 @@ import {
 import { dirname, join } from "node:path";
 
 import { normalizeCommand } from "../analysis/command.js";
+import { commandIdentityKey } from "../analysis/command-identity.js";
 import { normalizeRepoPath } from "../analysis/test-map.js";
 import type {
   AnalysisSummary,
   AnalysisUnit,
   BaselineComparison,
+  CommandIdentity,
   Confidence,
   Finding,
 } from "../core/model.js";
@@ -28,6 +30,7 @@ export interface StoreWarning {
 
 export interface StoredCommandCost {
   command: string;
+  command_identity?: CommandIdentity;
   duration_min: number;
   session_refs: string[];
 }
@@ -121,6 +124,33 @@ function isStringArray(value: unknown): value is string[] {
     value.every((entry) => typeof entry === "string");
 }
 
+function normalizeCommandIdentity(value: unknown): CommandIdentity {
+  if (!isObjectRecord(value)) throw new TypeError("command identity must be an object");
+  const cwd = value.repo_relative_cwd;
+  if (
+    typeof cwd !== "string" ||
+    (cwd !== "." && (cwd === "" || cwd.includes("\0") ||
+      cwd.startsWith("/") || /^[A-Za-z]:[\\/]/u.test(cwd) ||
+      cwd.split("/").some((segment) =>
+        segment === "" || segment === "." || segment === "..")))
+  ) {
+    throw new TypeError("command identity cwd must be normalized and repository-relative");
+  }
+  const argv = value.normalized_argv;
+  if (!isStringArray(argv) || argv.length === 0 || argv[0] === "") {
+    throw new TypeError("command identity argv must have a non-empty executable");
+  }
+  const executor = value.executor;
+  if (executor !== "shell" && executor !== "native-tool") {
+    throw new TypeError("command identity executor is invalid");
+  }
+  return { repo_relative_cwd: cwd, normalized_argv: [...argv], executor };
+}
+
+function isCommandIdentity(value: unknown): boolean {
+  try { normalizeCommandIdentity(value); return true; } catch { return false; }
+}
+
 const RULE_IDS = new Set([
   "R001",
   "R002",
@@ -200,6 +230,10 @@ function findingCommandCosts(
   findings: readonly Finding[],
 ): StoredCommandCost[] {
   return findings.flatMap((finding) => {
+    const rawIdentity = finding.evidence.command_identity;
+    const identity = rawIdentity === undefined
+      ? undefined
+      : normalizeCommandIdentity(rawIdentity);
     const command = finding.evidence.command;
     if (typeof command !== "string") return [];
     const durationMs = finding.evidence.duration_ms;
@@ -209,6 +243,7 @@ function findingCommandCosts(
     if (!finiteNonnegative(durationMin) || durationMin <= 0) return [];
     return [{
       command,
+      ...(identity === undefined ? {} : { command_identity: identity }),
       duration_min: durationMin,
       session_refs: [...finding.evidence.session_refs],
     }];
@@ -218,31 +253,44 @@ function findingCommandCosts(
 function normalizedCommandCosts(
   costs: readonly StoredCommandCost[],
 ): StoredCommandCost[] {
-  const byCommand = new Map<string, StoredCommandCost>();
+  const byKey = new Map<string, StoredCommandCost & { durations: number[] }>();
   for (const cost of costs) {
+    const identity = cost.command_identity === undefined
+      ? undefined
+      : normalizeCommandIdentity(cost.command_identity);
     if (!finiteNonnegative(cost.duration_min) || cost.duration_min <= 0) {
       continue;
     }
     const command = normalizeCommand(cost.command);
     if (command === null) continue;
-    const existing = byCommand.get(command);
+    const key = identity === undefined
+      ? `legacy\0${command}`
+      : `identity\0${commandIdentityKey(identity)}`;
+    const existing = byKey.get(key);
     if (existing === undefined) {
-      byCommand.set(command, {
+      byKey.set(key, {
         command,
-        duration_min: cost.duration_min,
+        ...(identity === undefined ? {} : { command_identity: identity }),
+        duration_min: 0,
+        durations: [cost.duration_min],
         session_refs: sortedUnique(cost.session_refs),
       });
     } else {
-      existing.duration_min += cost.duration_min;
+      if (command < existing.command) existing.command = command;
+      existing.durations.push(cost.duration_min);
       existing.session_refs = sortedUnique([
         ...existing.session_refs,
         ...cost.session_refs,
       ]);
     }
   }
-  return [...byCommand.values()].sort(
-    (left, right) => left.command.localeCompare(right.command),
-  );
+  return [...byKey.entries()]
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .map(([, { durations, ...cost }]) => ({
+      ...cost,
+      duration_min: durations.sort((left, right) => left - right)
+        .reduce((total, duration) => total + duration, 0),
+    }));
 }
 
 type NormalizedReadObservation = StoredReadObservation & { confidence: Confidence };
@@ -413,7 +461,9 @@ function isRecord(value: unknown): value is AnalysisRecord {
       typeof cost.command === "string" &&
       finiteNonnegative(cost.duration_min) &&
       Array.isArray(cost.session_refs) &&
-      cost.session_refs.every((entry) => typeof entry === "string")
+      cost.session_refs.every((entry) => typeof entry === "string") &&
+      (cost.command_identity === undefined ||
+        isCommandIdentity(cost.command_identity))
     );
 }
 
