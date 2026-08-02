@@ -1,10 +1,10 @@
 # ccprof
 
-`ccprof` is a local profiler that reconciles Claude Code session logs with the
-final Git diff, one PR at a time, and shows where minutes can be recovered —
-with evidence and a fix recipe attached. It uses only deterministic rules, so
-the same input always produces the same result. No LLM is involved in the
-analysis.
+`ccprof` is a local profiler that reconciles Claude Code and Codex session logs
+with the final Git diff, one PR at a time, and shows where minutes can be
+recovered — with evidence and a fix recipe attached. It uses only
+deterministic rules, so the same input always produces the same result. No LLM
+is involved in the analysis.
 
 ## Requirements and installation
 
@@ -307,9 +307,11 @@ jest, vitest, cargo, and pytest.
 
 ## Supported sources and schema drift
 
-The source implemented in Phase 1 is **Claude Code**. It normally discovers
-`~/.claude/projects` automatically. The `SessionSource` interface is prepared for
-additions such as Codex, but a parser for Codex logs is not implemented yet.
+Two sources are discovered together by default: **Claude Code** (normally
+`~/.claude/projects`) and **Codex** (normally `~/.codex/sessions`, overridden
+with `CCPROF_CODEX_SESSIONS_DIR`). Sessions from both are filtered to the
+repository's canonical working directory and the query's head branch before
+being combined into a single analysis.
 
 Claude Code's JSONL is an unpublished schema, so drift is absorbed at the parser
 boundary. For cumulative snapshots sharing a `message.id` the final form wins,
@@ -320,7 +322,26 @@ Sidechains and compaction are normalized as well.
 
 Markdown, baselines, and store-driven R006 were originally Phase 2 items, but
 they are included in this release. Framework-specific flaky test name
-extraction and a Codex parser are future extensions.
+extraction is a future extension.
+
+### Codex sessions and skipped rules
+
+Codex's rollout transcripts do not carry every field Claude Code's logs do. A
+rule whose detection is structurally blind without a capability is skipped for
+sessions that lack it, rather than silently reporting a false zero:
+
+| Rule | Requires | Why it is skipped for Codex sessions |
+|---|---|---|
+| R001 (rework) | `edit_fragments` | Codex rollouts do not record surviving/absent edit fragments, so rework edits cannot be distinguished from ordinary ones. |
+| R007 (context-bloat) | `token_usage` | Codex rollouts do not record per-result token counts, so the large-result and compaction thresholds have nothing to measure against. |
+
+R005 (serial-slack) needs `tool_timestamps`, which Codex rollouts do provide,
+so R005 is **not** skipped for Codex sessions. The authoritative mapping is
+`RULE_REQUIRED_CAPABILITIES` in `src/rules/capabilities.ts`.
+
+When any analyzed session lacks a capability a rule requires, that rule is
+listed in `skipped_rules` in JSON v2 and summarized in the TTY and Markdown
+reports as `Skipped rules (source lacks required data): ...`.
 
 ## Privacy and storage
 
@@ -337,7 +358,8 @@ $XDG_DATA_HOME/ccprof/<sha256(canonical-repo-path)>/
 ```
 
 For verification or unusual layouts, `CCPROF_DATA_DIR` overrides the storage
-root and `CCPROF_CLAUDE_PROJECTS_DIR` overrides the Claude projects directory.
+root, `CCPROF_CLAUDE_PROJECTS_DIR` overrides the Claude projects directory, and
+`CCPROF_CODEX_SESSIONS_DIR` overrides the Codex sessions directory.
 
 ## Exit codes
 
