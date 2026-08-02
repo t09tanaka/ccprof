@@ -162,6 +162,17 @@ export interface Session {
    * full capabilities (every existing constructor and test is unaffected).
    */
   capabilities?: readonly SessionCapability[];
+  /**
+   * A hook-recorded (`Stop` event) wall-clock end time for this session,
+   * set only when `applyHookEvents` extended `ended_at_ms` from an
+   * in-window hook row. Distinct from `ended_at_ms` - which is always the
+   * last observed event's log timestamp - so timeline building can tell
+   * "the log's own last timestamp" from "a verified, hook-confirmed later
+   * end" and only extend measured time for the latter. `undefined` means
+   * no hook corroborated this session's end (every existing constructor
+   * and test is unaffected).
+   */
+  verified_ended_at_ms?: number;
 }
 
 export interface Interval {

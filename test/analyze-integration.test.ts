@@ -1433,10 +1433,25 @@ function hookEventSession(sessionId: string, repo: string): Session {
   };
 }
 
-test("a hook-events.jsonl file with a matching, in-window Stop row is read without a warning", async () => {
+test("a hook-events.jsonl file with a matching, in-window Stop row is read without a warning and measurably extends the timeline", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-hook-events-inwindow-"));
   try {
     const repo = await realpath(await makeRepository(root));
+    const extendByMs = 5 * 60_000;
+
+    const baselineStorePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data-baseline") },
+    });
+    const baselineSession = hookEventSession("hook-session", repo);
+    const baseline = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths: baselineStorePaths,
+      sessionSource: { discover: async () => [baselineSession] },
+      persist: false,
+    });
+
     const storePaths = await resolveStorePaths(repo, {
       env: { CCPROF_DATA_DIR: join(root, "data") },
     });
@@ -1444,7 +1459,7 @@ test("a hook-events.jsonl file with a matching, in-window Stop row is read witho
     await write(
       storePaths.hook_events_path,
       `${JSON.stringify({
-        received_at_ms: session.ended_at_ms + 5 * 60_000,
+        received_at_ms: session.ended_at_ms + extendByMs,
         session_id: session.session_id,
         hook_event_name: "Stop",
       })}\n`,
@@ -1456,11 +1471,24 @@ test("a hook-events.jsonl file with a matching, in-window Stop row is read witho
       nowMs: NOW_MS,
       storePaths,
       sessionSource: { discover: async () => [session] },
+      persist: false,
     });
 
     assert.deepEqual(
       result.warnings.filter((warning) => warning.code.startsWith("hook_events")),
       [],
+    );
+
+    // The hook-recorded Stop row must actually extend measured time by the
+    // gap it corroborates, not just parse cleanly - this is the point of
+    // Session.verified_ended_at_ms feeding a synthetic timeline tail.
+    assert.equal(
+      result.ledger.totals_ms.measured,
+      baseline.ledger.totals_ms.measured + extendByMs,
+    );
+    assert.equal(
+      result.report.summary.measured_min,
+      baseline.report.summary.measured_min + extendByMs / 60_000,
     );
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1496,6 +1524,10 @@ test("a Stop row more than 30 minutes past ended_at_ms is read without a warning
       result.warnings.filter((warning) => warning.code.startsWith("hook_events")),
       [],
     );
+    // An out-of-window row must not extend measured time: the session's
+    // own two events span exactly one minute, unmodified.
+    assert.equal(result.ledger.totals_ms.measured, 60_000);
+    assert.equal(result.report.summary.measured_min, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1530,6 +1562,10 @@ test("a Stop row for an unrelated session_id is read without a warning", async (
       result.warnings.filter((warning) => warning.code.startsWith("hook_events")),
       [],
     );
+    // A row keyed to a different session_id must not extend this session's
+    // measured time.
+    assert.equal(result.ledger.totals_ms.measured, 60_000);
+    assert.equal(result.report.summary.measured_min, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1557,6 +1593,8 @@ test("analysis proceeds unchanged when hook-events.jsonl is absent", async () =>
       [],
     );
     assert.equal(result.report.unit.sessions.length, 1);
+    assert.equal(result.ledger.totals_ms.measured, 60_000);
+    assert.equal(result.report.summary.measured_min, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

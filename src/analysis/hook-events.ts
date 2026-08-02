@@ -105,9 +105,11 @@ export async function loadHookEvents(
 /**
  * Extends each session's `ended_at_ms` to the latest hook-recorded `Stop`
  * wall-clock time that both follows it and falls within
- * `HOOK_EVENT_END_WINDOW_MS` after it. Rows for a different
- * `hook_event_name` (including the `ccprof_notified` throttle marker),
- * rows for a non-matching `session_id`, and in-range-but-wrong-direction or
+ * `HOOK_EVENT_END_WINDOW_MS` after it, and records that same value as
+ * `verified_ended_at_ms` so timeline building can tell a hook-corroborated
+ * end from a plain log timestamp. Rows for a different `hook_event_name`
+ * (including the `ccprof_notified` throttle marker), rows for a
+ * non-matching `session_id`, and in-range-but-wrong-direction or
  * out-of-window rows are all ignored. Pure: sessions with no applicable row
  * are returned unchanged (by reference); only sessions that actually gain a
  * later end time get a new object.
@@ -135,6 +137,11 @@ export function applyHookEvents(
         receivedAtMs <= session.ended_at_ms + HOOK_EVENT_END_WINDOW_MS,
     );
     if (inWindow.length === 0) return session;
-    return { ...session, ended_at_ms: Math.max(...inWindow) };
+    const extendedEndedAtMs = Math.max(...inWindow);
+    return {
+      ...session,
+      ended_at_ms: extendedEndedAtMs,
+      verified_ended_at_ms: extendedEndedAtMs,
+    };
   });
 }

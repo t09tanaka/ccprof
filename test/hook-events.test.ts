@@ -50,10 +50,11 @@ function stopRow(
 
 // --- applyHookEvents -------------------------------------------------
 
-test("applyHookEvents extends ended_at_ms to a matching in-window Stop event", () => {
+test("applyHookEvents extends ended_at_ms and verified_ended_at_ms to a matching in-window Stop event", () => {
   const session = makeSession("s1", 1_000_000);
   const [result] = applyHookEvents([session], [stopRow("s1", 1_000_500)]);
   assert.equal(result?.ended_at_ms, 1_000_500);
+  assert.equal(result?.verified_ended_at_ms, 1_000_500);
   assert.notEqual(result, session, "a changed session must be a new object");
 });
 
@@ -66,6 +67,7 @@ test("applyHookEvents picks the max in-window Stop event when several exist", ()
   ];
   const [result] = applyHookEvents([session], rows);
   assert.equal(result?.ended_at_ms, 1_000_900);
+  assert.equal(result?.verified_ended_at_ms, 1_000_900);
 });
 
 test("applyHookEvents ignores a Stop event beyond the 30-minute window", () => {
@@ -73,6 +75,7 @@ test("applyHookEvents ignores a Stop event beyond the 30-minute window", () => {
   const justOutside = 1_000_000 + HOOK_EVENT_END_WINDOW_MS + 1;
   const [result] = applyHookEvents([session], [stopRow("s1", justOutside)]);
   assert.equal(result, session, "an out-of-window session must be unchanged");
+  assert.equal(result?.verified_ended_at_ms, undefined);
 });
 
 test("applyHookEvents accepts a Stop event exactly at the 30-minute boundary", () => {
@@ -80,6 +83,7 @@ test("applyHookEvents accepts a Stop event exactly at the 30-minute boundary", (
   const atBoundary = 1_000_000 + HOOK_EVENT_END_WINDOW_MS;
   const [result] = applyHookEvents([session], [stopRow("s1", atBoundary)]);
   assert.equal(result?.ended_at_ms, atBoundary);
+  assert.equal(result?.verified_ended_at_ms, atBoundary);
 });
 
 test("applyHookEvents ignores a Stop event for a different session_id", () => {
@@ -89,6 +93,7 @@ test("applyHookEvents ignores a Stop event for a different session_id", () => {
     [stopRow("other-session", 1_000_500)],
   );
   assert.equal(result, session);
+  assert.equal(result?.verified_ended_at_ms, undefined);
 });
 
 test("applyHookEvents ignores a Stop event at or before ended_at_ms", () => {

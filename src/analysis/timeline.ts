@@ -185,6 +185,69 @@ function rawIntervalsByAgent(
   return result;
 }
 
+/**
+ * One synthetic `"inference"` action per session whose `verified_ended_at_ms`
+ * (a hook-recorded `Stop` wall clock, from `applyHookEvents`) lands after
+ * that session's own last observed event. The action spans
+ * `[lastEventTimestamp, verified_ended_at_ms]` so the verified tail counts
+ * as measured time via `rawByAgent`/`activeByAgent` in `buildTimeline`
+ * instead of silently vanishing past the log's last timestamp. Sessions
+ * without `verified_ended_at_ms` - the overwhelming majority, since it's
+ * only set when a hook row corroborated the end - are entirely unaffected,
+ * which is what keeps the plain (unverified) "session end adds no tail"
+ * behavior exactly as it was.
+ */
+function verifiedTailActions(
+  sessions: readonly Session[],
+  events: readonly OrderedEvent[],
+): InternalAction[] {
+  const lastEventByLaneKey = new Map<string, OrderedEvent>();
+  for (const ordered of events) {
+    const current = lastEventByLaneKey.get(ordered.laneKey);
+    if (
+      current === undefined ||
+      ordered.event.timestamp_ms > current.event.timestamp_ms ||
+      (ordered.event.timestamp_ms === current.event.timestamp_ms &&
+        ordered.inputIndex > current.inputIndex)
+    ) {
+      lastEventByLaneKey.set(ordered.laneKey, ordered);
+    }
+  }
+
+  const actions: InternalAction[] = [];
+  for (const session of sessions) {
+    const verifiedEndedAtMs = session.verified_ended_at_ms;
+    if (
+      verifiedEndedAtMs === undefined || !Number.isFinite(verifiedEndedAtMs)
+    ) {
+      continue;
+    }
+    const laneKey = [session.source_path, session.session_id].join("\0");
+    const last = lastEventByLaneKey.get(laneKey);
+    if (last === undefined || verifiedEndedAtMs <= last.event.timestamp_ms) {
+      continue;
+    }
+    actions.push({
+      action: {
+        action_id: `${last.event.session_ref}:verified_end`,
+        kind: "inference",
+        interval: {
+          start_ms: last.event.timestamp_ms,
+          end_ms: verifiedEndedAtMs,
+        },
+        session_id: last.event.session_id,
+        agent_id: last.event.agent_id,
+        session_refs: [last.event.session_ref],
+        confidence: "low",
+        concurrent: false,
+        paths: [],
+      },
+      agentKey: last.agentKey,
+    });
+  }
+  return actions;
+}
+
 function isUserQuestionTool(use: ToolUseEvent): boolean {
   return (
     use.tool_name.replaceAll("-", "_").toLowerCase() === "askuserquestion"
@@ -607,6 +670,16 @@ export function buildTimeline(
   const caveats: string[] = [];
   const events = collectEvents(sessions, caveats);
   const rawByAgent = rawIntervalsByAgent(events);
+  const tailActions = verifiedTailActions(sessions, events);
+  for (const tail of tailActions) {
+    rawByAgent.set(
+      tail.agentKey,
+      unionIntervals([
+        ...(rawByAgent.get(tail.agentKey) ?? []),
+        tail.action.interval,
+      ]),
+    );
+  }
   const tools = pairTools(events, idleThresholdMs, caveats);
   const internalActions = [
     ...tools.actions,
@@ -619,6 +692,7 @@ export function buildTimeline(
       idleThresholdMs,
       caveats,
     ),
+    ...tailActions,
   ];
 
   const awayByAgent = new Map<string, Interval[]>();
