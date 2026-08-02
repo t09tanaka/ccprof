@@ -367,7 +367,7 @@ test("R005 rejects validation commands without proven disjoint relevance", () =>
     [
       matchedAction("opaque", 0, 100, "contributing_run", {
         tool_name: "Bash",
-        command: "npm test && npm run build",
+        command: "npm test && unknown-tool",
         relevance_paths: ["test/a.test.ts"],
       }),
       matchedAction("check", 110, 210, "contributing_run", {
@@ -1603,6 +1603,156 @@ test("R008 keeps command-scoped unknown edit relevance conservative", () => {
       ],
       editRelevanceByActionId: relevance,
     }),
+    [],
+  );
+});
+
+test("R005 does not treat coordination actions as serial read candidates", () => {
+  assert.deepEqual(
+    detectSerialSlack([
+      matchedAction("todo", 0, 100, "coordination", {
+        tool_name: "TodoWrite",
+        tool_use_id: "todo",
+      }),
+      matchedAction("agent", 200, 300, "coordination", {
+        tool_name: "Agent",
+        tool_use_id: "agent",
+      }),
+    ]),
+    [],
+  );
+  assert.deepEqual(
+    detectSerialSlack([
+      matchedAction("read-a", 0, 100, "safe_read", {
+        tool_name: "Read",
+        tool_use_id: "read-a",
+        paths: ["src/a.ts"],
+      }),
+      matchedAction("todo", 200, 300, "coordination", {
+        tool_name: "TodoWrite",
+        tool_use_id: "todo",
+      }),
+      matchedAction("read-b", 400, 500, "safe_read", {
+        tool_name: "Read",
+        tool_use_id: "read-b",
+        paths: ["test/b.test.ts"],
+      }),
+    ]),
+    [],
+  );
+});
+
+function flakyEpisodeWith(
+  between: MatchedAction,
+): ReturnType<typeof detectFlakyTests> {
+  const actions = [
+    matchedAction("failed", 0, 100, "contributing_run", {
+      tool_name: "Bash",
+      tool_use_id: "failed",
+      command: "npm test",
+      normalized_command: "npm test",
+      target: "npm test",
+    }),
+    between,
+    matchedAction("passed", 200, 260, "redundant_run", {
+      tool_name: "Bash",
+      tool_use_id: "passed",
+      command: "npm test",
+      normalized_command: "npm test",
+      target: "npm test",
+    }),
+  ];
+  return detectFlakyTests(actions, {
+    toolResults: [
+      toolResult("failed", 100, "failure"),
+      toolResult("passed", 260, "success"),
+    ],
+  });
+}
+
+test("R008 treats delegation and vcs coordination as unknown mutation risk", () => {
+  assert.deepEqual(
+    flakyEpisodeWith(
+      matchedAction("agent", 110, 150, "coordination", {
+        tool_name: "Agent",
+        tool_use_id: "agent",
+      }),
+    ),
+    [],
+  );
+  assert.deepEqual(
+    flakyEpisodeWith(
+      matchedAction("checkout", 110, 150, "coordination", {
+        tool_name: "Bash",
+        tool_use_id: "checkout",
+        command: "git checkout main",
+        normalized_command: "git checkout main",
+      }),
+    ),
+    [],
+  );
+});
+
+test("R008 does not treat recording or read-only coordination as mutation risk", () => {
+  const withTodo = flakyEpisodeWith(
+    matchedAction("todo", 110, 150, "coordination", {
+      tool_name: "TodoWrite",
+      tool_use_id: "todo",
+    }),
+  );
+  assert.equal(withTodo.length, 1);
+  const withStatus = flakyEpisodeWith(
+    matchedAction("status", 110, 150, "coordination", {
+      tool_name: "Bash",
+      tool_use_id: "status",
+      command: "git status",
+      normalized_command: "git status",
+    }),
+  );
+  assert.equal(withStatus.length, 1);
+});
+
+test("R008 does not claim fail-to-pass for a composite whose failure is unattributable", () => {
+  const command = "cd app && npm test";
+  const actions = [
+    matchedAction("failed", 0, 100, "contributing_run", {
+      tool_name: "Bash",
+      tool_use_id: "failed",
+      command,
+      normalized_command: command,
+      target: command,
+    }),
+    matchedAction("passed", 200, 260, "redundant_run", {
+      tool_name: "Bash",
+      tool_use_id: "passed",
+      command: "cd app  &&  npm test",
+      normalized_command: command,
+      target: command,
+    }),
+  ];
+  // The composite failure could come from `cd app`, so it is not a definite
+  // test failure and no flaky episode may be claimed.
+  assert.deepEqual(
+    detectFlakyTests(actions, {
+      toolResults: [
+        toolResult("failed", 100, "failure"),
+        toolResult("passed", 260, "success"),
+      ],
+    }),
+    [],
+  );
+});
+
+test("R008 treats a composite vcs coordination action as unknown mutation risk", () => {
+  assert.deepEqual(
+    flakyEpisodeWith(
+      matchedAction("commit", 110, 150, "coordination", {
+        tool_name: "Bash",
+        tool_use_id: "commit",
+        command: "git add -A && git commit -m x",
+        normalized_command: "git add -A && git commit -m x",
+      }),
+    ),
     [],
   );
 });

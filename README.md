@@ -217,6 +217,17 @@ estimated_floor_min = measured_min - point_recoverable_min
 ブランチ作成時刻がないため、PR作成時刻が得られない場合は head 固有の最古
 コミットを開始境界として使い、caveat を付けます。
 
+名前で決定的に識別できる既知の調整・委任・調査ツール（TodoWrite / Agent /
+Skill / WebFetch 等）と、既知の安全な単一コマンド（git / gh と ls・cat・rg
+などの読み取り系）は、unexplained ではなく正常コスト（normal）に分類しま
+す。`cd backend && npm test` や `npm test 2>&1 | tail` のような複合コマン
+ドも、全セグメントが既知（test/build/check/vcs/読み取り系/cd）でリダイレ
+クトを除いて解釈できる場合に限り同じ規則で分類します。未知のツール（MCP
+ツール等）や、未知のセグメント・コマンド置換を含むシェル合成は従来どおり
+unexplained のままです。AskUserQuestion はツール実行時間ではなくユーザー
+回答待ち（人間待ち）として扱い、idle threshold を厳密に超えた場合は放置
+（away）として `idle_excluded_min` に分離します。
+
 ## テスト対応の上書き
 
 JS/TS の `package.json`、Rust の `Cargo.toml` と一般的なテストパスは

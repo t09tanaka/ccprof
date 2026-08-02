@@ -159,6 +159,7 @@ export type ActionMatch =
   | "redundant_run"
   | "safe_read"
   | "duplicate_read"
+  | "coordination"
   | "unexplained";
 
 export interface MatchedAction extends TimelineAction {

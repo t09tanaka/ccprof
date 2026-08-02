@@ -22,10 +22,14 @@ import type {
   ToolUseEvent,
 } from "./model.js";
 import {
+  isDelegationToolName,
   matchTimelineActions,
   type ActionObservation,
 } from "../analysis/diff-matcher.js";
-import { classifyCommand } from "../analysis/command.js";
+import {
+  classifyCommand,
+  commandMayMutateRepo,
+} from "../analysis/command.js";
 import {
   buildTimeline,
   type TimelineResult,
@@ -318,7 +322,7 @@ function mappedTestCommands(testMap: TestMap): ReadonlySet<string> {
       .flatMap((mapping) => mapping.commands)
       .filter((command) => {
         const family = classifyCommand(command).family;
-        return family === "test" || family === "other";
+        return family !== "build" && family !== "check";
       }),
   );
 }
@@ -381,6 +385,7 @@ function contributingIntervals(
     "contributing_edit",
     "contributing_run",
     "safe_read",
+    "coordination",
   ]);
   return actions
     .filter((action) => contributing.has(action.match))
@@ -445,7 +450,11 @@ async function readObservations(
           (mutation.match === "unexplained" &&
             mutation.normalized_command === undefined &&
             !READ_ONLY_TOOL.test((mutation.tool_name ?? "")
-              .replaceAll("-", "_").toLowerCase())))
+              .replaceAll("-", "_").toLowerCase())) ||
+          (mutation.match === "coordination" &&
+            isDelegationToolName(mutation.tool_name)) ||
+          (mutation.command !== undefined &&
+            commandMayMutateRepo(mutation.command)))
       )) continue;
       byPath.set(path, [...(byPath.get(path) ?? []), action]);
       eligibleReadKeys.add([action.session_id, action.agent_id, action.action_id, path].join("\0"));

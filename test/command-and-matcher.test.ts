@@ -1228,3 +1228,438 @@ test("failed or missing-result reads are unexplained and never seed duplicates",
   assert.equal(matched[0]?.match_confidence, "low");
   assert.match(matched[0]?.caveats.join("\n") ?? "", /successful/iu);
 });
+
+test("recognizes vcs and inspect command families deterministically", () => {
+  assert.equal(classifyCommand("git status").family, "vcs");
+  assert.equal(classifyCommand("git status").opaque, false);
+  assert.equal(classifyCommand("gh pr view 12").family, "vcs");
+  assert.equal(classifyCommand("ls -la").family, "inspect");
+  assert.equal(classifyCommand("rg pattern src").family, "inspect");
+  const composed = classifyCommand("git status && unknown-tool");
+  assert.equal(composed.opaque, true);
+  assert.equal(composed.family, "other");
+});
+
+test("recognizes additional read-only executables and write-mode sed conservatively", () => {
+  for (const [command, family] of [
+    ["echo done", "inspect"],
+    ["printf %s x", "inspect"],
+    ["date -u", "inspect"],
+    ["sed -n 1p src/a.ts", "inspect"],
+    ["sed s/a/b/ src/a.ts", "inspect"],
+    ["sed -i.bak s/a/b/ src/a.ts", "other"],
+    ["sed -i s/a/b/ src/a.ts", "other"],
+    ["sed --in-place=.bak s/a/b/ src/a.ts", "other"],
+    ["sed -ni s/a/b/ src/a.ts", "other"],
+    ["sed -nEi.bak s/a/b/ src/a.ts", "other"],
+    ["xargs rm", "other"],
+    ["mkdir build", "other"],
+  ] as const) {
+    assert.equal(classifyCommand(command).family, family, command);
+  }
+  const composite = classifyCommand("echo foo && git add x");
+  assert.equal(composite.opaque, false);
+  assert.equal(composite.family, "vcs");
+});
+
+test("keeps writable variants of find, sort, and awk unrecognized", () => {
+  for (const [command, family] of [
+    ["find src -name *.ts", "inspect"],
+    ["find . -delete", "other"],
+    ["find . -exec rm {} \\;", "other"],
+    ["find . -execdir chmod +x {} \\;", "other"],
+    ["find . -fprintf log %p", "other"],
+    ["sort file.txt", "inspect"],
+    ["sort -u file.txt", "inspect"],
+    ["sort -o out.txt file.txt", "other"],
+    ["sort --output=out.txt file.txt", "other"],
+    ["awk {print} file.txt", "other"],
+  ] as const) {
+    assert.equal(classifyCommand(command).family, family, command);
+  }
+});
+
+test("only all-and composites keep a definite success and never a definite failure", () => {
+  const piped = classifyCommand("npm test 2>&1 | tail -1");
+  assert.deepEqual(
+    classifyCommandResult(piped, { status: "success", exitCode: 0 }),
+    { status: "unknown", definite: false, source: "unknown" },
+  );
+  assert.deepEqual(
+    classifyCommandResult(piped, { status: "unknown", output: "12 passed" }),
+    { status: "unknown", definite: false, source: "unknown" },
+  );
+  assert.equal(
+    classifyCommandResult(piped, { status: "timeout" }).status,
+    "timeout",
+  );
+  for (const raw of ["npm test ; true", "npm test || true"]) {
+    assert.deepEqual(
+      classifyCommandResult(classifyCommand(raw), {
+        status: "success",
+        exitCode: 0,
+      }),
+      { status: "unknown", definite: false, source: "unknown" },
+      raw,
+    );
+  }
+
+  const allAnd = classifyCommand("npm test && npm run build");
+  assert.deepEqual(
+    classifyCommandResult(allAnd, { status: "success" }),
+    { status: "success", definite: true, source: "metadata" },
+  );
+  const failed = classifyCommandResult(allAnd, {
+    status: "failure",
+    exitCode: 1,
+  });
+  assert.equal(failed.status, "failure");
+  assert.equal(failed.definite, false);
+
+  const redirectOnly = classifyCommand("npm test 2>&1");
+  assert.deepEqual(
+    classifyCommandResult(redirectOnly, { status: "failure", exitCode: 1 }),
+    { status: "failure", definite: true, source: "metadata" },
+  );
+});
+
+test("a piped test success does not seed the redundant-run history", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("edit", 0, "Edit", {
+        paths: ["src/widget.ts"],
+        fragments: ["export const widget = true;"],
+      }),
+      observe("run-1", 200, "Bash", { command: "npm test 2>&1 | tail -1" }),
+      observe("run-2", 400, "Bash", { command: "npm test 2>&1 | tail -1" }),
+    ],
+    {
+      diff: diff([
+        file("src/widget.ts", { addedLines: ["export const widget = true;"] }),
+      ]),
+      testMap: explicitMap,
+    },
+  );
+  // The piped success is not definite, so no successful-run snapshot is
+  // recorded and the repeat can never be classified as redundant.
+  assert.equal(matched[1]?.match, "contributing_run");
+  assert.equal(matched[2]?.match, "contributing_run");
+});
+
+test("classifies composite commands whose segments are all recognized", () => {
+  const cdTest = classifyCommand("cd backend && npm test");
+  assert.equal(cdTest.opaque, false);
+  assert.equal(cdTest.family, "test");
+  assert.equal(cdTest.scope, "full");
+  assert.equal(cdTest.normalized, "cd backend && npm test");
+
+  const piped = classifyCommand("npm test 2>&1 | tail -20");
+  assert.equal(piped.opaque, false);
+  assert.equal(piped.family, "test");
+  assert.equal(piped.scope, "full");
+
+  const vcs = classifyCommand("git add -A && git commit -m x");
+  assert.equal(vcs.opaque, false);
+  assert.equal(vcs.family, "vcs");
+  assert.equal(vcs.scope, "unknown");
+  assert.deepEqual(vcs.targets, []);
+
+  const redirected = classifyCommand("npm test > out.txt");
+  assert.equal(redirected.opaque, false);
+  assert.equal(redirected.family, "test");
+
+  const inspectOnly = classifyCommand("ls -la | sort | uniq");
+  assert.equal(inspectOnly.opaque, false);
+  assert.equal(inspectOnly.family, "inspect");
+  assert.equal(inspectOnly.scope, "unknown");
+});
+
+test("composite normalized commands round-trip through classification", () => {
+  const normalized = normalizeCommand("cd backend  &&  npm test 2>&1 | tail -20");
+  assert.ok(normalized !== null);
+  assert.equal(classifyCommand(normalized).family, "test");
+  assert.equal(normalizeCommand(normalized), normalized);
+});
+
+test("keeps composite commands with unknown segments or substitution opaque", () => {
+  for (const raw of [
+    "ls && unknown-tool",
+    "echo $(date)",
+    "npm test && touch sentinel",
+    "npm test &",
+    "npm test >",
+    "cd backend && cd frontend",
+  ]) {
+    const descriptor = classifyCommand(raw);
+    assert.equal(descriptor.opaque, true, raw);
+    assert.equal(descriptor.family, "other", raw);
+  }
+});
+
+test("a composite with multiple test or build segments keeps an unknown scope", () => {
+  const doubled = classifyCommand("npm test && npm run build");
+  assert.equal(doubled.opaque, false);
+  assert.equal(doubled.family, "test");
+  assert.equal(doubled.scope, "unknown");
+  assert.deepEqual(doubled.targets, []);
+});
+
+test("classifies known coordination tools while unknown tools stay unexplained", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("todo", 0, "TodoWrite"),
+      observe("mcp", 200, "mcp__foo__bar"),
+      observe("fetch", 400, "WebFetch"),
+      observe("agent", 600, "Agent"),
+      observe("skill", 800, "Skill"),
+    ],
+    { diff: diff([]), testMap: explicitMap },
+  );
+  assert.deepEqual(matched.map((entry) => entry.match), [
+    "coordination",
+    "unexplained",
+    "coordination",
+    "coordination",
+    "coordination",
+  ]);
+  assert.equal(matched[0]?.match_confidence, "high");
+  assert.match(
+    matched[1]?.caveats.join("\n") ?? "",
+    /not known well enough/iu,
+  );
+});
+
+test("classifies single vcs and inspect commands as coordination but keeps unknown composition opaque", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("git", 0, "Bash", { command: "git status" }),
+      observe("ls", 200, "Bash", { command: "ls -la" }),
+      observe("mix", 400, "Bash", { command: "git status && unknown-tool" }),
+    ],
+    { diff: diff([]), testMap: explicitMap },
+  );
+  assert.deepEqual(matched.map((entry) => entry.match), [
+    "coordination",
+    "coordination",
+    "unexplained",
+  ]);
+  assert.equal(matched[0]?.match_confidence, "high");
+  assert.equal(matched[0]?.normalized_command, "git status");
+  assert.equal(matched[1]?.normalized_command, "ls -la");
+  assert.equal(matched[2]?.normalized_command, undefined);
+});
+
+test("classifies composite test runs so repeats become redundant", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("edit", 0, "Edit", {
+        paths: ["src/widget.ts"],
+        fragments: ["export const widget = true;"],
+      }),
+      observe("run-1", 200, "Bash", { command: "cd backend && npm test" }),
+      observe("run-2", 400, "Bash", { command: "cd backend  &&  npm test" }),
+    ],
+    {
+      diff: diff([
+        file("src/widget.ts", { addedLines: ["export const widget = true;"] }),
+      ]),
+      testMap: explicitMap,
+    },
+  );
+  assert.deepEqual(matched.map((entry) => entry.match), [
+    "contributing_edit",
+    "contributing_run",
+    "redundant_run",
+  ]);
+  assert.equal(matched[1]?.normalized_command, "cd backend && npm test");
+  assert.equal(matched[2]?.normalized_command, "cd backend && npm test");
+});
+
+test("a piped test command with redirects matches the explicit test map", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("edit", 0, "Edit", {
+        paths: ["src/widget.ts"],
+        fragments: ["export const widget = true;"],
+      }),
+      observe("run", 200, "Bash", { command: "npm test 2>&1 | tail -20" }),
+    ],
+    {
+      diff: diff([
+        file("src/widget.ts", { addedLines: ["export const widget = true;"] }),
+      ]),
+      testMap: explicitMap,
+    },
+  );
+  assert.equal(matched[1]?.match, "contributing_run");
+  assert.equal(matched[1]?.match_confidence, "high");
+  assert.deepEqual(matched[1]?.relevance_paths, ["src/widget.ts"]);
+});
+
+test("classifies a composite vcs command as coordination", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("commit", 0, "Bash", {
+        command: "git add -A && git commit -m x",
+      }),
+    ],
+    { diff: diff([]), testMap: explicitMap },
+  );
+  assert.equal(matched[0]?.match, "coordination");
+  assert.equal(
+    matched[0]?.normalized_command,
+    "git add -A && git commit -m x",
+  );
+});
+
+test("a composite with an output redirect still invalidates duplicate-read state", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("read-1", 0, "Read", { paths: ["src/widget.ts"] }),
+      observe("redirected", 200, "Bash", { command: "npm test > out.txt" }),
+      observe("read-2", 400, "Read", { paths: ["src/widget.ts"] }),
+    ],
+    { diff: diff([]), testMap: explicitMap },
+  );
+  assert.equal(matched[0]?.match, "safe_read");
+  assert.equal(matched[2]?.match, "safe_read");
+});
+
+test("a composite vcs mutation between runs still blocks redundancy", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("edit", 0, "Edit", {
+        paths: ["src/widget.ts"],
+        fragments: ["export const widget = true;"],
+      }),
+      observe("run-1", 200, "Bash", { command: "npm test" }),
+      observe("pull", 400, "Bash", { command: "git fetch && git merge" }),
+      observe("run-2", 600, "Bash", { command: "npm test" }),
+    ],
+    {
+      diff: diff([
+        file("src/widget.ts", { addedLines: ["export const widget = true;"] }),
+      ]),
+      testMap: explicitMap,
+    },
+  );
+  assert.equal(matched[2]?.match, "coordination");
+  assert.equal(matched[3]?.match, "unexplained");
+});
+
+test("prefers explicit test-map classification over vcs coordination", () => {
+  const mappedVcsMap = parseExplicitTestMap({
+    mappings: [
+      {
+        source: ["src/**"],
+        tests: ["test/**"],
+        commands: ["git testcmd"],
+      },
+    ],
+  });
+  const matched = matchTimelineActions(
+    [
+      observe("edit", 0, "Edit", {
+        paths: ["src/widget.ts"],
+        fragments: ["export const widget = true;"],
+      }),
+      observe("run", 200, "Bash", { command: "git testcmd" }),
+    ],
+    {
+      diff: diff([
+        file("src/widget.ts", { addedLines: ["export const widget = true;"] }),
+      ]),
+      testMap: mappedVcsMap,
+    },
+  );
+  assert.equal(matched[1]?.match, "contributing_run");
+});
+
+test("delegation tools invalidate duplicate-read state but recording tools do not", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("read-1", 0, "Read", { paths: ["src/widget.ts"] }),
+      observe("todo", 200, "TodoWrite"),
+      observe("read-2", 400, "Read", { paths: ["src/widget.ts"] }),
+      observe("agent", 600, "Agent"),
+      observe("read-3", 800, "Read", { paths: ["src/widget.ts"] }),
+    ],
+    { diff: diff([]), testMap: explicitMap },
+  );
+  assert.deepEqual(matched.map((entry) => entry.match), [
+    "safe_read",
+    "coordination",
+    "duplicate_read",
+    "coordination",
+    "safe_read",
+  ]);
+});
+
+test("an inspect command does not invalidate duplicate-read state but a vcs command does", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("read-1", 0, "Read", { paths: ["src/widget.ts"] }),
+      observe("ls", 200, "Bash", { command: "ls -la" }),
+      observe("read-2", 400, "Read", { paths: ["src/widget.ts"] }),
+      observe("git", 600, "Bash", { command: "git checkout main" }),
+      observe("read-3", 800, "Read", { paths: ["src/widget.ts"] }),
+    ],
+    { diff: diff([]), testMap: explicitMap },
+  );
+  assert.deepEqual(matched.map((entry) => entry.match), [
+    "safe_read",
+    "coordination",
+    "duplicate_read",
+    "coordination",
+    "safe_read",
+  ]);
+});
+
+test("a vcs command between runs still blocks redundancy conservatively", () => {
+  const matched = matchTimelineActions(
+    [
+      observe("edit", 0, "Edit", {
+        paths: ["src/widget.ts"],
+        fragments: ["export const widget = true;"],
+      }),
+      observe("run-1", 200, "Bash", { command: "npm test" }),
+      observe("checkout", 400, "Bash", { command: "git checkout main" }),
+      observe("run-2", 600, "Bash", { command: "npm test" }),
+    ],
+    {
+      diff: diff([
+        file("src/widget.ts", { addedLines: ["export const widget = true;"] }),
+      ]),
+      testMap: explicitMap,
+    },
+  );
+  assert.equal(matched[1]?.match, "contributing_run");
+  assert.equal(matched[2]?.match, "coordination");
+  assert.equal(matched[3]?.match, "unexplained");
+  assert.match(
+    matched[3]?.caveats.join("\n") ?? "",
+    /unknown mutation scope/iu,
+  );
+});
+
+test("inherits a coordination classification for its causal inference", () => {
+  const todo = observe("todo", 0, "TodoWrite");
+  const inference: ActionObservation = {
+    action: action("todo-inference", 110, {
+      kind: "inference",
+      paths: [],
+      tool_use_id: "todo",
+      tool_name: "TodoWrite",
+    }),
+    ...(todo.toolUse === undefined ? {} : { toolUse: todo.toolUse }),
+    ...(todo.toolResult === undefined ? {} : { toolResult: todo.toolResult }),
+  };
+  const matched = matchTimelineActions([todo, inference], {
+    diff: diff([]),
+    testMap: explicitMap,
+  });
+  assert.deepEqual(matched.map((entry) => entry.match), [
+    "coordination",
+    "coordination",
+  ]);
+});

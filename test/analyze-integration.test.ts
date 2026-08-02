@@ -3,6 +3,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -14,6 +15,7 @@ import {
   analyze,
   NoAnalyzableTimestampsError,
 } from "../src/core/analyze.js";
+import type { Session } from "../src/core/model.js";
 import { parseExplicitTestMap } from "../src/analysis/test-map.js";
 import { runCommand } from "../src/git/client.js";
 import { ClaudeSessionSource } from "../src/sources/claude/discover.js";
@@ -461,6 +463,137 @@ test("R008 excludes manifest build/check commands but keeps explicit custom test
         )
         .sort(),
       ["make test"],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+function coordinationSession(
+  sessionId: string,
+  repo: string,
+  toolName: string,
+): Session {
+  const shared = {
+    session_id: sessionId,
+    agent_id: "main",
+    is_sidechain: false,
+    confidence: "high" as const,
+  };
+  const t0 = NOW_MS - 600_000;
+  return {
+    session_id: sessionId,
+    source: "claude",
+    source_path: join(repo, `${sessionId}.jsonl`),
+    observed_cwds: [repo],
+    observed_branches: ["feature"],
+    started_at_ms: t0,
+    ended_at_ms: t0 + 180_000,
+    confidence: "high",
+    warnings: [],
+    events: [
+      {
+        ...shared,
+        kind: "tool_use",
+        timestamp_ms: t0,
+        entry_uuid: "read-use",
+        session_ref: `${sessionId}#read-use`,
+        source_index: 0,
+        tool_use_id: "read-1",
+        tool_name: "Read",
+        input: {},
+        paths: ["src/value.ts"],
+        edit_fragments: [],
+        cwd: repo,
+      },
+      {
+        ...shared,
+        kind: "tool_result",
+        timestamp_ms: t0 + 60_000,
+        entry_uuid: "read-result",
+        session_ref: `${sessionId}#read-result`,
+        source_index: 1,
+        tool_use_id: "read-1",
+        status: "success",
+        output: "export const value = 2;",
+        output_bytes: 24,
+        estimated_tokens: 6,
+      },
+      {
+        ...shared,
+        kind: "tool_use",
+        timestamp_ms: t0 + 120_000,
+        entry_uuid: "tool-use",
+        session_ref: `${sessionId}#tool-use`,
+        source_index: 2,
+        tool_use_id: "coord-1",
+        tool_name: toolName,
+        input: {},
+        paths: [],
+        edit_fragments: [],
+        ...(toolName === "Bash" ? { command: "git status" } : {}),
+      },
+      {
+        ...shared,
+        kind: "tool_result",
+        timestamp_ms: t0 + 180_000,
+        entry_uuid: "tool-result",
+        session_ref: `${sessionId}#tool-result`,
+        source_index: 3,
+        tool_use_id: "coord-1",
+        status: "success",
+        output: "ok",
+        output_bytes: 2,
+        estimated_tokens: 1,
+      },
+    ],
+  };
+}
+
+test("coordination tools count as normal time while delegation still invalidates frozen-head reads", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-coordination-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const analyzeWith = async (toolName: string, sessionId: string) =>
+      await analyze({
+        cwd: repo,
+        pr: "main...feature",
+        nowMs: NOW_MS,
+        storePaths,
+        sessionSource: {
+          discover: async () => [
+            coordinationSession(sessionId, repo, toolName),
+          ],
+        },
+      });
+
+    const todo = await analyzeWith("TodoWrite", "todo-session");
+    assert.equal(todo.ledger.totals_ms.measured, 180_000);
+    assert.equal(todo.ledger.totals_ms.normal, 120_000);
+    assert.equal(todo.ledger.totals_ms.unexplained, 60_000);
+    assert.equal(todo.record.read_observations?.length, 1);
+    assert.equal(todo.record.read_observations?.[0]?.path, "src/value.ts");
+
+    const agent = await analyzeWith("Agent", "agent-session");
+    assert.equal(agent.ledger.totals_ms.normal, 120_000);
+    assert.deepEqual(agent.record.read_observations, []);
+
+    const unknown = await analyzeWith("mcp__custom__tool", "mcp-session");
+    assert.equal(unknown.ledger.totals_ms.normal, 60_000);
+    assert.equal(unknown.ledger.totals_ms.unexplained, 120_000);
+
+    const vcs = await analyzeWith("Bash", "vcs-session");
+    assert.equal(vcs.ledger.totals_ms.normal, 120_000);
+    assert.deepEqual(vcs.record.read_observations, []);
+    assert.deepEqual(
+      vcs.record.command_costs.map(({ command, duration_min }) => ({
+        command,
+        duration_min,
+      })),
+      [{ command: "git status", duration_min: 1 }],
     );
   } finally {
     await rm(root, { recursive: true, force: true });

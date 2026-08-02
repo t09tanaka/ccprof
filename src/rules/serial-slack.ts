@@ -96,6 +96,9 @@ export function isReadOnlyCommand(command: string | undefined): boolean {
   if (command === undefined || command.trim() === "") return false;
   const descriptor = classifyCommand(command);
   if (descriptor.opaque || descriptor.tokens.length === 0) return false;
+  // Composite commands are never vouched for as read-only: a later segment
+  // or redirect could write even when the first segment looks safe.
+  if (descriptor.segmentFamilies !== undefined) return false;
   const executable = basename(descriptor.tokens[0] ?? "")
     .toLocaleLowerCase("en-US");
   const args = descriptor.tokens.slice(1);

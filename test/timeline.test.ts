@@ -572,3 +572,71 @@ test("compaction breaks causal action attribution and session end adds no tail",
   assert.equal(timeline.rawIntervals.at(-1)?.end_ms, 20);
   assert.ok(timeline.caveats.some((item) => item.includes("compaction")));
 });
+
+test("AskUserQuestion becomes human wait with tool metadata retained", () => {
+  const timeline = buildTimeline([
+    session([
+      toolUse("ask", 0, 0, "main", {
+        tool_name: "AskUserQuestion",
+        paths: [],
+      }),
+      toolResult("ask", 1_000, 1),
+    ]),
+  ]);
+
+  assert.deepEqual(timeline.toolIntervals, []);
+  assert.deepEqual(timeline.humanWaitIntervals, [
+    { start_ms: 0, end_ms: 1_000 },
+  ]);
+  assert.deepEqual(timeline.activeIntervals, timeline.rawIntervals);
+  const action = timeline.actions.find(
+    (candidate) => candidate.tool_use_id === "ask",
+  );
+  assert.equal(action?.kind, "human_wait");
+  assert.equal(action?.tool_name, "AskUserQuestion");
+  assert.deepEqual(action?.interval, { start_ms: 0, end_ms: 1_000 });
+});
+
+test("an AskUserQuestion wait exactly at the threshold stays human wait", () => {
+  const timeline = buildTimeline(
+    [
+      session([
+        toolUse("ask", 0, 0, "main", {
+          tool_name: "AskUserQuestion",
+          paths: [],
+        }),
+        toolResult("ask", 1_000, 1),
+      ]),
+    ],
+    { idleThresholdMs: 1_000 },
+  );
+
+  assert.deepEqual(timeline.humanWaitIntervals, [
+    { start_ms: 0, end_ms: 1_000 },
+  ]);
+  assert.deepEqual(timeline.idleIntervals, []);
+});
+
+test("an AskUserQuestion wait over the threshold becomes away and is idle-excluded", () => {
+  const timeline = buildTimeline(
+    [
+      session([
+        toolUse("ask", 0, 0, "main", {
+          tool_name: "AskUserQuestion",
+          paths: [],
+        }),
+        toolResult("ask", 1_001, 1),
+      ]),
+    ],
+    { idleThresholdMs: 1_000 },
+  );
+
+  assert.deepEqual(timeline.humanWaitIntervals, []);
+  assert.deepEqual(timeline.activeIntervals, []);
+  assert.deepEqual(timeline.idleIntervals, [{ start_ms: 0, end_ms: 1_001 }]);
+  const action = timeline.actions.find(
+    (candidate) => candidate.tool_use_id === "ask",
+  );
+  assert.equal(action?.kind, "away");
+  assert.equal(action?.tool_name, "AskUserQuestion");
+});
