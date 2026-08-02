@@ -1,6 +1,23 @@
+import type { AdvisoryText } from "../advisory/advisory.js";
 import type { ReportV2 } from "../core/model.js";
 
-function reportForDisplay(report: ReportV2): ReportV2 {
+export interface JsonReportOptions {
+  advisory?: AdvisoryText;
+}
+
+/**
+ * Display-only shape: `advisory` extends the rendered JSON, never
+ * `ReportV2` itself, so the store and baselines cannot carry LLM output.
+ * The field is omitted entirely without `--advisory`, keeping existing
+ * output byte-identical (same additive-optional stance as
+ * `skipped_rules`).
+ */
+type DisplayReport = ReportV2 & { advisory?: AdvisoryText };
+
+function reportForDisplay(
+  report: ReportV2,
+  advisory?: AdvisoryText,
+): DisplayReport {
   return {
     version: 2,
     unit: {
@@ -27,9 +44,17 @@ function reportForDisplay(report: ReportV2): ReportV2 {
           missing: [...skipped.missing],
         })),
       }),
+    ...(advisory === undefined
+      ? {}
+      : { advisory: { source: advisory.source, text: advisory.text } }),
   };
 }
 
-export function renderJsonReport(report: ReportV2): string {
-  return `${JSON.stringify(reportForDisplay(report), null, 2)}\n`;
+export function renderJsonReport(
+  report: ReportV2,
+  options: JsonReportOptions = {},
+): string {
+  return `${
+    JSON.stringify(reportForDisplay(report, options.advisory), null, 2)
+  }\n`;
 }

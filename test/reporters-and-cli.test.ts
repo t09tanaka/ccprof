@@ -382,11 +382,13 @@ test("CLI parser accepts direct analyze, optional PR selectors, durations, stats
     kind: "analyze",
     format: "tty",
     color: false,
+    advisory: false,
   });
   assert.deepEqual(parseCliArgs(["--pr", "--json"]), {
     kind: "analyze",
     format: "json",
     color: false,
+    advisory: false,
   });
   for (const selector of [
     "123",
@@ -413,6 +415,7 @@ test("CLI parser accepts direct analyze, optional PR selectors, durations, stats
       pr: "42",
       format: "markdown",
       color: true,
+      advisory: false,
       idleThresholdMs: 90_000,
       testMapPath: "test-map.json",
     },
@@ -458,6 +461,7 @@ test("analysis-window CLI options accept strict RFC3339 and duration forms", () 
       kind: "analyze",
       format: "tty",
       color: false,
+      advisory: false,
       sinceMs: 0,
       commitAnchorLookbackMs: 7_200_000,
     },
@@ -472,6 +476,7 @@ test("analysis-window CLI options accept strict RFC3339 and duration forms", () 
       kind: "analyze",
       format: "tty",
       color: false,
+      advisory: false,
       sinceMs: Date.UTC(2026, 7, 3, 17, 4, 56),
       commitAnchorLookbackMs: 5_400_000,
     },
@@ -487,6 +492,7 @@ test("analysis-window CLI options accept strict RFC3339 and duration forms", () 
       kind: "analyze",
       format: "tty",
       color: false,
+      advisory: false,
       sinceMs: 0,
       commitAnchorLookbackMs: 0,
     },

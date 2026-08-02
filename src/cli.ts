@@ -39,6 +39,7 @@ import { sanitizeHumanText } from "./reporters/sanitize.js";
 export const USAGE = `Usage: ccprof [--pr [<number|url|base...head>]] [--json|--md]
               [--idle-threshold <duration>] [--test-map <path>] [--color]
               [--since <RFC3339>] [--commit-lookback <duration>]
+              [--advisory]
        ccprof stats [--json]
        ccprof dismiss <finding-key> [--reason <text>]
        ccprof hook-event [--notify]
@@ -88,6 +89,7 @@ export interface ParsedAnalyzeCommand {
   kind: "analyze";
   format: AnalyzeOutputFormat;
   color: boolean;
+  advisory: boolean;
   pr?: string;
   sinceMs?: number;
   commitAnchorLookbackMs?: number;
@@ -295,6 +297,7 @@ function parseAnalyzeArgs(
 ): ParsedAnalyzeCommand {
   let format: AnalyzeOutputFormat = "tty";
   let color = false;
+  let advisory = false;
   let pr: string | undefined;
   let sinceMs: number | undefined;
   let commitAnchorLookbackMs: number | undefined;
@@ -303,6 +306,7 @@ function parseAnalyzeArgs(
   let sawPr = false;
   let sawFormat = false;
   let sawColor = false;
+  let sawAdvisory = false;
   let sawSince = false;
   let sawCommitLookback = false;
   let sawIdle = false;
@@ -322,6 +326,14 @@ function parseAnalyzeArgs(
       if (sawColor) throw new CliUsageError("--color was specified twice");
       sawColor = true;
       color = true;
+      continue;
+    }
+    if (token === "--advisory") {
+      if (sawAdvisory) {
+        throw new CliUsageError("--advisory was specified twice");
+      }
+      sawAdvisory = true;
+      advisory = true;
       continue;
     }
     if (token === "--pr") {
@@ -440,6 +452,7 @@ function parseAnalyzeArgs(
     kind: "analyze",
     format,
     color,
+    advisory,
     ...(pr === undefined ? {} : { pr }),
     ...(sinceMs === undefined ? {} : { sinceMs }),
     ...(commitAnchorLookbackMs === undefined
@@ -667,6 +680,7 @@ export async function runCli(
         format: command.format,
         color: command.color ||
           (command.format === "tty" && stdoutIsTTY),
+        ...(command.advisory ? { advisory: true } : {}),
         ...(command.pr === undefined ? {} : { pr: command.pr }),
         ...(command.sinceMs === undefined
           ? {}
