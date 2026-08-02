@@ -47,6 +47,40 @@ const BASE = "1".repeat(40);
 const HEAD = "2".repeat(40);
 const MERGE_BASE = "3".repeat(40);
 
+async function resolveReflogFixture(options: {
+  oidLength?: 40 | 64;
+  localHead?: string | null;
+  reflog: CommandResult;
+}) {
+  const length = options.oidLength ?? 40;
+  const base = "1".repeat(length);
+  const head = "2".repeat(length);
+  const mergeBase = "3".repeat(length);
+  const localHead = options.localHead === undefined ? head : options.localHead;
+  const fixture = fakeRunner(({ command, args }) => {
+    if (command === "gh") {
+      return ok(JSON.stringify({
+        number: 7, url: "https://github.example/acme/widget/pull/7",
+        baseRefName: "main", baseRefOid: base,
+        headRefName: "topic", headRefOid: head, isCrossRepository: false,
+        createdAt: "2026-07-01T00:00:00Z",
+      }));
+    }
+    if (args[0] === "rev-parse" && args[1] === "--show-toplevel") return ok("/repo\n");
+    if (args[0] === "rev-parse" && args.at(-1) === `${base}^{commit}`) return ok(`${base}\n`);
+    if (args[0] === "rev-parse" && args.at(-1) === `${head}^{commit}`) return ok(`${head}\n`);
+    if (args[0] === "rev-parse" && args.at(-1) === "refs/heads/topic^{commit}")
+      return localHead === null ? { code: 1, stdout: "", stderr: "missing" } : ok(`${localHead}\n`);
+    if (args[0] === "merge-base") return ok(`${mergeBase}\n`);
+    if (args[0] === "reflog") return options.reflog;
+    if (args[0] === "log") return ok("100\u0000100\n");
+    return { code: 2, stdout: "", stderr: `unexpected ${args.join(" ")}` };
+  });
+  const context = await resolvePrContext({ cwd: "/repo", input: "7",
+    runner: fixture.runner, nowMs: 1_000_000 });
+  return { context, calls: fixture.calls, head };
+}
+
 test("runCommand passes metacharacters literally, bounds output, and times out", async () => {
   const literal = await runCommand(
     process.execPath,
@@ -153,8 +187,8 @@ test("explicit range freezes refs, computes merge-base, and keeps time facts", a
       ],
       [["merge-base", BASE, HEAD].join("\0"), `${MERGE_BASE}\n`],
       [
-        ["log", "--format=%at", `${BASE}..${HEAD}`].join("\0"),
-        `200\n100\n`,
+        ["log", "--format=%at%x00%ct", `${BASE}..${HEAD}`].join("\0"),
+        `200\u0000200\n100\u0000100\n`,
       ],
     ]);
     const output = outputs.get(key);
@@ -168,6 +202,7 @@ test("explicit range freezes refs, computes merge-base, and keeps time facts", a
     input: "main..feature",
     runner: fixture.runner,
     nowMs: 999_000,
+    includeBranchReflog: false,
   });
 
   assert.deepEqual(context, {
@@ -202,7 +237,7 @@ test("explicit range freezes refs, computes merge-base, and keeps time facts", a
         "feature^{commit}",
       ],
       ["git", "merge-base", BASE, HEAD],
-      ["git", "log", "--format=%at", `${BASE}..${HEAD}`],
+      ["git", "log", "--format=%at%x00%ct", `${BASE}..${HEAD}`],
     ],
   );
   assert.equal(fixture.calls.some(({ args }) => args.includes("fetch")), false);
@@ -235,7 +270,7 @@ test("PR URL uses exact gh metadata, disables prompts, and preserves creation", 
       return ok(`${MERGE_BASE}\n`);
     }
     if (args[0] === "log") {
-      return ok(`1782860000\n`);
+      return ok(`1782860000\u00001782860000\n`);
     }
     return { code: 2, stdout: "", stderr: "unexpected" };
   });
@@ -245,6 +280,7 @@ test("PR URL uses exact gh metadata, disables prompts, and preserves creation", 
     input: url,
     runner: fixture.runner,
     nowMs: 1_800_000_000_000,
+    includeBranchReflog: false,
   });
 
   assert.equal(context.number, 17);
@@ -319,6 +355,68 @@ test("gh metadata accepts only full hexadecimal base and head OIDs", () => {
   }
 });
 
+test("trusted branch reflogs support SHA-1/SHA-256 and use the latest creation", async () => {
+  for (const oidLength of [40, 64] as const) {
+    const head = "2".repeat(oidLength);
+    const older = "4".repeat(oidLength);
+    const oldest = "5".repeat(oidLength);
+    const reflog = [
+      head, "refs/heads/topic@{300}", "commit: latest",
+      older, "refs/heads/topic@{200}", "branch: Created from main",
+      oldest, "refs/heads/topic@{100}", "branch: Created from stale-main",
+      "",
+    ].join("\0");
+    const resolved = await resolveReflogFixture({ oidLength, reflog: ok(reflog) });
+
+    assert.equal(resolved.context.branchReflogStartedAtMs, 200_000);
+    assert.deepEqual(resolved.context.warnings, []);
+    assert.equal(resolved.calls.some(({ args }) =>
+      args.join("\0") === [
+        "reflog", "show", "-z", "--date=unix",
+        "--format=%H%x00%gD%x00%gs", "--end-of-options", "refs/heads/topic",
+      ].join("\0")
+    ), true);
+  }
+});
+
+test("successful but untrusted branch reflog evidence warns once", async () => {
+  const validHead = HEAD;
+  const cases: readonly [string, CommandResult, RegExp][] = [
+    ["truncated", ok("partial", { stdoutTruncated: true }), /truncated/i],
+    ["incomplete triple", ok(`${validHead}\0refs/heads/topic@{300}\0`), /malformed/i],
+    ["invalid OID", ok(`invalid\0refs/heads/topic@{300}\0commit: latest\0`), /malformed/i],
+    ["invalid selector", ok(`${validHead}\0refs/heads/topic@{later}\0commit: latest\0`), /malformed/i],
+    ["latest row race", ok(`${"6".repeat(40)}\0refs/heads/topic@{300}\0commit: latest\0`), /frozen PR head/i],
+    ["no creation", ok(`${validHead}\0refs/heads/topic@{300}\0commit: latest\0`), /creation/i],
+  ];
+
+  for (const [label, reflog, warning] of cases) {
+    const { context } = await resolveReflogFixture({ reflog });
+    assert.equal(context.branchReflogStartedAtMs, undefined, label);
+    assert.equal(context.warnings.length, 1, label);
+    assert.match(context.warnings[0] ?? "", warning, label);
+  }
+});
+
+test("local branch trust failures and ordinary reflog exits fall back safely", async () => {
+  const valid = ok(`${HEAD}\0refs/heads/topic@{200}\0branch: Created from main\0`);
+  const mismatch = await resolveReflogFixture({ localHead: "6".repeat(40), reflog: valid });
+  assert.equal(mismatch.context.branchReflogStartedAtMs, undefined);
+  assert.equal(mismatch.context.warnings.length, 1);
+  assert.match(mismatch.context.warnings[0] ?? "", /frozen PR head/i);
+  assert.equal(mismatch.calls.some(({ args }) => args[0] === "reflog"), false);
+
+  const missing = await resolveReflogFixture({ localHead: null, reflog: valid });
+  assert.equal(missing.context.branchReflogStartedAtMs, undefined);
+  assert.deepEqual(missing.context.warnings, []);
+
+  const failed = await resolveReflogFixture({
+    reflog: { code: 1, stdout: "", stderr: "no reflog" },
+  });
+  assert.equal(failed.context.branchReflogStartedAtMs, undefined);
+  assert.deepEqual(failed.context.warnings, []);
+});
+
 test("implicit resolution falls back from gh to the remote default without fetching", async () => {
   const fixture = fakeRunner(({ command, args }) => {
     const key = [command, ...args].join("\0");
@@ -366,7 +464,7 @@ test("implicit resolution falls back from gh to the remote default without fetch
       ],
       [["git", "merge-base", BASE, HEAD].join("\0"), ok(`${MERGE_BASE}\n`)],
       [
-        ["git", "log", "--format=%at", `${BASE}..${HEAD}`].join("\0"),
+        ["git", "log", "--format=%at%x00%ct", `${BASE}..${HEAD}`].join("\0"),
         ok(""),
       ],
     ]);
@@ -430,7 +528,7 @@ test("truncated git log output cannot establish an earliest timestamp", async ()
     }
     if (args[0] === "merge-base") return ok(`${MERGE_BASE}\n`);
     if (args[0] === "log") {
-      return ok(`100\n`, { stdoutTruncated: true });
+      return ok(`100\u0000100\n`, { stdoutTruncated: true });
     }
     return { code: 2, stdout: "", stderr: "unexpected" };
   });
@@ -446,7 +544,7 @@ test("truncated git log output cannot establish an earliest timestamp", async ()
   assert.match(context.warnings[0] ?? "", /git log.*truncated/i);
 });
 
-test("earliestUniqueCommit uses git log author timestamps and picks the minimum", async () => {
+test("earliestUniqueCommit conservatively uses the earliest author or committer timestamp", async () => {
   const fixture = fakeRunner(({ args }) => {
     if (args[0] === "rev-parse" && args[1] === "--show-toplevel") {
       return ok("/repo\n");
@@ -456,8 +554,8 @@ test("earliestUniqueCommit uses git log author timestamps and picks the minimum"
     }
     if (args[0] === "merge-base") return ok(`${MERGE_BASE}\n`);
     if (args[0] === "log") {
-      assert.deepEqual(args, ["log", "--format=%at", `${BASE}..${HEAD}`]);
-      return ok(`300\n100\n200\n`);
+      assert.deepEqual(args, ["log", "--format=%at%x00%ct", `${BASE}..${HEAD}`]);
+      return ok(`300\u0000400\n50\u0000500\n200\u0000200\n`);
     }
     return { code: 2, stdout: "", stderr: "unexpected" };
   });
@@ -469,7 +567,7 @@ test("earliestUniqueCommit uses git log author timestamps and picks the minimum"
     nowMs: 999_000,
   });
 
-  assert.equal(context.earliestUniqueCommitAtMs, 100_000);
+  assert.equal(context.earliestUniqueCommitAtMs, 50_000);
   assert.deepEqual(context.warnings, []);
 });
 
@@ -483,7 +581,7 @@ test("malformed git log rows are ignored and reported as warnings", async () => 
     }
     if (args[0] === "merge-base") return ok(`${MERGE_BASE}\n`);
     if (args[0] === "log") {
-      return ok(`200\nnot-a-timestamp\n100\n\n`);
+      return ok(`200\u0000200\nnot-a-timestamp\u0000300\n100\u0000100\n\n`);
     }
     return { code: 2, stdout: "", stderr: "unexpected" };
   });
