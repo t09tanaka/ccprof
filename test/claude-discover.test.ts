@@ -754,3 +754,26 @@ test("splits head-other-head sessions into separate segments", async (t) => {
   // identities must differ.
   assert.notEqual(sessions[0]?.source_path, sessions[1]?.source_path);
 });
+
+test("discovery forwards the frozen end into Claude parsing", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-discover-end-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const projects = join(root, "projects");
+  const repo = join(root, "repo");
+  await Promise.all([mkdir(projects), mkdir(repo)]);
+  const before = transcript({ sessionId: "snapshot", cwd: repo,
+    branch: "feature/end", at: "2026-07-31T04:00:00.000Z" })
+    .replace("snapshot-entry", "snapshot-before");
+  const future = transcript({ sessionId: "snapshot", cwd: repo,
+    branch: "feature/end", at: "2026-07-31T05:00:00.000Z" })
+    .replace("snapshot-entry", "snapshot-future");
+  await writeFile(join(projects, "snapshot.jsonl"), before + future);
+
+  const sessions = await discoverClaudeSessions(projects, {
+    repoRoot: repo, headBranch: "feature/end",
+    startedAtMs: Date.parse("2026-07-31T03:00:00.000Z"),
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+  });
+  assert.deepEqual(sessions[0]?.events.map((event) => event.entry_uuid),
+    ["snapshot-before"]);
+});

@@ -1304,3 +1304,59 @@ test("sidechain branch changes do not advance the main agent's epoch", async () 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("freezes Claude rows at an inclusive end snapshot without renumbering", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "ccprof-end-snapshot-"));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "snapshot.jsonl");
+  const cutoff = Date.parse("2026-07-31T12:00:00.000Z");
+  const base = { sessionId: "frozen", cwd: "/frozen", gitBranch: "feature/frozen",
+    isSidechain: false };
+  const rows: unknown[] = [
+    { ...base, type: "user", uuid: "boundary", timestamp: cutoff,
+      message: { role: "user", content: "at boundary" } },
+    { ...base, type: "assistant", uuid: "initial", timestamp: cutoff - 1,
+      message: { id: "snapshot", role: "assistant", content: [
+        { type: "text", text: "before" },
+        { type: "tool_use", id: "tool", name: "Bash", input: { command: "true" } },
+      ], usage: { input_tokens: 1, output_tokens: 1 } } },
+    { ...base, type: "user", uuid: "result-before", timestamp: cutoff,
+      message: { role: "user", content: [
+        { type: "tool_result", tool_use_id: "tool", content: "frozen result" },
+      ] } },
+    { ...base, cwd: "/future", gitBranch: "feature/future", type: "assistant",
+      uuid: "future-snapshot", timestamp: cutoff + 1,
+      message: { id: "snapshot", role: "assistant", content: [
+        { type: "text", text: "before future" },
+      ], usage: { input_tokens: 9, output_tokens: 9 } } },
+    { ...base, cwd: "/future", gitBranch: "feature/future", type: "user",
+      uuid: "future-result", timestamp: cutoff + 2, message: { role: "user",
+        content: [{ type: "tool_result", tool_use_id: "tool", content: "future result" }] } },
+    { ...base, type: "assistant", timestamp: cutoff + 3,
+      message: { id: "future-malformed", role: "assistant",
+        content: [{ type: "unknown", payload: "must not warn" }] } },
+    { ...base, type: "user", uuid: "late-physical", timestamp: cutoff - 2,
+      message: { role: "user", content: "out of order" } },
+    { ...base, type: "assistant", timestamp: "invalid", message: {} },
+    { ...base, type: "user", uuid: "missing-time", message: {} },
+    { type: "user", timestamp: "invalid", message: {} },
+    { ...base, type: "mode", timestamp: "invalid" },
+  ];
+  await writeFile(path, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n{\n42\n`);
+
+  const parsed = await parseClaudeTranscriptDetailed(path, { endedAtMs: cutoff });
+  const session = parsed.sessions[0];
+  assert.ok(session);
+  assert.deepEqual(session.observed_cwds, ["/frozen"]);
+  assert.deepEqual(session.observed_branches, ["feature/frozen"]);
+  assert.ok(session.events.some((event) => event.entry_uuid === "boundary"));
+  assert.equal(session.events.find((event) => event.entry_uuid === "late-physical")?.source_index, 6);
+  const assistant = session.events.find((event) => event.kind === "assistant");
+  assert.equal(assistant?.kind === "assistant" ? assistant.text : undefined, "before");
+  const result = session.events.find((event) => event.kind === "tool_result");
+  assert.equal(result?.kind === "tool_result" ? result.output : undefined, "frozen result");
+  assert.deepEqual(parsed.warnings.map(({ code, line }) => [code, line]), [
+    ["invalid_timestamp", 8], ["invalid_timestamp", 9],
+    ["missing_session_id", 10], ["invalid_json", 12], ["invalid_row", 13],
+  ]);
+});

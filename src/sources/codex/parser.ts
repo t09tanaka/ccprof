@@ -25,6 +25,7 @@ import {
 export interface ParseCodexSessionOptions {
   sourcePath: string;
   raw: string;
+  endedAtMs?: number;
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -97,6 +98,7 @@ function fileNameStem(sourcePath: string): string {
 function parseRows(
   sourcePath: string,
   raw: string,
+  endedAtMs?: number,
 ): { rows: ParsedRow[]; warnings: SourceWarning[] } {
   const warnings: SourceWarning[] = [];
   const rows: ParsedRow[] = [];
@@ -135,6 +137,7 @@ function parseRows(
       );
       return;
     }
+    if (endedAtMs !== undefined && timestampMs > endedAtMs) return;
     const type = nonEmptyString(parsed.type);
     if (type === undefined) {
       warnings.push(
@@ -441,8 +444,8 @@ function buildFunctionCallOutputEvent(
 export function parseCodexSession(
   options: ParseCodexSessionOptions,
 ): Session | null {
-  const { sourcePath, raw } = options;
-  const { rows, warnings } = parseRows(sourcePath, raw);
+  const { sourcePath, raw, endedAtMs } = options;
+  const { rows, warnings } = parseRows(sourcePath, raw, endedAtMs);
 
   const sessionMetaRow = rows.find((row) => row.type === "session_meta");
   let sessionMetaId: string | undefined;
