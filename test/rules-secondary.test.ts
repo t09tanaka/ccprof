@@ -1827,3 +1827,39 @@ test("R008 keeps an empty failed test list for unrecognized failure output", () 
   assert.deepEqual(finding.evidence.failed_tests, []);
   assert.doesNotMatch(finding.fix_recipe.suggestion, /Start with/u);
 });
+
+test("R008 orders extracted failed test names by code units", () => {
+  const actions = [
+    matchedAction("failed", 0, 100, "contributing_run", {
+      tool_name: "Bash",
+      tool_use_id: "failed",
+      command: "npm test",
+      normalized_command: "npm test",
+      target: "npm test",
+    }),
+    matchedAction("passed", 200, 260, "redundant_run", {
+      tool_name: "Bash",
+      tool_use_id: "passed",
+      command: "npm test",
+      normalized_command: "npm test",
+      target: "npm test",
+    }),
+  ];
+  const finding = detectFlakyTests(actions, {
+    toolResults: [
+      toolResult("failed", 100, "failure", {
+        output: [
+          "test tests::flaky_case ... FAILED",
+          "FAILED tests/test_a.py::test_one - boom",
+        ].join("\n"),
+      }),
+      toolResult("passed", 260, "success"),
+    ],
+  })[0];
+
+  assert.ok(finding !== undefined);
+  assert.deepEqual(finding.evidence.failed_tests, [
+    "tests/test_a.py::test_one",
+    "tests::flaky_case",
+  ]);
+});

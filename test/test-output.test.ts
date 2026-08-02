@@ -71,9 +71,9 @@ test("extracts cargo and pytest failures verbatim", () => {
   ].join("\n");
   assert.deepEqual(extractFailedTestNames(output), {
     names: [
-      "tests::flaky_case",
       "tests/test_a.py::test_one",
       "tests/test_b.py::TestSuite::test_two",
+      "tests::flaky_case",
     ],
     truncated: false,
   });
@@ -110,4 +110,43 @@ test("caps the extracted names at 20 and reports truncation", () => {
   assert.equal(result.names.length, 20);
   assert.equal(result.truncated, true);
   assert.equal(result.names[0], "case 01");
+});
+
+test("ignores TAP TODO and SKIP directives and accepts omitted numbers", () => {
+  const output = [
+    "not ok 1 - expected failure # TODO fix later",
+    "not ok 2 - skipped thing # SKIP reason",
+    "not ok 3 - lower directive # todo",
+    "not ok - unnumbered failure",
+    "not ok 4 - keeps #123 in the name",
+  ].join("\n");
+  assert.deepEqual(extractFailedTestNames(output), {
+    names: ["keeps #123 in the name", "unnumbered failure"],
+    truncated: false,
+  });
+});
+
+test("keeps pytest node ids with spaces and cuts at the error separator", () => {
+  const output = [
+    "FAILED tests/a.py::test_x[case with space] - AssertionError: boom",
+    "FAILED tests/a.py::test_y[two words]",
+  ].join("\n");
+  assert.deepEqual(extractFailedTestNames(output), {
+    names: [
+      "tests/a.py::test_x[case with space]",
+      "tests/a.py::test_y[two words]",
+    ],
+    truncated: false,
+  });
+});
+
+test("strips OSC and C1 control sequences before matching", () => {
+  const output = [
+    "\u001B]0;window title\u0007not ok 1 - osc case",
+    "\u009B31mnot ok 2 - c1 case\u009B0m",
+  ].join("\n");
+  assert.deepEqual(extractFailedTestNames(output), {
+    names: ["c1 case", "osc case"],
+    truncated: false,
+  });
 });

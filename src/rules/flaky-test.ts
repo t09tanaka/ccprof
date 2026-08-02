@@ -22,6 +22,7 @@ import {
 } from "./shared.js";
 import { isDelegationToolName } from "../analysis/diff-matcher.js";
 import {
+  compareCodeUnits,
   extractFailedTestNames,
   MAX_FAILED_TEST_NAMES,
 } from "../analysis/test-output.js";
@@ -497,9 +498,9 @@ export function detectFlakyTests(
       const extractions = failedRuns.map(({ result }) =>
         extractFailedTestNames(result.output)
       );
-      const distinctFailedTests = sortedUnique(
-        extractions.flatMap(({ names }) => names),
-      );
+      const distinctFailedTests = [
+        ...new Set(extractions.flatMap(({ names }) => names)),
+      ].sort(compareCodeUnits);
       const failedTests = distinctFailedTests.slice(
         0,
         MAX_FAILED_TEST_NAMES,
@@ -523,7 +524,7 @@ export function detectFlakyTests(
         ]),
       ]);
       const historical = historyByCommand.get(command);
-      return createFindingCandidate({
+      const candidate = createFindingCandidate({
         rule_id: "R008",
         title: "Test failed then passed without a relevant edit",
         classification: "repo",
@@ -606,5 +607,9 @@ export function detectFlakyTests(
             ]),
         ]),
       });
+      // canonicalEvidence re-sorts string arrays with localeCompare; restore
+      // the deterministic code-unit ordering for extracted test names.
+      candidate.evidence.failed_tests = [...failedTests];
+      return candidate;
     });
 }
