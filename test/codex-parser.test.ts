@@ -216,3 +216,57 @@ test("falls back to the file name stem and low confidence when session_meta is a
     ),
   );
 });
+
+test("classifies a function_call_output with no exit-code marker as unknown", () => {
+  const raw = [
+    '{"timestamp":"2026-07-30T11:00:00.000Z","type":"session_meta","payload":{"id":"unknown-exit-session","cwd":"/workspace/repo"}}',
+    '{"timestamp":"2026-07-30T11:00:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-x","output":"no exit code information here"}}',
+  ].join("\n");
+
+  const session = parseCodexSession({ sourcePath: "unknown-exit.jsonl", raw });
+  assert.ok(session);
+
+  const result = session.events.find((event) => event.kind === "tool_result");
+  assert.ok(result && result.kind === "tool_result");
+  assert.equal(result.status, "unknown");
+  assert.equal(result.exit_code, undefined);
+  assert.equal(result.output, "no exit code information here");
+});
+
+test("skips function_call rows missing call_id/name and function_call_output rows missing output, warning instead of throwing", () => {
+  const raw = [
+    '{"timestamp":"2026-07-30T12:00:00.000Z","type":"session_meta","payload":{"id":"missing-fields-session","cwd":"/workspace/repo"}}',
+    '{"timestamp":"2026-07-30T12:00:01.000Z","type":"response_item","payload":{"type":"function_call","arguments":"{}"}}',
+    '{"timestamp":"2026-07-30T12:00:02.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-missing-output"}}',
+    '{"timestamp":"2026-07-30T12:00:03.000Z","type":"response_item","payload":{"type":"message","role":"user","content":"Keep the session alive."}}',
+  ].join("\n");
+
+  const session = parseCodexSession({
+    sourcePath: "missing-fields.jsonl",
+    raw,
+  });
+  assert.ok(session);
+
+  // Only the trailing user message should have produced an event; both the
+  // call_id/name-less function_call and the output-less function_call_output
+  // are dropped.
+  assert.equal(session.events.length, 1);
+  assert.equal(session.events[0]?.kind, "genuine_user");
+
+  const invalidRowWarnings = session.warnings.filter(
+    (warning) => warning.code === "codex_row_invalid",
+  );
+  assert.equal(invalidRowWarnings.length, 2);
+});
+
+test("returns null for a session with a valid session_meta but zero emitted events", () => {
+  const raw = [
+    '{"timestamp":"2026-07-30T13:00:00.000Z","type":"session_meta","payload":{"id":"empty-events-session","cwd":"/workspace/repo","git":{"branch":"main"}}}',
+    '{"timestamp":"2026-07-30T13:00:01.000Z","type":"turn_context","payload":{"cwd":"/workspace/repo"}}',
+  ].join("\n");
+
+  assert.equal(
+    parseCodexSession({ sourcePath: "empty-events.jsonl", raw }),
+    null,
+  );
+});
