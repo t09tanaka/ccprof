@@ -6,6 +6,7 @@ import {
   type AnalyzeOptions,
   type AnalyzeResult,
 } from "../core/analyze.js";
+import type { Finding } from "../core/model.js";
 import {
   resolveStorePaths,
   type StorePaths,
@@ -28,7 +29,7 @@ export interface HookEventCommandDependencies {
   resolveStorePaths?: (repoRoot: string) => Promise<StorePaths>;
   analyze?: (
     options: AnalyzeOptions,
-  ) => Promise<Pick<AnalyzeResult, "allFindings">>;
+  ) => Promise<Pick<AnalyzeResult, "report">>;
 }
 
 interface HookPayload {
@@ -47,7 +48,10 @@ interface HookEventLogRow {
  * the event log needs are extracted; anything else on the payload (cwd,
  * transcript_path, ...) is ignored. Returns `undefined` for anything that
  * isn't a JSON object, per the "silent success on bad input" contract -
- * callers must not append a row in that case.
+ * callers must not append a row in that case. Also returns `undefined`
+ * when both fields are missing/non-string: a row with neither field is
+ * useless to the throttle/analysis reader and is treated the same as
+ * malformed input rather than appended.
  */
 function parsePayload(stdinText: string): HookPayload | undefined {
   let value: unknown;
@@ -62,10 +66,12 @@ function parsePayload(stdinText: string): HookPayload | undefined {
   const record = value as Record<string, unknown>;
   const sessionId = record.session_id;
   const hookEventName = record.hook_event_name;
-  return {
-    session_id: typeof sessionId === "string" ? sessionId : "",
-    hook_event_name: typeof hookEventName === "string" ? hookEventName : "",
-  };
+  const session_id = typeof sessionId === "string" ? sessionId : "";
+  const hook_event_name = typeof hookEventName === "string"
+    ? hookEventName
+    : "";
+  if (session_id === "" && hook_event_name === "") return undefined;
+  return { session_id, hook_event_name };
 }
 
 function isHookEventLogRow(value: unknown): value is HookEventLogRow {
@@ -124,7 +130,13 @@ function isThrottled(
   });
 }
 
-function notifyStdout(findings: AnalyzeResult["allFindings"]): string {
+/**
+ * Summarizes from `report.findings`, not `allFindings`: the report is
+ * already dismissal-applied and filtered to `recoverable.min > 0`, so a
+ * finding the user dismissed via `ccprof dismiss` (14-day suppression) or
+ * one below the recoverable threshold never resurfaces here.
+ */
+function notifyStdout(findings: Finding[]): string {
   if (findings.length === 0) return "";
   const count = findings.length;
   const top = findings[0];
@@ -167,9 +179,21 @@ export async function runHookEventCommand(
 
     if (options.notify !== true) return SILENT_SUCCESS;
 
+    // Two simultaneous Stop hooks (e.g. concurrent agent turns racing on
+    // the same repo) can both read `rows` before either append lands below
+    // and thus both observe "not throttled" - a benign TOCTOU accepted by
+    // design: the worst outcome is one duplicate notification, not a
+    // correctness issue.
     const rows = await readEventRows(paths.hook_events_path);
     if (isThrottled(rows, nowMs)) return SILENT_SUCCESS;
 
+    // The throttle marker is written before `analyze` runs, not after it
+    // succeeds. This is deliberate: if `analyze` is consistently failing
+    // (e.g. a broken repo state), each 10-minute window still gets marked
+    // "notified" and the next attempt waits out the full window rather
+    // than re-running an expensive failing analysis on every subsequent
+    // turn. The trade-off is that a transient failure also burns a window
+    // silently, which is judged an acceptable cost for bounding retry cost.
     await appendEventRow(paths.hook_events_path, {
       received_at_ms: nowMs,
       session_id: payload.session_id,
@@ -183,7 +207,7 @@ export async function runHookEventCommand(
         nowMs,
         persist: false,
       });
-      return { stdout: notifyStdout(result.allFindings), warnings: [] };
+      return { stdout: notifyStdout(result.report.findings), warnings: [] };
     } catch {
       // analyze failures (exit 3/4/5-equivalent exceptions, and anything
       // else) must never surface: --notify is best-effort.

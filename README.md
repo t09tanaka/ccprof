@@ -161,7 +161,10 @@ and preserves the surrounding `.claude/settings.json` verbatim, including key
 order; running it again when the entry already exists is a no-op. By default
 it edits the repository's `.claude/settings.json`; `--global` targets
 `~/.claude/settings.json` instead. Outside an interactive terminal, pass
-`--yes` to skip the confirmation prompt. `ccprof hooks uninstall` (with the
+`--yes` to skip the confirmation prompt. The installed hook invokes
+`ccprof` by name, so it requires `ccprof` to be resolvable on `PATH` (e.g.
+via `npm install --global ccprof`); if it isn't, `hooks install` still
+installs the entry but prints a warning. `ccprof hooks uninstall` (with the
 same `--global`/`--yes` flags) removes only the ccprof-installed entry,
 leaving any other hooks untouched. Both actions report when there is nothing
 to do, and print the settings path they wrote to.

@@ -179,6 +179,54 @@ test("install preserves the file's own key order instead of alphabetizing", asyn
   });
 });
 
+test("install warns when ccprof is not resolvable on PATH but still installs", async () => {
+  await withTempRepo(async (repoRoot) => {
+    const dependencies: HooksCommandDependencies = {
+      resolveRepoRoot: async () => repoRoot,
+      isOnPath: async () => false,
+    };
+    const result = await runHooksCommand(
+      { cwd: repoRoot, action: "install", global: false, yes: true },
+      dependencies,
+    );
+    assert.match(result.stdout, /Installed ccprof Stop hook into/u);
+    assert.equal(result.warnings.length, 1);
+    assert.match(
+      result.warnings[0] ?? "",
+      /"ccprof" was not found on PATH/u,
+    );
+    const parsed = JSON.parse(
+      await readFile(settingsPathFor(repoRoot), "utf8"),
+    ) as unknown;
+    assert.deepEqual(parsed, {
+      hooks: {
+        Stop: [
+          {
+            hooks: [
+              { type: "command", command: "ccprof hook-event --notify" },
+            ],
+          },
+        ],
+      },
+    });
+  });
+});
+
+test("install does not warn when ccprof is resolvable on PATH", async () => {
+  await withTempRepo(async (repoRoot) => {
+    const dependencies: HooksCommandDependencies = {
+      resolveRepoRoot: async () => repoRoot,
+      isOnPath: async () => true,
+    };
+    const result = await runHooksCommand(
+      { cwd: repoRoot, action: "install", global: false, yes: true },
+      dependencies,
+    );
+    assert.match(result.stdout, /Installed ccprof Stop hook into/u);
+    assert.deepEqual(result.warnings, []);
+  });
+});
+
 test("install is idempotent when the marker is already present", async () => {
   await withTempRepo(async (repoRoot) => {
     const dependencies: HooksCommandDependencies = {

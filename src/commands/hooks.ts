@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -6,6 +7,12 @@ import { createInterface } from "node:readline/promises";
 
 import type { CommandExecutionResult } from "./analyze.js";
 import { resolveCurrentRepoRoot } from "./stats.js";
+
+/** The name the installed hook command invokes; also what the PATH check
+ * below resolves. Kept separate from `CCPROF_HOOK_MARKER` (a substring
+ * match against the full installed command) since this is an exact
+ * executable name passed to `which`. */
+const CCPROF_EXECUTABLE = "ccprof";
 
 /** Substring identifying a hook command entry as ours; also the command
  * ccprof installs (with `--notify` appended), so any Stop entry whose
@@ -27,6 +34,10 @@ export interface HooksCommandOptions {
 export interface HooksCommandDependencies {
   resolveRepoRoot?: (cwd: string) => Promise<string>;
   homeDir?: () => string;
+  /** Resolves whether `command` is found on PATH. Defaults to spawning
+   * `which <command>` and checking its exit code. Injectable so tests
+   * don't depend on the real PATH/`which` availability. */
+  isOnPath?: (command: string) => Promise<boolean>;
 }
 
 export class HooksConfirmationRequiredError extends Error {
@@ -259,6 +270,24 @@ function withoutInstalledEntries(
   return { changed: true, settings: nextSettings };
 }
 
+/**
+ * Default `isOnPath`: spawns `which <command>` and treats a zero exit code
+ * as "found". `which` is POSIX-only, so on Windows-style platforms the
+ * check is skipped entirely (treated as resolvable) rather than shelling
+ * out to a platform-specific equivalent (`where`) with different exit
+ * semantics; the warning simply never fires there. A spawn error (e.g.
+ * `which` itself missing) is likewise treated as "found" - the check is a
+ * best-effort courtesy, not a hard gate on install.
+ */
+async function defaultIsOnPath(command: string): Promise<boolean> {
+  if (process.platform === "win32") return true;
+  return await new Promise((resolve) => {
+    const child = spawn("which", [command], { stdio: "ignore" });
+    child.on("error", () => resolve(true));
+    child.on("close", (code) => resolve(code === 0));
+  });
+}
+
 async function defaultConfirm(message: string): Promise<boolean> {
   const rl = createInterface({
     input: process.stdin,
@@ -309,13 +338,22 @@ export async function runHooksCommand(
     if (!confirmed) {
       return { stdout: "aborted\n", warnings: [] };
     }
+    const onPath = await (dependencies.isOnPath ?? defaultIsOnPath)(
+      CCPROF_EXECUTABLE,
+    );
+    const warnings = onPath
+      ? []
+      : [
+        `warning: "${CCPROF_EXECUTABLE}" was not found on PATH; the ` +
+        "installed hook will fail until ccprof is globally installed",
+      ];
     await writeJsonPreservingKeyOrder(
       settingsPath,
       withInstalledEntry(current),
     );
     return {
       stdout: `Installed ccprof Stop hook into ${settingsPath}\n`,
-      warnings: [],
+      warnings,
     };
   }
 

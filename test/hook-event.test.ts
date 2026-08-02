@@ -121,6 +121,30 @@ test("broken JSON on stdin appends nothing and returns silent success", async ()
   });
 });
 
+test("a payload with both session_id and hook_event_name empty/absent appends nothing", async () => {
+  await temporaryStore(async (paths) => {
+    const dependencies: HookEventCommandDependencies = {
+      resolveRepoRoot: async () => "/repo",
+      resolveStorePaths: async () => paths,
+    };
+    for (
+      const stdinText of [
+        JSON.stringify({}),
+        JSON.stringify({ cwd: "/repo" }),
+        JSON.stringify({ session_id: "", hook_event_name: "" }),
+        JSON.stringify({ session_id: 42, hook_event_name: null }),
+      ]
+    ) {
+      const result = await runHookEventCommand(
+        { cwd: "/repo", stdinText, nowMs: 1_000 },
+        dependencies,
+      );
+      assert.deepEqual(result, { stdout: "", warnings: [] });
+    }
+    await assert.rejects(readFile(paths.hook_events_path, "utf8"));
+  });
+});
+
 test("an unwritable store target returns silent success without throwing", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-hook-event-blocked-"));
   try {
@@ -216,7 +240,13 @@ test("--notify reports findings count and top title when analyze succeeds", asyn
       analyze: async (options) => {
         receivedOptions = options;
         return {
-          allFindings: [finding("Rework loop"), finding("Serial slack")],
+          report: {
+            version: 2,
+            unit: { repo: "/repo", pr_ref: null, sessions: [] },
+            summary: {} as never,
+            findings: [finding("Rework loop"), finding("Serial slack")],
+            caveats: [],
+          } as never,
         };
       },
     };
@@ -244,7 +274,38 @@ test("--notify emits nothing when analyze finds zero findings", async () => {
     const dependencies: HookEventCommandDependencies = {
       resolveRepoRoot: async () => "/repo",
       resolveStorePaths: async () => paths,
-      analyze: async () => ({ allFindings: [] }),
+      analyze: async () => ({ report: { findings: [] } as never }),
+    };
+    const result = await runHookEventCommand(
+      {
+        cwd: "/repo",
+        stdinText: JSON.stringify({
+          session_id: "session-1",
+          hook_event_name: "Stop",
+        }),
+        nowMs: 1_000,
+        notify: true,
+      },
+      dependencies,
+    );
+    assert.deepEqual(result, { stdout: "", warnings: [] });
+  });
+});
+
+test("--notify does not surface a dismissed finding, even though allFindings still contains it", async () => {
+  await temporaryStore(async (paths) => {
+    // Simulates what analyze() actually returns after applying
+    // dismissals: report.findings is already filtered, while allFindings
+    // (unused by notify now) still carries the dismissed finding. If
+    // notify ever regresses to summarizing from allFindings again, this
+    // assertion catches it directly.
+    const dependencies: HookEventCommandDependencies = {
+      resolveRepoRoot: async () => "/repo",
+      resolveStorePaths: async () => paths,
+      analyze: async () => ({
+        report: { findings: [] } as never,
+        allFindings: [finding("Dismissed finding")],
+      } as never),
     };
     const result = await runHookEventCommand(
       {
@@ -270,7 +331,7 @@ test("--notify throttles repeated analyze calls within a 10-minute window", asyn
       resolveStorePaths: async () => paths,
       analyze: async () => {
         analyzeCalls += 1;
-        return { allFindings: [] };
+        return { report: { findings: [] } as never };
       },
     };
     const stdinText = JSON.stringify({
@@ -316,7 +377,7 @@ test("non-notify hook events never run analyze", async () => {
       resolveStorePaths: async () => paths,
       analyze: async () => {
         analyzeCalls += 1;
-        return { allFindings: [] };
+        return { report: { findings: [] } as never };
       },
     };
     await runHookEventCommand(
