@@ -1,7 +1,9 @@
 import { detectability } from "../analysis/adoption.js";
+import { commandIdentityKey, formatCommandIdentityTarget } from "../analysis/command-identity.js";
 import type {
   BaselineNotable,
   Bound,
+  CommandIdentity,
   Finding,
   RuleId,
 } from "../core/model.js";
@@ -15,6 +17,7 @@ export interface StatsBaselineMetric extends BaselineNotable {}
 
 export interface StatsChronicCommand {
   command: string;
+  command_identity?: CommandIdentity;
   presence_count: number;
   cost_ratio: number;
   estimated_min: number;
@@ -82,6 +85,18 @@ function rounded(value: number): number {
 
 function numberEvidence(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function statsIdentity(value: unknown): CommandIdentity | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const identity = value as Record<string, unknown>;
+  const cwd = identity.repo_relative_cwd;
+  const argv = identity.normalized_argv;
+  const executor = identity.executor;
+  if (typeof cwd !== "string" || !Array.isArray(argv) || argv.length === 0 ||
+    argv[0] === "" || argv.some((entry) => typeof entry !== "string") ||
+    (executor !== "shell" && executor !== "native-tool")) return undefined;
+  return { repo_relative_cwd: cwd, normalized_argv: [...argv] as string[], executor };
 }
 
 function recordOrder(
@@ -289,15 +304,25 @@ export function summarizeStats(
   const latest = ordered.at(-1);
   const baselineMetrics = latest?.summary.baseline?.notable ?? [];
   const chronicCommands = detectChronicCost(ordered)
-    .map((finding) => ({
-      command: finding.target,
+    .flatMap((finding) => {
+      const command = finding.evidence.command;
+      const identity = statsIdentity(finding.evidence.command_identity);
+      if (typeof command !== "string" || identity === undefined) return [];
+      return [{
+      command,
+      command_identity: identity,
       presence_count: numberEvidence(finding.evidence.presence_count),
       cost_ratio: numberEvidence(finding.evidence.cost_ratio),
       estimated_min: rounded(
         finding.recoverable.estimated_ms / 60_000,
       ),
-    }))
-    .sort((left, right) => left.command.localeCompare(right.command));
+    }];
+    })
+    .sort((left, right) => {
+      const leftKey = commandIdentityKey(left.command_identity);
+      const rightKey = commandIdentityKey(right.command_identity);
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
   const byRule = new Map<RuleId, number>();
   for (const record of ordered) {
     for (const finding of record.findings) {
@@ -331,7 +356,13 @@ export function renderStatsJson(stats: StatsReport): string {
   const stable: StatsReport = {
     history_count: stats.history_count,
     baseline_metrics: [...stats.baseline_metrics],
-    chronic_commands: [...stats.chronic_commands],
+    chronic_commands: stats.chronic_commands.map((entry) => ({
+      ...entry,
+      ...(entry.command_identity === undefined ? {} : { command_identity: {
+        ...entry.command_identity,
+        normalized_argv: [...entry.command_identity.normalized_argv],
+      } }),
+    })),
     rule_minutes: [...stats.rule_minutes],
     recurring_findings: [...stats.recurring_findings],
     adoptions: [...stats.adoptions],
@@ -363,6 +394,14 @@ function adoptionLine(entry: StatsAdoption): string {
   return `- [${entry.rule_id}] adopted ${utcDate(entry.detected_at_ms)} (${entry.method}): ${
     adoptionStatusText(entry)
   }, ${formatMinutes(entry.minutes_before)} -> ${formatMinutes(entry.minutes_after)}`;
+}
+
+function chronicCommandLabel(entry: StatsChronicCommand): string {
+  const identity = entry.command_identity;
+  return identity === undefined
+    ? entry.command
+    : formatCommandIdentityTarget(identity, entry.command) +
+      (identity.executor === "native-tool" ? " [native-tool]" : "");
 }
 
 export function renderStatsTty(stats: StatsReport): string {
@@ -403,7 +442,7 @@ export function renderStatsTty(stats: StatsReport): string {
       ? ["- none"]
       : stats.chronic_commands.map(
           (command) =>
-            `- ${oneLine(command.command)}: ${formatMinutes(command.estimated_min)} avg upper (${rounded(command.cost_ratio * 100)}%, ${command.presence_count} analyses)`,
+            `- ${oneLine(chronicCommandLabel(command))}: ${formatMinutes(command.estimated_min)} avg upper (${rounded(command.cost_ratio * 100)}%, ${command.presence_count} analyses)`,
         )),
     "Baseline metrics:",
     ...(stats.baseline_metrics.length === 0

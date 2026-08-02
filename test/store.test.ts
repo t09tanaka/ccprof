@@ -22,6 +22,7 @@ import type {
 } from "../src/core/model.js";
 import { commandIdentityKey } from "../src/analysis/command-identity.js";
 import { detectChronicCost } from "../src/rules/chronic-cost.js";
+import { findingKey } from "../src/rules/shared.js";
 import {
   loadAdoptions,
   saveAdoptions,
@@ -65,6 +66,11 @@ function commandIdentity(
   return { repo_relative_cwd: cwd, normalized_argv: [...argv], executor };
 }
 
+function identityEvidence(identity: CommandIdentity) {
+  return { repo_relative_cwd: identity.repo_relative_cwd,
+    normalized_argv: [...identity.normalized_argv], executor: identity.executor };
+}
+
 function finding(
   key: string,
   command = "npm test",
@@ -102,10 +108,15 @@ function record(
     commandMin?: number;
     metric?: number;
     includeCommand?: boolean;
+    commandIdentity?: CommandIdentity | undefined;
   } = {},
 ): AnalysisRecord {
   const measuredMin = options.measuredMin ?? 100;
   const command = options.command ?? "npm test";
+  const storedFinding = finding(`finding-${id}`, command, options.commandMin ?? 10);
+  if (options.commandIdentity !== undefined) {
+    storedFinding.evidence.command_identity = identityEvidence(options.commandIdentity);
+  }
   return makeAnalysisRecord({
     analysis_id: id,
     created_at_ms: createdAtMs,
@@ -115,7 +126,7 @@ function record(
       sessions: [`session-${id}`],
     },
     summary: { ...summary, measured_min: measuredMin },
-    findings: [finding(`finding-${id}`, command, options.commandMin ?? 10)],
+    findings: [storedFinding],
     metrics: {
       human_wait_ratio: options.metric ?? createdAtMs,
     },
@@ -123,6 +134,10 @@ function record(
       ? []
       : [{
           command,
+          ...(options.commandIdentity === undefined ? {} : {
+            command_identity: commandIdentity(options.commandIdentity.repo_relative_cwd,
+              options.commandIdentity.normalized_argv, options.commandIdentity.executor),
+          }),
           duration_min: options.commandMin ?? 10,
           session_refs: [`session-${id}#run`],
         }],
@@ -624,11 +639,17 @@ test("adoption write failures return warnings without throwing", async () => {
   });
 });
 
-test("R006 requires five histories, presence in three, and a 30 percent cost ratio", () => {
+function r006FindingKey(identity: CommandIdentity): string {
+  return findingKey("R006", `command-identity:${Buffer.from(
+    commandIdentityKey(identity), "utf8").toString("hex")}`);
+}
+test("R006 requires five histories, identity presence in three, and a 30 percent cost ratio", () => {
+  const api = commandIdentity("packages/api");
   const qualifying = Array.from({ length: 5 }, (_, index) =>
     record(`r006-${index}`, index, {
       commandMin: index < 3 ? 50 : 0,
       includeCommand: index < 3,
+      commandIdentity: api,
     })
   );
   const findings = detectChronicCost(qualifying);
@@ -638,7 +659,9 @@ test("R006 requires five histories, presence in three, and a 30 percent cost rat
   assert.equal(chronic.rule_id, "R006");
   assert.equal(chronic.classification, "repo");
   assert.equal(chronic.scope, "separate_issue");
-  assert.equal(chronic.target, "npm test");
+  assert.equal(chronic.target, "packages/api :: npm test");
+  assert.equal(chronic.finding_key, r006FindingKey(api));
+  assert.deepEqual(chronic.evidence.command_identity, api);
   assert.equal(chronic.evidence.history_count, 5);
   assert.equal(chronic.evidence.presence_count, 3);
   assert.equal(chronic.evidence.cost_ratio, 0.3);
@@ -646,6 +669,8 @@ test("R006 requires five histories, presence in three, and a 30 percent cost rat
   assert.equal(chronic.evidence.minimum_presence_count, 3);
   assert.equal(chronic.evidence.minimum_cost_ratio, 0.3);
   assert.equal(chronic.recoverable.bound, "upper");
+  assert.equal(chronic.fix_recipe.verify, "npm test");
+  assert.match(chronic.fix_recipe.suggestion, /packages\/api/u);
 
   assert.deepEqual(detectChronicCost(qualifying.slice(0, 4)), []);
   assert.deepEqual(
@@ -664,6 +689,7 @@ test("R006 requires five histories, presence in three, and a 30 percent cost rat
         record(`ratio-${index}`, index, {
           commandMin: index < 3 ? 49.99 : 0,
           includeCommand: index < 3,
+          commandIdentity: api,
         })
       ),
     ),
@@ -671,11 +697,84 @@ test("R006 requires five histories, presence in three, and a 30 percent cost rat
   );
 });
 
+test("R006 isolates identity lanes and accepts only exact-identity finding refs", () => {
+  const api = commandIdentity("packages/api");
+  const web = commandIdentity("packages/web");
+  const native = commandIdentity("packages/api", undefined, "native-tool");
+  const cost = (identity: CommandIdentity | undefined, duration_min: number, ref: string) => ({
+    command: "npm test", ...(identity === undefined ? {} : { command_identity: identity }),
+    duration_min, session_refs: [ref],
+  });
+  const histories = Array.from({ length: 5 }, (_, index) => ({
+    ...record(`lanes-${index}`, index, { includeCommand: false }),
+    command_costs: [
+      ...(index < 3 ? [cost(api, 50, `api-cost-${index}`)] : []),
+      ...(index < 2 ? [cost(web, 80, `web-cost-${index}`),
+        cost(native, 80, `native-cost-${index}`)] : []),
+      cost(undefined, 100, `legacy-cost-${index}`),
+    ],
+  }));
+  const evidence = (key: string, identity?: CommandIdentity) => {
+    const value = finding(key, `different display ${key}`);
+    value.evidence.session_refs = [`${key}#finding`];
+    if (identity !== undefined) value.evidence.command_identity = identityEvidence(identity);
+    return value;
+  };
+  const malformed = evidence("malformed", api);
+  malformed.evidence.command_identity = { ...identityEvidence(api), repo_relative_cwd: "/repo" };
+  histories[0]!.findings = [evidence("api", api), evidence("web", web),
+    evidence("native", native), evidence("legacy"), malformed];
+  const chronic = detectChronicCost(histories)[0];
+  assert.ok(chronic !== undefined);
+  assert.equal(chronic.evidence.cost_min, 150);
+  assert.equal(chronic.evidence.presence_count, 3);
+  assert.deepEqual(chronic.evidence.session_refs,
+    ["api-cost-0", "api-cost-1", "api-cost-2", "api#finding"]);
+});
+test("R006 ignores legacy presence and sums duplicate decimal costs deterministically", () => {
+  const api = commandIdentity("packages/api");
+  const legacy = Array.from({ length: 5 }, (_, index) =>
+    record(`legacy-${index}`, index, { commandMin: 100, commandIdentity: undefined }));
+  assert.deepEqual(detectChronicCost(legacy), []);
+  assert.deepEqual(detectChronicCost(legacy.map((_, index) =>
+    record(`mixed-${index}`, index, { commandMin: 100,
+      commandIdentity: index < 2 ? api : undefined }))), []);
+  const fractional = Array.from({ length: 5 }, (_, index) => ({
+    ...record(`fractional-${index}`, index, { measuredMin: 1, includeCommand: false }),
+    command_costs: [0.1, 0.2, 0.3].map((duration_min, costIndex) => ({
+      command: "npm test", command_identity: api, duration_min,
+      session_refs: [`fractional-${index}#${costIndex}`],
+    })),
+  }));
+  const reversed = fractional.map((entry) => ({
+    ...entry, command_costs: [...entry.command_costs].reverse(),
+  })).reverse();
+  const findings = detectChronicCost(fractional);
+  assert.deepEqual(findings, detectChronicCost(reversed));
+  assert.equal(findings[0]?.evidence.cost_min, 3);
+  assert.equal(findings[0]?.evidence.presence_count, 5);
+});
+test("R006 distinguishes a native identity and clones its exact argv", () => {
+  const argv = ["npm", "test", "", "--flag", "--flag"];
+  const native = commandIdentity("packages/api", argv, "native-tool");
+  const histories = Array.from({ length: 5 }, (_, index) => record(`native-${index}`, index, {
+    commandMin: index < 3 ? 50 : 0, includeCommand: index < 3, commandIdentity: native,
+  }));
+  const chronic = detectChronicCost(histories)[0];
+  assert.ok(chronic !== undefined);
+  assert.equal(chronic.target, "packages/api :: npm test [native-tool]");
+  assert.equal(chronic.finding_key, r006FindingKey(native));
+  assert.notEqual(chronic.finding_key, r006FindingKey(commandIdentity("packages/api", argv)));
+  assert.deepEqual(chronic.evidence.command_identity, native);
+  assert.notEqual(chronic.evidence.command_identity?.normalized_argv, argv);
+});
 test("R006 defensively ignores malformed finding evidence at its boundary", () => {
+  const api = commandIdentity("packages/api");
   const histories = Array.from({ length: 5 }, (_, index) =>
     record(`defensive-${index}`, index, {
       commandMin: index < 3 ? 50 : 0,
       includeCommand: index < 3,
+      commandIdentity: api,
     })
   );
   histories[0] = {
