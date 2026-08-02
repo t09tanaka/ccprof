@@ -235,6 +235,7 @@ export interface AnalysisSummary {
   idle_excluded_min: number;
   estimated_floor_min: number;
   recoverable_min: number;
+  human_wait_min: number;
   unexplained_min: number;
   baseline: BaselineComparison | null;
 }

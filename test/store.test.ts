@@ -45,6 +45,7 @@ const summary: AnalysisSummary = {
   idle_excluded_min: 10,
   estimated_floor_min: 70,
   recoverable_min: 30,
+  human_wait_min: 0,
   unexplained_min: 5,
   baseline: null,
 };
@@ -492,4 +493,47 @@ test("R006 defensively ignores malformed finding evidence at its boundary", () =
   };
 
   assert.equal(detectChronicCost(histories).length, 1);
+});
+
+test("loads a legacy analysis record without human_wait_min and no warnings", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-legacy-summary-"));
+  try {
+    const paths = await resolveStorePaths(join(root, "repo"), {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const legacy = {
+      schema_version: 1,
+      analysis_id: "legacy-record",
+      created_at_ms: 1,
+      unit: {
+        repo: "/repo",
+        pr_ref: "main...legacy",
+        sessions: ["legacy"],
+      },
+      summary: {
+        measured_min: 10,
+        idle_excluded_min: 1,
+        estimated_floor_min: 9,
+        recoverable_min: 1,
+        unexplained_min: 2,
+        baseline: null,
+      },
+      findings: [],
+      metrics: { measured_min: 10 },
+      command_costs: [],
+    };
+    await mkdir(paths.analyses_dir, { recursive: true });
+    await writeFile(
+      join(paths.analyses_dir, "legacy.json"),
+      `${JSON.stringify(legacy, null, 2)}\n`,
+      "utf8",
+    );
+
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded.warnings, []);
+    assert.equal(loaded.records.length, 1);
+    assert.equal(loaded.records[0]?.analysis_id, "legacy-record");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

@@ -82,6 +82,7 @@ const summary: AnalysisSummary = {
   idle_excluded_min: 8,
   estimated_floor_min: 34,
   recoverable_min: 8,
+  human_wait_min: 2,
   unexplained_min: 3,
   baseline: {
     prs: 4,
@@ -141,6 +142,7 @@ test("JSON reporter emits one stable v2 document with at most three findings", (
 
   assert.equal(parsed.version, 2);
   assert.equal(parsed.summary.unexplained_min, 3);
+  assert.equal(parsed.summary.human_wait_min, 2);
   assert.equal(parsed.findings.length, 3);
   assert.equal(output.trim().split(/\n(?=\{)/u).length, 1);
   assert.doesNotMatch(output, /\u001b\[/u);
@@ -161,6 +163,7 @@ test("TTY reporter is conclusion-first, compact, and colors only by opt-in", () 
   assert.match(plain, /Timestamp \| precision/u);
   assert.match(plain, /1\. \[R001\]/u);
   assert.match(plain.split("\n")[0] ?? "", /8m idle excluded/u);
+  assert.match(plain.split("\n")[0] ?? "", /2m human wait/u);
   assert.match(plain.split("\n")[0] ?? "", /3m unexplained/u);
 });
 
@@ -171,6 +174,7 @@ test("Markdown reporter escapes dynamic pipes and never emits ANSI", () => {
   assert.match(output, /Repeated \\\| full test/u);
   assert.match(output, /npm test \\\| tee output/u);
   assert.match(output, /Timestamp \\\| precision/u);
+  assert.match(output, /\| Human wait \| 2 \|/u);
   assert.doesNotMatch(output, /\u001b\[/u);
 });
 

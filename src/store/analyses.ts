@@ -185,6 +185,7 @@ function summaryMetrics(summary: AnalysisSummary): Record<string, number> {
     idle_excluded_min: summary.idle_excluded_min,
     estimated_floor_min: summary.estimated_floor_min,
     recoverable_min: summary.recoverable_min,
+    human_wait_min: summary.human_wait_min ?? 0,
     unexplained_min: summary.unexplained_min,
     recoverable_ratio:
       summary.measured_min > 0
@@ -389,6 +390,13 @@ function isRecord(value: unknown): value is AnalysisRecord {
     return false;
   }
   const summary = record.summary;
+  // Legacy records predate human_wait_min; a missing value is treated as 0.
+  if (
+    summary.human_wait_min !== undefined &&
+    !finiteNonnegative(summary.human_wait_min)
+  ) {
+    return false;
+  }
   return [
     summary.measured_min,
     summary.idle_excluded_min,

@@ -32,6 +32,8 @@ export interface LedgerInput {
   rawIntervals: readonly Interval[];
   activeIntervals: readonly Interval[];
   contributingIntervals: readonly Interval[];
+  /** Sub-threshold human wait; away time must already be excluded. */
+  humanWaitIntervals?: readonly Interval[];
   candidates: readonly FindingCandidate[];
   baseline?: BaselineComparison | null;
 }
@@ -51,6 +53,7 @@ export interface LedgerTotalsMs {
   idle_excluded: number;
   normal: number;
   recoverable: number;
+  human_wait: number;
   unexplained: number;
 }
 
@@ -61,6 +64,7 @@ export interface LedgerResult {
   normal_min: number;
   totals_ms: LedgerTotalsMs;
   pointRecoverableIntervals: Interval[];
+  humanWaitIntervals: Interval[];
   normalIntervals: Interval[];
   unexplainedIntervals: Interval[];
   idleIntervals: Interval[];
@@ -72,7 +76,7 @@ interface IndexedCandidate {
   index: number;
 }
 
-type PartitionName = "recoverable" | "normal" | "unexplained";
+type PartitionName = "recoverable" | "human_wait" | "normal" | "unexplained";
 
 function roundedHundredths(ms: number): number {
   return ms > 0 ? Math.round(ms / MS_PER_HUNDREDTH_MINUTE) : 0;
@@ -88,11 +92,13 @@ function apportionedMeasuredHundredths(
 ): Record<PartitionName, number> {
   const names: readonly PartitionName[] = [
     "recoverable",
+    "human_wait",
     "normal",
     "unexplained",
   ];
   const units: Record<PartitionName, number> = {
     recoverable: 0,
+    human_wait: 0,
     normal: 0,
     unexplained: 0,
   };
@@ -232,12 +238,17 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
     input.contributingIntervals,
     activeIntervals,
   );
-  const normalIntervals = subtractIntervals(
-    contributingIntervals,
+  const humanWaitIntervals = subtractIntervals(
+    intersectIntervals(input.humanWaitIntervals ?? [], activeIntervals),
     pointRecoverableIntervals,
   );
+  const normalIntervals = subtractIntervals(contributingIntervals, [
+    ...pointRecoverableIntervals,
+    ...humanWaitIntervals,
+  ]);
   const unexplainedIntervals = subtractIntervals(activeIntervals, [
     ...pointRecoverableIntervals,
+    ...humanWaitIntervals,
     ...normalIntervals,
   ]);
   const idleIntervals = subtractIntervals(rawIntervals, activeIntervals);
@@ -248,6 +259,7 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
     idle_excluded: durationMs(idleIntervals),
     normal: durationMs(normalIntervals),
     recoverable: durationMs(pointRecoverableIntervals),
+    human_wait: durationMs(humanWaitIntervals),
     unexplained: durationMs(unexplainedIntervals),
   };
   const measuredHundredths = roundedHundredths(totalsMs.measured);
@@ -255,6 +267,7 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
     totalsMs.measured,
     {
       recoverable: totalsMs.recoverable,
+      human_wait: totalsMs.human_wait,
       normal: totalsMs.normal,
       unexplained: totalsMs.unexplained,
     },
@@ -287,6 +300,9 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
         measuredHundredths - recoverableHundredths,
       ),
       recoverable_min: minutesFromHundredths(recoverableHundredths),
+      human_wait_min: minutesFromHundredths(
+        partitionHundredths.human_wait,
+      ),
       unexplained_min: minutesFromHundredths(
         partitionHundredths.unexplained,
       ),
@@ -302,6 +318,7 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
     normal_min: minutesFromHundredths(partitionHundredths.normal),
     totals_ms: totalsMs,
     pointRecoverableIntervals,
+    humanWaitIntervals,
     normalIntervals,
     unexplainedIntervals,
     idleIntervals,

@@ -150,6 +150,7 @@ function seedSummary() {
     idle_excluded_min: 0,
     estimated_floor_min: 9,
     recoverable_min: 1,
+    human_wait_min: 0,
     unexplained_min: 1,
     baseline: null,
   } as const;
@@ -240,6 +241,7 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
       first.report.summary.measured_min,
       first.ledger.normal_min +
         first.report.summary.recoverable_min +
+        first.report.summary.human_wait_min +
         first.report.summary.unexplained_min,
     );
     assert.equal(
@@ -594,6 +596,109 @@ test("coordination tools count as normal time while delegation still invalidates
         duration_min,
       })),
       [{ command: "git status", duration_min: 1 }],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+function humanWaitSession(sessionId: string, repo: string): Session {
+  const shared = {
+    session_id: sessionId,
+    agent_id: "main",
+    is_sidechain: false,
+    confidence: "high" as const,
+  };
+  const t0 = NOW_MS - 600_000;
+  const at = (
+    kind: "genuine_user" | "assistant",
+    entryUuid: string,
+    offsetMs: number,
+    sourceIndex: number,
+    text: string,
+  ) => ({
+    ...shared,
+    kind,
+    timestamp_ms: t0 + offsetMs,
+    entry_uuid: entryUuid,
+    session_ref: `${sessionId}#${entryUuid}`,
+    source_index: sourceIndex,
+    text,
+  });
+  return {
+    session_id: sessionId,
+    source: "claude",
+    source_path: join(repo, `${sessionId}.jsonl`),
+    observed_cwds: [repo],
+    observed_branches: ["feature"],
+    started_at_ms: t0,
+    ended_at_ms: t0 + 160_000,
+    confidence: "high",
+    warnings: [],
+    events: [
+      at("genuine_user", "u0", 0, 0, "Start the task."),
+      at("assistant", "a1", 10_000, 1, "Which option should I take?"),
+      at("genuine_user", "u1", 70_000, 2, "Take the first option."),
+      at("assistant", "a2", 80_000, 3, "Asking a follow-up."),
+      {
+        ...shared,
+        kind: "tool_use",
+        timestamp_ms: t0 + 90_000,
+        entry_uuid: "ask-use",
+        session_ref: `${sessionId}#ask-use`,
+        source_index: 4,
+        tool_use_id: "ask-1",
+        tool_name: "AskUserQuestion",
+        input: {},
+        paths: [],
+        edit_fragments: [],
+      },
+      {
+        ...shared,
+        kind: "tool_result",
+        timestamp_ms: t0 + 150_000,
+        entry_uuid: "ask-result",
+        session_ref: `${sessionId}#ask-result`,
+        source_index: 5,
+        tool_use_id: "ask-1",
+        status: "success",
+        output: "answered",
+        output_bytes: 8,
+        estimated_tokens: 2,
+      },
+      at("assistant", "a3", 160_000, 6, "Continuing with the answer."),
+    ],
+  };
+}
+
+test("turn waits and AskUserQuestion waits land in human_wait_min instead of unexplained", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-human-wait-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      sessionSource: {
+        discover: async () => [humanWaitSession("wait-session", repo)],
+      },
+    });
+
+    assert.equal(result.ledger.totals_ms.measured, 160_000);
+    assert.equal(result.ledger.totals_ms.human_wait, 120_000);
+    assert.equal(result.report.summary.human_wait_min, 2);
+    assert.equal(result.report.summary.unexplained_min, 0.67);
+    assert.equal(result.ledger.totals_ms.normal, 0);
+    assert.equal(
+      result.report.summary.measured_min,
+      result.ledger.normal_min +
+        result.report.summary.recoverable_min +
+        result.report.summary.human_wait_min +
+        result.report.summary.unexplained_min,
     );
   } finally {
     await rm(root, { recursive: true, force: true });

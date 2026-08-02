@@ -41,6 +41,7 @@ export function renderMarkdownReport(report: ReportV2): string {
     `| Idle excluded | ${report.summary.idle_excluded_min} |`,
     `| Point recoverable | ${report.summary.recoverable_min} |`,
     `| Estimated floor | ${report.summary.estimated_floor_min} |`,
+    `| Human wait | ${report.summary.human_wait_min} |`,
     `| Unexplained | ${report.summary.unexplained_min} |`,
     "",
     "### Findings",
