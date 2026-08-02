@@ -108,6 +108,7 @@ function compaction(
 function session(
   events: NormalizedEvent[],
   endedAtMs = events.at(-1)?.timestamp_ms ?? 0,
+  verifiedEndedAtMs?: number,
 ): Session {
   const timestamps = events
     .map((event) => event.timestamp_ms)
@@ -123,6 +124,9 @@ function session(
     confidence: "high",
     events,
     warnings: [],
+    ...(verifiedEndedAtMs === undefined
+      ? {}
+      : { verified_ended_at_ms: verifiedEndedAtMs }),
   };
 }
 
@@ -571,6 +575,120 @@ test("compaction breaks causal action attribution and session end adds no tail",
   assert.deepEqual(timeline.inferenceIntervals, []);
   assert.equal(timeline.rawIntervals.at(-1)?.end_ms, 20);
   assert.ok(timeline.caveats.some((item) => item.includes("compaction")));
+});
+
+test("a session with no verified_ended_at_ms still adds no tail, even when ended_at_ms diverges from the last event", () => {
+  // Same shape as the pinned "session end adds no tail" case above, plus an
+  // explicit check that unverified sessions get no synthetic action at all -
+  // this must keep failing to add a tail so hook-events wiring (which sets
+  // verified_ended_at_ms only when a Stop row actually corroborates it)
+  // can't accidentally widen the unverified case.
+  const timeline = buildTimeline([
+    session([user(0, 0), assistant(20, 1)], 10_000),
+  ]);
+
+  assert.deepEqual(timeline.rawIntervals, [{ start_ms: 0, end_ms: 20 }]);
+  assert.deepEqual(timeline.activeIntervals, [{ start_ms: 0, end_ms: 20 }]);
+  assert.equal(
+    timeline.actions.some((action) =>
+      action.action_id.endsWith(":verified_end")
+    ),
+    false,
+  );
+});
+
+test("a verified_ended_at_ms past the last event adds a low-confidence inference tail that counts as measured time", () => {
+  const timeline = buildTimeline([
+    session([user(0, 0), assistant(20, 1)], 20, 25_000),
+  ]);
+
+  const tail = timeline.actions.find((action) =>
+    action.action_id.endsWith(":verified_end")
+  );
+  assert.ok(tail, "a verified tail action must be emitted");
+  assert.equal(tail?.kind, "inference");
+  assert.deepEqual(tail?.interval, { start_ms: 20, end_ms: 25_000 });
+  assert.equal(tail?.confidence, "low");
+  assert.equal(tail?.concurrent, false);
+  assert.equal(tail?.session_id, "s1");
+  assert.equal(tail?.agent_id, "main");
+  assert.equal(tail?.tool_use_id, undefined);
+  assert.equal(tail?.tool_name, undefined);
+  assert.equal(tail?.command, undefined);
+  assert.deepEqual(tail?.paths, []);
+
+  // The verified tail must extend raw/active time, not just appear as a
+  // cosmetic action - this is what makes it count as measured instead of
+  // vanishing past the log's last timestamp.
+  assert.deepEqual(timeline.rawIntervals, [{ start_ms: 0, end_ms: 25_000 }]);
+  assert.deepEqual(
+    timeline.activeIntervals,
+    [{ start_ms: 0, end_ms: 25_000 }],
+  );
+  assert.deepEqual(timeline.idleIntervals, []);
+});
+
+test("a verified_ended_at_ms that does not exceed the last event adds no tail", () => {
+  const timeline = buildTimeline([
+    session([user(0, 0), assistant(20, 1)], 20, 20),
+  ]);
+
+  assert.equal(
+    timeline.actions.some((action) =>
+      action.action_id.endsWith(":verified_end")
+    ),
+    false,
+  );
+  assert.deepEqual(timeline.rawIntervals, [{ start_ms: 0, end_ms: 20 }]);
+});
+
+test("a verified tail exceeding a configured idle threshold becomes away: raw grows but active/measured does not", () => {
+  const fiveMinutes = 5 * 60_000;
+  const tenMinutes = 10 * 60_000;
+  const timeline = buildTimeline(
+    [session([user(0, 0), assistant(20, 1)], 20, tenMinutes)],
+    { idleThresholdMs: fiveMinutes },
+  );
+
+  const tail = timeline.actions.find((action) =>
+    action.action_id.endsWith(":verified_end")
+  );
+  assert.ok(tail, "a verified tail action must still be emitted");
+  assert.equal(tail?.kind, "away");
+  assert.deepEqual(tail?.interval, { start_ms: 20, end_ms: tenMinutes });
+  assert.equal(tail?.confidence, "low");
+
+  // Raw time picks up the full tail (it's still an observed span)...
+  assert.deepEqual(
+    timeline.rawIntervals,
+    [{ start_ms: 0, end_ms: tenMinutes }],
+  );
+  // ...but active/measured time does not grow past the real last event,
+  // matching how every other over-threshold gap in this module behaves;
+  // the excess lands in idleIntervals instead.
+  assert.deepEqual(timeline.activeIntervals, [{ start_ms: 0, end_ms: 20 }]);
+  assert.deepEqual(
+    timeline.idleIntervals,
+    [{ start_ms: 20, end_ms: tenMinutes }],
+  );
+});
+
+test("a verified tail exactly at a configured idle threshold stays inference (active)", () => {
+  const fiveMinutes = 5 * 60_000;
+  const timeline = buildTimeline(
+    [session([user(0, 0), assistant(20, 1)], 20, 20 + fiveMinutes)],
+    { idleThresholdMs: fiveMinutes },
+  );
+
+  const tail = timeline.actions.find((action) =>
+    action.action_id.endsWith(":verified_end")
+  );
+  assert.equal(tail?.kind, "inference");
+  assert.deepEqual(
+    timeline.activeIntervals,
+    [{ start_ms: 0, end_ms: 20 + fiveMinutes }],
+  );
+  assert.deepEqual(timeline.idleIntervals, []);
 });
 
 test("AskUserQuestion becomes human wait with tool metadata retained", () => {

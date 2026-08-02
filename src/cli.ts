@@ -16,6 +16,15 @@ import {
   type DismissCommandOptions,
 } from "./commands/dismiss.js";
 import {
+  runHookEventCommand,
+  type HookEventCommandOptions,
+} from "./commands/hook-event.js";
+import {
+  HooksConfirmationRequiredError,
+  runHooksCommand,
+  type HooksCommandOptions,
+} from "./commands/hooks.js";
+import {
   runStatsCommand,
   type StatsCommandOptions,
 } from "./commands/stats.js";
@@ -30,6 +39,8 @@ export const USAGE = `Usage: ccprof [--pr [<number|url|base...head>]] [--json|--
               [--idle-threshold <duration>] [--test-map <path>] [--color]
        ccprof stats [--json]
        ccprof dismiss <finding-key> [--reason <text>]
+       ccprof hook-event [--notify]
+       ccprof hooks install|uninstall [--global] [--yes]
        ccprof --version
 `;
 
@@ -91,6 +102,18 @@ export interface ParsedDismissCommand {
   reason?: string;
 }
 
+export interface ParsedHookEventCommand {
+  kind: "hook-event";
+  notify: boolean;
+}
+
+export interface ParsedHooksCommand {
+  kind: "hooks";
+  action: "install" | "uninstall";
+  global: boolean;
+  yes: boolean;
+}
+
 export interface ParsedHelpCommand {
   kind: "help";
 }
@@ -103,6 +126,8 @@ export type ParsedCliCommand =
   | ParsedAnalyzeCommand
   | ParsedStatsCommand
   | ParsedDismissCommand
+  | ParsedHookEventCommand
+  | ParsedHooksCommand
   | ParsedHelpCommand
   | ParsedVersionCommand;
 
@@ -116,6 +141,12 @@ export interface CliHandlers {
   dismiss: (
     options: DismissCommandOptions,
   ) => Promise<CommandExecutionResult>;
+  hookEvent: (
+    options: HookEventCommandOptions,
+  ) => Promise<CommandExecutionResult>;
+  hooks: (
+    options: HooksCommandOptions,
+  ) => Promise<CommandExecutionResult>;
 }
 
 export interface CliRuntime {
@@ -124,12 +155,20 @@ export interface CliRuntime {
   stdout?: (value: string) => void;
   stdoutIsTTY?: boolean;
   stderr?: (value: string) => void;
+  /**
+   * Pre-collected stdin text for the `hook-event` command. Tests inject
+   * this to avoid touching `process.stdin`; when omitted, `runCli` reads
+   * stdin to completion before dispatching `hook-event`.
+   */
+  stdinText?: string;
 }
 
 const defaultHandlers: CliHandlers = {
   analyze: runAnalyzeCommand,
   stats: runStatsCommand,
   dismiss: runDismissCommand,
+  hookEvent: runHookEventCommand,
+  hooks: runHooksCommand,
 };
 
 function requiredOptionValue(
@@ -352,6 +391,42 @@ function parseDismissArgs(
   };
 }
 
+function parseHookEventArgs(
+  args: readonly string[],
+): ParsedHookEventCommand {
+  let notify = false;
+  for (const token of args) {
+    if (token !== "--notify" || notify) {
+      throw new CliUsageError(`unknown hook-event argument: ${token}`);
+    }
+    notify = true;
+  }
+  return { kind: "hook-event", notify };
+}
+
+function parseHooksArgs(args: readonly string[]): ParsedHooksCommand {
+  const action = args[0];
+  if (action !== "install" && action !== "uninstall") {
+    throw new CliUsageError("hooks requires an install or uninstall action");
+  }
+  let global = false;
+  let yes = false;
+  for (const token of args.slice(1)) {
+    if (token === "--global") {
+      if (global) throw new CliUsageError("--global was specified twice");
+      global = true;
+      continue;
+    }
+    if (token === "--yes") {
+      if (yes) throw new CliUsageError("--yes was specified twice");
+      yes = true;
+      continue;
+    }
+    throw new CliUsageError(`unknown hooks argument: ${token}`);
+  }
+  return { kind: "hooks", action, global, yes };
+}
+
 export function parseCliArgs(
   args: readonly string[],
 ): ParsedCliCommand {
@@ -363,6 +438,8 @@ export function parseCliArgs(
   }
   if (args[0] === "stats") return parseStatsArgs(args.slice(1));
   if (args[0] === "dismiss") return parseDismissArgs(args.slice(1));
+  if (args[0] === "hook-event") return parseHookEventArgs(args.slice(1));
+  if (args[0] === "hooks") return parseHooksArgs(args.slice(1));
   return parseAnalyzeArgs(args);
 }
 
@@ -377,7 +454,8 @@ function errorMessage(error: unknown): string {
 function exitCodeFor(error: unknown): number {
   if (
     error instanceof CliUsageError ||
-    error instanceof FindingNotFoundError
+    error instanceof FindingNotFoundError ||
+    error instanceof HooksConfirmationRequiredError
   ) {
     return 2;
   }
@@ -389,6 +467,46 @@ function exitCodeFor(error: unknown): number {
     return 4;
   }
   return 5;
+}
+
+async function readStdinText(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/**
+ * Dispatches `hook-event` outside `runCli`'s main try/catch so nothing -
+ * not a malformed `--notify` flag, not a stdin read failure, not a handler
+ * throw - can turn into a nonzero exit. Claude Code treats any nonzero
+ * hook exit as a blocking failure, so this command must always report
+ * success even when it privately did nothing.
+ */
+async function runHookEventDispatch(
+  commandArgs: readonly string[],
+  runtime: CliRuntime,
+  handlers: CliHandlers,
+  cwd: string,
+  stdout: (value: string) => void,
+  stderr: (value: string) => void,
+): Promise<void> {
+  try {
+    const parsed = parseHookEventArgs(commandArgs);
+    const stdinText = runtime.stdinText ?? await readStdinText();
+    const result = await handlers.hookEvent({
+      cwd,
+      stdinText,
+      notify: parsed.notify,
+    });
+    stdout(withTrailingNewline(result.stdout));
+    for (const warning of result.warnings) {
+      stderr(withTrailingNewline(sanitizeHumanText(warning)));
+    }
+  } catch {
+    // Swallowed by design: see the doc comment above.
+  }
 }
 
 export async function runCli(
@@ -406,6 +524,17 @@ export async function runCli(
   });
   const handlers = runtime.handlers ?? defaultHandlers;
   const cwd = runtime.cwd ?? process.cwd();
+  if (args[0] === "hook-event") {
+    await runHookEventDispatch(
+      args.slice(1),
+      runtime,
+      handlers,
+      cwd,
+      stdout,
+      stderr,
+    );
+    return 0;
+  }
   try {
     const command = parseCliArgs(args);
     if (command.kind === "help") {
@@ -436,12 +565,25 @@ export async function runCli(
         cwd,
         json: command.json,
       });
-    } else {
+    } else if (command.kind === "dismiss") {
       result = await handlers.dismiss({
         cwd,
         findingKey: command.findingKey,
         ...(command.reason === undefined ? {} : { reason: command.reason }),
       });
+    } else if (command.kind === "hooks") {
+      result = await handlers.hooks({
+        cwd,
+        action: command.action,
+        global: command.global,
+        yes: command.yes,
+      });
+    } else {
+      // command.kind === "hook-event": runCli dispatches hook-event before
+      // this try/catch (see below) so its always-exit-0 contract holds even
+      // for CLI-level parse errors. Unreachable in practice; kept only so
+      // the analyze/stats/dismiss/hooks narrowing above stays exhaustive.
+      throw new CliUsageError("hook-event must be dispatched separately");
     }
     stdout(withTrailingNewline(result.stdout));
     for (const warning of result.warnings) {

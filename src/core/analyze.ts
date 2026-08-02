@@ -37,6 +37,10 @@ import {
   commandMayMutateRepo,
 } from "../analysis/command.js";
 import {
+  applyHookEvents,
+  loadHookEvents,
+} from "../analysis/hook-events.js";
+import {
   buildTimeline,
   type TimelineResult,
 } from "../analysis/timeline.js";
@@ -117,6 +121,16 @@ export interface AnalyzeOptions {
   runner?: CommandRunner;
   nowMs?: number;
   externalToolNames?: ReadonlySet<string>;
+  /**
+   * When `false`, skips persisting this analysis: neither `saveAnalysis`
+   * nor `saveAdoptions` is called. Adoption detection itself is skipped
+   * entirely in that case too (rather than running detection but
+   * discarding the result) since detection only exists to feed the save,
+   * and running it would spend a git-backed check for no benefit. Callers
+   * that need a persisted `record`/`adoptions` (e.g. `ccprof stats`) must
+   * use the default `true`. Defaults to `true`.
+   */
+  persist?: boolean;
 }
 
 export interface AnalyzeWarning {
@@ -771,7 +785,7 @@ export async function analyze(
   const sourceErrors: unknown[] = [];
   const source = options.sessionSource ??
     defaultSessionSource(options, (error) => sourceErrors.push(error));
-  const sessions = orderedSessions(
+  let sessions = orderedSessions(
     await source.discover({
       repoRoot: context.repoRoot,
       headBranch: context.headBranch,
@@ -799,6 +813,17 @@ export async function analyze(
     ...sessions.flatMap((session) => session.warnings.map(sourceWarning)),
   );
 
+  // Resolved here (ahead of the diff/testMap Promise.all below) because
+  // hook-recorded wall clock times must be folded into `sessions` before
+  // `buildTimeline` runs; diff and testMap have no such ordering
+  // requirement and stay parallelized together.
+  const paths = options.storePaths === undefined
+    ? await resolveStorePaths(context.repoRoot)
+    : options.storePaths;
+  const hookEvents = await loadHookEvents(paths.hook_events_path);
+  warnings.push(...hookEvents.warnings.map(storeWarning));
+  sessions = applyHookEvents(sessions, hookEvents.rows);
+
   const inapplicableRules = skippedRules(sessions);
   warnings.push(...inapplicableRules.map(skippedRuleWarning));
 
@@ -814,7 +839,7 @@ export async function analyze(
     throw new NoAnalyzableTimestampsError();
   }
 
-  const [diff, testMap, paths] = await Promise.all([
+  const [diff, testMap] = await Promise.all([
     collectDiffEvidence({
       cwd: context.repoRoot,
       baseOid: context.base.oid,
@@ -822,9 +847,6 @@ export async function analyze(
       ...(options.runner === undefined ? {} : { runner: options.runner }),
     }),
     resolveTestMap(options, context.repoRoot),
-    options.storePaths === undefined
-      ? resolveStorePaths(context.repoRoot)
-      : Promise.resolve(options.storePaths),
   ]);
   warnings.push(
     ...diff.caveats.map((message) => textWarning("git_diff", message)),
@@ -842,20 +864,27 @@ export async function analyze(
     ...adoptionResult.warnings.map(storeWarning),
   );
   const history = priorRecords(historyResult.records, context);
+  const persist = options.persist ?? true;
 
-  const adoptionDetection = await detectAdoptions({
-    repoRoot: context.repoRoot,
-    candidates: adoptionCandidates(history, adoptionResult.records),
-    detectedAtMs: context.resolvedAtMs,
-    ...(options.runner === undefined ? {} : { runner: options.runner }),
-  });
-  warnings.push(...adoptionDetection.warnings);
-  const mergedAdoptions = adoptionDetection.adoptions.length === 0
-    ? adoptionResult.records
-    : [...adoptionResult.records, ...adoptionDetection.adoptions];
-  if (adoptionDetection.adoptions.length > 0) {
-    const adoptionSaveWarnings = await saveAdoptions(paths, mergedAdoptions);
-    warnings.push(...adoptionSaveWarnings.map(storeWarning));
+  // Adoption detection only exists to feed a save; when persist is false
+  // (e.g. a hook-driven `--notify` analysis) skip it entirely rather than
+  // detect-then-discard, which would spend a git-backed check for nothing.
+  let mergedAdoptions = adoptionResult.records;
+  if (persist) {
+    const adoptionDetection = await detectAdoptions({
+      repoRoot: context.repoRoot,
+      candidates: adoptionCandidates(history, adoptionResult.records),
+      detectedAtMs: context.resolvedAtMs,
+      ...(options.runner === undefined ? {} : { runner: options.runner }),
+    });
+    warnings.push(...adoptionDetection.warnings);
+    mergedAdoptions = adoptionDetection.adoptions.length === 0
+      ? adoptionResult.records
+      : [...adoptionResult.records, ...adoptionDetection.adoptions];
+    if (adoptionDetection.adoptions.length > 0) {
+      const adoptionSaveWarnings = await saveAdoptions(paths, mergedAdoptions);
+      warnings.push(...adoptionSaveWarnings.map(storeWarning));
+    }
   }
   const adoptions = [...mergedAdoptions].sort(
     (left, right) => left.finding_key.localeCompare(right.finding_key),
@@ -928,7 +957,9 @@ export async function analyze(
     command_costs: costs,
     read_observations: reads.observations,
   });
-  const saveResult = await saveAnalysis(paths, record);
+  const saveResult = persist
+    ? await saveAnalysis(paths, record)
+    : { record, warnings: [] as StoreWarning[] };
   warnings.push(...saveResult.warnings.map(storeWarning));
 
   const applied = applyDismissals(

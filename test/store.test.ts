@@ -332,6 +332,7 @@ test("analysis write failures return warnings without throwing", async () => {
       history_index_path: join(blockingFile, "index.json"),
       dismissals_path: join(blockingFile, "dismissals.json"),
       adoptions_path: join(blockingFile, "adoptions.json"),
+      hook_events_path: join(blockingFile, "hook-events.jsonl"),
     };
     const result = await saveAnalysis(paths, record("write-failure", 100));
     assert.equal(result.record.analysis_id, "write-failure");
