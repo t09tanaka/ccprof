@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
-import test from "node:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import test, { type TestContext } from "node:test";
 
 import { makeSessionRef } from "../src/core/model.js";
 import { parseCodexSession } from "../src/sources/codex/parser.js";
@@ -9,32 +10,51 @@ import { parseCodexSession } from "../src/sources/codex/parser.js";
 const fixturePath = (name: string): string =>
   resolve(process.cwd(), "test", "fixtures", "codex", name);
 
-const readFixture = (name: string): string =>
-  readFileSync(fixturePath(name), "utf8");
+/**
+ * Writes `raw` to `<tempdir>/<name>` so path-based parsing sees the intended
+ * file name (the parser falls back to the file name stem for the session id).
+ * The temp directory is removed when the test finishes.
+ */
+async function tempRollout(
+  t: TestContext,
+  name: string,
+  raw: string,
+): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), "ccprof-codex-parser-"));
+  t.after(async () => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, name);
+  await writeFile(path, raw);
+  return path;
+}
 
-test("returns null when there is no parseable content", () => {
+test("returns null when there is no parseable content", async (t) => {
   assert.equal(
-    parseCodexSession({ sourcePath: "empty.jsonl", raw: "" }),
+    await parseCodexSession({
+      sourcePath: await tempRollout(t, "empty.jsonl", ""),
+    }),
     null,
   );
   assert.equal(
-    parseCodexSession({ sourcePath: "blank.jsonl", raw: "   \n\n  " }),
+    await parseCodexSession({
+      sourcePath: await tempRollout(t, "blank.jsonl", "   \n\n  "),
+    }),
     null,
   );
   assert.equal(
-    parseCodexSession({
-      sourcePath: "garbage.jsonl",
-      raw: "not json at all\n{also not json",
+    await parseCodexSession({
+      sourcePath: await tempRollout(
+        t,
+        "garbage.jsonl",
+        "not json at all\n{also not json",
+      ),
     }),
     null,
   );
 });
 
-test("normalizes a well-formed Codex rollout into a Session", () => {
-  const raw = readFixture("session-basic.jsonl");
-  const session = parseCodexSession({
+test("normalizes a well-formed Codex rollout into a Session", async () => {
+  const session = await parseCodexSession({
     sourcePath: fixturePath("session-basic.jsonl"),
-    raw,
   });
 
   assert.ok(session);
@@ -58,10 +78,9 @@ test("normalizes a well-formed Codex rollout into a Session", () => {
   }
 });
 
-test("joins user message text parts and skips injected instruction text", () => {
-  const session = parseCodexSession({
+test("joins user message text parts and skips injected instruction text", async () => {
+  const session = await parseCodexSession({
     sourcePath: fixturePath("session-basic.jsonl"),
-    raw: readFixture("session-basic.jsonl"),
   });
   assert.ok(session);
 
@@ -75,10 +94,9 @@ test("joins user message text parts and skips injected instruction text", () => 
   );
 });
 
-test("joins assistant message content array parts and carries no token usage", () => {
-  const session = parseCodexSession({
+test("joins assistant message content array parts and carries no token usage", async () => {
+  const session = await parseCodexSession({
     sourcePath: fixturePath("session-basic.jsonl"),
-    raw: readFixture("session-basic.jsonl"),
   });
   assert.ok(session);
 
@@ -100,10 +118,9 @@ test("joins assistant message content array parts and carries no token usage", (
   }
 });
 
-test("maps exec_command/shell function_call rows into tool_use events", () => {
-  const session = parseCodexSession({
+test("maps exec_command/shell function_call rows into tool_use events", async () => {
+  const session = await parseCodexSession({
     sourcePath: fixturePath("session-basic.jsonl"),
-    raw: readFixture("session-basic.jsonl"),
   });
   assert.ok(session);
 
@@ -139,10 +156,9 @@ test("maps exec_command/shell function_call rows into tool_use events", () => {
   assert.equal(brokenArgsCall.confidence, "low");
 });
 
-test("maps function_call_output rows into tool_result events with exit-code status", () => {
-  const session = parseCodexSession({
+test("maps function_call_output rows into tool_result events with exit-code status", async () => {
+  const session = await parseCodexSession({
     sourcePath: fixturePath("session-basic.jsonl"),
-    raw: readFixture("session-basic.jsonl"),
   });
   assert.ok(session);
 
@@ -171,20 +187,18 @@ test("maps function_call_output rows into tool_result events with exit-code stat
   );
 });
 
-test("ignores reasoning, event_msg, and turn_context rows", () => {
-  const session = parseCodexSession({
+test("ignores reasoning, event_msg, and turn_context rows", async () => {
+  const session = await parseCodexSession({
     sourcePath: fixturePath("session-basic.jsonl"),
-    raw: readFixture("session-basic.jsonl"),
   });
   assert.ok(session);
   // 1 user + 2 assistant + 3 tool_use + 2 tool_result = 8 events total.
   assert.equal(session.events.length, 8);
 });
 
-test("degrades malformed rows to warnings instead of throwing", () => {
-  const session = parseCodexSession({
+test("degrades malformed rows to warnings instead of throwing", async () => {
+  const session = await parseCodexSession({
     sourcePath: fixturePath("session-basic.jsonl"),
-    raw: readFixture("session-basic.jsonl"),
   });
   assert.ok(session);
 
@@ -198,10 +212,9 @@ test("degrades malformed rows to warnings instead of throwing", () => {
   );
 });
 
-test("falls back to the file name stem and low confidence when session_meta is absent", () => {
-  const session = parseCodexSession({
+test("falls back to the file name stem and low confidence when session_meta is absent", async () => {
+  const session = await parseCodexSession({
     sourcePath: fixturePath("no-session-meta.jsonl"),
-    raw: readFixture("no-session-meta.jsonl"),
   });
 
   assert.ok(session);
@@ -217,13 +230,15 @@ test("falls back to the file name stem and low confidence when session_meta is a
   );
 });
 
-test("classifies a function_call_output with no exit-code marker as unknown", () => {
+test("classifies a function_call_output with no exit-code marker as unknown", async (t) => {
   const raw = [
     '{"timestamp":"2026-07-30T11:00:00.000Z","type":"session_meta","payload":{"id":"unknown-exit-session","cwd":"/workspace/repo"}}',
     '{"timestamp":"2026-07-30T11:00:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-x","output":"no exit code information here"}}',
   ].join("\n");
 
-  const session = parseCodexSession({ sourcePath: "unknown-exit.jsonl", raw });
+  const session = await parseCodexSession({
+    sourcePath: await tempRollout(t, "unknown-exit.jsonl", raw),
+  });
   assert.ok(session);
 
   const result = session.events.find((event) => event.kind === "tool_result");
@@ -233,7 +248,7 @@ test("classifies a function_call_output with no exit-code marker as unknown", ()
   assert.equal(result.output, "no exit code information here");
 });
 
-test("skips function_call rows missing call_id/name and function_call_output rows missing output, warning instead of throwing", () => {
+test("skips function_call rows missing call_id/name and function_call_output rows missing output, warning instead of throwing", async (t) => {
   const raw = [
     '{"timestamp":"2026-07-30T12:00:00.000Z","type":"session_meta","payload":{"id":"missing-fields-session","cwd":"/workspace/repo"}}',
     '{"timestamp":"2026-07-30T12:00:01.000Z","type":"response_item","payload":{"type":"function_call","arguments":"{}"}}',
@@ -241,9 +256,8 @@ test("skips function_call rows missing call_id/name and function_call_output row
     '{"timestamp":"2026-07-30T12:00:03.000Z","type":"response_item","payload":{"type":"message","role":"user","content":"Keep the session alive."}}',
   ].join("\n");
 
-  const session = parseCodexSession({
-    sourcePath: "missing-fields.jsonl",
-    raw,
+  const session = await parseCodexSession({
+    sourcePath: await tempRollout(t, "missing-fields.jsonl", raw),
   });
   assert.ok(session);
 
@@ -259,13 +273,15 @@ test("skips function_call rows missing call_id/name and function_call_output row
   assert.equal(invalidRowWarnings.length, 2);
 });
 
-test("does not fabricate an exit code from a quoted phrase mid-output", () => {
+test("does not fabricate an exit code from a quoted phrase mid-output", async (t) => {
   const raw = [
     '{"timestamp":"2026-07-30T14:00:00.000Z","type":"session_meta","payload":{"id":"quoted-phrase-session","cwd":"/workspace/repo"}}',
     '{"timestamp":"2026-07-30T14:00:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-quoted","output":"cat ci.log\\nsome earlier line\\nProcess exited with code 1\\nthat line was quoted from an old log, not this run status"}}',
   ].join("\n");
 
-  const session = parseCodexSession({ sourcePath: "quoted-phrase.jsonl", raw });
+  const session = await parseCodexSession({
+    sourcePath: await tempRollout(t, "quoted-phrase.jsonl", raw),
+  });
   assert.ok(session);
 
   const result = session.events.find((event) => event.kind === "tool_result");
@@ -274,13 +290,15 @@ test("does not fabricate an exit code from a quoted phrase mid-output", () => {
   assert.equal(result.exit_code, undefined);
 });
 
-test("prefers metadata.exit_code over text scanning, even when the text does not match", () => {
+test("prefers metadata.exit_code over text scanning, even when the text does not match", async (t) => {
   const raw = [
     '{"timestamp":"2026-07-30T15:00:00.000Z","type":"session_meta","payload":{"id":"metadata-exit-session","cwd":"/workspace/repo"}}',
     '{"timestamp":"2026-07-30T15:00:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-meta","output":"{\\"output\\":\\"no matching phrase here\\",\\"metadata\\":{\\"exit_code\\":2}}"}}',
   ].join("\n");
 
-  const session = parseCodexSession({ sourcePath: "metadata-exit.jsonl", raw });
+  const session = await parseCodexSession({
+    sourcePath: await tempRollout(t, "metadata-exit.jsonl", raw),
+  });
   assert.ok(session);
 
   const result = session.events.find((event) => event.kind === "tool_result");
@@ -290,10 +308,9 @@ test("prefers metadata.exit_code over text scanning, even when the text does not
   assert.equal(result.output, "no matching phrase here");
 });
 
-test("extracts edit paths and fragments from apply_patch file headers", () => {
-  const session = parseCodexSession({
+test("extracts edit paths and fragments from apply_patch file headers", async () => {
+  const session = await parseCodexSession({
     sourcePath: fixturePath("apply-patch.jsonl"),
-    raw: readFixture("apply-patch.jsonl"),
   });
   assert.ok(session);
 
@@ -313,10 +330,9 @@ test("extracts edit paths and fragments from apply_patch file headers", () => {
   assert.equal(patchCall.confidence, "high");
 });
 
-test("warns and leaves paths empty when an apply_patch body has no file headers", () => {
-  const session = parseCodexSession({
+test("warns and leaves paths empty when an apply_patch body has no file headers", async () => {
+  const session = await parseCodexSession({
     sourcePath: fixturePath("apply-patch.jsonl"),
-    raw: readFixture("apply-patch.jsonl"),
   });
   assert.ok(session);
 
@@ -334,7 +350,7 @@ test("warns and leaves paths empty when an apply_patch body has no file headers"
   assert.equal(noPathWarnings[0]?.line, 4);
 });
 
-test("deduplicates and trims repeated apply_patch header paths", () => {
+test("deduplicates and trims repeated apply_patch header paths", async (t) => {
   const patch = [
     "*** Begin Patch",
     "*** Update File: src/app/health.ts ",
@@ -359,7 +375,9 @@ test("deduplicates and trims repeated apply_patch header paths", () => {
     }),
   ].join("\n");
 
-  const session = parseCodexSession({ sourcePath: "apply-patch-dedupe.jsonl", raw });
+  const session = await parseCodexSession({
+    sourcePath: await tempRollout(t, "apply-patch-dedupe.jsonl", raw),
+  });
   assert.ok(session);
 
   const patchCall = session.events.find((event) => event.kind === "tool_use");
@@ -367,7 +385,7 @@ test("deduplicates and trims repeated apply_patch header paths", () => {
   assert.deepEqual(patchCall.paths, ["src/app/health.ts"]);
 });
 
-test("warns once per distinct unknown response_item subtype without affecting events", () => {
+test("warns once per distinct unknown response_item subtype without affecting events", async (t) => {
   const raw = [
     '{"timestamp":"2026-07-30T16:00:00.000Z","type":"session_meta","payload":{"id":"unknown-subtype-session","cwd":"/workspace/repo"}}',
     '{"timestamp":"2026-07-30T16:00:01.000Z","type":"response_item","payload":{"type":"local_shell_call","call_id":"call-a","status":"completed"}}',
@@ -375,7 +393,9 @@ test("warns once per distinct unknown response_item subtype without affecting ev
     '{"timestamp":"2026-07-30T16:00:03.000Z","type":"response_item","payload":{"type":"message","role":"user","content":"Keep the session alive."}}',
   ].join("\n");
 
-  const session = parseCodexSession({ sourcePath: "unknown-subtype.jsonl", raw });
+  const session = await parseCodexSession({
+    sourcePath: await tempRollout(t, "unknown-subtype.jsonl", raw),
+  });
   assert.ok(session);
 
   assert.equal(session.events.length, 1);
@@ -388,19 +408,21 @@ test("warns once per distinct unknown response_item subtype without affecting ev
   assert.match(unknownSubtypeWarnings[0]?.message ?? "", /local_shell_call/u);
 });
 
-test("returns null for a session with a valid session_meta but zero emitted events", () => {
+test("returns null for a session with a valid session_meta but zero emitted events", async (t) => {
   const raw = [
     '{"timestamp":"2026-07-30T13:00:00.000Z","type":"session_meta","payload":{"id":"empty-events-session","cwd":"/workspace/repo","git":{"branch":"main"}}}',
     '{"timestamp":"2026-07-30T13:00:01.000Z","type":"turn_context","payload":{"cwd":"/workspace/repo"}}',
   ].join("\n");
 
   assert.equal(
-    parseCodexSession({ sourcePath: "empty-events.jsonl", raw }),
+    await parseCodexSession({
+      sourcePath: await tempRollout(t, "empty-events.jsonl", raw),
+    }),
     null,
   );
 });
 
-test("freezes Codex rows after timestamp validation at an inclusive boundary", () => {
+test("freezes Codex rows after timestamp validation at an inclusive boundary", async (t) => {
   const cutoff = Date.parse("2026-07-31T12:00:00.000Z");
   const row = (timestamp: unknown, type?: unknown, payload?: unknown) =>
     JSON.stringify({ timestamp: typeof timestamp === "number"
@@ -423,7 +445,10 @@ test("freezes Codex rows after timestamp validation at an inclusive boundary", (
     JSON.stringify({ type: "response_item", payload: {} }),
   ].join("\n");
 
-  const session = parseCodexSession({ sourcePath: "snapshot.jsonl", raw, endedAtMs: cutoff });
+  const session = await parseCodexSession({
+    sourcePath: await tempRollout(t, "snapshot.jsonl", raw),
+    endedAtMs: cutoff,
+  });
   assert.ok(session);
   assert.equal(session.session_id, "frozen");
   assert.equal(session.confidence, "high");
@@ -437,7 +462,7 @@ test("freezes Codex rows after timestamp validation at an inclusive boundary", (
     [["codex_row_invalid", 7], ["codex_row_invalid", 8]]);
 });
 
-test("prefers event workdir, then event cwd, then session metadata cwd", () => {
+test("prefers event workdir, then event cwd, then session metadata cwd", async (t) => {
   const call = (id: string, input: Record<string, unknown>): string =>
     JSON.stringify({
       timestamp: `2026-07-31T13:00:0${id}.000Z`,
@@ -455,7 +480,9 @@ test("prefers event workdir, then event cwd, then session metadata cwd", () => {
     call("2", { cmd: "pwd", workdir: "  ", cwd: "/event/cwd" }),
     call("3", { cmd: "pwd", workdir: "", cwd: "  " }),
   ].join("\n");
-  const session = parseCodexSession({ sourcePath: "cwd-priority.jsonl", raw });
+  const session = await parseCodexSession({
+    sourcePath: await tempRollout(t, "cwd-priority.jsonl", raw),
+  });
   assert.ok(session);
   const toolCwds = session.events
     .filter((event) => event.kind === "tool_use")
@@ -472,7 +499,7 @@ test("prefers event workdir, then event cwd, then session metadata cwd", () => {
   ]);
 });
 
-test("does not invent a cwd when event and session metadata omit it", () => {
+test("does not invent a cwd when event and session metadata omit it", async (t) => {
   const raw = JSON.stringify({
     timestamp: "2026-07-31T14:00:00.000Z",
     type: "response_item",
@@ -484,7 +511,9 @@ test("does not invent a cwd when event and session metadata omit it", () => {
     },
   });
 
-  const session = parseCodexSession({ sourcePath: "missing-cwd.jsonl", raw });
+  const session = await parseCodexSession({
+    sourcePath: await tempRollout(t, "missing-cwd.jsonl", raw),
+  });
   assert.ok(session);
   const tool = session.events.find((event) => event.kind === "tool_use");
   assert.ok(tool?.kind === "tool_use");

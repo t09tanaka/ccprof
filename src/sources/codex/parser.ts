@@ -1,4 +1,6 @@
+import { createReadStream } from "node:fs";
 import { basename } from "node:path";
+import { createInterface } from "node:readline";
 
 import {
   makeSessionRef,
@@ -18,13 +20,13 @@ import {
  * Codex rollout logs are one JSON object per line:
  * `{"timestamp": ISO8601, "type": "session_meta"|"turn_context"|"response_item"|"event_msg", "payload": {...}}`.
  *
- * Unlike the Claude parser, this module works over an already-read `raw`
- * string rather than streaming a file, and always yields at most one
- * `Session` per call (a rollout file represents a single Codex session).
+ * Like the Claude parser, this module streams the rollout file line by line
+ * rather than holding the whole transcript in memory, and always yields at
+ * most one `Session` per call (a rollout file represents a single Codex
+ * session). The returned promise rejects when the file cannot be read.
  */
 export interface ParseCodexSessionOptions {
   sourcePath: string;
-  raw: string;
   endedAtMs?: number;
 }
 
@@ -95,19 +97,20 @@ function fileNameStem(sourcePath: string): string {
   return dot > 0 ? base.slice(0, dot) : base;
 }
 
-function parseRows(
+async function parseRows(
   sourcePath: string,
-  raw: string,
   endedAtMs?: number,
-): { rows: ParsedRow[]; warnings: SourceWarning[] } {
+): Promise<{ rows: ParsedRow[]; warnings: SourceWarning[] }> {
   const warnings: SourceWarning[] = [];
   const rows: ParsedRow[] = [];
-  const lines = raw.split(/\r\n|\r|\n/);
+  const input = createReadStream(sourcePath, { encoding: "utf8" });
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  let line = 0;
 
-  lines.forEach((rawLine, index) => {
-    const line = index + 1;
+  for await (const rawLine of lines) {
+    line += 1;
     if (rawLine.trim().length === 0) {
-      return;
+      continue;
     }
 
     let parsed: unknown;
@@ -117,13 +120,13 @@ function parseRows(
       warnings.push(
         warn(sourcePath, line, "codex_row_invalid", "Ignored malformed JSON row."),
       );
-      return;
+      continue;
     }
     if (!isRecord(parsed)) {
       warnings.push(
         warn(sourcePath, line, "codex_row_invalid", "JSONL row is not an object."),
       );
-      return;
+      continue;
     }
     const timestampMs = parseTimestamp(parsed.timestamp);
     if (timestampMs === undefined) {
@@ -135,15 +138,15 @@ function parseRows(
           "Ignored a row with an invalid or missing timestamp.",
         ),
       );
-      return;
+      continue;
     }
-    if (endedAtMs !== undefined && timestampMs > endedAtMs) return;
+    if (endedAtMs !== undefined && timestampMs > endedAtMs) continue;
     const type = nonEmptyString(parsed.type);
     if (type === undefined) {
       warnings.push(
         warn(sourcePath, line, "codex_row_invalid", "Ignored a row without a type."),
       );
-      return;
+      continue;
     }
     if (!isRecord(parsed.payload)) {
       warnings.push(
@@ -154,11 +157,11 @@ function parseRows(
           "Ignored a row without a payload object.",
         ),
       );
-      return;
+      continue;
     }
 
     rows.push({ type, payload: parsed.payload, timestampMs, line });
-  });
+  }
 
   return { rows, warnings };
 }
@@ -442,11 +445,11 @@ function buildFunctionCallOutputEvent(
   };
 }
 
-export function parseCodexSession(
+export async function parseCodexSession(
   options: ParseCodexSessionOptions,
-): Session | null {
-  const { sourcePath, raw, endedAtMs } = options;
-  const { rows, warnings } = parseRows(sourcePath, raw, endedAtMs);
+): Promise<Session | null> {
+  const { sourcePath, endedAtMs } = options;
+  const { rows, warnings } = await parseRows(sourcePath, endedAtMs);
 
   const sessionMetaRow = rows.find((row) => row.type === "session_meta");
   let sessionMetaId: string | undefined;
