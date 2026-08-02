@@ -203,6 +203,12 @@ The installed hook does two things on every Stop event:
 is not meant to be run manually, but is documented here for completeness.
 Without `--notify` it only appends the Stop event to the log.
 
+The `hook-events.jsonl` log is bounded automatically: whenever an append
+pushes it past 1 MiB, the hook compacts it in place, dropping rows older
+than 30 days (and, if that still is not enough, the oldest remaining rows)
+so the log never stays above 1 MiB. Compaction is best-effort — like every
+other hook failure mode, a failed compaction degrades to silent success.
+
 ## JSON v2
 
 In JSON mode, stdout is a single JSON document with no extra logging mixed in.
