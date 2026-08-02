@@ -26,6 +26,7 @@ import {
   ClaudeDiscoveryError,
   ClaudeSessionSource,
 } from "../src/sources/claude/discover.js";
+import { CodexSessionSource } from "../src/sources/codex/discover.js";
 import type { SessionQuery, SessionSource } from "../src/sources/session-source.js";
 import {
   loadAnalyses,
@@ -284,7 +285,7 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
     });
     assert.equal(
       firstSource.queries[0]?.startedAtMs,
-      first.window.started_at_ms,
+      0,
     );
     assert.equal(
       firstSource.queries[0]?.endedAtMs,
@@ -496,6 +497,63 @@ test("PR number, PR URL, and explicit range produce equivalent analysis semantic
       completeness: "complete",
     });
     assert.deepEqual(interceptedSelectors, ["17", url]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("session branch transition recovers pre-commit work only on broad fallback discovery", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-session-transition-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const transitionAtMs = Date.parse(FEATURE_COMMIT_DATE) - 60_000;
+    const common = { session_id: "transition", agent_id: "main", is_sidechain: false,
+      confidence: "high" as const, branch: "feature", branch_epoch: 1 };
+    const session: Session = {
+      session_id: "transition", source: "claude", source_path: join(repo, "transition.jsonl"),
+      observed_cwds: [repo], observed_branches: ["feature"], confidence: "high",
+      started_at_ms: transitionAtMs, ended_at_ms: transitionAtMs + 40_000, warnings: [],
+      events: [
+        { ...common, kind: "genuine_user", timestamp_ms: transitionAtMs,
+          entry_uuid: "u0", session_ref: "transition#u0", source_index: 0, text: "Start." },
+        { ...common, kind: "assistant", timestamp_ms: transitionAtMs + 20_000,
+          entry_uuid: "a1", session_ref: "transition#a1", source_index: 1, text: "Working." },
+        { ...common, kind: "assistant", timestamp_ms: transitionAtMs + 40_000,
+          entry_uuid: "a2", session_ref: "transition#a2", source_index: 2, text: "Ready." },
+      ],
+    };
+    const queries: SessionQuery[] = [];
+    const source: SessionSource = { discover: async (query) => (queries.push({ ...query }), [session]) };
+    const noReflogRunner: CommandRunner = async (command, args, options) =>
+      command === "git" && args[0] === "reflog"
+        ? { code: 1, stdout: "", stderr: "reflog unavailable" }
+        : await runCommand(command, args, options);
+    const storePaths = await resolveStorePaths(repo, { env: { CCPROF_DATA_DIR: join(root, "data") } });
+    const run = async (runner: CommandRunner, sinceMs?: number) => {
+      queries.length = 0;
+      const result = await analyze({ cwd: repo, pr: "main...feature", nowMs: NOW_MS, runner,
+        sessionSource: source, storePaths, persist: false, ...(sinceMs === undefined ? {} : { sinceMs }) });
+      return { result, query: queries[0] };
+    };
+
+    const broad = await run(noReflogRunner);
+    assert.deepEqual([broad.query?.startedAtMs, broad.result.window.started_at_ms,
+      broad.result.window.start_source], [0, transitionAtMs, "session_branch_transition"]);
+    assert.equal(broad.result.ledger.totals_ms.measured, 40_000);
+
+    const explicitAtMs = transitionAtMs + 20_000;
+    const explicit = await run(noReflogRunner, explicitAtMs);
+    assert.deepEqual([explicit.query?.startedAtMs, explicit.result.window.start_source],
+      [explicitAtMs, "explicit"]);
+
+    const headOid = await git(repo, ["rev-parse", "HEAD"]), reflogAtMs = transitionAtMs + 10_000;
+    const reflogRunner: CommandRunner = async (command, args, options) =>
+      command === "git" && args[0] === "reflog"
+        ? { code: 0, stdout: `${headOid}\0refs/heads/feature@{${reflogAtMs / 1_000}}\0branch: Created from main\0`, stderr: "" }
+        : await runCommand(command, args, options);
+    const reflog = await run(reflogRunner);
+    assert.deepEqual([reflog.query?.startedAtMs, reflog.result.window.start_source],
+      [reflogAtMs, "branch_reflog"]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1387,45 +1445,43 @@ test("propagates the underlying source error, not NoMatchingSessionsError, when 
   }
 });
 
-test("continues analysis with a session_source_error warning when sessions were found despite one source throwing", async () => {
+test("partial source failure warns and rejects surviving transition evidence", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-source-error-partial-"));
   try {
     const repo = await makeRepository(root);
-    const claudeProjects = await makeMalformedClaudeProjects(root);
-    const codexSessions = await makeCodexSessions(root, repo, "feature");
     const storePaths = await resolveStorePaths(repo, {
       env: { CCPROF_DATA_DIR: join(root, "data") },
     });
-
-    const result = await analyze({
-      cwd: repo,
-      pr: "main...feature",
-      nowMs: NOW_MS,
-      storePaths,
-      claudeProjectsDirectory: claudeProjects,
-      codexSessionsDirectory: codexSessions,
-    });
-
-    assert.deepEqual(result.report.unit.sessions, ["codex-integration"]);
-    const sourceErrorWarning = result.warnings.find(
-      (warning) => warning.code === "session_source_error",
-    );
-    assert.ok(
-      sourceErrorWarning,
-      "the Claude source failure must surface as a session_source_error warning",
-    );
-    assert.ok(
-      sourceErrorWarning?.message.startsWith(
-        "Claude session discovery failed for one or more sources.",
-      ),
-      "the base message must be preserved",
-    );
-    assert.ok(
-      sourceErrorWarning?.message.includes(
-        join(claudeProjects, "malformed.jsonl"),
-      ),
-      "the failing source's path must be included so the warning is actionable",
-    );
+    const anchorAtMs = Date.parse(FEATURE_COMMIT_DATE);
+    const transitionAtMs = anchorAtMs - 60_000;
+    const failingPath = join(root, "failed-codex-source.jsonl");
+    const base = hookEventSession("transition", repo);
+    const transition: Session = { ...base, started_at_ms: transitionAtMs,
+      ended_at_ms: anchorAtMs + 1_000,
+      events: [transitionAtMs, anchorAtMs, anchorAtMs + 1_000]
+        .map((timestamp_ms, index) => ({ ...base.events[index === 0 ? 0 : 1]!,
+          timestamp_ms, entry_uuid: `e${index}`, session_ref: `transition#e${index}`,
+          source_index: index, branch: "feature", branch_epoch: 1 })) };
+    const claudeDiscover = ClaudeSessionSource.prototype.discover;
+    const codexDiscover = CodexSessionSource.prototype.discover;
+    ClaudeSessionSource.prototype.discover = async () => [transition];
+    CodexSessionSource.prototype.discover = async () => {
+      throw new ClaudeDiscoveryError([{ code: "source_read_error",
+        message: "Could not read a source.", source_path: failingPath }]);
+    };
+    try {
+      const result = await analyze({ cwd: repo, pr: "main...feature",
+        nowMs: NOW_MS, storePaths, persist: false });
+      assert.equal(result.window.start_source, "commit_anchor_lookback");
+      assert.equal(result.window.started_at_ms, anchorAtMs);
+      assert.deepEqual(result.report.unit.sessions, ["transition"]);
+      const warning = result.warnings.find(({ code }) => code === "session_source_error")?.message ?? "";
+      assert.ok(warning.startsWith("Claude session discovery failed for one or more sources."));
+      assert.ok(warning.includes(failingPath));
+    } finally {
+      ClaudeSessionSource.prototype.discover = claudeDiscover;
+      CodexSessionSource.prototype.discover = codexDiscover;
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
