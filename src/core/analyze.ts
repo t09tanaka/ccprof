@@ -37,6 +37,10 @@ import {
   commandMayMutateRepo,
 } from "../analysis/command.js";
 import {
+  applyHookEvents,
+  loadHookEvents,
+} from "../analysis/hook-events.js";
+import {
   buildTimeline,
   type TimelineResult,
 } from "../analysis/timeline.js";
@@ -781,7 +785,7 @@ export async function analyze(
   const sourceErrors: unknown[] = [];
   const source = options.sessionSource ??
     defaultSessionSource(options, (error) => sourceErrors.push(error));
-  const sessions = orderedSessions(
+  let sessions = orderedSessions(
     await source.discover({
       repoRoot: context.repoRoot,
       headBranch: context.headBranch,
@@ -809,6 +813,17 @@ export async function analyze(
     ...sessions.flatMap((session) => session.warnings.map(sourceWarning)),
   );
 
+  // Resolved here (ahead of the diff/testMap Promise.all below) because
+  // hook-recorded wall clock times must be folded into `sessions` before
+  // `buildTimeline` runs; diff and testMap have no such ordering
+  // requirement and stay parallelized together.
+  const paths = options.storePaths === undefined
+    ? await resolveStorePaths(context.repoRoot)
+    : options.storePaths;
+  const hookEvents = await loadHookEvents(paths.hook_events_path);
+  warnings.push(...hookEvents.warnings.map(storeWarning));
+  sessions = applyHookEvents(sessions, hookEvents.rows);
+
   const inapplicableRules = skippedRules(sessions);
   warnings.push(...inapplicableRules.map(skippedRuleWarning));
 
@@ -824,7 +839,7 @@ export async function analyze(
     throw new NoAnalyzableTimestampsError();
   }
 
-  const [diff, testMap, paths] = await Promise.all([
+  const [diff, testMap] = await Promise.all([
     collectDiffEvidence({
       cwd: context.repoRoot,
       baseOid: context.base.oid,
@@ -832,9 +847,6 @@ export async function analyze(
       ...(options.runner === undefined ? {} : { runner: options.runner }),
     }),
     resolveTestMap(options, context.repoRoot),
-    options.storePaths === undefined
-      ? resolveStorePaths(context.repoRoot)
-      : Promise.resolve(options.storePaths),
   ]);
   warnings.push(
     ...diff.caveats.map((message) => textWarning("git_diff", message)),

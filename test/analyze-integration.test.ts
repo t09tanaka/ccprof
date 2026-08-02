@@ -1387,3 +1387,211 @@ test("full-capability (Claude-only) analyses omit skipped_rules and emit no capa
     await rm(root, { recursive: true, force: true });
   }
 });
+
+/** A minimal two-event session (just enough for `buildTimeline` to form an
+ * analyzable interval) used by the hook-events wiring tests below, where
+ * only `session_id` / `ended_at_ms` matter. */
+function hookEventSession(sessionId: string, repo: string): Session {
+  const shared = {
+    session_id: sessionId,
+    agent_id: "main",
+    is_sidechain: false,
+    confidence: "high" as const,
+  };
+  const t0 = NOW_MS - 600_000;
+  const endedAtMs = t0 + 60_000;
+  return {
+    session_id: sessionId,
+    source: "claude",
+    source_path: join(repo, `${sessionId}.jsonl`),
+    observed_cwds: [repo],
+    observed_branches: ["feature"],
+    started_at_ms: t0,
+    ended_at_ms: endedAtMs,
+    confidence: "high",
+    warnings: [],
+    events: [
+      {
+        ...shared,
+        kind: "genuine_user",
+        timestamp_ms: t0,
+        entry_uuid: "u0",
+        session_ref: `${sessionId}#u0`,
+        source_index: 0,
+        text: "Start the task.",
+      },
+      {
+        ...shared,
+        kind: "assistant",
+        timestamp_ms: endedAtMs,
+        entry_uuid: "a1",
+        session_ref: `${sessionId}#a1`,
+        source_index: 1,
+        text: "Done.",
+      },
+    ],
+  };
+}
+
+test("a hook-events.jsonl file with a matching, in-window Stop row is read without a warning", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-hook-events-inwindow-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const session = hookEventSession("hook-session", repo);
+    await write(
+      storePaths.hook_events_path,
+      `${JSON.stringify({
+        received_at_ms: session.ended_at_ms + 5 * 60_000,
+        session_id: session.session_id,
+        hook_event_name: "Stop",
+      })}\n`,
+    );
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      sessionSource: { discover: async () => [session] },
+    });
+
+    assert.deepEqual(
+      result.warnings.filter((warning) => warning.code.startsWith("hook_events")),
+      [],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a Stop row more than 30 minutes past ended_at_ms is read without a warning", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-hook-events-toolate-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const session = hookEventSession("hook-session", repo);
+    await write(
+      storePaths.hook_events_path,
+      `${JSON.stringify({
+        received_at_ms: session.ended_at_ms + 31 * 60_000,
+        session_id: session.session_id,
+        hook_event_name: "Stop",
+      })}\n`,
+    );
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      sessionSource: { discover: async () => [session] },
+    });
+
+    assert.deepEqual(
+      result.warnings.filter((warning) => warning.code.startsWith("hook_events")),
+      [],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a Stop row for an unrelated session_id is read without a warning", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-hook-events-mismatch-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const session = hookEventSession("hook-session", repo);
+    await write(
+      storePaths.hook_events_path,
+      `${JSON.stringify({
+        received_at_ms: session.ended_at_ms + 5 * 60_000,
+        session_id: "unrelated-session",
+        hook_event_name: "Stop",
+      })}\n`,
+    );
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      sessionSource: { discover: async () => [session] },
+    });
+
+    assert.deepEqual(
+      result.warnings.filter((warning) => warning.code.startsWith("hook_events")),
+      [],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("analysis proceeds unchanged when hook-events.jsonl is absent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-hook-events-absent-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const session = hookEventSession("hook-session", repo);
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      sessionSource: { discover: async () => [session] },
+    });
+
+    assert.deepEqual(
+      result.warnings.filter((warning) => warning.code.startsWith("hook_events")),
+      [],
+    );
+    assert.equal(result.report.unit.sessions.length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a corrupt hook-events.jsonl line degrades to one aggregate warning instead of failing analysis", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-hook-events-corrupt-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const session = hookEventSession("hook-session", repo);
+    await write(
+      storePaths.hook_events_path,
+      ["{not valid json", JSON.stringify({ session_id: "hook-session" })].join(
+        "\n",
+      ) + "\n",
+    );
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      sessionSource: { discover: async () => [session] },
+    });
+
+    const hookWarnings = result.warnings.filter(
+      (warning) => warning.code === "hook_events_invalid_rows",
+    );
+    assert.equal(hookWarnings.length, 1);
+    assert.match(hookWarnings[0]?.message ?? "", /^2 hook event rows /u);
+    assert.equal(hookWarnings[0]?.source, storePaths.hook_events_path);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
