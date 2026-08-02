@@ -6,6 +6,12 @@ recovered — with evidence and a fix recipe attached. It uses only
 deterministic rules, so the same input always produces the same result. No LLM
 is involved in the analysis.
 
+ccprof measures wasted time in the working process; it does not measure
+whether the judgment behind the work was right — choice of approach,
+interpretation of requirements, or design quality are out of scope. This is a
+deliberate boundary, not an oversight: it is what keeps the analysis
+deterministic (no LLM, reproducible).
+
 ## Requirements and installation
 
 - Node.js 20 or newer
@@ -367,7 +373,10 @@ Sidechains and compaction are normalized as well.
 
 Markdown, baselines, and store-driven R006 were originally Phase 2 items, but
 they are included in this release. Framework-specific flaky test name
-extraction is a future extension.
+extraction remains a future extension. An opt-in LLM advisory layer — offering
+judgment-level suggestions alongside the deterministic findings above, clearly
+separated from them — is a candidate for 0.3. Deterministic analysis stays the
+default either way; nothing here changes without an explicit opt-in.
 
 ### Codex sessions and skipped rules
 
