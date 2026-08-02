@@ -29,6 +29,7 @@ export interface PrContext {
   url?: string;
   isCrossRepository?: boolean;
   createdAtMs?: number;
+  branchReflogStartedAtMs?: number;
   earliestUniqueCommitAtMs?: number;
   resolvedAtMs: number;
   warnings: string[];
@@ -39,6 +40,7 @@ export interface ResolvePrContextOptions {
   input?: string;
   runner?: CommandRunner;
   nowMs?: number;
+  includeBranchReflog?: boolean;
 }
 
 export interface ExplicitRange {
@@ -201,10 +203,9 @@ async function earliestUniqueCommit(
   headOid: string,
   warnings: string[],
 ): Promise<number | undefined> {
-  // Author date (not committer date) survives rebase, so it remains a
-  // faithful lower bound for when work on these commits began even when the
-  // branch was rebased onto the base ref just before opening the PR.
-  const args = ["log", "--format=%at", `${baseOid}..${headOid}`];
+  // The earlier clock avoids excluding work when a rebase rewrites committer
+  // dates; trustworthy branch-creation reflog evidence remains preferred.
+  const args = ["log", "--format=%at%x00%ct", `${baseOid}..${headOid}`];
   const result = await git(runner, cwd, args);
   if (result.code !== 0) throw commandFailure("git", args, result);
   if (result.stdoutTruncated === true) {
@@ -213,15 +214,90 @@ async function earliestUniqueCommit(
   }
   let earliest: number | undefined;
   for (const line of result.stdout.split(/\r?\n/).filter(Boolean)) {
-    const match = /^(\d+)$/.exec(line);
-    const milliseconds = match === null ? Number.NaN : Number(match[1]) * 1_000;
-    if (!Number.isSafeInteger(milliseconds)) {
+    const fields = line.split("\0");
+    const timestamps = fields.map((field) =>
+      /^\d+$/.test(field) ? Number(field) * 1_000 : Number.NaN
+    );
+    if (fields.length !== 2 || timestamps.some((value) => !Number.isSafeInteger(value))) {
       warnings.push(`ignored malformed git log row: ${JSON.stringify(line)}`);
     } else {
-      earliest = earliest === undefined ? milliseconds : Math.min(earliest, milliseconds);
+      earliest = Math.min(earliest ?? Number.POSITIVE_INFINITY, ...timestamps);
     }
   }
   return earliest;
+}
+
+function parseBranchReflog(
+  stdout: string,
+  branchRef: string,
+  headOid: string,
+): { startedAtMs?: number; warning?: string } {
+  const fields = stdout.split("\0");
+  if (fields.pop() !== "" || fields.length % 3 !== 0) {
+    return { warning: `ignored malformed branch reflog evidence for ${branchRef}` };
+  }
+  const rows: { oid: string; atMs: number; subject: string }[] = [];
+  const selectorPrefix = `${branchRef}@{`;
+  for (let index = 0; index < fields.length; index += 3) {
+    const oid = fields[index] ?? "";
+    const selector = fields[index + 1] ?? "";
+    const subject = fields[index + 2] ?? "";
+    const secondsText = selector.startsWith(selectorPrefix) && selector.endsWith("}")
+      ? selector.slice(selectorPrefix.length, -1)
+      : "";
+    const milliseconds = /^\d+$/.test(secondsText) ? Number(secondsText) * 1_000 : Number.NaN;
+    if (!OID_PATTERN.test(oid) || !Number.isSafeInteger(milliseconds) || milliseconds < 0) {
+      return { warning: `ignored malformed branch reflog evidence for ${branchRef}` };
+    }
+    rows.push({ oid: oid.toLowerCase(), atMs: milliseconds, subject });
+  }
+  if (rows.length > 0 && rows[0]?.oid !== headOid) {
+    return { warning: "branch reflog latest row did not match the frozen PR head; branch start is unavailable" };
+  }
+  const creation = rows.find(({ subject }) => subject.startsWith("branch: Created from "));
+  return creation === undefined
+    ? { warning: "branch reflog did not contain a branch creation entry; branch start is unavailable" }
+    : { startedAtMs: creation.atMs };
+}
+
+async function branchReflogStart(
+  runner: CommandRunner,
+  cwd: string,
+  headBranch: string,
+  headOid: string,
+  warnings: string[],
+): Promise<number | undefined> {
+  if (headBranch === "HEAD") return undefined;
+  const branchRef = `refs/heads/${headBranch}`;
+  const localArgs = [
+    "rev-parse", "--verify", "--quiet", "--end-of-options", `${branchRef}^{commit}`,
+  ];
+  const local = await git(runner, cwd, localArgs);
+  if (local.code !== 0) return undefined;
+  let localOid: string;
+  try {
+    localOid = parseOid(local.stdout, `commit for ${branchRef}`);
+  } catch {
+    warnings.push(`ignored malformed local branch identity for ${branchRef}`);
+    return undefined;
+  }
+  if (localOid !== headOid) {
+    warnings.push(`local branch ${branchRef} did not match the frozen PR head; branch reflog was ignored`);
+    return undefined;
+  }
+  const reflogArgs = [
+    "reflog", "show", "-z", "--date=unix", "--format=%H%x00%gD%x00%gs",
+    "--end-of-options", branchRef,
+  ];
+  const reflog = await git(runner, cwd, reflogArgs);
+  if (reflog.code !== 0) return undefined;
+  if (reflog.stdoutTruncated === true) {
+    warnings.push("branch reflog output was truncated; branch start is unavailable");
+    return undefined;
+  }
+  const parsed = parseBranchReflog(reflog.stdout, branchRef, headOid);
+  if (parsed.warning !== undefined) warnings.push(parsed.warning);
+  return parsed.startedAtMs;
 }
 
 interface Resolution {
@@ -340,6 +416,15 @@ export async function resolvePrContext(
     resolution.frozenBaseOid ??
     (await freezeRef(runner, repoRoot, resolution.baseRef));
   const headOid = await freezeRef(runner, repoRoot, resolution.headRef);
+  const branchReflogStartedAtMs = options.includeBranchReflog === false
+    ? undefined
+    : await branchReflogStart(
+      runner,
+      repoRoot,
+      resolution.headLabel,
+      headOid,
+      warnings,
+    );
   const mergeArgs = ["merge-base", baseOid, headOid];
   const mergeResult = await git(runner, repoRoot, mergeArgs);
   if (mergeResult.code !== 0) throw commandFailure("git", mergeArgs, mergeResult);
@@ -376,6 +461,7 @@ export async function resolvePrContext(
     ...(createdAtMs === undefined || !Number.isSafeInteger(createdAtMs)
       ? {}
       : { createdAtMs }),
+    ...(branchReflogStartedAtMs === undefined ? {} : { branchReflogStartedAtMs }),
     ...(earliestUniqueCommitAtMs === undefined ? {} : { earliestUniqueCommitAtMs }),
     resolvedAtMs,
     warnings,

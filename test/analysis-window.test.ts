@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  analyze,
   InvalidAnalysisWindowError,
   resolveAnalysisWindow,
   type AnalyzeWarning,
 } from "../src/core/analyze.js";
+import type { CommandRunner } from "../src/git/client.js";
 import type { PrContext } from "../src/git/pr-context.js";
 
 function context(overrides: Partial<PrContext> = {}): PrContext {
@@ -32,13 +34,72 @@ test("createdAtMs is ignored for an otherwise identical snapshot", () => {
 });
 
 test("explicit since takes precedence and produces a complete window", () => {
-  assert.deepEqual(resolveAnalysisWindow(context(), { sinceMs: 700 }), {
+  assert.deepEqual(resolveAnalysisWindow(
+    context({ branchReflogStartedAtMs: 650 }),
+    { sinceMs: 700 },
+  ), {
     started_at_ms: 700,
     ended_at_ms: 1_000,
     start_source: "explicit",
     end_source: "analysis_time",
     completeness: "complete",
   });
+});
+
+test("an explicit start disables branch reflog probing", async () => {
+  const calls: string[][] = [];
+  const runner: CommandRunner = async (_command, args) => {
+    calls.push([...args]);
+    if (args[0] === "rev-parse" && args[1] === "--show-toplevel")
+      return { code: 0, stdout: "/repo\n", stderr: "" };
+    if (args[0] === "rev-parse") {
+      const oid = (args.at(-1)?.startsWith("main") === true ? "a" : "b").repeat(40);
+      return { code: 0, stdout: `${oid}\n`, stderr: "" };
+    }
+    if (args[0] === "merge-base")
+      return { code: 0, stdout: `${"a".repeat(40)}\n`, stderr: "" };
+    if (args[0] === "log") return { code: 0, stdout: "1\n", stderr: "" };
+    return { code: 1, stdout: "", stderr: "unavailable" };
+  };
+  const stop = new Error("stop after discovery");
+
+  await assert.rejects(analyze({
+    cwd: "/repo",
+    pr: "main...feature",
+    sinceMs: 700,
+    nowMs: 1_000,
+    runner,
+    sessionSource: { discover: async () => { throw stop; } },
+  }), (error) => error === stop);
+  assert.equal(calls.some((args) => args.includes("refs/heads/feature^{commit}")), false);
+  assert.equal(calls.some((args) => args[0] === "reflog"), false);
+});
+
+test("a valid branch reflog start precedes the commit-anchor fallback", () => {
+  assert.deepEqual(
+    resolveAnalysisWindow(context({ branchReflogStartedAtMs: 350 })),
+    {
+      started_at_ms: 350,
+      ended_at_ms: 1_000,
+      start_source: "branch_reflog",
+      end_source: "analysis_time",
+      completeness: "partial",
+    },
+  );
+});
+
+test("untrusted branch reflog starts warn and use the commit fallback", () => {
+  const cases = [
+    [1_001, "invalid_branch_reflog_start", "The branch reflog start followed analysis resolution; the commit anchor fallback was used."],
+    [401, "branch_reflog_after_commit_anchor", "The branch reflog start followed the earliest unique commit; the commit anchor fallback was used."],
+  ] as const;
+  for (const [startedAtMs, code, message] of cases) {
+    const warnings: AnalyzeWarning[] = [];
+    assert.equal(resolveAnalysisWindow(
+      context({ branchReflogStartedAtMs: startedAtMs }), {}, warnings,
+    ).started_at_ms, 400);
+    assert.deepEqual(warnings, [{ code, message }]);
+  }
 });
 
 test("commit-anchor lookback is applied and clamped at the Unix epoch", () => {
@@ -107,6 +168,10 @@ test("invalid supplied analysis-window millisecond values throw", () => {
       commitAnchorLookbackMs: Number.MAX_SAFE_INTEGER + 1,
     }),
     () => resolveAnalysisWindow(context({ earliestUniqueCommitAtMs: -1 })),
+    () => resolveAnalysisWindow(context({ branchReflogStartedAtMs: -1 })),
+    () => resolveAnalysisWindow(context({
+      branchReflogStartedAtMs: Number.MAX_SAFE_INTEGER + 1,
+    })),
   ];
   for (const resolve of invalid) {
     assert.throws(resolve, InvalidAnalysisWindowError);

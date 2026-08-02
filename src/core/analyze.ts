@@ -670,6 +670,12 @@ export function resolveAnalysisWindow(
       "earliest unique commit time",
     );
   }
+  if (context.branchReflogStartedAtMs !== undefined) {
+    validWindowTimestamp(
+      context.branchReflogStartedAtMs,
+      "branch reflog start",
+    );
+  }
 
   const endedAtMs = context.resolvedAtMs;
   if (options.sinceMs !== undefined) {
@@ -687,8 +693,31 @@ export function resolveAnalysisWindow(
     };
   }
 
-  const lookbackMs = options.commitAnchorLookbackMs ?? 0;
   const anchor = context.earliestUniqueCommitAtMs;
+  if (context.branchReflogStartedAtMs !== undefined) {
+    if (
+      context.branchReflogStartedAtMs <= endedAtMs &&
+      (anchor === undefined || context.branchReflogStartedAtMs <= anchor)
+    ) {
+      return {
+        started_at_ms: context.branchReflogStartedAtMs,
+        ended_at_ms: endedAtMs,
+        start_source: "branch_reflog",
+        end_source: "analysis_time",
+        completeness: "partial",
+      };
+    }
+    warnings.push(textWarning(
+      context.branchReflogStartedAtMs > endedAtMs
+        ? "invalid_branch_reflog_start"
+        : "branch_reflog_after_commit_anchor",
+      context.branchReflogStartedAtMs > endedAtMs
+        ? "The branch reflog start followed analysis resolution; the commit anchor fallback was used."
+        : "The branch reflog start followed the earliest unique commit; the commit anchor fallback was used.",
+    ));
+  }
+
+  const lookbackMs = options.commitAnchorLookbackMs ?? 0;
   if (anchor === undefined) {
     warnings.push(
       textWarning(
@@ -838,6 +867,7 @@ export async function analyze(
     ...(options.pr === undefined ? {} : { input: options.pr }),
     ...(options.runner === undefined ? {} : { runner: options.runner }),
     ...(options.nowMs === undefined ? {} : { nowMs: options.nowMs }),
+    includeBranchReflog: options.sinceMs === undefined,
   });
   const warnings: AnalyzeWarning[] = context.warnings.map((message) =>
     textWarning("pr_context", message)
