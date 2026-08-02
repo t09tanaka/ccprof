@@ -295,6 +295,7 @@ function buildFunctionCallEvent(
   baseConfidence: Confidence,
   warnings: SourceWarning[],
   sourcePath: string,
+  sessionCwd: string | undefined,
 ): ToolUseEvent | undefined {
   const callId = nonEmptyString(row.payload.call_id);
   const name = nonEmptyString(row.payload.name);
@@ -348,8 +349,11 @@ function buildFunctionCallEvent(
     );
   }
 
+  const cwd =
+    nonEmptyString(input.workdir) ??
+    nonEmptyString(input.cwd) ??
+    sessionCwd;
   let command: string | undefined;
-  let cwd: string | undefined;
   if (name === "exec_command" || name === "shell") {
     const cmdValue = input.cmd ?? input.command;
     if (typeof cmdValue === "string" && cmdValue.length > 0) {
@@ -361,9 +365,6 @@ function buildFunctionCallEvent(
       if (parts.length > 0) {
         command = parts.join(" ");
       }
-    }
-    if (typeof input.workdir === "string" && input.workdir.length > 0) {
-      cwd = input.workdir;
     }
   }
 
@@ -497,6 +498,7 @@ export function parseCodexSession(
         confidence,
         warnings,
         sourcePath,
+        sessionMetaCwd,
       );
       if (event !== undefined) {
         events.push(event);
@@ -541,12 +543,22 @@ export function parseCodexSession(
   }
 
   const timestamps = events.map((event) => event.timestamp_ms);
+  const observedCwds = [...new Set([
+    ...(sessionMetaCwd === undefined ? [] : [sessionMetaCwd]),
+    ...events.flatMap((event) =>
+      event.kind === "tool_use" &&
+        event.cwd !== undefined &&
+        event.cwd !== ""
+        ? [event.cwd]
+        : []
+    ),
+  ])];
 
   return {
     session_id: sessionId,
     source: "codex",
     source_path: sourcePath,
-    observed_cwds: sessionMetaCwd !== undefined ? [sessionMetaCwd] : [],
+    observed_cwds: observedCwds,
     observed_branches:
       sessionMetaBranch !== undefined ? [sessionMetaBranch] : [],
     started_at_ms: Math.min(...timestamps),

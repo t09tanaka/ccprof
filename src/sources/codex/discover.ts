@@ -1,7 +1,6 @@
 import { readdir, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import {
-  isAbsolute,
   join,
   relative,
   resolve,
@@ -10,6 +9,11 @@ import {
 
 import type { Session, SourceWarning } from "../../core/model.js";
 import { canonicalPath } from "../../git/common-dir.js";
+import {
+  alignSessionCwdsToRepository,
+  canonicalizeSessionCwds,
+  cwdMatchesRepository,
+} from "../cwd.js";
 import type {
   SessionQuery,
   SessionSource,
@@ -23,16 +27,6 @@ export interface CodexDiscoverOptions {
 
 const ROLLOUT_FILE_PATTERN = /^rollout-.*\.jsonl$/u;
 const DAY_MS = 24 * 60 * 60 * 1000;
-
-function isWithin(root: string, candidate: string): boolean {
-  const relation = relative(root, candidate);
-  return (
-    relation === "" ||
-    (relation !== ".." &&
-      !relation.startsWith(`..${sep}`) &&
-      !isAbsolute(relation))
-  );
-}
 
 function intersects(session: Session, query: SessionQuery): boolean {
   return (
@@ -171,33 +165,36 @@ export async function discoverCodexSessions(
     if (parsed === null) {
       continue;
     }
-    if (!intersects(parsed, query)) {
+    const canonicalSession = await canonicalizeSessionCwds(parsed);
+    if (!intersects(canonicalSession, query)) {
       continue;
     }
+    if (
+      !(await cwdMatchesRepository(
+        repoRoot,
+        canonicalSession.observed_cwds,
+      ))
+    ) {
+      continue;
+    }
+    const session = await alignSessionCwdsToRepository(
+      canonicalSession,
+      repoRoot,
+    );
 
-    const cwd = parsed.observed_cwds[0];
-    if (cwd === undefined) {
-      continue;
-    }
-    const canonicalCwd = await canonicalPath(cwd);
-    if (!isWithin(repoRoot, canonicalCwd)) {
-      continue;
-    }
-
-    const branch = parsed.observed_branches[0];
+    const branch = session.observed_branches[0];
     if (branch === undefined) {
       sessions.push({
-        ...parsed,
-        observed_cwds: [canonicalCwd],
+        ...session,
         confidence: "low",
-        warnings: [...parsed.warnings, missingBranchWarning(parsed)],
+        warnings: [...session.warnings, missingBranchWarning(session)],
       });
       continue;
     }
     if (branch !== query.headBranch) {
       continue;
     }
-    sessions.push({ ...parsed, observed_cwds: [canonicalCwd] });
+    sessions.push(session);
   }
 
   if (globalWarnings.length === 0) {

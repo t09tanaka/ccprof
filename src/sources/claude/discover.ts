@@ -1,6 +1,5 @@
 import { lstat, readdir, realpath } from "node:fs/promises";
 import {
-  dirname,
   isAbsolute,
   join,
   relative,
@@ -9,11 +8,12 @@ import {
 } from "node:path";
 
 import type { Confidence, Session, SourceWarning } from "../../core/model.js";
+import { canonicalPath } from "../../git/common-dir.js";
 import {
-  canonicalPath,
-  commonGitDirectory,
-  findGitMarker,
-} from "../../git/common-dir.js";
+  alignSessionCwdsToRepository,
+  canonicalizeSessionCwds,
+  cwdMatchesRepository,
+} from "../cwd.js";
 import type {
   SessionQuery,
   SessionSource,
@@ -133,29 +133,6 @@ function isWithin(root: string, candidate: string): boolean {
       !relation.startsWith(`..${sep}`) &&
       !isAbsolute(relation))
   );
-}
-
-async function cwdMatchesRepository(
-  repoRoot: string,
-  cwds: string[],
-): Promise<boolean> {
-  if (cwds.some((cwd) => isWithin(repoRoot, cwd))) {
-    return true;
-  }
-  const repoGitDirectory = await commonGitDirectory(repoRoot);
-  if (repoGitDirectory === undefined) {
-    return false;
-  }
-  for (const cwd of cwds) {
-    const cwdGitDirectory = await commonGitDirectory(cwd);
-    if (
-      cwdGitDirectory !== undefined &&
-      cwdGitDirectory === repoGitDirectory
-    ) {
-      return true;
-    }
-  }
-  return false;
 }
 
 function intersects(session: Session, query: SessionQuery): boolean {
@@ -278,125 +255,17 @@ function missingBranchWarning(session: Session): SourceWarning {
 }
 
 async function canonicalizeSession(session: Session): Promise<Session> {
-  const [observedCwds, events, sourcePath] = await Promise.all([
-    Promise.all(
-      session.observed_cwds.map((cwd) => canonicalPath(cwd)),
-    ),
-    Promise.all(
-      session.events.map(async (event) => {
-        if (
-          event.kind !== "tool_use" ||
-          event.cwd === undefined ||
-          event.cwd === ""
-        ) {
-          return event;
-        }
-        return {
-          ...event,
-          cwd: await canonicalPath(event.cwd),
-        };
-      }),
-    ),
+  const [canonicalSession, sourcePath] = await Promise.all([
+    canonicalizeSessionCwds(session),
     canonicalPath(session.source_path),
   ]);
-  const eventCwds = events.flatMap((event) =>
-    event.kind === "tool_use" &&
-      event.cwd !== undefined &&
-      event.cwd !== ""
-      ? [event.cwd]
-      : []
-  );
   return {
-    ...session,
+    ...canonicalSession,
     source_path: sourcePath,
-    observed_cwds: [...new Set([...observedCwds, ...eventCwds])],
-    events,
-    warnings: session.warnings.map((warning) => ({
+    warnings: canonicalSession.warnings.map((warning) => ({
       ...warning,
       source_path: sourcePath,
     })),
-  };
-}
-
-async function rebaseWorktreeCwd(
-  cwd: string,
-  repoRoot: string,
-  repoGitDirectory: string | undefined,
-): Promise<string> {
-  if (isWithin(repoRoot, cwd) || repoGitDirectory === undefined) {
-    return cwd;
-  }
-  const [marker, cwdGitDirectory] = await Promise.all([
-    findGitMarker(cwd),
-    commonGitDirectory(cwd),
-  ]);
-  if (
-    marker === undefined ||
-    cwdGitDirectory === undefined ||
-    cwdGitDirectory !== repoGitDirectory
-  ) {
-    return cwd;
-  }
-  const worktreeRoot = await canonicalPath(dirname(marker));
-  if (!isWithin(worktreeRoot, cwd)) {
-    return cwd;
-  }
-  const relativeCwd = relative(worktreeRoot, cwd);
-  if (
-    isAbsolute(relativeCwd) ||
-    relativeCwd === ".." ||
-    relativeCwd.startsWith(`..${sep}`)
-  ) {
-    return cwd;
-  }
-  const rebased = await canonicalPath(resolve(repoRoot, relativeCwd));
-  return isWithin(repoRoot, rebased) ? rebased : cwd;
-}
-
-async function alignSessionCwdsToRepository(
-  session: Session,
-  repoRoot: string,
-): Promise<Session> {
-  const repoGitDirectory = await commonGitDirectory(repoRoot);
-  const distinctCwds = [...new Set([
-    ...session.observed_cwds,
-    ...session.events.flatMap((event) =>
-      event.kind === "tool_use" &&
-        event.cwd !== undefined &&
-        event.cwd !== ""
-        ? [event.cwd]
-        : []
-    ),
-  ])];
-  const mappedCwds = new Map(
-    await Promise.all(
-      distinctCwds.map(async (cwd) => [
-        cwd,
-        await rebaseWorktreeCwd(cwd, repoRoot, repoGitDirectory),
-      ] as const),
-    ),
-  );
-  const events = session.events.map((event) =>
-    event.kind === "tool_use" &&
-      event.cwd !== undefined &&
-      event.cwd !== ""
-      ? { ...event, cwd: mappedCwds.get(event.cwd) ?? event.cwd }
-      : event
-  );
-  const eventCwds = events.flatMap((event) =>
-    event.kind === "tool_use" &&
-      event.cwd !== undefined &&
-      event.cwd !== ""
-      ? [event.cwd]
-      : []
-  );
-  return {
-    ...session,
-    observed_cwds: [...new Set([
-      ...session.observed_cwds.map((cwd) => mappedCwds.get(cwd) ?? cwd),
-      ...eventCwds,
-    ])],
-    events,
   };
 }
 
