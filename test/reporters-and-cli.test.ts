@@ -446,6 +446,7 @@ function handlers(
     analyze,
     stats: async () => ({ stdout: "{}\n", warnings: [] }),
     dismiss: async () => ({ stdout: "dismissed\n", warnings: [] }),
+    hookEvent: async () => ({ stdout: "", warnings: [] }),
   };
 }
 
@@ -644,6 +645,7 @@ const storePaths: StorePaths = {
   history_index_path: "/data/hash/index.json",
   dismissals_path: "/data/hash/dismissals.json",
   adoptions_path: "/data/hash/adoptions.json",
+  hook_events_path: "/data/hash/hook-events.jsonl",
 };
 
 test("dismiss rejects unknown finding keys before any write", async () => {
@@ -1351,6 +1353,7 @@ test("runStatsCommand loads adoptions and threads them into the summary", async 
     history_index_path: "/repo/.ccprof/hash/history.json",
     dismissals_path: "/repo/.ccprof/hash/dismissals.json",
     adoptions_path: "/repo/.ccprof/hash/adoptions.json",
+    hook_events_path: "/repo/.ccprof/hash/hook-events.jsonl",
   };
   const adoptions = adoptionFixtureAdoptions();
   const records = adoptionFixtureRecords();

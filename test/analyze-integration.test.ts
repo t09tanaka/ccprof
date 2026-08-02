@@ -400,6 +400,46 @@ test("rejects a matched session with only one valid timestamp", async () => {
   }
 });
 
+test("persist: false skips saveAnalysis and saveAdoptions while still returning findings", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-persist-false-"));
+  try {
+    const repo = await makeRepository(root);
+    const projects = await makeClaudeProjects(root, repo);
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const options = {
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      sessionSource: new ClaudeSessionSource(projects),
+      storePaths,
+      persist: false,
+    } as const;
+
+    const result = await analyze(options);
+
+    assert.ok(
+      result.allFindings.length > 0,
+      "a hook-driven analysis still surfaces findings in memory",
+    );
+    const history = await loadAnalyses(storePaths);
+    assert.deepEqual(
+      history.records,
+      [],
+      "no analysis record is written to disk when persist is false",
+    );
+    const adoptions = await loadAdoptions(storePaths);
+    assert.deepEqual(
+      adoptions.records,
+      [],
+      "adoption detection is skipped entirely, so nothing is written either",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("R008 excludes manifest build/check commands but keeps explicit custom tests", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-flaky-command-family-"));
   try {
