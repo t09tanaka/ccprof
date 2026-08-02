@@ -15,6 +15,10 @@ import {
   type AnalysisHistoryResult,
 } from "../store/analyses.js";
 import {
+  loadAdoptions,
+  type AdoptionLoadResult,
+} from "../store/adoptions.js";
+import {
   resolveStorePaths,
   type StorePaths,
 } from "../store/paths.js";
@@ -31,6 +35,9 @@ export interface StatsCommandDependencies {
   loadAnalyses?: (
     paths: StorePaths,
   ) => Promise<AnalysisHistoryResult>;
+  loadAdoptions?: (
+    paths: StorePaths,
+  ) => Promise<AdoptionLoadResult>;
 }
 
 export async function resolveCurrentRepoRoot(
@@ -76,11 +83,17 @@ export async function runStatsCommand(
   const history = await (
     dependencies.loadAnalyses ?? loadAnalyses
   )(paths);
-  const stats = summarizeStats(history.records);
+  const adoptions = await (
+    dependencies.loadAdoptions ?? loadAdoptions
+  )(paths);
+  const stats = summarizeStats(history.records, adoptions.records);
   return {
     stdout: options.json
       ? renderStatsJson(stats)
       : renderStatsTty(stats),
-    warnings: history.warnings.map(warningText),
+    warnings: [
+      ...history.warnings.map(warningText),
+      ...adoptions.warnings.map(warningText),
+    ],
   };
 }

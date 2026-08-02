@@ -1,10 +1,13 @@
+import { detectability } from "../analysis/adoption.js";
 import type {
   BaselineNotable,
   Bound,
+  Finding,
   RuleId,
 } from "../core/model.js";
 import { detectChronicCost } from "../rules/chronic-cost.js";
 import type { AnalysisRecord } from "../store/analyses.js";
+import type { AdoptionMethod, AdoptionRecord } from "../store/adoptions.js";
 import { sanitizeHumanText } from "./sanitize.js";
 import { formatMinutes } from "./tty.js";
 
@@ -42,12 +45,34 @@ export interface StatsRecurringFinding {
 
 export const STATS_RECURRING_TTY_LIMIT = 10;
 
+export type StatsAdoptionStatus = "no_recurrence" | "recurred" | "no_data";
+
+export interface StatsAdoption {
+  finding_key: string;
+  rule_id: RuleId;
+  title: string;
+  method: AdoptionMethod;
+  detected_at_ms: number;
+  analyses_after: number;
+  recurrences_after: number;
+  minutes_before: number;
+  minutes_after: number;
+  status: StatsAdoptionStatus;
+}
+
+export interface StatsAdoptionCoverage {
+  detectable: number;
+  undetectable: number;
+}
+
 export interface StatsReport {
   history_count: number;
   baseline_metrics: StatsBaselineMetric[];
   chronic_commands: StatsChronicCommand[];
   rule_minutes: StatsRuleMinutes[];
   recurring_findings: StatsRecurringFinding[];
+  adoptions: StatsAdoption[];
+  adoption_coverage: StatsAdoptionCoverage;
 }
 
 function rounded(value: number): number {
@@ -144,8 +169,102 @@ function recurringFindings(
     );
 }
 
+/**
+ * Compares an adoption record against the analysis history to see whether
+ * the finding it targeted kept showing up afterward. Title/rule_id are
+ * refreshed from the latest matching occurrence so renamed rule titles stay
+ * current; when the finding never appears in history, the adoption's own
+ * rule_id is used and the title is left blank.
+ */
+function adoptionOutcome(
+  adoption: AdoptionRecord,
+  ordered: readonly AnalysisRecord[],
+): StatsAdoption {
+  let ruleId = adoption.rule_id;
+  let title = "";
+  let analysesAfter = 0;
+  let recurrencesAfter = 0;
+  let minutesBefore = 0;
+  let minutesAfter = 0;
+  for (const record of ordered) {
+    const matches = record.findings.filter(
+      (finding) => finding.finding_key === adoption.finding_key,
+    );
+    const latestMatch = matches.at(-1);
+    if (latestMatch !== undefined) {
+      ruleId = latestMatch.rule_id;
+      title = latestMatch.title;
+    }
+    const minutes = matches.reduce(
+      (sum, finding) => sum + Math.max(0, numberEvidence(finding.recoverable.min)),
+      0,
+    );
+    if (record.created_at_ms > adoption.detected_at_ms) {
+      analysesAfter += 1;
+      minutesAfter += minutes;
+      if (matches.length > 0) recurrencesAfter += 1;
+    } else {
+      minutesBefore += minutes;
+    }
+  }
+  return {
+    finding_key: adoption.finding_key,
+    rule_id: ruleId,
+    title,
+    method: adoption.method,
+    detected_at_ms: adoption.detected_at_ms,
+    analyses_after: analysesAfter,
+    recurrences_after: recurrencesAfter,
+    minutes_before: rounded(minutesBefore),
+    minutes_after: rounded(minutesAfter),
+    status: analysesAfter === 0
+      ? "no_data"
+      : recurrencesAfter > 0
+        ? "recurred"
+        : "no_recurrence",
+  };
+}
+
+function adoptionOutcomes(
+  ordered: readonly AnalysisRecord[],
+  adoptions: readonly AdoptionRecord[],
+): StatsAdoption[] {
+  return adoptions
+    .map((adoption) => adoptionOutcome(adoption, ordered))
+    .sort((left, right) => left.finding_key.localeCompare(right.finding_key));
+}
+
+/**
+ * Counts, among finding keys seen in history that have no recorded
+ * adoption, how many are reachable by the deterministic adoption detector
+ * versus structurally invisible to it — making the detection gap explicit
+ * rather than silently under-reporting adoptions.
+ */
+function adoptionCoverage(
+  ordered: readonly AnalysisRecord[],
+  adoptions: readonly AdoptionRecord[],
+): StatsAdoptionCoverage {
+  const adoptedKeys = new Set(adoptions.map((entry) => entry.finding_key));
+  const latestByKey = new Map<string, Finding>();
+  for (const record of ordered) {
+    for (const finding of record.findings) {
+      latestByKey.set(finding.finding_key, finding);
+    }
+  }
+  let detectable = 0;
+  let undetectable = 0;
+  for (const [key, latest] of latestByKey) {
+    if (adoptedKeys.has(key)) continue;
+    const kind = detectability(latest);
+    if (kind === "undetectable") undetectable += 1;
+    else detectable += 1;
+  }
+  return { detectable, undetectable };
+}
+
 export function summarizeStats(
   records: readonly AnalysisRecord[],
+  adoptions: readonly AdoptionRecord[] = [],
 ): StatsReport {
   const ordered = [...records].sort(recordOrder);
   const latest = ordered.at(-1);
@@ -184,6 +303,8 @@ export function summarizeStats(
       }))
       .sort((left, right) => left.rule_id.localeCompare(right.rule_id)),
     recurring_findings: recurringFindings(ordered),
+    adoptions: adoptionOutcomes(ordered, adoptions),
+    adoption_coverage: adoptionCoverage(ordered, adoptions),
   };
 }
 
@@ -194,6 +315,8 @@ export function renderStatsJson(stats: StatsReport): string {
     chronic_commands: [...stats.chronic_commands],
     rule_minutes: [...stats.rule_minutes],
     recurring_findings: [...stats.recurring_findings],
+    adoptions: [...stats.adoptions],
+    adoption_coverage: { ...stats.adoption_coverage },
   };
   return `${JSON.stringify(stable, null, 2)}\n`;
 }
@@ -203,6 +326,24 @@ function oneLine(value: string): string {
     .replace(/[\r\n]+/gu, " ")
     .replace(/\s+/gu, " ")
     .trim();
+}
+
+function utcDate(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+function adoptionStatusText(entry: StatsAdoption): string {
+  if (entry.status === "no_data") return "no data yet";
+  if (entry.status === "recurred") {
+    return `recurred in ${entry.recurrences_after}/${entry.analyses_after} analyses`;
+  }
+  return `no recurrence in ${entry.analyses_after} analyses`;
+}
+
+function adoptionLine(entry: StatsAdoption): string {
+  return `- [${entry.rule_id}] adopted ${utcDate(entry.detected_at_ms)} (${entry.method}): ${
+    adoptionStatusText(entry)
+  }, ${formatMinutes(entry.minutes_before)} -> ${formatMinutes(entry.minutes_after)}`;
 }
 
 export function renderStatsTty(stats: StatsReport): string {
@@ -230,6 +371,14 @@ export function renderStatsTty(stats: StatsReport): string {
               ]
             : []),
         ]),
+    "Adopted suggestions:",
+    ...(stats.adoptions.length === 0
+      ? ["- none"]
+      : [
+          ...stats.adoptions.map(adoptionLine),
+          "  (observational only: recurrence absence does not prove causation)",
+        ]),
+    `Adoption coverage: ${stats.adoption_coverage.detectable} findings detectable, ${stats.adoption_coverage.undetectable} undetectable (not tracked)`,
     "Chronic commands:",
     ...(stats.chronic_commands.length === 0
       ? ["- none"]

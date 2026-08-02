@@ -50,6 +50,8 @@ import {
   makeAnalysisRecord,
   type AnalysisRecord,
 } from "../src/store/analyses.js";
+import type { AdoptionRecord } from "../src/store/adoptions.js";
+import { runStatsCommand } from "../src/commands/stats.js";
 import type { StorePaths } from "../src/store/paths.js";
 
 function finding(
@@ -315,6 +317,8 @@ test("stats TTY removes stored control strings while stats JSON preserves values
       last_bound: "point" as const,
       trend: "improved" as const,
     }],
+    adoptions: [],
+    adoption_coverage: { detectable: 0, undetectable: 0 },
   };
 
   const tty = renderStatsTty(stats);
@@ -897,4 +901,336 @@ test("stats TTY caps recurring findings at ten while JSON keeps all", () => {
 
   const json = JSON.parse(renderStatsJson(stats)) as typeof stats;
   assert.equal(json.recurring_findings.length, 12);
+});
+
+function adoptionFinding(
+  key: string,
+  overrides: Partial<Finding> = {},
+): Finding {
+  return finding(1, {
+    finding_key: key,
+    recoverable: { min: 0, bound: "point" },
+    ...overrides,
+  });
+}
+
+function adoptionAnalysisRecord(
+  id: string,
+  createdAtMs: number,
+  findings: Finding[],
+): AnalysisRecord {
+  return makeAnalysisRecord({
+    analysis_id: id,
+    created_at_ms: createdAtMs,
+    unit: { repo: "/repo", pr_ref: `main...${id}`, sessions: [id] },
+    summary: { ...summary, baseline: null },
+    findings,
+    metrics: {},
+    command_costs: [],
+  });
+}
+
+function adoptionRecordFixture(
+  overrides: Partial<AdoptionRecord> = {},
+): AdoptionRecord {
+  return {
+    finding_key: "key",
+    rule_id: "R001",
+    scope: "this_pr",
+    fingerprint: "fingerprint",
+    method: "claude_md_edit",
+    detected_at_ms: 0,
+    evidence: {
+      commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+      path: "CLAUDE.md",
+    },
+    ...overrides,
+  };
+}
+
+const ADOPTION_DAY0_MS = Date.UTC(2026, 7, 1, 12, 0, 0);
+
+function adoptionFixtureRecords(): AnalysisRecord[] {
+  return [
+    adoptionAnalysisRecord("a1", ADOPTION_DAY0_MS - 100_000, [
+      adoptionFinding("adopted-key", {
+        rule_id: "R003",
+        title: "Cache the build output",
+        scope: "claude_md",
+        recoverable: { min: 12, bound: "point" },
+      }),
+      adoptionFinding("recurred-key", {
+        rule_id: "R002",
+        title: "Redundant test runs",
+        scope: "this_pr",
+        recoverable: { min: 5, bound: "point" },
+      }),
+      adoptionFinding("no-data-key", {
+        rule_id: "R004",
+        title: "Missing changelog entry",
+        scope: "this_pr",
+        target: "docs/CHANGELOG.md",
+        recoverable: { min: 3, bound: "point" },
+      }),
+      adoptionFinding("stable-detectable-key", {
+        rule_id: "R001",
+        title: "Add CLAUDE.md guidance",
+        scope: "claude_md",
+        recoverable: { min: 1, bound: "point" },
+      }),
+      adoptionFinding("stable-undetectable-key", {
+        rule_id: "R002",
+        title: "Misc pattern",
+        scope: "this_pr",
+        recoverable: { min: 1, bound: "point" },
+      }),
+    ]),
+    adoptionAnalysisRecord("a2", ADOPTION_DAY0_MS + 100_000, [
+      adoptionFinding("recurred-key", {
+        rule_id: "R002",
+        title: "Redundant test runs",
+        scope: "this_pr",
+        recoverable: { min: 2, bound: "point" },
+      }),
+    ]),
+    adoptionAnalysisRecord("a3", ADOPTION_DAY0_MS + 200_000, []),
+    adoptionAnalysisRecord("a4", ADOPTION_DAY0_MS + 300_000, []),
+  ];
+}
+
+function adoptionFixtureAdoptions(): AdoptionRecord[] {
+  return [
+    adoptionRecordFixture({
+      finding_key: "adopted-key",
+      rule_id: "R003",
+      method: "claude_md_edit",
+      detected_at_ms: ADOPTION_DAY0_MS,
+    }),
+    adoptionRecordFixture({
+      finding_key: "recurred-key",
+      rule_id: "R002",
+      method: "target_file_edit",
+      detected_at_ms: ADOPTION_DAY0_MS + 50_000,
+    }),
+    adoptionRecordFixture({
+      finding_key: "no-data-key",
+      rule_id: "R004",
+      method: "claude_md_edit",
+      detected_at_ms: ADOPTION_DAY0_MS + 400_000,
+    }),
+    adoptionRecordFixture({
+      finding_key: "orphan-key",
+      rule_id: "R005",
+      method: "claude_md_edit",
+      detected_at_ms: ADOPTION_DAY0_MS - 200_000,
+    }),
+  ];
+}
+
+test("stats reports adoption outcomes and coverage without altering existing keys", () => {
+  const records = adoptionFixtureRecords();
+  const adoptions = adoptionFixtureAdoptions();
+
+  const stats = summarizeStats(records, adoptions);
+
+  assert.deepEqual(stats.adoptions, [
+    {
+      finding_key: "adopted-key",
+      rule_id: "R003",
+      title: "Cache the build output",
+      method: "claude_md_edit",
+      detected_at_ms: ADOPTION_DAY0_MS,
+      analyses_after: 3,
+      recurrences_after: 0,
+      minutes_before: 12,
+      minutes_after: 0,
+      status: "no_recurrence",
+    },
+    {
+      finding_key: "no-data-key",
+      rule_id: "R004",
+      title: "Missing changelog entry",
+      method: "claude_md_edit",
+      detected_at_ms: ADOPTION_DAY0_MS + 400_000,
+      analyses_after: 0,
+      recurrences_after: 0,
+      minutes_before: 3,
+      minutes_after: 0,
+      status: "no_data",
+    },
+    {
+      finding_key: "orphan-key",
+      rule_id: "R005",
+      title: "",
+      method: "claude_md_edit",
+      detected_at_ms: ADOPTION_DAY0_MS - 200_000,
+      analyses_after: 4,
+      recurrences_after: 0,
+      minutes_before: 0,
+      minutes_after: 0,
+      status: "no_recurrence",
+    },
+    {
+      finding_key: "recurred-key",
+      rule_id: "R002",
+      title: "Redundant test runs",
+      method: "target_file_edit",
+      detected_at_ms: ADOPTION_DAY0_MS + 50_000,
+      analyses_after: 3,
+      recurrences_after: 1,
+      minutes_before: 5,
+      minutes_after: 2,
+      status: "recurred",
+    },
+  ]);
+
+  assert.deepEqual(stats.adoption_coverage, { detectable: 1, undetectable: 1 });
+
+  // Existing keys stay byte-for-byte identical to the pre-adoption shape.
+  const legacyStats = summarizeStats(records);
+  assert.equal(stats.history_count, legacyStats.history_count);
+  assert.deepEqual(stats.baseline_metrics, legacyStats.baseline_metrics);
+  assert.deepEqual(stats.chronic_commands, legacyStats.chronic_commands);
+  assert.deepEqual(stats.rule_minutes, legacyStats.rule_minutes);
+  assert.deepEqual(stats.recurring_findings, legacyStats.recurring_findings);
+
+  const json = JSON.parse(renderStatsJson(stats)) as typeof stats;
+  assert.deepEqual(json, stats);
+});
+
+test("summarizeStats defaults adoptions to an empty array for backward compatibility", () => {
+  const records = adoptionFixtureRecords();
+  const stats = summarizeStats(records);
+  assert.deepEqual(stats.adoptions, []);
+  // No adoptions recorded yet, so every distinct finding is un-tracked.
+  assert.deepEqual(stats.adoption_coverage, { detectable: 2, undetectable: 3 });
+});
+
+test("stats TTY renders adopted suggestions with the caveat and coverage lines", () => {
+  const stats = summarizeStats(
+    adoptionFixtureRecords(),
+    adoptionFixtureAdoptions(),
+  );
+  const tty = renderStatsTty(stats);
+
+  assert.match(tty, /Adopted suggestions:/u);
+  assert.ok(
+    tty.includes(
+      "- [R003] adopted 2026-08-01 (claude_md_edit): no recurrence in 3 analyses, 12m -> 0m",
+    ),
+  );
+  assert.ok(
+    tty.includes(
+      "- [R004] adopted 2026-08-01 (claude_md_edit): no data yet, 3m -> 0m",
+    ),
+  );
+  assert.ok(
+    tty.includes(
+      "- [R005] adopted 2026-08-01 (claude_md_edit): no recurrence in 4 analyses, 0m -> 0m",
+    ),
+  );
+  assert.ok(
+    tty.includes(
+      "- [R002] adopted 2026-08-01 (target_file_edit): recurred in 1/3 analyses, 5m -> 2m",
+    ),
+  );
+  assert.ok(
+    tty.includes(
+      "  (observational only: recurrence absence does not prove causation)",
+    ),
+  );
+  assert.ok(
+    tty.includes("Adoption coverage: 1 findings detectable, 1 undetectable (not tracked)"),
+  );
+
+  const recurringIndex = tty.indexOf("Recurring findings:");
+  const adoptedIndex = tty.indexOf("Adopted suggestions:");
+  const caveatIndex = tty.indexOf(
+    "(observational only: recurrence absence does not prove causation)",
+  );
+  const coverageIndex = tty.indexOf("Adoption coverage:");
+  const chronicIndex = tty.indexOf("Chronic commands:");
+  assert.ok(recurringIndex < adoptedIndex);
+  assert.ok(adoptedIndex < caveatIndex);
+  assert.ok(caveatIndex < coverageIndex);
+  assert.ok(coverageIndex < chronicIndex);
+});
+
+test("stats TTY omits the caveat line and shows none when there are no adoptions", () => {
+  const stats = summarizeStats(adoptionFixtureRecords());
+  const tty = renderStatsTty(stats);
+  assert.match(tty, /Adopted suggestions:\n- none/u);
+  assert.doesNotMatch(
+    tty,
+    /observational only: recurrence absence does not prove causation/u,
+  );
+  assert.match(
+    tty,
+    /Adoption coverage: 2 findings detectable, 3 undetectable \(not tracked\)/u,
+  );
+});
+
+test("stats marks an adoption with zero follow-up analyses as no_data", () => {
+  const records = [
+    adoptionAnalysisRecord("only", ADOPTION_DAY0_MS - 1_000, [
+      adoptionFinding("solo-key", {
+        rule_id: "R006",
+        title: "Solo finding",
+        scope: "this_pr",
+        recoverable: { min: 4, bound: "point" },
+      }),
+    ]),
+  ];
+  const adoptions = [
+    adoptionRecordFixture({
+      finding_key: "solo-key",
+      rule_id: "R006",
+      method: "target_file_edit",
+      detected_at_ms: ADOPTION_DAY0_MS,
+    }),
+  ];
+  const stats = summarizeStats(records, adoptions);
+  assert.equal(stats.adoptions[0]?.status, "no_data");
+  assert.equal(stats.adoptions[0]?.analyses_after, 0);
+  assert.equal(stats.adoptions[0]?.recurrences_after, 0);
+  assert.equal(stats.adoptions[0]?.minutes_before, 4);
+  assert.equal(stats.adoptions[0]?.minutes_after, 0);
+});
+
+test("runStatsCommand loads adoptions and threads them into the summary", async () => {
+  const paths: StorePaths = {
+    canonical_repo: "/repo",
+    repo_hash: "hash",
+    root_dir: "/repo/.ccprof",
+    repo_dir: "/repo/.ccprof/hash",
+    analyses_dir: "/repo/.ccprof/hash/analyses",
+    history_index_path: "/repo/.ccprof/hash/history.json",
+    dismissals_path: "/repo/.ccprof/hash/dismissals.json",
+    adoptions_path: "/repo/.ccprof/hash/adoptions.json",
+  };
+  const adoptions = adoptionFixtureAdoptions();
+  const records = adoptionFixtureRecords();
+  let loadAdoptionsCalledWith: StorePaths | undefined;
+
+  const result = await runStatsCommand(
+    { cwd: "/repo", json: true },
+    {
+      resolveRepoRoot: async () => "/repo",
+      resolveStorePaths: async () => paths,
+      loadAnalyses: async () => ({ records, warnings: [] }),
+      loadAdoptions: async (calledPaths) => {
+        loadAdoptionsCalledWith = calledPaths;
+        return { records: adoptions, warnings: [] };
+      },
+    },
+  );
+
+  assert.deepEqual(loadAdoptionsCalledWith, paths);
+  const parsed = JSON.parse(result.stdout) as ReturnType<typeof summarizeStats>;
+  assert.deepEqual(parsed.adoptions.map((entry) => entry.finding_key).sort(), [
+    "adopted-key",
+    "no-data-key",
+    "orphan-key",
+    "recurred-key",
+  ]);
 });
