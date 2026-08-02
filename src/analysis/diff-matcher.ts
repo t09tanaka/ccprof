@@ -120,6 +120,7 @@ const COORDINATION_TOOLS = new Set([
   ...DELEGATION_TOOLS,
   ...RESEARCH_TOOLS,
 ]);
+const MCP_TOOL_PREFIX = /^mcp__[^_]/u;
 
 /**
  * Delegation tools may mutate the repository through a sub-agent, so their
@@ -195,9 +196,9 @@ export function matchTimelineActions(
       );
     }
 
-    const toolName = normalizedToolName(
-      observation.toolUse?.tool_name ?? observation.action.tool_name ?? "",
-    );
+    const rawToolName =
+      observation.toolUse?.tool_name ?? observation.action.tool_name ?? "";
+    const toolName = normalizedToolName(rawToolName);
     const observed = observedPaths(observation, options.repoRoot);
     const paths = observed.paths;
     if (EDIT_TOOLS.has(toolName)) {
@@ -287,13 +288,21 @@ export function matchTimelineActions(
     readUncertaintyOrdinal += 1;
     return rememberToolClassification(
       observation,
-      result(
-        observation.action,
-        "unexplained",
-        "low",
-        targetFor(observation, paths),
-        ["Tool semantics are not known well enough to classify contribution."],
-      ),
+      MCP_TOOL_PREFIX.test(rawToolName)
+        ? result(
+            observation.action,
+            "coordination",
+            "low",
+            targetFor(observation, paths),
+            ["MCP tool classified by server prefix"],
+          )
+        : result(
+            observation.action,
+            "unexplained",
+            "low",
+            targetFor(observation, paths),
+            ["Tool semantics are not known well enough to classify contribution."],
+          ),
       toolClassifications,
     );
   });

@@ -606,7 +606,7 @@ function coordinationSession(
   };
 }
 
-test("coordination tools count as normal time while delegation still invalidates frozen-head reads", async () => {
+test("coordination tools (including unknown mcp__ tools) count as normal time while delegation still invalidates frozen-head reads and truly unknown tools stay unexplained", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-coordination-"));
   try {
     const repo = await realpath(await makeRepository(root));
@@ -637,7 +637,12 @@ test("coordination tools count as normal time while delegation still invalidates
     assert.equal(agent.ledger.totals_ms.normal, 120_000);
     assert.deepEqual(agent.record.read_observations, []);
 
-    const unknown = await analyzeWith("mcp__custom__tool", "mcp-session");
+    const mcp = await analyzeWith("mcp__custom__tool", "mcp-session");
+    assert.equal(mcp.ledger.totals_ms.normal, 120_000);
+    assert.equal(mcp.ledger.totals_ms.unexplained, 60_000);
+    assert.equal(mcp.record.read_observations?.length, 1);
+
+    const unknown = await analyzeWith("CustomUnknownTool", "unknown-session");
     assert.equal(unknown.ledger.totals_ms.normal, 60_000);
     assert.equal(unknown.ledger.totals_ms.unexplained, 120_000);
 
