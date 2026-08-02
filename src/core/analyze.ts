@@ -67,6 +67,8 @@ import { detectRework } from "../rules/rework.js";
 import { detectSerialSlack } from "../rules/serial-slack.js";
 import { minimumConfidence } from "../rules/shared.js";
 import { ClaudeSessionSource } from "../sources/claude/discover.js";
+import { CodexSessionSource } from "../sources/codex/discover.js";
+import { CombinedSessionSource } from "../sources/combined.js";
 import type { SessionSource } from "../sources/session-source.js";
 import {
   computeBaseline,
@@ -105,6 +107,7 @@ export interface AnalyzeOptions {
   testMap?: TestMap;
   sessionSource?: SessionSource;
   claudeProjectsDirectory?: string;
+  codexSessionsDirectory?: string;
   storePaths?: StorePaths;
   runner?: CommandRunner;
   nowMs?: number;
@@ -552,7 +555,13 @@ function defaultSessionSource(options: AnalyzeOptions): SessionSource {
     options.claudeProjectsDirectory ??
     process.env.CCPROF_CLAUDE_PROJECTS_DIR ??
     join(homedir(), ".claude", "projects");
-  return new ClaudeSessionSource(projectsDirectory);
+  const claudeSource = new ClaudeSessionSource(projectsDirectory);
+  const codexSource = new CodexSessionSource(
+    options.codexSessionsDirectory === undefined
+      ? undefined
+      : { sessionsDirectory: options.codexSessionsDirectory },
+  );
+  return new CombinedSessionSource([claudeSource, codexSource]);
 }
 
 function contextWindow(
