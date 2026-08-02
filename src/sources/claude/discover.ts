@@ -196,37 +196,60 @@ function scopeSessionToHeadBranch(
   if (session.events.some((event) => event.branch === undefined)) {
     return [session];
   }
-  const segments: Session["events"][] = [];
-  let current: Session["events"] = [];
-  let currentEpoch: number | undefined;
+  const byAgent = new Map<string, Session["events"]>();
   for (const event of session.events) {
-    if (event.branch === headBranch) {
-      // An epoch change between two head-branch events proves a departure
-      // that was recorded only on rows that emit no events.
-      if (current.length > 0 && event.branch_epoch !== currentEpoch) {
-        segments.push(current);
-        current = [];
-      }
-      currentEpoch = event.branch_epoch;
-      current.push(event);
-    } else if (current.length > 0) {
-      segments.push(current);
-      current = [];
-      currentEpoch = undefined;
-    }
+    const group = byAgent.get(event.agent_id);
+    if (group === undefined) byAgent.set(event.agent_id, [event]);
+    else group.push(event);
   }
-  if (current.length > 0) segments.push(current);
-  if (segments.length === 0) return [];
-  if (segments[0]?.length === session.events.length) {
+
+  const runs: { agentId: string; run: number; events: Session["events"] }[] =
+    [];
+  for (const [agentId, agentEvents] of byAgent) {
+    let current: Session["events"] = [];
+    let currentEpoch: number | undefined;
+    let run = 0;
+    const flush = (): void => {
+      if (current.length === 0) return;
+      runs.push({ agentId, run, events: current });
+      run += 1;
+      current = [];
+    };
+    for (const event of agentEvents) {
+      if (event.branch === headBranch) {
+        // Within one agent lane, an epoch change between two head-branch
+        // events proves a departure recorded only on rows without events.
+        if (current.length > 0 && event.branch_epoch !== currentEpoch) {
+          flush();
+        }
+        currentEpoch = event.branch_epoch;
+        current.push(event);
+      } else {
+        flush();
+        currentEpoch = undefined;
+      }
+    }
+    flush();
+  }
+  if (runs.length === 0) return [];
+  const includedCount = runs.reduce(
+    (total, entry) => total + entry.events.length,
+    0,
+  );
+  if (
+    includedCount === session.events.length &&
+    runs.length === byAgent.size
+  ) {
     return [session];
   }
-  return segments.map((events, index) => {
+  return runs.map(({ agentId, run, events }, index) => {
     const timestamps = events.map((event) => event.timestamp_ms);
     const segment: Session = {
       ...session,
       // The timeline builds per-(source_path, session_id, agent_id) interval
-      // lanes, so segments need distinct source identities to stay disjoint.
-      source_path: `${session.source_path}#branch-segment-${index.toString(10)}`,
+      // lanes, so segments need distinct source identities to stay disjoint
+      // while other agents' unbroken runs remain whole.
+      source_path: `${session.source_path}#branch-segment-${agentId}-${run.toString(10)}`,
       events: [...events],
       started_at_ms: Math.min(...timestamps),
       ended_at_ms: Math.max(...timestamps),

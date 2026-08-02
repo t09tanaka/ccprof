@@ -1290,25 +1290,65 @@ function compactionEvent(
 }
 
 /**
- * Stamps every row with the effective branch in file order: the last
- * observed non-empty gitBranch, with rows before the first branch-carrying
- * row adopting that first branch. Rows that emit no events (system rows,
- * meta users) still advance the effective branch for later rows. A branch
- * epoch counter advances on every effective-branch change so departures
- * that are visible only on non-event rows remain detectable downstream.
+ * Stamps every row with the effective branch: the last observed non-empty
+ * gitBranch within the row's agent lane, with rows before the lane's first
+ * branch-carrying row adopting that first branch. Rows that emit no events
+ * (system rows, meta users) still advance the effective branch for later
+ * rows in their lane. A per-lane branch epoch counter advances on every
+ * effective-branch change so departures visible only on non-event rows
+ * remain detectable downstream, without a sidechain's branch changes
+ * advancing the main agent's epoch.
+ *
+ * Lanes that carry no branch metadata at all (typical subagents) fall back
+ * to file-order inheritance so they stay attributable to the surrounding
+ * branch context.
  */
-function stampEffectiveBranches(sessionRows: ParsedRow[]): void {
-  let effective = sessionRows.find((row) => row.branch !== undefined)?.branch;
-  if (effective === undefined) return;
-  let epoch = 0;
+function stampEffectiveBranches(
+  sessionRows: ParsedRow[],
+  agentFor: (row: ParsedRow) => string,
+): void {
+  const fileBranches = new Map<number, string>();
+  const fileEpochs = new Map<number, number>();
+  let fileEffective = sessionRows.find(
+    (row) => row.branch !== undefined,
+  )?.branch;
+  if (fileEffective === undefined) return;
+  let fileEpoch = 0;
   for (const row of sessionRows) {
-    if (row.branch !== undefined && row.branch !== effective) {
-      effective = row.branch;
-      epoch += 1;
-    } else if (row.branch === undefined) {
-      row.branch = effective;
+    if (row.branch !== undefined && row.branch !== fileEffective) {
+      fileEffective = row.branch;
+      fileEpoch += 1;
     }
-    row.branchEpoch = epoch;
+    fileBranches.set(row.sourceIndex, row.branch ?? fileEffective);
+    fileEpochs.set(row.sourceIndex, fileEpoch);
+  }
+
+  const lanes = new Map<string, ParsedRow[]>();
+  for (const row of sessionRows) {
+    const lane = agentFor(row);
+    const group = lanes.get(lane);
+    if (group === undefined) lanes.set(lane, [row]);
+    else group.push(row);
+  }
+  for (const laneRows of lanes.values()) {
+    let effective = laneRows.find((row) => row.branch !== undefined)?.branch;
+    if (effective === undefined) {
+      for (const row of laneRows) {
+        row.branch = fileBranches.get(row.sourceIndex) as string;
+        row.branchEpoch = fileEpochs.get(row.sourceIndex) as number;
+      }
+      continue;
+    }
+    let epoch = 0;
+    for (const row of laneRows) {
+      if (row.branch !== undefined && row.branch !== effective) {
+        effective = row.branch;
+        epoch += 1;
+      } else if (row.branch === undefined) {
+        row.branch = effective;
+      }
+      row.branchEpoch = epoch;
+    }
   }
 }
 
@@ -1322,7 +1362,6 @@ function normalizeSession(
   if (first === undefined) {
     return undefined;
   }
-  stampEffectiveBranches(sessionRows);
   const sessionId = first.sessionId;
   const rowsByUuid = new Map<string, ParsedRow[]>();
   for (const row of sessionRows) {
@@ -1407,6 +1446,7 @@ function normalizeSession(
     }
     return agent;
   };
+  stampEffectiveBranches(sessionRows, agentFor);
 
   const ordered: OrderedEvent[] = [];
   const assistantGroups = new Map<string, AssistantRow[]>();

@@ -935,3 +935,70 @@ test("a branch departure visible only on non-event rows still splits the segment
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("an other-branch sidechain does not split the main agent's head segment", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-branch-sidechain-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const projects = join(root, "claude-projects");
+    const mainRow = (
+      uuid: string,
+      at: string,
+      branch: string | undefined,
+      text: string,
+    ): string =>
+      JSON.stringify({
+        sessionId: "side-mix",
+        cwd: repo,
+        type: "user",
+        uuid,
+        timestamp: at,
+        ...(branch === undefined ? {} : { gitBranch: branch }),
+        message: { role: "user", content: text },
+      });
+    const sideRow = (uuid: string, at: string, branch?: string): string =>
+      JSON.stringify({
+        sessionId: "side-mix",
+        cwd: repo,
+        type: "user",
+        uuid,
+        timestamp: at,
+        isSidechain: true,
+        agentId: "side",
+        ...(branch === undefined ? {} : { gitBranch: branch }),
+        message: { role: "user", content: `sidechain ${uuid}` },
+      });
+    const rows = [
+      mainRow("m-1", "2026-01-01T00:05:00.000Z", "feature", "head work"),
+      mainRow("m-2", "2026-01-01T00:05:30.000Z", undefined, "continues"),
+      sideRow("s-1", "2026-01-01T00:06:00.000Z", "feature/other"),
+      sideRow("s-2", "2026-01-01T00:07:00.000Z"),
+      mainRow("m-3", "2026-01-01T00:08:00.000Z", undefined, "still head"),
+      mainRow("m-4", "2026-01-01T00:08:20.000Z", undefined, "finish"),
+    ];
+    await write(
+      join(projects, "fixture", "side-mix.jsonl"),
+      `${rows.join("\n")}\n`,
+    );
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      sessionSource: new ClaudeSessionSource(projects),
+    });
+
+    assert.deepEqual(result.report.unit.sessions, ["side-mix"]);
+    // The main agent stays on the head branch from 00:05:00 to 00:08:20, so
+    // its 200s span must stay whole; the sidechain's other-branch time is
+    // excluded and must add nothing.
+    assert.equal(result.ledger.totals_ms.raw_observed, 200_000);
+    assert.equal(result.ledger.totals_ms.measured, 200_000);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -1253,3 +1253,54 @@ test("a branch departure recorded only on non-event rows advances the epoch", as
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("sidechain branch changes do not advance the main agent's epoch", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ccprof-branch-lanes-"));
+  try {
+    const path = join(directory, "lanes.jsonl");
+    const rows = [
+      {
+        sessionId: "lanes",
+        type: "user",
+        uuid: "m1",
+        timestamp: "2026-07-31T03:00:00.000Z",
+        cwd: "/repo",
+        gitBranch: "feature/main",
+        message: { role: "user", content: "main work" },
+      },
+      {
+        sessionId: "lanes",
+        type: "user",
+        uuid: "s1",
+        timestamp: "2026-07-31T03:01:00.000Z",
+        cwd: "/repo",
+        isSidechain: true,
+        agentId: "side",
+        gitBranch: "feature/side",
+        message: { role: "user", content: "side work" },
+      },
+      {
+        sessionId: "lanes",
+        type: "user",
+        uuid: "m2",
+        timestamp: "2026-07-31T03:02:00.000Z",
+        cwd: "/repo",
+        message: { role: "user", content: "main continues" },
+      },
+    ];
+    await writeFile(path, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+
+    const session = await parseClaudeSession(path);
+    assert.ok(session);
+    const byUuid = new Map(
+      session.events.map((event) => [event.entry_uuid, event]),
+    );
+    assert.equal(byUuid.get("m1")?.branch, "feature/main");
+    assert.equal(byUuid.get("s1")?.branch, "feature/side");
+    // The sidechain's branch neither leaks into nor advances the main lane.
+    assert.equal(byUuid.get("m2")?.branch, "feature/main");
+    assert.equal(byUuid.get("m2")?.branch_epoch, byUuid.get("m1")?.branch_epoch);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
