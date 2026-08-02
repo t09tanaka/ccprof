@@ -38,7 +38,9 @@ export function suggestionKeywords(suggestion: string): string[] {
   const tokens = normalized
     .split(/[^\p{L}\p{N}_./-]+/u)
     .filter((token) => token.length >= 4);
-  return [...new Set(tokens)].sort((left, right) => left.localeCompare(right)).slice(0, 8);
+  return [...new Set(tokens)]
+    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
+    .slice(0, 8);
 }
 
 export interface AdoptionCandidateFinding {
@@ -145,6 +147,24 @@ function parseTargetLog(stdout: string): TargetCommit[] {
     });
 }
 
+/**
+ * Selects the chronologically oldest commit among those that already
+ * satisfy the caller's qualifying condition, with the commit oid as a
+ * deterministic tie-breaker for equal timestamps.
+ */
+function oldestQualifying<T extends { oid: string; timestampMs: number }>(
+  commits: readonly T[],
+): T | undefined {
+  return commits.reduce<T | undefined>((oldest, current) => {
+    if (oldest === undefined) return current;
+    if (current.timestampMs < oldest.timestampMs) return current;
+    if (current.timestampMs === oldest.timestampMs && current.oid < oldest.oid) {
+      return current;
+    }
+    return oldest;
+  }, undefined);
+}
+
 function makeRecord(
   candidate: AdoptionCandidateFinding,
   method: AdoptionMethod,
@@ -198,11 +218,12 @@ async function detectClaudeMdAdoptions(
   const adoptions: AdoptionRecord[] = [];
   for (const candidate of candidates) {
     const keywords = suggestionKeywords(candidate.suggestion);
-    const match = commits.find(
+    const qualifying = commits.filter(
       (commit) =>
         commit.timestampMs > candidate.recorded_at_ms &&
         keywords.some((keyword) => commit.addedTextLower.includes(keyword)),
     );
+    const match = oldestQualifying(qualifying);
     if (match !== undefined) {
       adoptions.push(makeRecord(candidate, "claude_md_edit", match.oid, "CLAUDE.md", detectedAtMs));
     }
@@ -233,7 +254,8 @@ async function detectTargetFileAdoption(
     return undefined;
   }
   const commits = parseTargetLog(result.stdout);
-  const match = commits.find((commit) => commit.timestampMs > candidate.recorded_at_ms);
+  const qualifying = commits.filter((commit) => commit.timestampMs > candidate.recorded_at_ms);
+  const match = oldestQualifying(qualifying);
   return match === undefined
     ? undefined
     : makeRecord(candidate, "target_file_edit", match.oid, target, detectedAtMs);

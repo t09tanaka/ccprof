@@ -120,6 +120,25 @@ test("suggestionKeywords splits on non letter/number/underscore/dot/slash/dash a
   assert.deepEqual(keywords, [...keywords].sort());
 });
 
+test("suggestionKeywords sorts non-ASCII tokens by code point, not locale collation, and caps at 8", () => {
+  // Nine distinct 4-character CJK ideograph tokens at consecutive code
+  // points (U+4E00..U+4E08). A locale-aware comparator (e.g. `localeCompare`
+  // under a non-root/non-"en" locale) can reorder these relative to a plain
+  // code-point comparison, so asserting the exact expected order guards
+  // against regressing to a non-deterministic sort.
+  const tokensByCodePoint = Array.from({ length: 9 }, (_, index) =>
+    String.fromCodePoint(0x4e00 + index).repeat(4)
+  );
+  const shuffledOrder = [8, 3, 0, 6, 1, 7, 4, 2, 5];
+  const shuffledSuggestion = shuffledOrder
+    .map((index) => String.fromCodePoint(0x4e00 + index).repeat(4))
+    .join(" ");
+
+  const keywords = suggestionKeywords(shuffledSuggestion);
+
+  assert.deepEqual(keywords, tokensByCodePoint.slice(0, 8));
+});
+
 // --- findingFingerprint -------------------------------------------------
 
 test("findingFingerprint is stable for identical input and changes with any field", () => {
@@ -359,6 +378,84 @@ test("detectAdoptions does not detect a claude_md adoption when the later commit
   }
 });
 
+test("detectAdoptions never adopts via claude_md when the suggestion has no keywords of length >= 4", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-adoption-empty-keywords-"));
+  try {
+    const repo = await makeRepo(root);
+    await commit(
+      repo,
+      { "CLAUDE.md": "# Project rules\n" },
+      "base",
+      "2025-12-31T00:00:00.000Z",
+    );
+    const candidate = baseCandidate({
+      recorded_at_ms: Date.parse("2026-01-01T00:00:00.000Z"),
+      suggestion: "do it ok",
+    });
+    assert.deepEqual(suggestionKeywords(candidate.suggestion), []);
+    await commit(
+      repo,
+      { "CLAUDE.md": "# Project rules\nDo it ok now, always.\n" },
+      "edit after recorded_at_ms",
+      "2026-01-02T00:00:00.000Z",
+    );
+
+    const result = await detectAdoptions({
+      repoRoot: repo,
+      candidates: [candidate],
+      detectedAtMs: Date.parse("2026-01-03T00:00:00.000Z"),
+    });
+
+    assert.deepEqual(result.adoptions, []);
+    assert.deepEqual(result.warnings, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("detectAdoptions attributes claude_md evidence to the oldest qualifying commit, not the newest", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-adoption-claudemd-oldest-"));
+  try {
+    const repo = await makeRepo(root);
+    await commit(
+      repo,
+      { "CLAUDE.md": "# Project rules\n\nBe nice.\n" },
+      "base",
+      "2025-12-31T00:00:00.000Z",
+    );
+    const candidate = baseCandidate({
+      recorded_at_ms: Date.parse("2026-01-01T00:00:00.000Z"),
+      suggestion: "Add a lint step before merging changes",
+    });
+    const olderQualifying = await commit(
+      repo,
+      { "CLAUDE.md": "# Project rules\n\nBe nice.\nAdd a lint step before merging.\n" },
+      "adopt suggestion (older, qualifies)",
+      "2026-01-02T00:00:00.000Z",
+    );
+    await commit(
+      repo,
+      {
+        "CLAUDE.md":
+          "# Project rules\n\nBe nice.\nAdd a lint step before merging.\nDocument the lint step for reviewers.\n",
+      },
+      "adopt suggestion further (newer, also qualifies)",
+      "2026-01-03T00:00:00.000Z",
+    );
+
+    const result = await detectAdoptions({
+      repoRoot: repo,
+      candidates: [candidate],
+      detectedAtMs: Date.parse("2026-01-04T00:00:00.000Z"),
+    });
+
+    assert.equal(result.adoptions.length, 1);
+    assert.equal(result.adoptions[0]?.evidence.commit, olderQualifying);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 // --- detectAdoptions: target_file -----------------------------------------
 
 test("detectAdoptions detects a target_file adoption when the target is edited after recorded_at_ms", async () => {
@@ -395,6 +492,48 @@ test("detectAdoptions detects a target_file adoption when the target is edited a
     assert.equal(adoption?.method, "target_file_edit");
     assert.equal(adoption?.evidence.commit, fixCommit);
     assert.equal(adoption?.evidence.path, "src/flaky.test.ts");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("detectAdoptions attributes target_file evidence to the oldest qualifying commit, not the newest", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-adoption-target-oldest-"));
+  try {
+    const repo = await makeRepo(root);
+    await commit(
+      repo,
+      { "src/flaky.test.ts": "// flaky test\n" },
+      "base",
+      "2025-12-31T00:00:00.000Z",
+    );
+    const candidate = baseCandidate({
+      scope: "separate_issue",
+      rule_id: "R008",
+      target: "src/flaky.test.ts",
+      recorded_at_ms: Date.parse("2026-01-01T00:00:00.000Z"),
+    });
+    const olderFix = await commit(
+      repo,
+      { "src/flaky.test.ts": "// fixed flaky test (attempt 1)\n" },
+      "fix flaky test (older, qualifies)",
+      "2026-01-02T00:00:00.000Z",
+    );
+    await commit(
+      repo,
+      { "src/flaky.test.ts": "// fixed flaky test (attempt 2)\n" },
+      "fix flaky test again (newer, also qualifies)",
+      "2026-01-03T00:00:00.000Z",
+    );
+
+    const result = await detectAdoptions({
+      repoRoot: repo,
+      candidates: [candidate],
+      detectedAtMs: Date.parse("2026-01-04T00:00:00.000Z"),
+    });
+
+    assert.equal(result.adoptions.length, 1);
+    assert.equal(result.adoptions[0]?.evidence.commit, olderFix);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -471,8 +610,12 @@ test("detectAdoptions reports adoption_detection_failed and skips claude_md cand
 });
 
 test("detectAdoptions reports adoption_detection_failed and skips only the failing target_file candidate", async () => {
+  const okOid = "a".repeat(40);
+  const okSeconds = Math.floor(Date.parse("2026-01-02T00:00:00.000Z") / 1_000);
   const fixture = fakeRunner(({ args }) => {
-    if (args.includes("src/ok.ts")) return { code: 0, stdout: "", stderr: "" };
+    if (args.includes("src/ok.ts")) {
+      return { code: 0, stdout: `${okOid}\x00${okSeconds}\n`, stderr: "" };
+    }
     return { code: 128, stdout: "", stderr: "fatal: bad revision" };
   });
   const failing = baseCandidate({
@@ -480,12 +623,14 @@ test("detectAdoptions reports adoption_detection_failed and skips only the faili
     scope: "separate_issue",
     rule_id: "R008",
     target: "src/broken.ts",
+    recorded_at_ms: Date.parse("2026-01-01T00:00:00.000Z"),
   });
   const ok = baseCandidate({
     finding_key: "finding-ok",
     scope: "separate_issue",
     rule_id: "R008",
     target: "src/ok.ts",
+    recorded_at_ms: Date.parse("2026-01-01T00:00:00.000Z"),
   });
 
   const result = await detectAdoptions({
@@ -495,7 +640,9 @@ test("detectAdoptions reports adoption_detection_failed and skips only the faili
     detectedAtMs: 0,
   });
 
-  assert.deepEqual(result.adoptions, []);
+  assert.equal(result.adoptions.length, 1);
+  assert.equal(result.adoptions[0]?.finding_key, "finding-ok");
+  assert.equal(result.adoptions[0]?.evidence.commit, okOid);
   assert.equal(result.warnings.length, 1);
   assert.equal(result.warnings[0]?.code, "adoption_detection_failed");
 });
