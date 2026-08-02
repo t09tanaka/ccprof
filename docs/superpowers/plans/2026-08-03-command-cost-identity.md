@@ -127,7 +127,7 @@ npm run build:test && node --test --test-name-pattern='command costs|coordinatio
 - [x] Have a separate validation subagent run Node 20 `npm ci`, `npm run check`, focused store/integration tests, determinism, build, and package smoke.
 - [x] Run the repository's local GitHub Actions equivalent before push because aggregation and persistence logic change.
 - [x] Confirm exactly five changed files, at most 280 added implementation+test lines, no schema-version/package/version/changelog change, and no R006/stats/R008/Store-v2 diff.
-- [ ] Commit without amend, push `feature/command-cost-identity`, open a PR against `main`, and wait for all required remote checks and reviews. Merge only under the user's standing authorization.
+- [x] Complete the pre-merge gate without amend: commit, push `feature/command-cost-identity`, open a PR against `main`, and wait for all required remote checks plus the absence of actionable review feedback. Merge remains a post-gate action under the user's standing authorization.
 - [ ] After merged-commit verification, use guarded worktree cleanup for only `/Users/tanakatakuto/Documents/GitHub/ccprof/.claude/worktrees/command-cost-identity` and its local branch.
 
 ## Explicit staged follow-ups
