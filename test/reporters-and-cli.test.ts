@@ -302,6 +302,15 @@ test("stats TTY removes stored control strings while stats JSON preserves values
       estimated_min: 2,
     }],
     rule_minutes: [],
+    recurring_findings: [{
+      finding_key: "recurring-attack",
+      rule_id: "R002" as const,
+      title: "Recurring\u0007 title\u001b[31m attack\u001b[0m",
+      occurrence_count: 2,
+      first_min: 3,
+      last_min: 1,
+      trend: "improved" as const,
+    }],
   };
 
   const tty = renderStatsTty(stats);
@@ -312,6 +321,7 @@ test("stats TTY removes stored control strings while stats JSON preserves values
   );
   assert.match(tty, /npm test -- safe/u);
   assert.match(tty, /human _wait_ratio/u);
+  assert.match(tty, /Recurring title attack/u);
 
   const json = JSON.parse(renderStatsJson(stats)) as typeof stats;
   assert.equal(json.chronic_commands[0]?.command, command);
@@ -664,4 +674,136 @@ test("the built CLI runs through an npm-link-style symlink", async () => {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+function recurringRecord(
+  index: number,
+  findings: Finding[],
+): AnalysisRecord {
+  return makeAnalysisRecord({
+    analysis_id: `recurring-${index}`,
+    created_at_ms: index,
+    unit: {
+      repo: "/repo",
+      pr_ref: `main...recurring-${index}`,
+      sessions: [`s${index}`],
+    },
+    summary: { ...summary, baseline: null },
+    findings,
+    metrics: {},
+    command_costs: [],
+  });
+}
+
+function recurringFinding(
+  key: string,
+  ruleId: Finding["rule_id"],
+  min: number,
+  title = `Title ${key}`,
+): Finding {
+  return finding(1, {
+    finding_key: key,
+    rule_id: ruleId,
+    title,
+    recoverable: { min, bound: "point" },
+  });
+}
+
+test("stats reports recurring findings with per-analysis sums and trends", () => {
+  const records = [
+    recurringRecord(1, [
+      recurringFinding("improved-key", "R002", 12.5, "Redundant test or build runs"),
+      recurringFinding("worsened-key", "R001", 1),
+      recurringFinding("flat-key", "R003", 2),
+      recurringFinding("dup-key", "R005", 1),
+      recurringFinding("dup-key", "R005", 2),
+      recurringFinding("single-key", "R004", 9),
+    ]),
+    recurringRecord(2, [
+      recurringFinding("improved-key", "R002", 8.2, "Redundant test or build runs"),
+      recurringFinding("worsened-key", "R001", 3),
+      recurringFinding("flat-key", "R003", 2),
+      recurringFinding("dup-key", "R005", 3),
+    ]),
+  ];
+  const stats = summarizeStats(records);
+
+  assert.deepEqual(stats.recurring_findings, [
+    {
+      finding_key: "improved-key",
+      rule_id: "R002",
+      title: "Redundant test or build runs",
+      occurrence_count: 2,
+      first_min: 12.5,
+      last_min: 8.2,
+      trend: "improved",
+    },
+    {
+      finding_key: "worsened-key",
+      rule_id: "R001",
+      title: "Title worsened-key",
+      occurrence_count: 2,
+      first_min: 1,
+      last_min: 3,
+      trend: "worsened",
+    },
+    {
+      finding_key: "dup-key",
+      rule_id: "R005",
+      title: "Title dup-key",
+      occurrence_count: 2,
+      first_min: 3,
+      last_min: 3,
+      trend: "flat",
+    },
+    {
+      finding_key: "flat-key",
+      rule_id: "R003",
+      title: "Title flat-key",
+      occurrence_count: 2,
+      first_min: 2,
+      last_min: 2,
+      trend: "flat",
+    },
+  ]);
+
+  const tty = renderStatsTty(stats);
+  assert.match(tty, /Recurring findings:/u);
+  assert.match(
+    tty,
+    /- \[R002\] 12\.5m -> 8\.2m \(improved, seen 2x\) Redundant test or build runs/u,
+  );
+  assert.match(tty, /- \[R001\] 1m -> 3m \(worsened, seen 2x\)/u);
+  assert.doesNotMatch(tty, /single-key|Title single-key/u);
+});
+
+test("stats reports no recurring findings for a single analysis", () => {
+  const stats = summarizeStats([
+    recurringRecord(1, [recurringFinding("only-key", "R002", 5)]),
+  ]);
+  assert.deepEqual(stats.recurring_findings, []);
+  assert.match(renderStatsTty(stats), /Recurring findings:\n- none/u);
+});
+
+test("stats TTY caps recurring findings at ten while JSON keeps all", () => {
+  const keys = Array.from(
+    { length: 12 },
+    (_, index) => `key-${String(index).padStart(2, "0")}`,
+  );
+  const records = [1, 2].map((index) =>
+    recurringRecord(
+      index,
+      keys.map((key, position) => recurringFinding(key, "R002", 24 - position)),
+    )
+  );
+  const stats = summarizeStats(records);
+  assert.equal(stats.recurring_findings.length, 12);
+
+  const tty = renderStatsTty(stats);
+  const lines = tty.split("\n").filter((line) => line.startsWith("- [R002]"));
+  assert.equal(lines.length, 10);
+  assert.match(tty, /and 2 more/u);
+
+  const json = JSON.parse(renderStatsJson(stats)) as typeof stats;
+  assert.equal(json.recurring_findings.length, 12);
 });
