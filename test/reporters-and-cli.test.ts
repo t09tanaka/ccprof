@@ -308,7 +308,9 @@ test("stats TTY removes stored control strings while stats JSON preserves values
       title: "Recurring\u0007 title\u001b[31m attack\u001b[0m",
       occurrence_count: 2,
       first_min: 3,
+      first_bound: "point" as const,
       last_min: 1,
+      last_bound: "point" as const,
       trend: "improved" as const,
     }],
   };
@@ -700,12 +702,13 @@ function recurringFinding(
   ruleId: Finding["rule_id"],
   min: number,
   title = `Title ${key}`,
+  bound: Finding["recoverable"]["bound"] = "point",
 ): Finding {
   return finding(1, {
     finding_key: key,
     rule_id: ruleId,
     title,
-    recoverable: { min, bound: "point" },
+    recoverable: { min, bound },
   });
 }
 
@@ -735,7 +738,9 @@ test("stats reports recurring findings with per-analysis sums and trends", () =>
       title: "Redundant test or build runs",
       occurrence_count: 2,
       first_min: 12.5,
+      first_bound: "point",
       last_min: 8.2,
+      last_bound: "point",
       trend: "improved",
     },
     {
@@ -744,7 +749,9 @@ test("stats reports recurring findings with per-analysis sums and trends", () =>
       title: "Title worsened-key",
       occurrence_count: 2,
       first_min: 1,
+      first_bound: "point",
       last_min: 3,
+      last_bound: "point",
       trend: "worsened",
     },
     {
@@ -753,7 +760,9 @@ test("stats reports recurring findings with per-analysis sums and trends", () =>
       title: "Title dup-key",
       occurrence_count: 2,
       first_min: 3,
+      first_bound: "point",
       last_min: 3,
+      last_bound: "point",
       trend: "flat",
     },
     {
@@ -762,7 +771,9 @@ test("stats reports recurring findings with per-analysis sums and trends", () =>
       title: "Title flat-key",
       occurrence_count: 2,
       first_min: 2,
+      first_bound: "point",
       last_min: 2,
+      last_bound: "point",
       trend: "flat",
     },
   ]);
@@ -775,6 +786,32 @@ test("stats reports recurring findings with per-analysis sums and trends", () =>
   );
   assert.match(tty, /- \[R001\] 1m -> 3m \(worsened, seen 2x\)/u);
   assert.doesNotMatch(tty, /single-key|Title single-key/u);
+});
+
+test("stats marks mixed-bound recurrences as indeterminate", () => {
+  const stats = summarizeStats([
+    recurringRecord(1, [
+      recurringFinding("mixed-key", "R007", 5, "Oversized tool result", "point"),
+    ]),
+    recurringRecord(2, [
+      recurringFinding("mixed-key", "R007", 2, "Oversized tool result", "upper"),
+    ]),
+  ]);
+  assert.deepEqual(stats.recurring_findings, [{
+    finding_key: "mixed-key",
+    rule_id: "R007",
+    title: "Oversized tool result",
+    occurrence_count: 2,
+    first_min: 5,
+    first_bound: "point",
+    last_min: 2,
+    last_bound: "upper",
+    trend: "indeterminate",
+  }]);
+  assert.match(
+    renderStatsTty(stats),
+    /- \[R007\] 5m -> 2m \(indeterminate, seen 2x\) Oversized tool result/u,
+  );
 });
 
 test("stats reports no recurring findings for a single analysis", () => {

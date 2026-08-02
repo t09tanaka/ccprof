@@ -1,5 +1,6 @@
 import type {
   BaselineNotable,
+  Bound,
   RuleId,
 } from "../core/model.js";
 import { detectChronicCost } from "../rules/chronic-cost.js";
@@ -21,7 +22,11 @@ export interface StatsRuleMinutes {
   minutes: number;
 }
 
-export type RecurringTrend = "improved" | "worsened" | "flat";
+export type RecurringTrend =
+  | "improved"
+  | "worsened"
+  | "flat"
+  | "indeterminate";
 
 export interface StatsRecurringFinding {
   finding_key: string;
@@ -29,7 +34,9 @@ export interface StatsRecurringFinding {
   title: string;
   occurrence_count: number;
   first_min: number;
+  first_bound: Bound;
   last_min: number;
+  last_bound: Bound;
   trend: RecurringTrend;
 }
 
@@ -71,25 +78,35 @@ function recurringFindings(
     rule_id: RuleId;
     title: string;
     minutesPerAnalysis: number[];
+    boundsPerAnalysis: Bound[];
   }>();
   for (const record of ordered) {
-    const perAnalysis = new Map<string, number>();
+    const perAnalysis = new Map<string, { minutes: number; bound: Bound }>();
     for (const finding of record.findings) {
       const minutes = numberEvidence(finding.recoverable.min);
-      perAnalysis.set(
-        finding.finding_key,
-        (perAnalysis.get(finding.finding_key) ?? 0) + Math.max(0, minutes),
-      );
+      const existing = perAnalysis.get(finding.finding_key);
+      perAnalysis.set(finding.finding_key, {
+        minutes: (existing?.minutes ?? 0) + Math.max(0, minutes),
+        // A sum with any upper-bound contribution is itself an upper bound.
+        bound: existing?.bound === "upper" ||
+            finding.recoverable.bound === "upper"
+          ? "upper"
+          : "point",
+      });
       if (!byKey.has(finding.finding_key)) {
         byKey.set(finding.finding_key, {
           rule_id: finding.rule_id,
           title: finding.title,
           minutesPerAnalysis: [],
+          boundsPerAnalysis: [],
         });
       }
     }
-    for (const [key, minutes] of perAnalysis) {
-      byKey.get(key)?.minutesPerAnalysis.push(minutes);
+    for (const [key, value] of perAnalysis) {
+      const entry = byKey.get(key);
+      if (entry === undefined) continue;
+      entry.minutesPerAnalysis.push(value.minutes);
+      entry.boundsPerAnalysis.push(value.bound);
     }
   }
   return [...byKey.entries()]
@@ -97,18 +114,26 @@ function recurringFindings(
     .map(([finding_key, entry]): StatsRecurringFinding => {
       const first_min = rounded(entry.minutesPerAnalysis[0] ?? 0);
       const last_min = rounded(entry.minutesPerAnalysis.at(-1) ?? 0);
+      const first_bound = entry.boundsPerAnalysis[0] ?? "point";
+      const last_bound = entry.boundsPerAnalysis.at(-1) ?? "point";
       return {
         finding_key,
         rule_id: entry.rule_id,
         title: entry.title,
         occurrence_count: entry.minutesPerAnalysis.length,
         first_min,
+        first_bound,
         last_min,
-        trend: last_min < first_min
-          ? "improved"
-          : last_min > first_min
-            ? "worsened"
-            : "flat",
+        last_bound,
+        // Comparing an upper bound against a point estimate says nothing
+        // about real change, so mixed bounds stay indeterminate.
+        trend: first_bound !== last_bound
+          ? "indeterminate"
+          : last_min < first_min
+            ? "improved"
+            : last_min > first_min
+              ? "worsened"
+              : "flat",
       };
     })
     .sort(
