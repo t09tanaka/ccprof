@@ -539,6 +539,46 @@ test("detectAdoptions attributes target_file evidence to the oldest qualifying c
   }
 });
 
+test("detectAdoptions does not let a target's pathspec magic/fnmatch match unrelated committed files", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-adoption-target-pathspec-"));
+  try {
+    const repo = await makeRepo(root);
+    await commit(
+      repo,
+      { "src/foo.ts": "// original\n" },
+      "base",
+      "2025-12-31T00:00:00.000Z",
+    );
+    // "sr?/foo.ts" is accepted by normalizeRepoPath (only `*` is rejected
+    // outside glob mode) but, without `:(literal)`, git's pathspec magic
+    // would fnmatch the `?` against "src/foo.ts" and treat the edit below
+    // as evidence of adoption for a target that was never actually touched.
+    const candidate = baseCandidate({
+      scope: "separate_issue",
+      rule_id: "R008",
+      target: "sr?/foo.ts",
+      recorded_at_ms: Date.parse("2026-01-01T00:00:00.000Z"),
+    });
+    await commit(
+      repo,
+      { "src/foo.ts": "// edited after recorded_at_ms\n" },
+      "edit unrelated file that fnmatch would have matched",
+      "2026-01-02T00:00:00.000Z",
+    );
+
+    const result = await detectAdoptions({
+      repoRoot: repo,
+      candidates: [candidate],
+      detectedAtMs: Date.parse("2026-01-03T00:00:00.000Z"),
+    });
+
+    assert.deepEqual(result.adoptions, []);
+    assert.deepEqual(result.warnings, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("detectAdoptions finds no target_file adoption when the target was never edited afterward", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-adoption-target-untouched-"));
   try {
@@ -609,11 +649,60 @@ test("detectAdoptions reports adoption_detection_failed and skips claude_md cand
   assert.equal(result.warnings[0]?.code, "adoption_detection_failed");
 });
 
+test("detectAdoptions reports adoption_detection_failed and skips claude_md candidates when git output is truncated", async () => {
+  const fixture = fakeRunner(() => ({
+    code: 0,
+    stdout: "",
+    stderr: "",
+    stdoutTruncated: true,
+  }));
+  const candidate = baseCandidate();
+
+  const result = await detectAdoptions({
+    repoRoot: "/repo",
+    candidates: [candidate],
+    runner: fixture.runner,
+    detectedAtMs: 0,
+  });
+
+  assert.deepEqual(result.adoptions, []);
+  assert.equal(result.warnings.length, 1);
+  assert.equal(result.warnings[0]?.code, "adoption_detection_failed");
+  assert.match(result.warnings[0]?.message ?? "", /truncat/u);
+});
+
+test("detectAdoptions reports adoption_detection_failed and skips a target_file candidate when git times out", async () => {
+  const fixture = fakeRunner(() => ({
+    code: 124,
+    stdout: "",
+    stderr: "",
+    timedOut: true,
+  }));
+  const candidate = baseCandidate({
+    scope: "separate_issue",
+    rule_id: "R008",
+    target: "src/a.ts",
+    recorded_at_ms: 0,
+  });
+
+  const result = await detectAdoptions({
+    repoRoot: "/repo",
+    candidates: [candidate],
+    runner: fixture.runner,
+    detectedAtMs: 0,
+  });
+
+  assert.deepEqual(result.adoptions, []);
+  assert.equal(result.warnings.length, 1);
+  assert.equal(result.warnings[0]?.code, "adoption_detection_failed");
+  assert.match(result.warnings[0]?.message ?? "", /timed out/u);
+});
+
 test("detectAdoptions reports adoption_detection_failed and skips only the failing target_file candidate", async () => {
   const okOid = "a".repeat(40);
   const okSeconds = Math.floor(Date.parse("2026-01-02T00:00:00.000Z") / 1_000);
   const fixture = fakeRunner(({ args }) => {
-    if (args.includes("src/ok.ts")) {
+    if (args.includes(":(literal)src/ok.ts")) {
       return { code: 0, stdout: `${okOid}\x00${okSeconds}\n`, stderr: "" };
     }
     return { code: 128, stdout: "", stderr: "fatal: bad revision" };

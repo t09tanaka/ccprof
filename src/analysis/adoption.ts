@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 import type { AnalyzeWarning } from "../core/analyze.js";
 import type { Finding, RuleId, Scope } from "../core/model.js";
-import { runCommand, type CommandRunner } from "../git/client.js";
+import { runCommand, type CommandResult, type CommandRunner } from "../git/client.js";
 import type { AdoptionMethod, AdoptionRecord } from "../store/adoptions.js";
 import { normalizeRepoPath } from "./test-map.js";
 
@@ -197,6 +197,25 @@ function detectionFailedWarning(path: string, stderr: string): AnalyzeWarning {
   };
 }
 
+/**
+ * `runCommand` can return a successful exit code while the captured output
+ * was still cut short (byte cap or timeout kill). Acting on that partial
+ * `stdout` risks mistaking incomplete history for "no adoption". Detect it
+ * explicitly so callers skip the affected candidate(s) instead.
+ */
+function partialOutputWarning(path: string, result: CommandResult): AnalyzeWarning | undefined {
+  if (!result.timedOut && !result.stdoutTruncated) return undefined;
+  const reasons = [
+    result.timedOut === true ? "timed out" : undefined,
+    result.stdoutTruncated === true ? "output truncated" : undefined,
+  ].filter((reason): reason is string => reason !== undefined);
+  return {
+    code: "adoption_detection_failed",
+    message: `git log for ${path} produced partial output (${reasons.join(", ")}); skipping adoption detection`,
+    source: path,
+  };
+}
+
 async function detectClaudeMdAdoptions(
   candidates: readonly AdoptionCandidateFinding[],
   repoRoot: string,
@@ -210,6 +229,11 @@ async function detectClaudeMdAdoptions(
     ["--no-pager", "log", "--format=%H%x00%ct", "-p", "--unified=0", "--", "CLAUDE.md"],
     { cwd: repoRoot },
   );
+  const partialWarning = partialOutputWarning("CLAUDE.md", result);
+  if (partialWarning !== undefined) {
+    warnings.push(partialWarning);
+    return [];
+  }
   if (result.code !== 0) {
     warnings.push(detectionFailedWarning("CLAUDE.md", result.stderr));
     return [];
@@ -246,9 +270,18 @@ async function detectTargetFileAdoption(
   }
   const result = await runner(
     "git",
-    ["--no-pager", "log", "--format=%H%x00%ct", "--", target],
+    // `:(literal)` disables git's pathspec magic/fnmatch after `--` so a
+    // target string sourced from session logs (e.g. containing `?`, `*`,
+    // `[...]`, or `:!...`) is matched as an exact literal path rather than a
+    // glob or exclusion pattern.
+    ["--no-pager", "log", "--format=%H%x00%ct", "--", `:(literal)${target}`],
     { cwd: repoRoot },
   );
+  const partialWarning = partialOutputWarning(target, result);
+  if (partialWarning !== undefined) {
+    warnings.push(partialWarning);
+    return undefined;
+  }
   if (result.code !== 0) {
     warnings.push(detectionFailedWarning(target, result.stderr));
     return undefined;
