@@ -1,4 +1,4 @@
-import { readdir, readFile, realpath } from "node:fs/promises";
+import { readdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import {
   join,
@@ -143,9 +143,12 @@ export async function discoverCodexSessions(
     if (!withinDiscoveryWindow(root, file, query)) {
       continue;
     }
-    let raw: string;
+    let parsed: Session | null;
     try {
-      raw = await readFile(file, "utf8");
+      parsed = await parseCodexSession({
+        sourcePath: file,
+        endedAtMs: query.endedAtMs,
+      });
     } catch {
       globalWarnings.push(
         sourceWarning(
@@ -156,12 +159,6 @@ export async function discoverCodexSessions(
       );
       continue;
     }
-
-    const parsed = parseCodexSession({
-      sourcePath: file,
-      raw,
-      endedAtMs: query.endedAtMs,
-    });
     if (parsed === null) {
       continue;
     }
