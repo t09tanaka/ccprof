@@ -82,5 +82,5 @@ npm run build:test && node --test --test-name-pattern='R002' .test-dist/test/rul
 - [x] Have a separate validation subagent run Node 20 `npm ci`, `npm run check`, focused R002 tests, determinism, build, and package smoke.
 - [x] Run the repository's local GitHub Actions equivalent before push because rule logic changes.
 - [x] Confirm exactly four changed files, added source+test lines are at most 260, no exported signature/type or version/package/changelog change exists, and the worktree is clean after commit.
-- [ ] Commit without amend, push `feature/r002-command-identity`, open a PR against `main`, wait for every required remote check/review, then merge only under the user's standing authorization.
+- [x] Complete the pre-merge gate without amend: commit, push `feature/r002-command-identity`, open a PR against `main`, and wait for every required remote check plus the absence of actionable review feedback. Merge remains a post-gate action under the user's standing authorization.
 - [ ] After merge verification, clean up only `/Users/tanakatakuto/Documents/GitHub/ccprof/.claude/worktrees/r002-command-identity` and its local branch using the guarded worktree cleanup flow.
