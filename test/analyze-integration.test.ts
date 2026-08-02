@@ -874,3 +874,64 @@ test("time between head-branch segments is not counted as the current PR", async
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("a branch departure visible only on non-event rows still splits the segments", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-branch-epoch-gap-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const projects = join(root, "claude-projects");
+    const userRow = (
+      uuid: string,
+      at: string,
+      branch: string | undefined,
+      text: string,
+    ): string =>
+      JSON.stringify({
+        sessionId: "epoch-gap",
+        cwd: repo,
+        type: "user",
+        uuid,
+        timestamp: at,
+        ...(branch === undefined ? {} : { gitBranch: branch }),
+        message: { role: "user", content: text },
+      });
+    const rows = [
+      userRow("h-1", "2026-01-01T00:05:00.000Z", "feature", "head work"),
+      userRow("h-2", "2026-01-01T00:05:30.000Z", undefined, "still head"),
+      // The other-branch interlude is visible only on a non-event system row.
+      JSON.stringify({
+        sessionId: "epoch-gap",
+        cwd: repo,
+        type: "system",
+        uuid: "sys-other",
+        timestamp: "2026-01-01T00:06:00.000Z",
+        gitBranch: "feature/other",
+      }),
+      userRow("h-3", "2026-01-01T00:08:00.000Z", "feature", "back on head"),
+      userRow("h-4", "2026-01-01T00:08:20.000Z", undefined, "finishing"),
+    ];
+    await write(
+      join(projects, "fixture", "epoch-gap.jsonl"),
+      `${rows.join("\n")}\n`,
+    );
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      sessionSource: new ClaudeSessionSource(projects),
+    });
+
+    assert.deepEqual(result.report.unit.sessions, ["epoch-gap"]);
+    // 30s before and 20s after the departure; the 00:05:30 -> 00:08:00 span
+    // spent on the other branch must not be bridged into this PR.
+    assert.equal(result.ledger.totals_ms.raw_observed, 50_000);
+    assert.equal(result.ledger.totals_ms.measured, 50_000);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

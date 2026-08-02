@@ -198,12 +198,21 @@ function scopeSessionToHeadBranch(
   }
   const segments: Session["events"][] = [];
   let current: Session["events"] = [];
+  let currentEpoch: number | undefined;
   for (const event of session.events) {
     if (event.branch === headBranch) {
+      // An epoch change between two head-branch events proves a departure
+      // that was recorded only on rows that emit no events.
+      if (current.length > 0 && event.branch_epoch !== currentEpoch) {
+        segments.push(current);
+        current = [];
+      }
+      currentEpoch = event.branch_epoch;
       current.push(event);
     } else if (current.length > 0) {
       segments.push(current);
       current = [];
+      currentEpoch = undefined;
     }
   }
   if (current.length > 0) segments.push(current);

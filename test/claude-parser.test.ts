@@ -1204,3 +1204,52 @@ test("a branchless prefix adopts the first branch observed in the file", async (
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("a branch departure recorded only on non-event rows advances the epoch", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ccprof-branch-epoch-"));
+  try {
+    const path = join(directory, "epoch.jsonl");
+    const rows = [
+      {
+        sessionId: "epoch",
+        type: "user",
+        uuid: "u1",
+        timestamp: "2026-07-31T03:00:00.000Z",
+        cwd: "/repo",
+        gitBranch: "feature/a",
+        message: { role: "user", content: "before departure" },
+      },
+      {
+        // Emits no event, but proves the session left the branch.
+        sessionId: "epoch",
+        type: "system",
+        uuid: "sys1",
+        timestamp: "2026-07-31T03:05:00.000Z",
+        cwd: "/repo",
+        gitBranch: "feature/b",
+      },
+      {
+        sessionId: "epoch",
+        type: "user",
+        uuid: "u2",
+        timestamp: "2026-07-31T03:10:00.000Z",
+        cwd: "/repo",
+        gitBranch: "feature/a",
+        message: { role: "user", content: "after returning" },
+      },
+    ];
+    await writeFile(path, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+
+    const session = await parseClaudeSession(path);
+    assert.ok(session);
+    const byUuid = new Map(
+      session.events.map((event) => [event.entry_uuid, event]),
+    );
+    assert.equal(byUuid.get("u1")?.branch, "feature/a");
+    assert.equal(byUuid.get("u2")?.branch, "feature/a");
+    assert.equal(byUuid.get("u1")?.branch_epoch, 0);
+    assert.equal(byUuid.get("u2")?.branch_epoch, 2);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

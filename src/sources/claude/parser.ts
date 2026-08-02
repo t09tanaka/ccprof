@@ -76,6 +76,7 @@ interface ParsedRow {
   line: number;
   cwd?: string;
   branch?: string;
+  branchEpoch?: number;
   parentUuid?: string;
   agentId?: string;
   isSidechain: boolean;
@@ -931,6 +932,7 @@ function eventBase(
   confidence: Confidence;
   parent_uuid?: string;
   branch?: string;
+  branch_epoch?: number;
 } {
   return {
     timestamp_ms: row.timestampMs,
@@ -943,6 +945,9 @@ function eventBase(
     confidence: row.hasSyntheticUuid || hasSchemaLoss ? "low" : "high",
     ...(row.parentUuid !== undefined ? { parent_uuid: row.parentUuid } : {}),
     ...(row.branch !== undefined ? { branch: row.branch } : {}),
+    ...(row.branchEpoch !== undefined
+      ? { branch_epoch: row.branchEpoch }
+      : {}),
   };
 }
 
@@ -1288,17 +1293,22 @@ function compactionEvent(
  * Stamps every row with the effective branch in file order: the last
  * observed non-empty gitBranch, with rows before the first branch-carrying
  * row adopting that first branch. Rows that emit no events (system rows,
- * meta users) still advance the effective branch for later rows.
+ * meta users) still advance the effective branch for later rows. A branch
+ * epoch counter advances on every effective-branch change so departures
+ * that are visible only on non-event rows remain detectable downstream.
  */
 function stampEffectiveBranches(sessionRows: ParsedRow[]): void {
   let effective = sessionRows.find((row) => row.branch !== undefined)?.branch;
   if (effective === undefined) return;
+  let epoch = 0;
   for (const row of sessionRows) {
-    if (row.branch !== undefined) {
+    if (row.branch !== undefined && row.branch !== effective) {
       effective = row.branch;
-    } else {
+      epoch += 1;
+    } else if (row.branch === undefined) {
       row.branch = effective;
     }
+    row.branchEpoch = epoch;
   }
 }
 

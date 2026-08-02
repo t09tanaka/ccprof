@@ -53,6 +53,12 @@ interface NormalizedEventBase {
   parent_uuid?: string;
   /** Git branch recorded on the source row, when the log provided one. */
   branch?: string;
+  /**
+   * Monotonic counter that advances whenever the effective branch changes in
+   * source order, including on rows that emit no events. Two events on the
+   * same branch but different epochs are separated by a branch departure.
+   */
+  branch_epoch?: number;
 }
 
 export interface GenuineUserEvent extends NormalizedEventBase {
