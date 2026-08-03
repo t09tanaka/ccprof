@@ -24,8 +24,8 @@ export async function findGitMarker(start: string): Promise<string | undefined> 
     if (!(await lstat(current)).isDirectory()) {
       current = dirname(current);
     }
-  } catch {
-    return undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") current = dirname(current); else return undefined;
   }
 
   while (true) {

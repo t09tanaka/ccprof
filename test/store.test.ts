@@ -152,6 +152,27 @@ function record(
   });
 }
 
+function snapshotOptions(sourceDigest = "1".repeat(64)) {
+  return {
+    snapshot: {
+      repo_id: "6".repeat(64),
+      base_oid: "a".repeat(40),
+      head_oid: "b".repeat(40),
+      merge_base_oid: "a".repeat(40),
+      window: {
+        started_at_ms: 1,
+        start_source: "commit_anchor_lookback" as const,
+        end_source: "analysis_time" as const,
+        completeness: "partial" as const,
+      },
+      source_digest: sourceDigest,
+      config_digest: "3".repeat(64),
+      policy_digest: "4".repeat(64),
+      history_digest: "5".repeat(64),
+    },
+  };
+}
+
 async function temporaryStore(
   callback: (paths: StorePaths, root: string) => Promise<void>,
 ): Promise<void> {
@@ -602,79 +623,321 @@ test("SQLite bootstrap rejects unknown future schemas without mutation", async (
   });
 });
 
-test("analysis records are immutable, complete, atomically indexed, and stably ordered", async () => {
+test("analysis snapshots ignore invocation identity while retaining every execution", async () => {
   await temporaryStore(async (paths) => {
-    const later = record("later", 200);
-    const earlier = record("earlier", 100);
-    assert.deepEqual((await saveAnalysis(paths, later)).warnings, []);
-    assert.deepEqual((await saveAnalysis(paths, earlier)).warnings, []);
+    const first = record("first-execution", 100);
+    const second = {
+      ...first,
+      analysis_id: "second-execution",
+      created_at_ms: 200,
+    };
+    assert.deepEqual((await saveAnalysis(paths, second)).warnings, []);
+    assert.deepEqual((await saveAnalysis(paths, first)).warnings, []);
 
     const loaded = await loadAnalyses(paths);
     assert.deepEqual(loaded.warnings, []);
-    assert.deepEqual(
-      loaded.records.map(({ analysis_id }) => analysis_id),
-      ["earlier", "later"],
-    );
-    assert.deepEqual(loaded.records[1]?.findings, later.findings);
-    assert.equal(loaded.records[1]?.findings.length, 1);
+    assert.equal(loaded.records.length, 1);
+    assert.deepEqual(loaded.records[0], first);
 
-    const index = JSON.parse(await readFile(paths.history_index_path, "utf8")) as {
-      analyses: { analysis_id: string }[];
-    };
-    assert.deepEqual(
-      index.analyses.map(({ analysis_id }) => analysis_id),
-      ["earlier", "later"],
-    );
-    const files = [
-      ...(await readdir(paths.repo_dir)),
-      ...(await readdir(paths.analyses_dir)),
-    ];
+    const database = openStoreDatabase(paths);
+    try {
+      const snapshots = database.prepare(
+        "SELECT snapshot_id, created_at_ms FROM analysis_snapshots",
+      ).all() as { snapshot_id: string; created_at_ms: number }[];
+      assert.equal(snapshots.length, 1);
+      assert.equal(snapshots[0]?.created_at_ms, 100);
+      assert.deepEqual(database.prepare(
+        "SELECT execution_id, snapshot_id, executed_at_ms FROM analysis_executions ORDER BY executed_at_ms, execution_id",
+      ).all(), [
+        { execution_id: "first-execution", snapshot_id: snapshots[0]?.snapshot_id,
+          executed_at_ms: 100 },
+        { execution_id: "second-execution", snapshot_id: snapshots[0]?.snapshot_id,
+          executed_at_ms: 200 },
+      ]);
+    } finally {
+      database.close();
+    }
+
+    const files = await readdir(paths.repo_dir);
     assert.equal(files.some((path) => path.endsWith(".tmp")), false);
   });
 });
 
-test("corrupt indexes rebuild from immutable records and corrupt records are skipped", async () => {
+test("rich snapshot input and normalized-result changes create distinct snapshots", async () => {
   await temporaryStore(async (paths) => {
-    await saveAnalysis(paths, record("good", 100));
-    await writeFile(paths.history_index_path, "{not json", "utf8");
-    await writeFile(join(paths.analyses_dir, "broken.json"), "{bad", "utf8");
+    const first = record("first-input", 100);
+    const second = { ...first, analysis_id: "second-input", created_at_ms: 200 };
+    const changedResult = {
+      ...first,
+      analysis_id: "changed-result",
+      created_at_ms: 300,
+      summary: { ...first.summary, measured_min: 101 },
+    };
+    assert.deepEqual(
+      (await saveAnalysis(paths, first, snapshotOptions("1".repeat(64)))).warnings,
+      [],
+    );
+    assert.deepEqual(
+      (await saveAnalysis(paths, second, snapshotOptions("2".repeat(64)))).warnings,
+      [],
+    );
+    assert.deepEqual(
+      (await saveAnalysis(paths, changedResult, snapshotOptions("1".repeat(64))))
+        .warnings,
+      [],
+    );
+
+    const database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_snapshots",
+      ).pluck().get(), 3);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_executions",
+      ).pluck().get(), 3);
+    } finally {
+      database.close();
+    }
+  });
+});
+
+test("analysis execution and snapshot-envelope conflicts roll back atomically", async () => {
+  await temporaryStore(async (paths) => {
+    const first = record("immutable-execution", 100);
+    assert.deepEqual(
+      (await saveAnalysis(paths, first, snapshotOptions())).warnings,
+      [],
+    );
+
+    const conflictingExecution = { ...first, created_at_ms: 200 };
+    const executionConflict = await saveAnalysis(
+      paths,
+      conflictingExecution,
+      snapshotOptions("2".repeat(64)),
+    );
+    assert.ok(executionConflict.warnings.length > 0);
+
+    const database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_snapshots",
+      ).pluck().get(), 1);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_executions",
+      ).pluck().get(), 1);
+
+      const snapshotId = database.prepare(
+        "SELECT snapshot_id FROM analysis_snapshots",
+      ).pluck().get() as string;
+      database.prepare(
+        "UPDATE analysis_snapshots SET record_json = ? WHERE snapshot_id = ?",
+      ).run("{}", snapshotId);
+
+      const envelopeConflict = await saveAnalysis(paths, {
+        ...first,
+        analysis_id: "new-execution",
+        created_at_ms: 300,
+      }, snapshotOptions());
+      assert.ok(envelopeConflict.warnings.length > 0);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_snapshots",
+      ).pluck().get(), 1);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_executions",
+      ).pluck().get(), 1);
+    } finally {
+      database.close();
+    }
+  });
+});
+
+test("legacy analysis migration keeps valid first records, marks completion, and never rescans", async () => {
+  await temporaryStore(async (paths) => {
+    const first = record("legacy-id", 100);
+    const duplicate = {
+      ...record("different-content", 200),
+      analysis_id: first.analysis_id,
+    };
+    await mkdir(paths.analyses_dir, { recursive: true });
     await writeFile(
-      join(paths.analyses_dir, "null-finding.json"),
-      JSON.stringify({
-        ...record("null-finding", 200),
-        findings: [null],
-      }),
+      join(paths.analyses_dir, "01-valid.json"),
+      `${JSON.stringify(first)}\n`,
       "utf8",
     );
     await writeFile(
-      join(paths.analyses_dir, "bad-evidence.json"),
-      JSON.stringify({
-        ...record("bad-evidence", 300),
-        findings: [{
-          ...finding("bad-evidence"),
-          evidence: null,
-        }],
-      }),
+      join(paths.analyses_dir, "02-duplicate.json"),
+      `${JSON.stringify(duplicate)}\n`,
+      "utf8",
+    );
+    await writeFile(join(paths.analyses_dir, "03-corrupt.json"), "{bad", "utf8");
+    await writeFile(paths.history_index_path, "legacy-index-sentinel", "utf8");
+
+    const migrated = await loadAnalyses(paths);
+    assert.deepEqual(migrated.records, [first]);
+    assert.ok(migrated.warnings.some(
+      ({ code }) => code === "duplicate_analysis_record",
+    ));
+    assert.ok(migrated.warnings.some(
+      ({ code }) => code === "corrupt_analysis_record",
+    ));
+
+    const database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_snapshots",
+      ).pluck().get(), 1);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_executions",
+      ).pluck().get(), 1);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("legacy-analyses-json-v1"), 1);
+    } finally {
+      database.close();
+    }
+
+    assert.deepEqual(await readdir(paths.analyses_dir), [
+      "01-valid.json",
+      "02-duplicate.json",
+      "03-corrupt.json",
+    ]);
+    assert.equal(await readFile(paths.history_index_path, "utf8"),
+      "legacy-index-sentinel");
+
+    const late = record("late-after-marker", 300);
+    await writeFile(
+      join(paths.analyses_dir, "04-late.json"),
+      `${JSON.stringify(late)}\n`,
+      "utf8",
+    );
+    const loadedAgain = await loadAnalyses(paths);
+    assert.deepEqual(loadedAgain.warnings, []);
+    assert.deepEqual(loadedAgain.records, [first]);
+  });
+});
+
+test("legacy analysis migration leaves a non-directory source incomplete and retries after repair", async () => {
+  await temporaryStore(async (paths) => {
+    await mkdir(paths.repo_dir, { recursive: true });
+    await writeFile(paths.analyses_dir, "not a directory\n", "utf8");
+
+    const incomplete = await loadAnalyses(paths);
+    assert.deepEqual(incomplete.records, []);
+    assert.ok(incomplete.warnings.some(
+      ({ code }) => code === "history_read_failed",
+    ));
+
+    let database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("legacy-analyses-json-v1"), 0);
+    } finally {
+      database.close();
+    }
+
+    await rm(paths.analyses_dir, { force: true });
+    await mkdir(paths.analyses_dir);
+    const repaired = record("legacy-after-repair", 100);
+    await writeFile(
+      join(paths.analyses_dir, "valid.json"),
+      `${JSON.stringify(repaired)}\n`,
       "utf8",
     );
 
-    const loaded = await loadAnalyses(paths);
-    assert.deepEqual(
-      loaded.records.map(({ analysis_id }) => analysis_id),
-      ["good"],
+    const retried = await loadAnalyses(paths);
+    assert.deepEqual(retried, { records: [repaired], warnings: [] });
+    database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("legacy-analyses-json-v1"), 1);
+    } finally {
+      database.close();
+    }
+  });
+});
+
+test("legacy analysis migration rolls back rows and marker after an operational insert failure", async () => {
+  await temporaryStore(async (paths) => {
+    await mkdir(paths.analyses_dir, { recursive: true });
+    const legacy = record("legacy-after-database-retry", 100);
+    await writeFile(
+      join(paths.analyses_dir, "valid.json"),
+      `${JSON.stringify(legacy)}\n`,
+      "utf8",
     );
-    assert.ok(
-      loaded.warnings.some(({ code }) => code === "corrupt_history_index"),
-    );
-    assert.ok(
-      loaded.warnings.some(({ code }) => code === "corrupt_analysis_record"),
-    );
-    assert.equal(
-      loaded.warnings.filter(
-        ({ code }) => code === "corrupt_analysis_record",
-      ).length,
-      3,
-    );
+
+    let database = openStoreDatabase(paths);
+    try {
+      database.exec(`CREATE TRIGGER reject_legacy_snapshot
+        BEFORE INSERT ON analysis_snapshots BEGIN
+          SELECT RAISE(ABORT, 'forced legacy migration failure');
+        END`);
+    } finally {
+      database.close();
+    }
+
+    const failed = await loadAnalyses(paths);
+    assert.deepEqual(failed.records, []);
+    assert.ok(failed.warnings.some(
+      ({ code }) => code === "history_read_failed",
+    ));
+
+    database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_snapshots",
+      ).pluck().get(), 0);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_executions",
+      ).pluck().get(), 0);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("legacy-analyses-json-v1"), 0);
+      database.exec("DROP TRIGGER reject_legacy_snapshot");
+    } finally {
+      database.close();
+    }
+
+    const retried = await loadAnalyses(paths);
+    assert.deepEqual(retried, { records: [legacy], warnings: [] });
+    database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_snapshots",
+      ).pluck().get(), 1);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_executions",
+      ).pluck().get(), 1);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("legacy-analyses-json-v1"), 1);
+    } finally {
+      database.close();
+    }
+  });
+});
+
+test("completed legacy migration remains readable while another connection holds the writer lock", async () => {
+  await temporaryStore(async (paths) => {
+    assert.deepEqual(await loadAnalyses(paths), { records: [], warnings: [] });
+
+    const writer = openStoreDatabase(paths);
+    writer.exec("BEGIN IMMEDIATE");
+    try {
+      const startedAtMs = Date.now();
+      const loaded = await loadAnalyses(paths);
+      const elapsedMs = Date.now() - startedAtMs;
+      assert.deepEqual(loaded, { records: [], warnings: [] });
+      assert.ok(
+        elapsedMs < 2_000,
+        `marker fast path waited ${elapsedMs}ms for an unnecessary writer lock`,
+      );
+    } finally {
+      writer.exec("ROLLBACK");
+      writer.close();
+    }
   });
 });
 

@@ -36,19 +36,20 @@ async function mapSessionCwds(
   const distinctCwds = [...new Set([
     ...session.observed_cwds,
     ...toolEventCwds(session),
+    ...session.events.flatMap((event) => event.kind === "tool_use"
+      ? event.paths.filter(isAbsolute) : []),
   ])];
   const mappedCwds = new Map(
     await Promise.all(
       distinctCwds.map(async (cwd) => [cwd, await mapper(cwd)] as const),
     ),
   );
-  const events = session.events.map((event) =>
-    event.kind === "tool_use" &&
-      event.cwd !== undefined &&
-      event.cwd !== ""
-      ? { ...event, cwd: mappedCwds.get(event.cwd) ?? event.cwd }
-      : event
-  );
+  const events = session.events.map((event) => event.kind !== "tool_use" ? event : {
+    ...event,
+    paths: event.paths.map((path) => isAbsolute(path) ? mappedCwds.get(path) ?? path : path),
+    ...(event.cwd === undefined || event.cwd === "" ? {}
+      : { cwd: mappedCwds.get(event.cwd) ?? event.cwd }),
+  });
   return {
     ...session,
     observed_cwds: [...new Set([
@@ -83,7 +84,7 @@ async function rebaseWorktreeCwd(
   repoRoot: string,
   repoGitDirectory: string | undefined,
 ): Promise<string> {
-  if (isWithin(repoRoot, cwd) || repoGitDirectory === undefined) return cwd;
+  if (repoGitDirectory === undefined) return cwd;
   const [marker, cwdGitDirectory] = await Promise.all([
     findGitMarker(cwd),
     commonGitDirectory(cwd),

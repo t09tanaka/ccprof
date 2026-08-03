@@ -57,6 +57,20 @@ jobs:
           npm install --global --prefix "$RUNNER_TEMP/ccprof-prefix" "$RUNNER_TEMP/ccprof-pack"/*.tgz
           "$RUNNER_TEMP/ccprof-prefix/bin/ccprof" --version
           "$RUNNER_TEMP/ccprof-prefix/bin/ccprof" --help
+          mkdir -p "$RUNNER_TEMP/ccprof-smoke-repo" "$RUNNER_TEMP/ccprof-smoke-data"
+          git -C "$RUNNER_TEMP/ccprof-smoke-repo" init
+          (
+            cd "$RUNNER_TEMP/ccprof-smoke-repo"
+            CCPROF_DATA_DIR="$RUNNER_TEMP/ccprof-smoke-data" \
+              "$RUNNER_TEMP/ccprof-prefix/bin/ccprof" stats --json \
+              > "$RUNNER_TEMP/ccprof-stats.json"
+          )
+          node -e '
+            const fs = require("node:fs");
+            const stats = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            if (stats.history_count !== 0) process.exit(1);
+          ' "$RUNNER_TEMP/ccprof-stats.json"
+          test "$(find "$RUNNER_TEMP/ccprof-smoke-data" -type f -name store.sqlite3 -print | wc -l)" -eq 1
 
   determinism-golden:
     name: determinism-golden

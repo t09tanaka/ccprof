@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 
 import {
   durationMs,
@@ -45,6 +45,7 @@ import {
 } from "../analysis/hook-events.js";
 import {
   buildTimeline,
+  DEFAULT_IDLE_THRESHOLD_MS,
   type TimelineResult,
 } from "../analysis/timeline.js";
 import {
@@ -83,11 +84,13 @@ import { CodexSessionSource } from "../sources/codex/discover.js";
 import { CombinedSessionSource } from "../sources/combined.js";
 import type { SessionSource } from "../sources/session-source.js";
 import {
+  analysisDigest,
   computeBaseline,
   loadAnalyses,
   makeAnalysisRecord,
   saveAnalysis,
   type AnalysisRecord,
+  type AnalysisSnapshotIdentity,
   type StoreWarning,
   type StoredCommandCost,
   type StoredReadObservation,
@@ -900,11 +903,72 @@ function priorRecords(
   history: readonly AnalysisRecord[],
   context: PrContext,
 ): AnalysisRecord[] {
-  return history.filter(
-    (record) =>
-      record.unit.repo !== context.repoRoot ||
-      record.unit.pr_ref !== context.prRef,
-  );
+  return history.filter((record) => record.unit.pr_ref !== context.prRef);
+}
+
+function relativeRepoPath(value: string, repoRoot: string): string | undefined {
+  const normalized = value.normalize("NFC");
+  if (!isAbsolute(normalized)) return undefined;
+  const local = relative(repoRoot, normalized);
+  if (local === "") return ".";
+  return !isAbsolute(local) && local !== ".." && !local.startsWith(`..${sep}`)
+    ? local.split(sep).join("/") : undefined;
+}
+function snapshotPath(value: string, repoRoot: string): string {
+  return relativeRepoPath(value, repoRoot) ??
+    value.normalize("NFC").replaceAll("\\", "/").replace(/^\.\//u, "");
+}
+function sourceFailureSnapshot(error: unknown): unknown {
+  if (!(error instanceof Error)) return { type: typeof error, name: "non_error_throw" };
+  return { type: error.constructor.name, name: error.name, message: error.message,
+    ...(error instanceof ClaudeDiscoveryError ? { warnings: error.warnings.map(
+      ({ source_path: _path, ...warning }) => warning) } : {}) };
+}
+function sourceSnapshot(sessions: readonly Session[], repoRoot: string): unknown[] {
+  return sessions.map((session) => {
+    const { source_path: _sourcePath, ...rest } = session;
+    const projected = { ...rest, observed_cwds: session.observed_cwds.map(
+      (path) => snapshotPath(path, repoRoot)),
+      ...(session.capabilities === undefined ? {} : { capabilities: uniqueSorted(session.capabilities) }),
+      events: session.events.map((event) => event.kind === "tool_use"
+        ? { ...event, paths: event.paths.map((path) => snapshotPath(path, repoRoot)),
+          ...(event.cwd === undefined ? {} : { cwd: snapshotPath(event.cwd, repoRoot) }) }
+        : event),
+      warnings: session.warnings.map(({ source_path: _path, ...warning }) => warning) };
+    return { projected, key: analysisDigest("source-session-order-v1", projected) };
+  }).sort((left, right) => left.key.localeCompare(right.key)).map(({ projected }) => projected);
+}
+function snapshotIdentity(paths: StorePaths, context: PrContext, window: AnalysisWindow,
+  sessions: readonly Session[], testMap: TestMap, options: AnalyzeOptions,
+  history: readonly AnalysisRecord[], inapplicable: readonly SkippedRule[], sourceErrors: readonly unknown[],
+  hookWarnings: readonly StoreWarning[]): AnalysisSnapshotIdentity {
+  const mappings = testMap.mappings.map((mapping) => ({ source: uniqueSorted(mapping.source),
+    tests: uniqueSorted(mapping.tests),
+    commands: uniqueSorted(mapping.commands), confidence: mapping.confidence,
+    origin: mapping.origin, caveat: mapping.caveat,
+  })).map((value) => ({ value, key: analysisDigest("test-map-entry-v1", value) }))
+    .sort((left, right) => left.key.localeCompare(right.key))
+    .filter((entry, index, all) => index === 0 || entry.key !== all[index - 1]?.key)
+    .map(({ value }) => value);
+  const sortedHistory = [...history].sort((left, right) => left.created_at_ms - right.created_at_ms ||
+    left.analysis_id.localeCompare(right.analysis_id));
+  return {
+    repo_id: paths.repo_hash, base_oid: context.base.oid.toLowerCase(),
+    head_oid: context.head.oid.toLowerCase(), merge_base_oid: context.mergeBaseOid.toLowerCase(),
+    window: { started_at_ms: window.started_at_ms, start_source: window.start_source,
+      end_source: window.end_source, completeness: window.completeness,
+      ...(window.end_source === "explicit" ? { ended_at_ms: window.ended_at_ms } : {}) },
+    source_digest: analysisDigest("analysis-source-v1", {
+      sessions: sourceSnapshot(sessions, context.repoRoot), discovery_failures: sourceErrors.map(sourceFailureSnapshot),
+      hook_warnings: hookWarnings.map(({ path: _path, ...warning }) => warning) }),
+    config_digest: analysisDigest("analysis-config-v1", {
+      idle_threshold_ms: options.idleThresholdMs ?? DEFAULT_IDLE_THRESHOLD_MS, mappings,
+      caveats: uniqueSorted(testMap.caveats), external_tool_names: uniqueSorted([...(options.externalToolNames ?? [])]) }),
+    policy_digest: analysisDigest("analysis-policy-v1", {
+      fingerprint: "ccprof-rule-policy-2026-08-03-v1",
+      applicability: ruleApplicability(sessions), skipped_rules: inapplicable }),
+    history_digest: analysisDigest("analysis-history-v1", sortedHistory),
+  };
 }
 
 /**
@@ -1138,7 +1202,7 @@ export async function analyze(
     options.externalToolNames,
   ).filter((candidate) => !inapplicableRuleIds.has(candidate.rule_id));
   const unit = {
-    repo: context.repoRoot,
+    repo: paths.canonical_repo,
     pr_ref: context.prRef,
     sessions: uniqueSorted(sessions.map((session) => session.session_id)),
   };
@@ -1179,7 +1243,10 @@ export async function analyze(
     read_observations: reads.observations,
   });
   const saveResult = persist
-    ? await saveAnalysis(paths, record)
+    ? await saveAnalysis(paths, record, { snapshot: snapshotIdentity(
+        paths, context, window, sessions, testMap, options, history, inapplicableRules,
+        sourceErrors, hookEvents.warnings,
+      ) })
     : { record, warnings: [] as StoreWarning[] };
   warnings.push(...saveResult.warnings.map(storeWarning));
 

@@ -22,11 +22,13 @@ import {
   runCommand,
   type CommandRunner,
 } from "../src/git/client.js";
+import { findGitMarker } from "../src/git/common-dir.js";
 import {
   ClaudeDiscoveryError,
   ClaudeSessionSource,
 } from "../src/sources/claude/discover.js";
 import { CodexSessionSource } from "../src/sources/codex/discover.js";
+import { alignSessionCwdsToRepository } from "../src/sources/cwd.js";
 import type { SessionQuery, SessionSource } from "../src/sources/session-source.js";
 import {
   loadAnalyses,
@@ -35,6 +37,7 @@ import {
 import { loadAdoptions } from "../src/store/adoptions.js";
 import { saveDismissal } from "../src/store/dismissals.js";
 import { resolveStorePaths } from "../src/store/paths.js";
+import { openStoreDatabase } from "../src/store/sqlite.js";
 
 const NOW_MS = Date.parse("2026-01-01T01:00:00.000Z");
 const FEATURE_COMMIT_DATE = "2026-01-01T00:00:00.000Z";
@@ -237,9 +240,13 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
   try {
     const repo = await makeRepository(root);
     const projects = await makeClaudeProjects(root, repo);
-    const storePaths = await resolveStorePaths(repo, {
+    const resolvedStorePaths = await resolveStorePaths(repo, {
       env: { CCPROF_DATA_DIR: join(root, "data") },
     });
+    const storePaths = {
+      ...resolvedStorePaths,
+      canonical_repo: join(root, "canonical-repository"),
+    };
     for (let index = 0; index < 3; index += 1) {
       await saveAnalysis(storePaths, {
         analysis_id: `history-${index}`,
@@ -271,6 +278,7 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
     const secondSource = queryCapturingClaudeSource(projects);
     const second = await analyze({
       ...options,
+      nowMs: NOW_MS + 60_000,
       sessionSource: secondSource.source,
     });
 
@@ -359,12 +367,27 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
       ({ unit }) => unit.pr_ref === "main...feature",
     );
     assert.ok(current);
+    assert.equal(current.unit.repo, storePaths.canonical_repo);
     assert.equal(
       stored.records.filter(({ unit }) => unit.pr_ref === "main...feature")
         .length,
       1,
       "a deterministic rerun must reuse the immutable record",
     );
+    const database = openStoreDatabase(storePaths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_snapshots",
+      ).pluck().get(), 4);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_executions",
+      ).pluck().get(), 5);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_executions WHERE snapshot_id = (SELECT snapshot_id FROM analysis_executions WHERE execution_id = ?)",
+      ).pluck().get(first.record.analysis_id), 2);
+    } finally {
+      database.close();
+    }
     assert.deepEqual(
       current.findings.map(({ finding_key }) => finding_key),
       first.allFindings.map(({ finding_key }) => finding_key),
@@ -409,6 +432,109 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
       "dismissal filters only the displayed top findings",
     );
     assert.ok(dismissed.suppressedKeys.includes(approval.finding_key));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("linked worktrees preserve existing and missing root-absolute reads in both directions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-linked-snapshot-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    assert.equal(await findGitMarker(join(repo, "bad\0child")), undefined);
+    const linkedRepoPath = join(repo, ".test-worktrees", "linked");
+    await mkdir(dirname(linkedRepoPath), { recursive: true });
+    await git(repo, ["worktree", "add", "--detach", linkedRepoPath, "feature"]);
+    const linkedRepo = await realpath(linkedRepoPath);
+    await Promise.all([
+      mkdir(join(repo, "packages", "api"), { recursive: true }),
+      mkdir(join(linkedRepo, "packages", "api"), { recursive: true }),
+    ]);
+    const dataRoot = join(root, "data");
+    const mainStorePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: dataRoot },
+    });
+    const linkedStorePaths = await resolveStorePaths(linkedRepo, {
+      env: { CCPROF_DATA_DIR: dataRoot },
+    });
+    assert.equal(linkedStorePaths.canonical_repo, mainStorePaths.canonical_repo);
+    assert.equal(linkedStorePaths.repo_dir, mainStorePaths.repo_dir);
+
+    const session = (origin: string): Session => {
+      const value = coordinationSession("linked-session", origin, "TodoWrite");
+      const toolCwd = join(origin, "packages", "api");
+      return {
+        ...value,
+        observed_cwds: [toolCwd],
+        events: value.events.map((event) => event.kind === "tool_use"
+          ? {
+              ...event,
+              paths: [
+                ...event.paths.map((path) => join(origin, path)),
+                ...(event.tool_use_id === "read-1"
+                  ? [join(origin, "deleted", "nested", "value.ts")]
+                  : []),
+              ],
+              cwd: toolCwd,
+            }
+          : event),
+      };
+    };
+    const source = (origin: string): SessionSource => ({
+      discover: async ({ repoRoot }) => [
+        await alignSessionCwdsToRepository(session(origin), repoRoot),
+      ],
+    });
+    const first = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths: mainStorePaths,
+      sessionSource: source(repo),
+    });
+    const second = await analyze({
+      cwd: linkedRepo,
+      pr: "main...feature",
+      nowMs: NOW_MS + 60_000,
+      storePaths: linkedStorePaths,
+      sessionSource: source(repo),
+    });
+    const third = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS + 120_000,
+      storePaths: mainStorePaths,
+      sessionSource: source(linkedRepo),
+    });
+
+    assert.deepEqual(second.report, first.report);
+    assert.deepEqual(third.report, first.report);
+    const { analysis_id: _firstId, created_at_ms: _firstTime,
+      ...firstPayload } = first.record;
+    const { analysis_id: _secondId, created_at_ms: _secondTime,
+      ...secondPayload } = second.record;
+    const { analysis_id: _thirdId, created_at_ms: _thirdTime,
+      ...thirdPayload } = third.record;
+    assert.deepEqual(secondPayload, firstPayload);
+    assert.deepEqual(thirdPayload, firstPayload);
+    for (const result of [first, second, third]) {
+      assert.equal(result.record.unit.repo, mainStorePaths.canonical_repo);
+      assert.deepEqual(
+        result.record.read_observations?.map(({ path }) => path),
+        ["src/value.ts"],
+      );
+    }
+    const database = openStoreDatabase(mainStorePaths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_snapshots",
+      ).pluck().get(), 1);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_executions",
+      ).pluck().get(), 3);
+    } finally {
+      database.close();
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1551,6 +1677,57 @@ test("partial source failure warns and rejects surviving transition evidence", a
   }
 });
 
+test("partial source failure creates a distinct snapshot for an otherwise identical record", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-source-error-snapshot-"));
+  try {
+    const repo = await makeRepository(root);
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const session = hookEventSession("source-identity", repo);
+    const failingPath = join(root, "failed-codex-source.jsonl");
+    const claudeDiscover = ClaudeSessionSource.prototype.discover;
+    const codexDiscover = CodexSessionSource.prototype.discover;
+    ClaudeSessionSource.prototype.discover = async () => [session];
+    CodexSessionSource.prototype.discover = async () => [];
+    try {
+      const options = { cwd: repo, pr: "main...feature",
+        sinceMs: NOW_MS - 20 * 60_000, storePaths } as const;
+      const healthy = await analyze({ ...options, nowMs: NOW_MS });
+      CodexSessionSource.prototype.discover = async () => {
+        throw new ClaudeDiscoveryError([{ code: "source_read_error",
+          message: "Could not read a source.", source_path: failingPath }]);
+      };
+      const partial = await analyze({ ...options, nowMs: NOW_MS + 60_000 });
+      assert.ok(partial.warnings.some(
+        ({ code }) => code === "session_source_error",
+      ));
+      const { analysis_id: _healthyId, created_at_ms: _healthyTime,
+        ...healthyPayload } = healthy.record;
+      const { analysis_id: _partialId, created_at_ms: _partialTime,
+        ...partialPayload } = partial.record;
+      assert.deepEqual(partialPayload, healthyPayload);
+
+      const database = openStoreDatabase(storePaths);
+      try {
+        assert.equal(database.prepare(
+          "SELECT count(*) FROM analysis_snapshots",
+        ).pluck().get(), 2);
+        assert.equal(database.prepare(
+          "SELECT count(*) FROM analysis_executions",
+        ).pluck().get(), 2);
+      } finally {
+        database.close();
+      }
+    } finally {
+      ClaudeSessionSource.prototype.discover = claudeDiscover;
+      CodexSessionSource.prototype.discover = codexDiscover;
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("skips rules whose required capability is missing from a mixed Codex+Claude session set", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-skipped-rules-"));
   try {
@@ -1952,6 +2129,64 @@ test("a corrupt hook-events.jsonl line degrades to one aggregate warning instead
     assert.equal(hookWarnings.length, 1);
     assert.match(hookWarnings[0]?.message ?? "", /^2 hook event rows /u);
     assert.equal(hookWarnings[0]?.source, storePaths.hook_events_path);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("hook input completeness creates a new snapshot even when malformed rows do not change analysis output", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-hook-snapshot-completeness-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const run = async (nowMs: number) => await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs,
+      storePaths,
+      sessionSource: {
+        discover: async () => [hookEventSession("hook-session", repo)],
+      },
+    });
+
+    const first = await run(NOW_MS);
+    await run(NOW_MS + 60_000);
+    let database = openStoreDatabase(storePaths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_snapshots",
+      ).pluck().get(), 1);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_executions",
+      ).pluck().get(), 2);
+    } finally {
+      database.close();
+    }
+
+    await write(storePaths.hook_events_path, "{malformed\n");
+    const incomplete = await run(NOW_MS + 120_000);
+    assert.ok(incomplete.warnings.some(
+      ({ code }) => code === "hook_events_invalid_rows",
+    ));
+    const { analysis_id: _firstId, created_at_ms: _firstTime, ...firstPayload } =
+      first.record;
+    const { analysis_id: _incompleteId, created_at_ms: _incompleteTime,
+      ...incompletePayload } = incomplete.record;
+    assert.deepEqual(incompletePayload, firstPayload);
+
+    database = openStoreDatabase(storePaths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_snapshots",
+      ).pluck().get(), 2);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_executions",
+      ).pluck().get(), 3);
+    } finally {
+      database.close();
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

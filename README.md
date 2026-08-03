@@ -509,6 +509,20 @@ $XDG_DATA_HOME/ccprof/<sha256(canonical-repo-path)>/
 ~/.local/share/ccprof/<sha256(canonical-repo-path)>/
 ```
 
+Analysis history is stored transactionally in the repository-scoped
+`store.sqlite3` database, with SQLite running in WAL mode. Deterministic
+analysis snapshots are stored separately from their executions. A snapshot is
+reused only when the repository and Git OIDs, effective analysis window,
+source, configuration, policy, history, and normalized analysis payload are
+all identical; each rerun still records its execution without inflating stats
+or baselines.
+
+On first access, legacy `analyses/*.json` records are imported once. Corrupt
+entries produce warnings and are skipped; a committed migration marker prevents
+later rescans. The legacy JSON records and index remain untouched. This is a
+one-way migration, so concurrently running an older ccprof that still writes
+legacy analysis files is unsupported. Hook events remain JSONL.
+
 Store records remain raw so local baselines and history retain their existing
 identity and evidence. Privacy profiles govern rendered output and advisory
 input; they do not rewrite the Store. Protect the data directory as local
