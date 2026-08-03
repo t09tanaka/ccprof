@@ -473,15 +473,15 @@ test("Store snapshots compatibility metadata without reading Proxy values", () =
 
   for (const trapped of [
     new Proxy(decorated, {
-      get(target, property, receiver) {
-        if (property === "rule_version") {
-          throw new Error("token-secret metadata get trap");
-        }
-        return Reflect.get(target, property, receiver) as unknown;
-      },
+      ownKeys() { throw new Error("token-secret metadata ownKeys trap"); },
     }),
     new Proxy(decorated, {
-      ownKeys() { throw new Error("token-secret metadata ownKeys trap"); },
+      getOwnPropertyDescriptor(target, property) {
+        if (property === "rule_version") {
+          throw new Error("token-secret metadata descriptor trap");
+        }
+        return Reflect.getOwnPropertyDescriptor(target, property);
+      },
     }),
   ]) {
     assert.throws(
