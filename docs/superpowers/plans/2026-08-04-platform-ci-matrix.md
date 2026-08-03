@@ -44,50 +44,57 @@ implementation lines.
 
 **Files:** `test/ci-workflow.test.ts`
 
-- [ ] Add helpers that isolate top-level workflow job blocks without a YAML
+- [x] Add helpers that isolate top-level workflow job blocks without a YAML
   runtime dependency.
-- [ ] Assert the exact six matrix pairs, `fail-fast: false`, per-leg checkout,
+- [x] Assert the exact six matrix pairs, `fail-fast: false`, per-leg checkout,
   cached setup, install, native smoke, and full tests.
-- [ ] Assert blocking Node 20, non-blocking Node 26 with smoke/typecheck/tests,
+- [x] Assert blocking Node 20, non-blocking Node 26 with smoke/typecheck/tests,
   aggregate `always()` dependencies and success-only result logic, exact check
   names, and no aggregate test duplication.
-- [ ] Assert pinned actions, job timeouts, concurrency, permissions, CodeQL
+- [x] Assert pinned actions, job timeouts, concurrency, permissions, CodeQL
   Node 24, portable smoke-helper behavior, and support/canary documentation.
-- [ ] Ask the sonnet verifier to run the focused test and record RED against
+- [x] Ask the sonnet verifier to run the focused test and record RED against
   the unchanged workflows.
 
 ## Task 2: Implement runtime lanes and native smoke
 
 **Files:** `.github/workflows/ci.yml`, `tools/smoke-better-sqlite3.cjs`
 
-- [ ] Add the fail-fast-disabled Node 22/24 platform matrix.
-- [ ] Add the blocking Ubuntu Node 20 floor job.
-- [ ] Replace the old test job with the lightweight always-run aggregate gate.
-- [ ] Add the non-blocking Ubuntu Node 26 canary outside that dependency graph.
-- [ ] Move unchanged-name typecheck/package/determinism jobs to Node 24.
-- [ ] Implement the portable in-memory SQLite open/query/close smoke helper and
+- [x] Add the fail-fast-disabled Node 22/24 platform matrix.
+- [x] Add the blocking Ubuntu Node 20 floor job.
+- [x] Replace the old test job with the lightweight always-run aggregate gate.
+- [x] Add the non-blocking Ubuntu Node 26 canary outside that dependency graph.
+- [x] Move unchanged-name typecheck/package/determinism jobs to Node 24.
+- [x] Implement the portable in-memory SQLite open/query/close smoke helper and
   invoke it from every runtime compatibility lane.
-- [ ] Ask the verifier to confirm focused GREEN.
+- [x] Ask the verifier to confirm focused GREEN.
 
 ## Task 3: CodeQL and documentation
 
 **Files:** `.github/workflows/codeql.yml`, `README.md`
 
-- [ ] Move CodeQL setup to Node 24 without changing triggers or analysis.
-- [ ] Document supported blocking jobs, the Node 26 canary, native-addon smoke,
+- [x] Move CodeQL setup to Node 24 without changing triggers or analysis.
+- [x] Document supported blocking jobs, the Node 26 canary, native-addon smoke,
   and that `engines` remains authoritative.
-- [ ] Confirm the static workflow contracts remain GREEN.
+- [x] Confirm the static workflow contracts remain GREEN.
 
 ## Task 4: Review and local verification
 
-- [ ] Commit the implementation and both required `docs/superpowers/`
+- [x] Commit the implementation and both required `docs/superpowers/`
   artifacts without amend or worktree-only settings.
-- [ ] Run independent specification review and independent quality review;
+- [x] Run independent specification review and independent quality review;
   fix and re-review only defects introduced by this change.
-- [ ] Delegate focused static contracts, typecheck, full tests, package smoke,
+- [x] Delegate focused static contracts, typecheck, full tests, package smoke,
   determinism, and CodeQL build phase on the host OS.
-- [ ] Delegate `/run-github-actions-locally` before pushing because workflow
+- [x] Delegate `/run-github-actions-locally` before pushing because workflow
   logic changes.
+
+Verification evidence at `55e2c3a` on Darwin arm64, Node 24.7.0, npm 11.5.1:
+focused workflow contracts 7/7, full suite 616/616, determinism 1/1, typecheck,
+direct native smoke, isolated installed-package smoke, and CodeQL build phase
+all passed. Specification and quality/security reviews found no P0–P2 issues.
+The first package attempt hit only the user's npm-cache permissions; the same
+smoke passed with an isolated temporary cache.
 
 ## Task 5: PR, remote matrix, merge, and cleanup
 
