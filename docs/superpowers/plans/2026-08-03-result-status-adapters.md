@@ -90,5 +90,5 @@ Added implementation and test code must stay at or below 285 lines, with 300 as 
 - [x] Have a separate validation subagent run Node 20 `npm ci`, `npm run check`, focused Claude/Codex tests, determinism, build, and package smoke.
 - [x] Run the repository's local GitHub Actions equivalent before push because parser logic changes.
 - [x] Confirm exactly six changed files, at most 285 added implementation+test lines, parser status/evidence equality, and no ReportV2/Store/R002/R008/classifier/package/version/changelog diff.
-- [ ] Commit without amend, rebase on current `origin/main` if required, push, open a PR against `main`, wait for all checks and actionable review feedback, then merge under the user's standing authorization.
+- [x] Commit without amend, confirm the branch is based on current `origin/main`, push, open PR #37 against `main`, and wait for all checks plus absence of actionable review feedback. Merge remains a post-gate action under the user's standing authorization.
 - [ ] After merged-commit verification, clean up only this worktree and its local feature branch.
