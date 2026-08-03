@@ -62,7 +62,7 @@ jobs:
           (
             cd "$RUNNER_TEMP/ccprof-smoke-repo"
             CCPROF_DATA_DIR="$RUNNER_TEMP/ccprof-smoke-data" \
-              "$RUNNER_TEMP/ccprof-prefix/bin/ccprof" stats --json \
+              "$RUNNER_TEMP/ccprof-prefix/bin/ccprof" stats --privacy strict --json \
               > "$RUNNER_TEMP/ccprof-stats.json"
           )
           node -e '

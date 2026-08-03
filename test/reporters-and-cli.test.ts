@@ -48,12 +48,15 @@ import { renderMarkdownReport } from "../src/reporters/markdown.js";
 import {
   findingPrivacyReference,
   projectReportPrivacy,
+  projectStatsPrivacy,
+  sanitizePrivacyText,
   trustedVerificationCommand,
 } from "../src/reporters/privacy.js";
 import {
   renderStatsJson,
   renderStatsTty,
   summarizeStats,
+  type StatsReport,
 } from "../src/reporters/stats.js";
 import {
   renderTtyReport,
@@ -135,7 +138,8 @@ const PRIVACY_SOURCE =
   "/Users/alice/.claude/projects/SecretCo/session.jsonl";
 const PRIVACY_STORE =
   "/Users/alice/.ccprof/SecretCo/analyses/private.json";
-const PRIVACY_SESSION = "session-AZ09_SECRET_SESSION";
+const PRIVACY_SESSION =
+  "session-550e8400-e29b-41d4-a716-446655440001";
 const PRIVACY_URL =
   "https://github.internal.example/SecretCo/tickets/ENG-421";
 const PRIVACY_TICKET = "ENG-421";
@@ -224,6 +228,138 @@ function assertPrivacyCanariesAbsent(value: string): void {
   ]) {
     assert.ok(!value.includes(canary), `privacy leak: ${canary}`);
   }
+}
+
+const STATS_PRIVACY_WINDOWS_PATH =
+  String.raw`C:\Users\alice\SecretCo\ccprof\private.txt`;
+const STATS_PRIVACY_UNC_PATH =
+  String.raw`\\corp-files\ccprof\private.txt`;
+const STATS_PRIVACY_SESSION =
+  "session-550e8400-e29b-41d4-a716-446655440000";
+const STATS_PRIVACY_ARGV_SECRET = "ARGV_SECRET_123456789";
+const STATS_PRIVACY_KEY =
+  `${PRIVACY_REPO}:${STATS_PRIVACY_SESSION}:${PRIVACY_TOKEN}`;
+const STATS_PRIVACY_CANARIES = [
+  PRIVACY_REPO,
+  PRIVACY_SOURCE,
+  STATS_PRIVACY_WINDOWS_PATH,
+  STATS_PRIVACY_UNC_PATH,
+  PRIVACY_URL,
+  PRIVACY_TOKEN,
+  STATS_PRIVACY_SESSION,
+  STATS_PRIVACY_ARGV_SECRET,
+] as const;
+
+function statsPrivacyReport(): StatsReport {
+  const privateText = [
+    PRIVACY_REPO,
+    PRIVACY_SOURCE,
+    STATS_PRIVACY_WINDOWS_PATH,
+    STATS_PRIVACY_UNC_PATH,
+    PRIVACY_URL,
+    PRIVACY_TOKEN,
+    STATS_PRIVACY_SESSION,
+  ].join(" ");
+  return {
+    history_count: 7,
+    baseline_metrics: [{ metric: `metric ${privateText}`, value: 0.42, baseline: 0.17 }],
+    chronic_commands: [{
+      command: "npm test",
+      command_identity: {
+        repo_relative_cwd: ".",
+        normalized_argv: ["npm", "test"],
+        executor: "shell",
+      },
+      presence_count: 4,
+      cost_ratio: 0.57,
+      estimated_min: 12.25,
+    }, {
+      command: "[redacted-command]",
+      presence_count: 3,
+      cost_ratio: 0.43,
+      estimated_min: 8.5,
+    }, {
+      command: `${PRIVACY_COMMAND} ${STATS_PRIVACY_WINDOWS_PATH}`,
+      presence_count: 2,
+      cost_ratio: 0.29,
+      estimated_min: 6.75,
+    }, {
+      command: "npm test",
+      command_identity: {
+        repo_relative_cwd: PRIVACY_REPO,
+        normalized_argv: [
+          "npm",
+          "test",
+          `--password=${STATS_PRIVACY_ARGV_SECRET}`,
+          STATS_PRIVACY_UNC_PATH,
+        ],
+        executor: "native-tool",
+      },
+      presence_count: 2,
+      cost_ratio: 0.29,
+      estimated_min: 5.25,
+    }],
+    rule_minutes: [
+      { rule_id: "R001", minutes: 4.25 },
+      { rule_id: "R007", minutes: 9.5 },
+    ],
+    recurring_findings: [{
+      finding_key: STATS_PRIVACY_KEY,
+      rule_id: "R002",
+      title: `Recurring ${privateText}`,
+      occurrence_count: 3,
+      first_min: 12.5,
+      first_bound: "point",
+      last_min: 2.75,
+      last_bound: "upper",
+      trend: "indeterminate",
+    }],
+    adoptions: [{
+      finding_key: STATS_PRIVACY_KEY,
+      rule_id: "R002",
+      title: `Adopted ${privateText}`,
+      method: "target_file_edit",
+      detected_at_ms: 1_785_628_800_123,
+      analyses_after: 5,
+      recurrences_after: 1,
+      minutes_before: 12.5,
+      minutes_after: 2.75,
+      status: "recurred",
+    }],
+    adoption_coverage: { detectable: 8, undetectable: 2 },
+  };
+}
+
+function statsPrivacyPreservedFields(stats: StatsReport): unknown {
+  return {
+    history_count: stats.history_count,
+    baseline_metrics: stats.baseline_metrics.map(({ value, baseline }) => ({ value, baseline })),
+    chronic_commands: stats.chronic_commands.map(
+      ({ presence_count, cost_ratio, estimated_min }) =>
+        ({ presence_count, cost_ratio, estimated_min }),
+    ),
+    rule_minutes: stats.rule_minutes,
+    recurring_findings: stats.recurring_findings.map((entry) => ({
+      rule_id: entry.rule_id,
+      occurrence_count: entry.occurrence_count,
+      first_min: entry.first_min,
+      first_bound: entry.first_bound,
+      last_min: entry.last_min,
+      last_bound: entry.last_bound,
+      trend: entry.trend,
+    })),
+    adoptions: stats.adoptions.map((entry) => ({
+      rule_id: entry.rule_id,
+      method: entry.method,
+      detected_at_ms: entry.detected_at_ms,
+      analyses_after: entry.analyses_after,
+      recurrences_after: entry.recurrences_after,
+      minutes_before: entry.minutes_before,
+      minutes_after: entry.minutes_after,
+      status: entry.status,
+    })),
+    adoption_coverage: stats.adoption_coverage,
+  };
 }
 
 function terminalAttack(marker: string): string {
@@ -613,6 +749,35 @@ test("CLI parser accepts privacy profiles once in separated or inline form", () 
     ["--privacy=strict", "--privacy", "raw"],
   ]) {
     assert.throws(() => parseCliArgs(args), CliUsageError, args.join(" "));
+  }
+});
+
+test("stats CLI parser accepts privacy profiles with analyze-equivalent errors", () => {
+  for (const privacy of ["strict", "balanced", "raw"] as const) {
+    assert.deepEqual(parseCliArgs(["stats", "--privacy", privacy, "--json"]), {
+      kind: "stats",
+      json: true,
+      privacy,
+    });
+    assert.deepEqual(parseCliArgs(["stats", `--privacy=${privacy}`]), {
+      kind: "stats",
+      json: false,
+      privacy,
+    });
+  }
+
+  for (const [args, message] of [
+    [["--privacy"], "--privacy requires a value"],
+    [["--privacy="], "--privacy requires a value"],
+    [["--privacy", "unknown"], "--privacy must be strict, balanced, or raw"],
+    [["--privacy=STRICT"], "--privacy must be strict, balanced, or raw"],
+    [["--privacy=strict", "--privacy", "raw"], "--privacy was specified twice"],
+  ] as const) {
+    assert.throws(
+      () => parseCliArgs(["stats", ...args]),
+      (error) => error instanceof CliUsageError && error.message === message,
+      args.join(" "),
+    );
   }
 });
 
@@ -1148,6 +1313,107 @@ test("shared privacy uses stable finding references and redacts untrusted verifi
   assert.match(renderMarkdownReport(strict), new RegExp(reference, "u"));
 });
 
+test("stats raw privacy returns the report and keeps JSON and TTY bytes unchanged", () => {
+  const raw = statsPrivacyReport();
+  const projected = projectStatsPrivacy(raw, "raw", PRIVACY_REPO);
+
+  assert.equal(projected, raw);
+  assert.equal(renderStatsJson(projected), renderStatsJson(raw));
+  assert.equal(renderStatsTty(projected), renderStatsTty(raw));
+});
+
+test("privacy keeps ordinary session-prefixed prose", () => {
+  const prose = "session-based session-level session-scoped metrics";
+  for (const profile of ["strict", "balanced"] as const) {
+    assert.equal(sanitizePrivacyText(prose, profile, PRIVACY_REPO), prose);
+  }
+});
+
+test("stats display privacy aliases keys, removes canaries, and preserves facts", () => {
+  const raw = statsPrivacyReport();
+  const expectedReference = findingPrivacyReference(
+    PRIVACY_REPO,
+    STATS_PRIVACY_KEY,
+  );
+
+  for (const profile of ["strict", "balanced"] as const) {
+    const projected = projectStatsPrivacy(raw, profile, PRIVACY_REPO);
+    const rawOutput = renderStatsJson(raw);
+    const output = renderStatsJson(projected);
+
+    assert.equal(projected.recurring_findings[0]?.finding_key, expectedReference);
+    assert.equal(projected.adoptions[0]?.finding_key, expectedReference);
+    assert.equal(
+      projected.recurring_findings[0]?.finding_key,
+      projected.adoptions[0]?.finding_key,
+    );
+    assert.notEqual(
+      projected.baseline_metrics[0]?.metric,
+      raw.baseline_metrics[0]?.metric,
+    );
+    assert.notEqual(
+      projected.recurring_findings[0]?.title,
+      raw.recurring_findings[0]?.title,
+    );
+    assert.notEqual(projected.adoptions[0]?.title, raw.adoptions[0]?.title);
+    assert.deepEqual(
+      statsPrivacyPreservedFields(projected),
+      statsPrivacyPreservedFields(raw),
+    );
+    for (const canary of STATS_PRIVACY_CANARIES) {
+      const serialized = JSON.stringify(canary).slice(1, -1);
+      assert.ok(rawOutput.includes(serialized), `fixture lacks ${canary}`);
+      assert.ok(!output.includes(serialized), `${profile} leaked ${canary}`);
+    }
+  }
+});
+
+test("stats command privacy is allowlisted, deterministic, and non-mutating", () => {
+  const raw = statsPrivacyReport();
+  const before = structuredClone(raw);
+  const strict = projectStatsPrivacy(raw, "strict", PRIVACY_REPO);
+  const balanced = projectStatsPrivacy(raw, "balanced", PRIVACY_REPO);
+
+  assert.deepEqual(
+    strict.chronic_commands.map((entry) => entry.command),
+    ["npm test", "[redacted-command]", "[redacted-command]", "npm test"],
+  );
+  assert.ok(strict.chronic_commands.every(
+    (entry) => entry.command === "npm test" ||
+      entry.command === "[redacted-command]",
+  ));
+  assert.ok(strict.chronic_commands.every(
+    (entry) => !("command_identity" in entry),
+  ));
+
+  assert.equal(balanced.chronic_commands[0]?.command, "npm test");
+  assert.deepEqual(balanced.chronic_commands[0]?.command_identity, {
+    repo_relative_cwd: ".",
+    normalized_argv: ["npm", "test"],
+    executor: "shell",
+  });
+  assert.equal(balanced.chronic_commands[1]?.command, "[redacted-command]");
+  assert.equal(balanced.chronic_commands[2]?.command, "[redacted-command]");
+  assert.equal(balanced.chronic_commands[3]?.command, "npm test");
+  assert.equal("command_identity" in balanced.chronic_commands[3]!, false);
+
+  assert.deepEqual(raw, before);
+  assert.notEqual(strict, raw);
+  assert.notEqual(strict.chronic_commands, raw.chronic_commands);
+  assert.notEqual(
+    strict.chronic_commands[0]?.command_identity,
+    raw.chronic_commands[0]?.command_identity,
+  );
+  assert.deepEqual(
+    projectStatsPrivacy(raw, "strict", PRIVACY_REPO),
+    strict,
+  );
+  assert.deepEqual(
+    projectStatsPrivacy(raw, "balanced", PRIVACY_REPO),
+    balanced,
+  );
+});
+
 test("verification trust is limited to rule-specific fixed recipes", () => {
   const trust = (ruleId: Finding["rule_id"], verify: string) =>
     trustedVerificationCommand(finding(1, {
@@ -1360,6 +1626,83 @@ test("CI selects strict privacy and scrubs operational error paths", async () =>
   }), 0);
   assert.match(rawStderr, new RegExp(PRIVACY_SOURCE, "u"));
   assertTerminalAttackRemoved(rawStderr, "RAW_WARNING");
+});
+
+test("stats privacy defaults locally, honors local selection, and cannot weaken CI", async () => {
+  const quiet = (_value: string): void => undefined;
+  const scenarios = [
+    { args: ["stats", "--json"], ci: false, expected: "balanced" },
+    { args: ["stats", "--privacy=strict"], ci: false, expected: "strict" },
+    { args: ["stats", "--privacy=balanced"], ci: false, expected: "balanced" },
+    { args: ["stats", "--privacy=raw"], ci: false, expected: "raw" },
+    { args: ["stats", "--json"], ci: true, expected: "strict" },
+    { args: ["stats", "--privacy=balanced"], ci: true, expected: "strict" },
+    { args: ["stats", "--privacy=raw"], ci: true, expected: "strict" },
+  ] as const;
+
+  for (const scenario of scenarios) {
+    let dispatchedPrivacy: string | undefined;
+    const code = await runCli(scenario.args, {
+      ci: scenario.ci,
+      handlers: {
+        ...handlers(),
+        stats: async (options) => {
+          dispatchedPrivacy = (options as { privacy?: string }).privacy;
+          return { stdout: "{}", warnings: [] };
+        },
+      },
+      stdout: quiet,
+      stderr: quiet,
+    });
+    assert.equal(code, 0, scenario.args.join(" "));
+    assert.equal(dispatchedPrivacy, scenario.expected, scenario.args.join(" "));
+  }
+});
+
+test("stats active privacy covers warnings, parser failures, and operational failures", async () => {
+  const quiet = (_value: string): void => undefined;
+  let balancedWarning = "";
+  assert.equal(await runCli(["stats", "--json"], {
+    ci: false,
+    cwd: PRIVACY_REPO,
+    handlers: {
+      ...handlers(),
+      stats: async () => ({
+        stdout: "{}",
+        warnings: [`could not read ${PRIVACY_EXTERNAL_PATH}`],
+      }),
+    },
+    stdout: quiet,
+    stderr: (value) => {
+      balancedWarning += value;
+    },
+  }), 0);
+  assert.doesNotMatch(balancedWarning, new RegExp(PRIVACY_EXTERNAL_PATH, "u"));
+  assert.match(balancedWarning, /\[path\]/u);
+
+  for (const scenario of ["parser", "handler"] as const) {
+    let stderr = "";
+    const args = scenario === "parser"
+      ? ["stats", "--privacy=raw", `--unknown=${PRIVACY_EXTERNAL_PATH}`]
+      : ["stats", "--privacy=balanced"];
+    const code = await runCli(args, {
+      ci: true,
+      cwd: PRIVACY_REPO,
+      handlers: {
+        ...handlers(),
+        stats: async () => {
+          throw new Error(`could not read ${PRIVACY_EXTERNAL_PATH}`);
+        },
+      },
+      stdout: quiet,
+      stderr: (value) => {
+        stderr += value;
+      },
+    });
+    assert.equal(code, scenario === "parser" ? 2 : 5);
+    assert.match(stderr, /analysis failed \(details hidden by strict privacy\)/u);
+    assert.doesNotMatch(stderr, new RegExp(PRIVACY_EXTERNAL_PATH, "u"));
+  }
 });
 
 const storePaths: StorePaths = {
@@ -2294,7 +2637,7 @@ test("runStatsCommand loads adoptions and threads them into the summary", async 
   let loadAdoptionsCalledWith: StorePaths | undefined;
 
   const result = await runStatsCommand(
-    { cwd: "/repo", json: true },
+    { cwd: "/repo", json: true, privacy: "raw" },
     {
       resolveRepoRoot: async () => "/repo",
       resolveStorePaths: async () => paths,
@@ -2314,4 +2657,89 @@ test("runStatsCommand loads adoptions and threads them into the summary", async 
     "orphan-key",
     "recurred-key",
   ]);
+});
+
+test("runStatsCommand projects reports and Store warnings without mutation", async () => {
+  const records = adoptionFixtureRecords();
+  const adoptions = adoptionFixtureAdoptions();
+  const privateWarning = [
+    PRIVACY_EXTERNAL_PATH,
+    STATS_PRIVACY_WINDOWS_PATH,
+    STATS_PRIVACY_UNC_PATH,
+    PRIVACY_URL,
+    PRIVACY_TOKEN,
+    STATS_PRIVACY_SESSION,
+  ].join(" ");
+  const historyWarnings = [{
+    code: "private-row",
+    message: `history ${privateWarning}`,
+    path: PRIVACY_SOURCE,
+  }];
+  const adoptionWarnings = [{
+    code: "private-row",
+    message: `adoption ${privateWarning}`,
+    path: PRIVACY_STORE,
+  }];
+  const before = structuredClone({
+    records,
+    adoptions,
+    historyWarnings,
+    adoptionWarnings,
+  });
+  const dependencies = {
+    resolveRepoRoot: async () => PRIVACY_REPO,
+    resolveStorePaths: async () => storePaths,
+    loadAnalyses: async () => ({ records, warnings: historyWarnings }),
+    loadAdoptions: async () => ({ records: adoptions, warnings: adoptionWarnings }),
+  };
+
+  const raw = await runStatsCommand(
+    { cwd: PRIVACY_REPO, json: true, privacy: "raw" },
+    dependencies,
+  );
+  assert.equal(raw.stdout, renderStatsJson(summarizeStats(records, adoptions)));
+  assert.deepEqual(raw.warnings, [
+    `[private-row] history ${privateWarning} (${PRIVACY_SOURCE})`,
+    `[private-row] adoption ${privateWarning} (${PRIVACY_STORE})`,
+  ]);
+
+  for (const profile of ["strict", "balanced"] as const) {
+    const result = await runStatsCommand(
+      { cwd: PRIVACY_REPO, json: true, privacy: profile },
+      dependencies,
+    );
+    const projected = JSON.parse(result.stdout) as StatsReport;
+    const reference = findingPrivacyReference(PRIVACY_REPO, "recurred-key");
+    assert.equal(
+      projected.recurring_findings.find((entry) =>
+        entry.rule_id === "R002"
+      )?.finding_key,
+      reference,
+    );
+    assert.equal(
+      projected.adoptions.find((entry) => entry.rule_id === "R002")?.finding_key,
+      reference,
+    );
+    assert.doesNotMatch(result.stdout, /recurred-key/u);
+    if (profile === "strict") {
+      assert.deepEqual(result.warnings, ["[private-row] 2 warnings"]);
+    } else {
+      assert.equal(result.warnings.length, 2);
+      assert.ok(result.warnings.every((warning) => warning.includes("[path]")));
+    }
+    for (const canary of [
+      PRIVACY_EXTERNAL_PATH,
+      STATS_PRIVACY_WINDOWS_PATH,
+      STATS_PRIVACY_UNC_PATH,
+      PRIVACY_URL,
+      PRIVACY_TOKEN,
+      STATS_PRIVACY_SESSION,
+      PRIVACY_SOURCE,
+      PRIVACY_STORE,
+    ]) {
+      assert.ok(!result.warnings.join("\n").includes(canary), `${profile} warning leaked ${canary}`);
+    }
+  }
+
+  assert.deepEqual({ records, adoptions, historyWarnings, adoptionWarnings }, before);
 });
