@@ -1,11 +1,8 @@
-import { readFile } from "node:fs/promises";
-
 import type { RuleId, Scope } from "../core/model.js";
-import {
-  type StoreWarning,
-  writeJsonAtomically,
-} from "./analyses.js";
+import type { StoreWarning } from "./analyses.js";
+import { canonicalJson, readLegacyJson } from "./legacy-json.js";
 import type { StorePaths } from "./paths.js";
+import { openStoreDatabase, storeDatabasePath } from "./sqlite.js";
 
 export type AdoptionMethod = "claude_md_edit" | "target_file_edit";
 
@@ -44,18 +41,6 @@ const METHODS = new Set(["claude_md_edit", "target_file_edit"]);
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function errorCode(error: unknown): string | undefined {
-  if (
-    error !== null &&
-    typeof error === "object" &&
-    "code" in error &&
-    typeof error.code === "string"
-  ) {
-    return error.code;
-  }
-  return undefined;
 }
 
 function errorMessage(error: unknown): string {
@@ -107,30 +92,94 @@ function dedupeByFindingKey(
     .sort((left, right) => left.finding_key.localeCompare(right.finding_key));
 }
 
+type StoreDatabase = ReturnType<typeof openStoreDatabase>;
+type AdoptionRow = { finding_key: string; detected_at_ms: number; record_json: string };
+const LEGACY_ADOPTIONS_MIGRATION = "legacy-adoptions-json-v1";
+
+function closeDatabase(database: StoreDatabase | undefined): void {
+  try { database?.close(); } catch { /* Preserve the operation result. */ }
+}
+
+function storeWarning(code: string, message: string, path: string): StoreWarning {
+  return { code, message, path };
+}
+
+function scanLegacyAdoptions(paths: StorePaths): AdoptionLoadResult {
+  const read = readLegacyJson(paths.adoptions_path);
+  if (read.kind === "missing") return { records: [], warnings: [] };
+  if (read.kind === "corrupt" || !isAdoptionFile(read.value)) {
+    const message = read.kind === "corrupt"
+      ? read.message : "unsupported or invalid adoption file";
+    return { records: [], warnings: [storeWarning("corrupt_adoptions",
+      `Adoption history was skipped: ${message}`, paths.adoptions_path)] };
+  }
+  return { records: dedupeByFindingKey(read.value.adoptions), warnings: [] };
+}
+
+function migrationComplete(database: StoreDatabase): boolean {
+  return database.prepare("SELECT 1 FROM store_migrations WHERE name = ?")
+    .get(LEGACY_ADOPTIONS_MIGRATION) !== undefined;
+}
+
+function migrateLegacyAdoptions(
+  database: StoreDatabase,
+  paths: StorePaths,
+): StoreWarning[] {
+  if (migrationComplete(database)) return [];
+  const scanned = scanLegacyAdoptions(paths);
+  return database.transaction(() => {
+    if (migrationComplete(database)) return [];
+    const insert = database.prepare(`INSERT INTO adoptions
+      (finding_key, detected_at_ms, record_json) VALUES (?, ?, ?)
+      ON CONFLICT(finding_key) DO NOTHING`);
+    for (const record of scanned.records) {
+      insert.run(record.finding_key, record.detected_at_ms, canonicalJson(record));
+    }
+    database.prepare("INSERT INTO store_migrations(name, completed_at_ms) VALUES (?, ?)")
+      .run(LEGACY_ADOPTIONS_MIGRATION, Date.now());
+    return scanned.warnings;
+  }).immediate();
+}
+
+function parseAdoptionRow(row: AdoptionRow): AdoptionRecord {
+  const value = JSON.parse(row.record_json) as unknown;
+  if (!isAdoptionRecord(value) || canonicalJson(value) !== row.record_json ||
+    value.finding_key !== row.finding_key || value.detected_at_ms !== row.detected_at_ms) {
+    throw new TypeError("unsupported, non-canonical, or mismatched adoption record");
+  }
+  return value;
+}
+
 export async function loadAdoptions(
   paths: StorePaths,
 ): Promise<AdoptionLoadResult> {
+  const warnings: StoreWarning[] = [];
+  let database: StoreDatabase | undefined;
   try {
-    const value = JSON.parse(
-      await readFile(paths.adoptions_path, "utf8"),
-    ) as unknown;
-    if (!isAdoptionFile(value)) {
-      throw new TypeError("unsupported or invalid adoption file");
+    database = openStoreDatabase(paths);
+    try { warnings.push(...migrateLegacyAdoptions(database, paths)); }
+    catch (error) {
+      warnings.push(storeWarning("corrupt_adoptions",
+        `Adoption history could not be migrated: ${errorMessage(error)}`,
+        paths.adoptions_path));
     }
-    return { records: dedupeByFindingKey(value.adoptions), warnings: [] };
+    const rows = database.prepare(`SELECT finding_key, detected_at_ms, record_json
+      FROM adoptions ORDER BY finding_key`).all() as AdoptionRow[];
+    const records: AdoptionRecord[] = [];
+    for (const row of rows) {
+      try { records.push(parseAdoptionRow(row)); }
+      catch (error) {
+        warnings.push(storeWarning("corrupt_adoptions",
+          `Adoption record was skipped: ${errorMessage(error)}`,
+          `${storeDatabasePath(paths)}#adoptions/${row.finding_key}`));
+      }
+    }
+    return { records: dedupeByFindingKey(records), warnings };
   } catch (error) {
-    if (errorCode(error) === "ENOENT") {
-      return { records: [], warnings: [] };
-    }
-    return {
-      records: [],
-      warnings: [{
-        code: "corrupt_adoptions",
-        message: `Adoption history was skipped: ${errorMessage(error)}`,
-        path: paths.adoptions_path,
-      }],
-    };
-  }
+    return { records: [], warnings: [...warnings, storeWarning("corrupt_adoptions",
+      `Adoption history could not be read: ${errorMessage(error)}`,
+      storeDatabasePath(paths))] };
+  } finally { closeDatabase(database); }
 }
 
 export async function saveAdoptions(
@@ -138,17 +187,25 @@ export async function saveAdoptions(
   records: readonly AdoptionRecord[],
 ): Promise<StoreWarning[]> {
   const deduped = dedupeByFindingKey(records);
+  if (deduped.length === 0) return [];
+  const warnings: StoreWarning[] = [];
+  const targetPath = storeDatabasePath(paths);
+  let database: StoreDatabase | undefined;
   try {
-    await writeJsonAtomically(paths.adoptions_path, {
-      schema_version: 1,
-      adoptions: deduped,
-    } satisfies AdoptionFile);
-    return [];
+    database = openStoreDatabase(paths);
+    const store = database;
+    warnings.push(...migrateLegacyAdoptions(store, paths));
+    store.transaction(() => {
+      const insert = store.prepare(`INSERT INTO adoptions
+        (finding_key, detected_at_ms, record_json) VALUES (?, ?, ?)
+        ON CONFLICT(finding_key) DO NOTHING`);
+      for (const record of deduped) {
+        insert.run(record.finding_key, record.detected_at_ms, canonicalJson(record));
+      }
+    }).immediate();
   } catch (error) {
-    return [{
-      code: "adoption_write_failed",
-      message: `Adoptions could not be persisted: ${errorMessage(error)}`,
-      path: paths.adoptions_path,
-    }];
-  }
+    warnings.push(storeWarning("adoption_write_failed",
+      `Adoptions could not be persisted: ${errorMessage(error)}`, targetPath));
+  } finally { closeDatabase(database); }
+  return warnings;
 }
