@@ -586,6 +586,8 @@ test("rules CLI parsing accepts only list and canonical explain commands", () =>
     ["rules", "explain", "R004", "extra"],
     ["rules", "explain", "r004"],
     ["rules", "explain", "R999"],
+    ["rules", "list", "--help"],
+    ["rules", "explain", "R004", "--version"],
   ]) {
     assert.throws(() => parseCliArgs(args), CliUsageError, args.join(" "));
   }
@@ -621,8 +623,10 @@ test("rules CLI emits deterministic pretty JSON without handlers or private stat
 test("rules CLI rejects unknown input with actionable sanitized usage", async () => {
   for (const args of [
     ["rules", "explain", "R999"],
+    ["rules", "explain", "/private/repository/token-secret"],
     ["rules", "delete"],
     ["rules", "list", "extra"],
+    ["rules", "list", "--help"],
   ]) {
     let stdout = "";
     let stderr = "";
@@ -651,5 +655,14 @@ test("unknown rule lookup fails without a partial result", () => {
   assert.throws(
     () => ruleManifest("R999"),
     /unknown rule id.*R001.*R008/u,
+  );
+  assert.throws(
+    () => ruleManifest("/private/repository/token-secret"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /unknown rule id.*R001.*R008/u);
+      assert.doesNotMatch(error.message, /private|token-secret/u);
+      return true;
+    },
   );
 });
