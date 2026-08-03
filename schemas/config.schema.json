@@ -44,6 +44,35 @@
           }
         }
       }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "minimum_privacy": {
+          "enum": ["strict", "balanced", "raw"]
+        },
+        "allow_raw": {
+          "type": "boolean"
+        },
+        "allow_advisory": {
+          "type": "boolean"
+        },
+        "allow_export": {
+          "type": "boolean"
+        },
+        "raw_retention_days_max": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "required_source_coverage": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
     }
   }
 }

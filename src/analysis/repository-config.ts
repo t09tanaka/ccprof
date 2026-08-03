@@ -7,11 +7,26 @@ import {
   TestMapError,
   type TestMap,
 } from "./test-map.js";
+import type { RepositoryPolicyPreferences } from
+  "../policy/organization-policy.js";
 
 const CONFIG_PATH = ".ccprof/config.json";
-const CONFIG_KEYS = new Set(["$schema", "schema_version", "test_map"]);
+const CONFIG_KEYS = new Set([
+  "$schema",
+  "schema_version",
+  "test_map",
+  "policy",
+]);
 const TEST_MAP_KEYS = new Set(["mappings"]);
 const MAPPING_KEYS = new Set(["source", "tests", "commands"]);
+const POLICY_KEYS = new Set([
+  "minimum_privacy",
+  "allow_raw",
+  "allow_advisory",
+  "allow_export",
+  "raw_retention_days_max",
+  "required_source_coverage",
+]);
 const SAFE_IO_CODES = new Set([
   "EACCES",
   "EBADF",
@@ -92,7 +107,95 @@ function validateClosedTestMap(value: unknown): void {
   });
 }
 
-function parseConfig(text: string): TestMap {
+interface ParsedRepositoryConfig {
+  testMap: TestMap;
+  policy: RepositoryPolicyPreferences;
+}
+
+function emptyConfig(): ParsedRepositoryConfig {
+  return {
+    testMap: { mappings: [], caveats: [] },
+    policy: {},
+  };
+}
+
+function assertOptionalPrivacy(
+  value: unknown,
+): asserts value is RepositoryPolicyPreferences["minimum_privacy"] {
+  if (
+    value !== undefined && value !== "strict" &&
+    value !== "balanced" && value !== "raw"
+  ) {
+    throw new RepositoryConfigError("policy contains invalid values");
+  }
+}
+
+function assertOptionalBoolean(
+  value: unknown,
+): asserts value is boolean | undefined {
+  if (value !== undefined && typeof value !== "boolean") {
+    throw new RepositoryConfigError("policy contains invalid values");
+  }
+}
+
+function assertOptionalRetention(
+  value: unknown,
+): asserts value is number | undefined {
+  if (
+    value !== undefined &&
+    (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
+  ) {
+    throw new RepositoryConfigError("policy contains invalid values");
+  }
+}
+
+function assertOptionalCoverage(
+  value: unknown,
+): asserts value is number | undefined {
+  if (
+    value !== undefined &&
+    (typeof value !== "number" || !Number.isFinite(value) ||
+      value < 0 || value > 1)
+  ) {
+    throw new RepositoryConfigError("policy contains invalid values");
+  }
+}
+
+function parsePolicyPreferences(
+  value: unknown,
+): RepositoryPolicyPreferences {
+  assertClosedObject(value, POLICY_KEYS, "policy");
+  const minimumPrivacy = value.minimum_privacy;
+  const allowRaw = value.allow_raw;
+  const allowAdvisory = value.allow_advisory;
+  const allowExport = value.allow_export;
+  const rawRetentionDaysMax = value.raw_retention_days_max;
+  const requiredSourceCoverage = value.required_source_coverage;
+  assertOptionalPrivacy(minimumPrivacy);
+  assertOptionalBoolean(allowRaw);
+  assertOptionalBoolean(allowAdvisory);
+  assertOptionalBoolean(allowExport);
+  assertOptionalRetention(rawRetentionDaysMax);
+  assertOptionalCoverage(requiredSourceCoverage);
+  return {
+    ...(minimumPrivacy === undefined
+      ? {}
+      : { minimum_privacy: minimumPrivacy }),
+    ...(allowRaw === undefined ? {} : { allow_raw: allowRaw }),
+    ...(allowAdvisory === undefined
+      ? {}
+      : { allow_advisory: allowAdvisory }),
+    ...(allowExport === undefined ? {} : { allow_export: allowExport }),
+    ...(rawRetentionDaysMax === undefined
+      ? {}
+      : { raw_retention_days_max: rawRetentionDaysMax }),
+    ...(requiredSourceCoverage === undefined
+      ? {}
+      : { required_source_coverage: requiredSourceCoverage }),
+  };
+}
+
+function parseConfig(text: string): ParsedRepositoryConfig {
   let value: unknown;
   try {
     value = JSON.parse(text) as unknown;
@@ -109,8 +212,18 @@ function parseConfig(text: string): TestMap {
   ) {
     throw new RepositoryConfigError("$schema must be a non-empty string");
   }
+  const policy = value.policy === undefined
+    ? {}
+    : parsePolicyPreferences(value.policy);
   if (value.test_map === undefined) {
-    return { mappings: [], caveats: [], config_schema_version: 1 };
+    return {
+      testMap: {
+        mappings: [],
+        caveats: [],
+        config_schema_version: 1,
+      },
+      policy,
+    };
   }
   validateClosedTestMap(value.test_map);
   let parsed: TestMap;
@@ -123,24 +236,29 @@ function parseConfig(text: string): TestMap {
     throw new RepositoryConfigError("test_map could not be validated");
   }
   return {
-    mappings: parsed.mappings.map((mapping) => ({
-      ...mapping,
-      origin: "config",
-      caveat: "Relevance is based on .ccprof/config.json.",
-    })),
-    caveats: parsed.caveats,
-    config_schema_version: 1,
+    testMap: {
+      mappings: parsed.mappings.map((mapping) => ({
+        ...mapping,
+        origin: "config",
+        caveat: "Relevance is based on .ccprof/config.json.",
+      })),
+      caveats: parsed.caveats,
+      config_schema_version: 1,
+    },
+    policy,
   };
 }
 
-export async function loadRepositoryConfig(repoRoot: string): Promise<TestMap> {
+async function loadRepositoryConfigDocument(
+  repoRoot: string,
+): Promise<ParsedRepositoryConfig> {
   const directoryPath = join(repoRoot, ".ccprof");
   const path = join(repoRoot, ".ccprof", "config.json");
   let directoryBefore: Stats;
   try {
     directoryBefore = await lstat(directoryPath);
   } catch (error) {
-    if (errorCode(error) === "ENOENT") return { mappings: [], caveats: [] };
+    if (errorCode(error) === "ENOENT") return emptyConfig();
     throw ioFailure(".ccprof cannot be inspected", error);
   }
   assertConfigDirectory(directoryBefore);
@@ -162,7 +280,7 @@ export async function loadRepositoryConfig(repoRoot: string): Promise<TestMap> {
     if (!sameIdentity(directoryBefore, directoryAfter)) {
       throw new RepositoryConfigError(".ccprof changed during lookup");
     }
-    return { mappings: [], caveats: [] };
+    return emptyConfig();
   }
   assertConfigFile(pathBefore);
 
@@ -213,4 +331,15 @@ export async function loadRepositoryConfig(repoRoot: string): Promise<TestMap> {
     }
   }
   return parseConfig(text);
+}
+
+export async function loadRepositoryConfig(repoRoot: string): Promise<TestMap> {
+  return (await loadRepositoryConfigDocument(repoRoot)).testMap;
+}
+
+export async function loadRepositoryPolicyPreferences(
+  repoRoot: string,
+): Promise<RepositoryPolicyPreferences> {
+  const policy = (await loadRepositoryConfigDocument(repoRoot)).policy;
+  return { ...policy };
 }
