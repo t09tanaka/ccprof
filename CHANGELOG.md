@@ -4,6 +4,52 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/) and this project adheres
 to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-08-03
+
+### Added
+
+- Explicit analysis-window controls (`--since` and `--commit-lookback`) with a
+  frozen resolution boundary, trusted reflog/session-transition inference,
+  hook-stop attribution, and event slicing so later or cross-branch activity
+  cannot leak into the selected PR.
+- An opt-in `--advisory` layer that appends locally requested LLM suggestions
+  without changing deterministic findings, persistence, or exit status.
+- Store v2 on SQLite with transactional migration from legacy JSON,
+  content-addressed analysis snapshots, execution deduplication, dismissal and
+  adoption persistence, retention GC, and explicit repository-data deletion.
+- Repository-owned versioned configuration through `.ccprof/config.json` and
+  its published JSON Schema.
+- A human-gated maintainer release skill plus a tag-only GitHub workflow that
+  verifies the published npm artifact before producing provenance, a
+  runtime-only SPDX SBOM, checksums, and GitHub Release assets.
+
+### Changed
+
+- Command identity is now canonicalized by working directory and propagated
+  through redundant-run, chronic-cost, and flaky-test analysis.
+- Tool-result status evidence is normalized at the source boundary and consumed
+  by rules instead of relying only on output-text heuristics.
+- Codex rollout ingestion now streams JSONL, while both transcript adapters
+  enforce bounded file, line, node, depth, retained-byte, and warning budgets.
+- Hook-event logs compact at a bounded size, and shared JSON, Markdown, and TTY
+  output is projected through explicit strict, balanced, or raw privacy
+  profiles before rendering.
+
+### Fixed
+
+- R002, R006, and R008 no longer combine commands that share text but execute
+  in different repository contexts.
+- Analysis attribution now excludes events outside the frozen time window and
+  preserves terminal parser-budget failures instead of masking them as partial
+  success.
+
+### Security
+
+- Local finding explanations use repository-bound opaque references, and only
+  fixed rule-authored verification recipes can be marked trusted.
+- Shared-output privacy redacts identities, paths, credentials, URLs, and
+  secret-bearing evidence without rewriting raw local Store records.
+
 ## [0.2.0] - 2026-08-03
 
 ### Added
@@ -95,5 +141,6 @@ Initial release.
 - Stable exit codes (0 success, 2 usage, 3 unresolved context, 4 no analyzable
   session, 5 unrecoverable error), plus `--help` / `-h` and `--version` / `-v`.
 
+[0.3.0]: https://github.com/t09tanaka/ccprof/compare/v0.2.0...v0.3.0
 [0.1.1]: https://github.com/t09tanaka/ccprof/releases/tag/v0.1.1
 [0.1.0]: https://github.com/t09tanaka/ccprof/releases/tag/v0.1.0
