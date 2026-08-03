@@ -98,7 +98,7 @@ line render ordered coverage for new reports and retain its old skipped text
 when coverage is absent. Do not modify README, `.github`, Store schema, or rule
 semantics.
 
-- [ ] **Step 4: Verify GREEN, review, and commit**
+- [x] **Step 4: Verify GREEN, review, and commit**
 
 Delegate focused tests, `npm run check`, and applicable local Actions commands.
 Obtain independent spec review then quality/security review, fixing only
@@ -107,8 +107,22 @@ P0-P2 issues caused by this change in new commits. Commit reporter/tests as
 
 ### Task 4: PR lifecycle
 
-- [ ] Rebase on current `origin/main` if needed and delegate a fresh full check.
+- [x] Rebase on current `origin/main` if needed and delegate a fresh full check.
 - [ ] Push `feature/capability-coverage` and open
   `[Capabilities] feat: evaluate rule coverage per session lane` against `main`.
 - [ ] Monitor all remote checks, merge with a merge commit after green, sync
   `main`, then run `worktree-pr-flow:cleanup` after its safety checks.
+
+### Verification evidence
+
+- Rebased without conflicts onto `origin/main` at `8b5a3b7`, then verified HEAD
+  `285d64b` from a clean worktree.
+- Independent specification and quality/security reviews found no P0-P2 issues.
+- Local Actions equivalents passed: typecheck; SQLite smoke plus 632/632 tests;
+  blocking aggregate; canary typecheck/smoke/tests; isolated package smoke;
+  determinism golden 1/1; and the executable CodeQL `npm ci`/build steps.
+- `dependency-review` was skipped because it requires GitHub PR/API context;
+  the tag-only release workflow was not applicable. Local matrix commands ran
+  on Darwin arm64 with Node 24.7, so hosted OS and Node 20/22/26 coverage remains
+  the responsibility of remote Actions.
+- `git diff --check origin/main...HEAD` passed and the worktree remained clean.
