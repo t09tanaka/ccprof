@@ -46,33 +46,33 @@ jobs:
       - run: node tools/smoke-better-sqlite3.cjs
       - run: npm test
 
-  node20-compatibility:
-    name: node20-compatibility
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  arm64-native-smoke:
+    name: arm64-native-smoke
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
       - run: npm ci
+      - run: node -e 'if (process.arch !== "arm64") process.exit(1)'
       - run: node tools/smoke-better-sqlite3.cjs
-      - run: npm test
 
   unit-and-integration-tests:
     name: unit-and-integration-tests
-    needs: [unit-and-integration-matrix, node20-compatibility]
+    needs: [unit-and-integration-matrix, arm64-native-smoke]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
       MATRIX_RESULT: ${{ needs.unit-and-integration-matrix.result }}
-      NODE20_RESULT: ${{ needs.node20-compatibility.result }}
+      ARM64_RESULT: ${{ needs.arm64-native-smoke.result }}
     steps:
       - name: Require every blocking runtime lane
         run: |
-          if [ "$MATRIX_RESULT" != "success" ] || [ "$NODE20_RESULT" != "success" ]; then
+          if [ "$MATRIX_RESULT" != "success" ] || [ "$ARM64_RESULT" != "success" ]; then
             exit 1
           fi
 

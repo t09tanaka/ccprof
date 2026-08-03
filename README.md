@@ -18,7 +18,7 @@ deterministic report.
 
 ## Requirements and installation
 
-- Node.js 20 or 22–25
+- Node.js 22.x and 24.x are the only supported runtimes; Node.js 20, 23, and 25 are EOL and unsupported.
 - `git`
 - `gh`, but only when resolving a PR number/URL or the current PR from GitHub
 
@@ -690,11 +690,15 @@ under the Node built-in test runner. `better-sqlite3` provides the embedded
 SQLite runtime; only `git`, and `gh` when needed, are invoked as external
 processes.
 
-CI keeps Node 20 as a blocking compatibility floor. Node 22 and 24 run in a
-blocking matrix on Ubuntu, macOS, and Windows; every lane loads and queries the
-native `better-sqlite3` addon before running the full suite. Node 26 is a
-non-blocking canary; Node 26 is not a support claim. The package's `engines`
-field remains authoritative for supported runtimes.
+Node.js 22.x and 24.x are the only supported runtimes. Node.js 20, 23, and 25
+are EOL and unsupported. Both supported lines run in a blocking matrix on
+Ubuntu, macOS, and Windows; every lane loads and queries the native
+`better-sqlite3` addon before running the full suite. A native ARM64
+`ubuntu-24.04-arm` job performs a clean install and runs the `better-sqlite3`
+smoke. The case-insensitive filesystem test uses an explicit capability skip
+on case-sensitive hosts; the Windows and macOS matrix lanes own that coverage.
+Node.js 26 remains a non-blocking canary and is not a support claim. The
+package's `engines` field remains authoritative for supported runtimes.
 
 ### Maintainer release
 
