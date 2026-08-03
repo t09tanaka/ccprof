@@ -490,6 +490,21 @@ test("estimated floor accepts only strict high-confidence critical lower bounds"
       expectedFloorMin: 1,
     },
     {
+      name: "low evidence",
+      impact: {
+        lower_ms: 30_000,
+        upper_ms: 60_000,
+        kind: "critical_path_latency",
+      },
+      confidence: {
+        evidence: "low",
+        causal: "high",
+        source_completeness: 1,
+      },
+      expectedIntervals: [],
+      expectedFloorMin: 1,
+    },
+    {
       name: "medium causal confidence",
       impact: {
         lower_ms: 30_000,
@@ -515,6 +530,36 @@ test("estimated floor accepts only strict high-confidence critical lower bounds"
         evidence: "high",
         causal: "high",
         source_completeness: 0.5,
+      },
+      expectedIntervals: [],
+      expectedFloorMin: 1,
+    },
+    {
+      name: "low causal confidence",
+      impact: {
+        lower_ms: 30_000,
+        upper_ms: 60_000,
+        kind: "critical_path_latency",
+      },
+      confidence: {
+        evidence: "high",
+        causal: "low",
+        source_completeness: 1,
+      },
+      expectedIntervals: [],
+      expectedFloorMin: 1,
+    },
+    {
+      name: "zero source completeness",
+      impact: {
+        lower_ms: 30_000,
+        upper_ms: 60_000,
+        kind: "critical_path_latency",
+      },
+      confidence: {
+        evidence: "high",
+        causal: "high",
+        source_completeness: 0,
       },
       expectedIntervals: [],
       expectedFloorMin: 1,
