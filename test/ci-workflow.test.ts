@@ -5,6 +5,7 @@ import test from "node:test";
 
 const CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1";
 const SETUP_NODE_SHA = "820762786026740c76f36085b0efc47a31fe5020";
+const SUPPORTED_NODE_ENGINES = "22.x || 24.x";
 
 async function readProjectFile(path: string): Promise<string> {
   return readFile(resolve(process.cwd(), path), "utf8");
@@ -98,7 +99,7 @@ function sectionBefore(text: string, start: string, end: string): string {
   return text.slice(startIndex, endIndex);
 }
 
-function assertRuntimeLane(block: string): void {
+function assertNativeInstallLane(block: string): void {
   assert.match(block, new RegExp(`actions/checkout@${CHECKOUT_SHA}`, "u"));
   assert.match(block, new RegExp(`actions/setup-node@${SETUP_NODE_SHA}`, "u"));
   assert.match(block, /^\s+cache:\s*npm\s*$/mu);
@@ -107,6 +108,10 @@ function assertRuntimeLane(block: string): void {
     block,
     /^\s+- run:\s*node tools\/smoke-better-sqlite3\.cjs\s*$/mu,
   );
+}
+
+function assertRuntimeLane(block: string): void {
+  assertNativeInstallLane(block);
   assert.match(block, /^\s+- run:\s*npm test\s*$/mu);
 }
 
@@ -139,8 +144,8 @@ test("CI keeps explicit permissions, concurrency, pinned actions, and timeouts",
   );
   const blocks = jobBlocks(workflow);
   assert.deepEqual([...blocks.keys()].sort(), [
+    "arm64-native-smoke",
     "determinism-golden",
-    "node20-compatibility",
     "node26-canary",
     "package-smoke",
     "typecheck",
@@ -186,13 +191,10 @@ test("CI has the exact six blocking Node 22 and 24 platform pairs", async () => 
   assertRuntimeLane(matrix);
 });
 
-test("Node 20 blocks while Node 26 is a separate nonblocking canary", async () => {
+test("CI excludes Node 20 while Node 26 remains a separate nonblocking canary", async () => {
   const workflow = await readProjectFile(".github/workflows/ci.yml");
-  const node20 = job(workflow, "node20-compatibility");
-  assert.match(node20, /runs-on:\s*ubuntu-latest/u);
-  assert.match(node20, /node-version:\s*20/u);
-  assert.doesNotMatch(node20, /continue-on-error/u);
-  assertRuntimeLane(node20);
+  assert.equal(jobBlocks(workflow).has("node20-compatibility"), false);
+  assert.doesNotMatch(workflow, /node20-compatibility|node-version:\s*20/u);
 
   const node26 = job(workflow, "node26-canary");
   assert.match(node26, /runs-on:\s*ubuntu-latest/u);
@@ -202,13 +204,28 @@ test("Node 20 blocks while Node 26 is a separate nonblocking canary", async () =
   assert.match(node26, /^\s+- run:\s*npm run typecheck\s*$/mu);
 });
 
+test("ARM64 native smoke is blocking, pinned, isolated, and runs on real ARM64", async () => {
+  const workflow = await readProjectFile(".github/workflows/ci.yml");
+  const arm64 = job(workflow, "arm64-native-smoke");
+  assert.match(arm64, /^\s+name:\s*arm64-native-smoke\s*$/mu);
+  assert.match(arm64, /^\s+runs-on:\s*ubuntu-24\.04-arm\s*$/mu);
+  assert.match(arm64, /^\s+node-version:\s*24\s*$/mu);
+  assert.doesNotMatch(arm64, /continue-on-error/u);
+  assertNativeInstallLane(arm64);
+  assert.match(
+    arm64,
+    /^\s+- run:\s*node -e ['"][^\r\n]*process\.arch[^\r\n]*arm64[^\r\n]*['"]\s*$/mu,
+  );
+  assert.doesNotMatch(arm64, /^\s+- run:\s*npm test\s*$/mu);
+});
+
 test("the legacy test name is an always-run success-only aggregate gate", async () => {
   const workflow = await readProjectFile(".github/workflows/ci.yml");
   const aggregate = job(workflow, "unit-and-integration-tests");
   assert.match(aggregate, /^\s+name:\s*unit-and-integration-tests\s*$/mu);
   assert.deepEqual(
     yamlList(aggregate, "needs").sort(),
-    ["node20-compatibility", "unit-and-integration-matrix"],
+    ["arm64-native-smoke", "unit-and-integration-matrix"],
   );
   assert.match(aggregate, /^    if:\s*\$\{\{\s*always\(\)\s*\}\}\s*$/mu);
   assert.doesNotMatch(aggregate, /^    continue-on-error:/mu);
@@ -218,17 +235,31 @@ test("the legacy test name is an always-run success-only aggregate gate", async 
   );
   assert.match(
     aggregate,
-    /NODE20_RESULT:\s*\$\{\{\s*needs\.node20-compatibility\.result\s*\}\}/u,
+    /ARM64_RESULT:\s*\$\{\{\s*needs\.arm64-native-smoke\.result\s*\}\}/u,
   );
   assert.match(
     aggregate,
-    /if \[ "\$MATRIX_RESULT" != "success" \] \|\| \[ "\$NODE20_RESULT" != "success" \]; then\s+exit 1\s+fi/u,
+    /if \[ "\$MATRIX_RESULT" != "success" \] \|\| \[ "\$ARM64_RESULT" != "success" \]; then\s+exit 1\s+fi/u,
   );
-  assert.doesNotMatch(aggregate, /node26-canary/u);
+  assert.doesNotMatch(aggregate, /node20-compatibility|node26-canary|NODE20_RESULT/u);
   assert.doesNotMatch(
     aggregate,
     /actions\/checkout|actions\/setup-node|npm ci|smoke-better-sqlite3|^\s+- run:\s*npm test\s*$/mu,
   );
+});
+
+test("package metadata supports exactly Node 22.x and 24.x", async () => {
+  const packageJson = JSON.parse(
+    await readProjectFile("package.json"),
+  ) as { engines?: unknown };
+  const lockfile = JSON.parse(
+    await readProjectFile("package-lock.json"),
+  ) as { packages?: Record<string, { engines?: unknown }> };
+
+  assert.deepEqual(packageJson.engines, { node: SUPPORTED_NODE_ENGINES });
+  assert.deepEqual(lockfile.packages?.[""]?.engines, {
+    node: SUPPORTED_NODE_ENGINES,
+  });
 });
 
 test("existing named checks and CodeQL use Node 24", async () => {
@@ -268,14 +299,28 @@ test("the native addon smoke is portable and closes its in-memory database", asy
   assert.match(smoke, /finally\s*\{[\s\S]*database\.close\(\)[\s\S]*\}/u);
 });
 
-test("documentation distinguishes supported runtimes from the Node 26 canary", async () => {
+test("documentation defines the supported, EOL, canary, ARM64, and case-folding contracts", async () => {
   const readme = await readProjectFile("README.md");
-  assert.match(readme, /Node(?:\.js)? 20[\s\S]{0,120}blocking/u);
   assert.match(
     readme,
-    /Node(?:\.js)? 22 and 24[\s\S]{0,240}Ubuntu[\s\S]{0,80}macOS[\s\S]{0,80}Windows/u,
+    /Node(?:\.js)? 22\.x and 24\.x[\s\S]{0,160}only supported/u,
+  );
+  assert.match(
+    readme,
+    /Node(?:\.js)? 20,? 23,? and 25[\s\S]{0,120}EOL[\s\S]{0,80}unsupported/u,
   );
   assert.match(readme, /Node(?:\.js)? 26[\s\S]{0,120}non-blocking[\s\S]{0,80}canary/u);
   assert.match(readme, /Node(?:\.js)? 26[\s\S]{0,160}not a support claim/u);
-  assert.match(readme, /`engines`[\s\S]{0,120}authoritative/u);
+  assert.match(
+    readme,
+    /ARM64[\s\S]{0,200}ubuntu-24\.04-arm[\s\S]{0,200}better-sqlite3/u,
+  );
+  assert.match(
+    readme,
+    /case-insensitive filesystem[\s\S]{0,240}(?:explicit|capability)[\s\S]{0,80}skip/u,
+  );
+  assert.match(
+    readme,
+    /case-insensitive filesystem[\s\S]{0,400}Windows[\s\S]{0,120}macOS[\s\S]{0,120}matrix/u,
+  );
 });
