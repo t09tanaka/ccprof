@@ -38,6 +38,12 @@ import {
   type AdoptionCandidateFinding,
 } from "../analysis/adoption.js";
 import {
+  AnalysisBudgetMeter,
+  systemAnalysisBudgetClock,
+  type AnalysisBudgetClock,
+  type AnalysisBudgets,
+} from "../analysis/budgets.js";
+import {
   isDelegationToolName,
   matchTimelineActions,
   type ActionObservation,
@@ -102,7 +108,10 @@ import {
 } from "../sources/claude/discover.js";
 import { CodexSessionSource } from "../sources/codex/discover.js";
 import { CombinedSessionSource } from "../sources/combined.js";
-import type { SessionSource } from "../sources/session-source.js";
+import {
+  admitSessionEventPrefix,
+  type SessionSource,
+} from "../sources/session-source.js";
 import {
   analysisDigest,
   computeBaseline,
@@ -159,6 +168,8 @@ export interface AnalyzeOptions {
    * use the default `true`. Defaults to `true`.
    */
   persist?: boolean;
+  budgets?: AnalysisBudgets;
+  budgetClock?: AnalysisBudgetClock;
 }
 
 export interface AnalyzeWarning {
@@ -358,6 +369,23 @@ function orderedEvents(sessions: readonly Session[]): NormalizedEvent[] {
         left.session_ref.localeCompare(right.session_ref) ||
         left.kind.localeCompare(right.kind),
     );
+}
+
+function backstopBudgetedSessions(
+  sessions: readonly Session[],
+  meter: AnalysisBudgetMeter,
+): Session[] {
+  const admitted: Session[] = [];
+  const sourcePaths = new Set<string>();
+  for (const session of sessions) {
+    if (!sourcePaths.has(session.source_path)) {
+      if (!meter.admitSourceItem()) break;
+      sourcePaths.add(session.source_path);
+    }
+    admitted.push(...admitSessionEventPrefix([session], meter));
+    if (meter.stopped) break;
+  }
+  return admitted;
 }
 
 function toolKey(
@@ -1068,9 +1096,98 @@ function adoptionCandidates(
     .filter((candidate) => detectability(candidate) !== "undetectable");
 }
 
+async function finishBudgetedPartialAnalysis(
+  options: AnalyzeOptions,
+  meter: AnalysisBudgetMeter,
+  context: PrContext,
+  window: AnalysisWindow,
+  sessions: readonly Session[],
+  inputWarnings: readonly AnalyzeWarning[],
+  resolvedPaths?: StorePaths,
+): Promise<AnalyzeResult> {
+  meter.checkpoint();
+  const warnings = [...inputWarnings];
+  const coverage = ruleCoverage(sessions, window.completeness);
+  const inapplicableRules = skippedRules(coverage);
+  warnings.push(...inapplicableRules.map(skippedRuleWarning));
+  const timeline = buildTimeline(sessions, {
+    ...(options.idleThresholdMs === undefined
+      ? {}
+      : { idleThresholdMs: options.idleThresholdMs }),
+  });
+  warnings.push(
+    ...timeline.caveats.map((message) => textWarning("timeline", message)),
+  );
+  const ledger = reconcileLedger({
+    rawIntervals: timeline.rawIntervals,
+    activeIntervals: timeline.activeIntervals,
+    contributingIntervals: [],
+    humanWaitIntervals: timeline.humanWaitIntervals,
+    candidates: [],
+  });
+  const persist = options.persist ?? true;
+  const paths = resolvedPaths ?? options.storePaths ??
+    (persist ? await resolveStorePaths(context.repoRoot) : undefined);
+  const unit = {
+    repo: paths?.canonical_repo ?? context.repoRoot,
+    pr_ref: context.prRef,
+    sessions: uniqueSorted(sessions.map(({ session_id }) => session_id)),
+  };
+  const analysisBudget = meter.result();
+  const record = makeAnalysisRecord({
+    created_at_ms: context.resolvedAtMs,
+    unit,
+    summary: ledger.summary,
+    findings: [],
+    metrics: analysisMetrics(timeline),
+    command_costs: [],
+    read_observations: [],
+    analysis_budget: analysisBudget,
+  });
+  const saveResult = persist
+    ? await saveAnalysis(paths as StorePaths, record)
+    : { record, warnings: [] as StoreWarning[] };
+  warnings.push(...saveResult.warnings.map(storeWarning));
+  const normalizedWarnings = normalizeWarnings(warnings);
+  const caveats = uniqueSorted([
+    ...KNOWN_LIMITATIONS,
+    ...normalizedWarnings.map(warningCaveat),
+  ]);
+  const storedBudget = saveResult.record.analysis_budget ?? analysisBudget;
+  const report: ReportV2 = {
+    version: 2,
+    unit,
+    sources: sourceDescriptorsForSessions(sessions),
+    summary: ledger.summary,
+    findings: [],
+    caveats,
+    rule_coverage: coverage,
+    ...(inapplicableRules.length === 0
+      ? {}
+      : { skipped_rules: inapplicableRules }),
+    analysis_budget: storedBudget,
+  };
+  return {
+    report,
+    window,
+    allFindings: [],
+    record: saveResult.record,
+    warnings: normalizedWarnings,
+    suppressedKeys: [],
+    ledger,
+    adoptions: [],
+  };
+}
+
 export async function analyze(
   options: AnalyzeOptions,
 ): Promise<AnalyzeResult> {
+  const budgetMeter = options.budgets === undefined
+    ? undefined
+    : new AnalysisBudgetMeter(
+        options.budgets,
+        options.budgetClock ?? systemAnalysisBudgetClock(),
+      );
   const context = await resolvePrContext({
     cwd: options.cwd,
     ...(options.pr === undefined ? {} : { input: options.pr }),
@@ -1082,6 +1199,16 @@ export async function analyze(
     textWarning("pr_context", message)
   );
   const provisionalWindow = resolveAnalysisWindow(context, options);
+  if (budgetMeter !== undefined && !budgetMeter.checkpoint()) {
+    return finishBudgetedPartialAnalysis(
+      options,
+      budgetMeter,
+      context,
+      provisionalWindow,
+      [],
+      warnings,
+    );
+  }
   // Only the default (Claude + Codex combined) source reports per-source
   // discovery failures this way; an injected sessionSource (tests, or a
   // future custom integration) keeps its original throw-propagates
@@ -1089,14 +1216,34 @@ export async function analyze(
   const sourceErrors: unknown[] = [];
   const source = options.sessionSource ??
     defaultSessionSource(options, (error) => sourceErrors.push(error));
-  const discoveredSessions = await source.discover({
-    repoRoot: context.repoRoot,
-    headBranch: context.headBranch,
-    startedAtMs: provisionalWindow.start_source === "commit_anchor_lookback"
-      ? 0
-      : provisionalWindow.started_at_ms,
-    endedAtMs: provisionalWindow.ended_at_ms,
-  });
+  let discoveredSessions: Session[];
+  try {
+    discoveredSessions = await source.discover({
+      repoRoot: context.repoRoot,
+      headBranch: context.headBranch,
+      startedAtMs: provisionalWindow.start_source === "commit_anchor_lookback"
+        ? 0
+        : provisionalWindow.started_at_ms,
+      endedAtMs: provisionalWindow.ended_at_ms,
+      ...(budgetMeter === undefined
+        ? {}
+        : { analysisBudgetMeter: budgetMeter }),
+    });
+  } catch (error) {
+    if (budgetMeter === undefined) throw error;
+    budgetMeter.recordSourceFailure();
+    discoveredSessions = [];
+  }
+  if (
+    budgetMeter !== undefined &&
+    source.budgetCooperative !== true &&
+    !budgetMeter.stopped
+  ) {
+    discoveredSessions = backstopBudgetedSessions(
+      discoveredSessions,
+      budgetMeter,
+    );
+  }
   const transitionAtMs = provisionalWindow.start_source ===
       "commit_anchor_lookback" && sourceErrors.length === 0
     ? deriveSessionBranchTransitionAtMs(
@@ -1124,6 +1271,20 @@ export async function analyze(
   let sessions = orderedSessions(
     sliceSessionsToAnalysisWindow(discoveredSessions, window),
   );
+  if (budgetMeter !== undefined &&
+    (budgetMeter.stopped || !budgetMeter.checkpoint())) {
+    warnings.push(
+      ...sessions.flatMap((session) => session.warnings.map(sourceWarning)),
+    );
+    return finishBudgetedPartialAnalysis(
+      options,
+      budgetMeter,
+      context,
+      window,
+      sessions,
+      warnings,
+    );
+  }
   if (sessions.length === 0) {
     // If discovery failed, surface that cause instead of the generic empty
     // result even when broad discovery returned only pre-window sessions.
@@ -1150,6 +1311,17 @@ export async function analyze(
   const paths = options.storePaths === undefined
     ? await resolveStorePaths(context.repoRoot)
     : options.storePaths;
+  if (budgetMeter !== undefined && !budgetMeter.checkpoint()) {
+    return finishBudgetedPartialAnalysis(
+      options,
+      budgetMeter,
+      context,
+      window,
+      sessions,
+      warnings,
+      paths,
+    );
+  }
   const hookEvents = await loadHookEvents(paths.hook_events_path);
   warnings.push(...hookEvents.warnings.map(storeWarning));
   sessions = applyHookEvents(
@@ -1160,6 +1332,17 @@ export async function analyze(
       discoveredSessionIdCounts.get(row.session_id) === 1
     ),
   );
+  if (budgetMeter !== undefined && !budgetMeter.checkpoint()) {
+    return finishBudgetedPartialAnalysis(
+      options,
+      budgetMeter,
+      context,
+      window,
+      sessions,
+      warnings,
+      paths,
+    );
+  }
 
   const coverage = ruleCoverage(sessions, window.completeness);
   const inapplicableRules = skippedRules(coverage);
@@ -1177,6 +1360,18 @@ export async function analyze(
     throw new NoAnalyzableTimestampsError();
   }
 
+  if (budgetMeter !== undefined && !budgetMeter.checkpoint()) {
+    return finishBudgetedPartialAnalysis(
+      options,
+      budgetMeter,
+      context,
+      window,
+      sessions,
+      warnings,
+      paths,
+    );
+  }
+
   const [diff, testMap] = await Promise.all([
     collectDiffEvidence({
       cwd: context.repoRoot,
@@ -1190,6 +1385,17 @@ export async function analyze(
     ...diff.caveats.map((message) => textWarning("git_diff", message)),
     ...testMap.caveats.map((message) => textWarning("test_map", message)),
   );
+  if (budgetMeter !== undefined && !budgetMeter.checkpoint()) {
+    return finishBudgetedPartialAnalysis(
+      options,
+      budgetMeter,
+      context,
+      window,
+      sessions,
+      warnings,
+      paths,
+    );
+  }
 
   const [historyResult, dismissalResult, adoptionResult] = await Promise.all([
     loadAnalyses(paths),
@@ -1201,6 +1407,17 @@ export async function analyze(
     ...dismissalResult.warnings.map(storeWarning),
     ...adoptionResult.warnings.map(storeWarning),
   );
+  if (budgetMeter !== undefined && !budgetMeter.checkpoint()) {
+    return finishBudgetedPartialAnalysis(
+      options,
+      budgetMeter,
+      context,
+      window,
+      sessions,
+      warnings,
+      paths,
+    );
+  }
   const history = priorRecords(historyResult.records, context);
   const persist = options.persist ?? true;
 
@@ -1216,12 +1433,34 @@ export async function analyze(
       ...(options.runner === undefined ? {} : { runner: options.runner }),
     });
     warnings.push(...adoptionDetection.warnings);
+    if (budgetMeter !== undefined && !budgetMeter.checkpoint()) {
+      return finishBudgetedPartialAnalysis(
+        options,
+        budgetMeter,
+        context,
+        window,
+        sessions,
+        warnings,
+        paths,
+      );
+    }
     mergedAdoptions = adoptionDetection.adoptions.length === 0
       ? adoptionResult.records
       : [...adoptionResult.records, ...adoptionDetection.adoptions];
     if (adoptionDetection.adoptions.length > 0) {
       const adoptionSaveWarnings = await saveAdoptions(paths, mergedAdoptions);
       warnings.push(...adoptionSaveWarnings.map(storeWarning));
+      if (budgetMeter !== undefined && !budgetMeter.checkpoint()) {
+        return finishBudgetedPartialAnalysis(
+          options,
+          budgetMeter,
+          context,
+          window,
+          sessions,
+          warnings,
+          paths,
+        );
+      }
     }
   }
   const adoptions = [...mergedAdoptions].sort(
@@ -1289,7 +1528,29 @@ export async function analyze(
     R007: evidenceLane(sessionLanes.R007),
     R008: evidenceLane(sessionLanes.R008),
   };
+  if (budgetMeter !== undefined && !budgetMeter.checkpoint()) {
+    return finishBudgetedPartialAnalysis(
+      options,
+      budgetMeter,
+      context,
+      window,
+      sessions,
+      warnings,
+      paths,
+    );
+  }
   const reads = await readObservations(matched, context, options.runner, warnings);
+  if (budgetMeter !== undefined && !budgetMeter.checkpoint()) {
+    return finishBudgetedPartialAnalysis(
+      options,
+      budgetMeter,
+      context,
+      window,
+      sessions,
+      warnings,
+      paths,
+    );
+  }
   const candidates = ruleCandidates(
     ruleLanes,
     history,
@@ -1330,6 +1591,8 @@ export async function analyze(
     ? preliminaryLedger
     : reconcileLedger({ ...ledgerInput, baseline });
   const allFindings = ledger.findings.map(withRuleManifest).sort(findingOrder);
+  budgetMeter?.checkpoint();
+  const analysisBudget = budgetMeter?.result();
   const record = makeAnalysisRecord({
     created_at_ms: context.resolvedAtMs,
     unit,
@@ -1338,6 +1601,9 @@ export async function analyze(
     metrics,
     command_costs: costs,
     read_observations: reads.observations,
+    ...(analysisBudget === undefined
+      ? {}
+      : { analysis_budget: analysisBudget }),
   });
   const saveResult = persist
     ? await saveAnalysis(paths, record, { snapshot: snapshotIdentity(
@@ -1372,6 +1638,9 @@ export async function analyze(
     ...(inapplicableRules.length === 0
       ? {}
       : { skipped_rules: inapplicableRules }),
+    ...(analysisBudget === undefined
+      ? {}
+      : { analysis_budget: analysisBudget }),
   };
   return {
     report,

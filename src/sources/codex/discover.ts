@@ -1,4 +1,4 @@
-import { readdir, realpath } from "node:fs/promises";
+import { readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import {
   join,
@@ -18,6 +18,7 @@ import type {
   SessionQuery,
   SessionSource,
 } from "../session-source.js";
+import { admitSessionEventPrefix } from "../session-source.js";
 import { parseCodexSession } from "./parser.js";
 
 export interface CodexDiscoverOptions {
@@ -129,6 +130,7 @@ export async function discoverCodexSessions(
   try {
     root = await realpath(sessionsDirectory);
   } catch {
+    query.analysisBudgetMeter?.recordSourceFailure();
     return [];
   }
 
@@ -140,14 +142,43 @@ export async function discoverCodexSessions(
   const sessions: Session[] = [];
 
   for (const file of files) {
+    if (query.analysisBudgetMeter?.stopped === true) break;
     if (!withinDiscoveryWindow(root, file, query)) {
       continue;
+    }
+    let fileSize: number;
+    try {
+      fileSize = (await stat(file)).size;
+    } catch {
+      query.analysisBudgetMeter?.recordSourceFailure();
+      if (query.analysisBudgetMeter !== undefined) break;
+      globalWarnings.push(
+        sourceWarning(
+          "codex_source_read_error",
+          "Could not inspect a Codex rollout transcript.",
+          file,
+        ),
+      );
+      continue;
+    }
+    let admittedFileBytes: number | undefined;
+    if (query.analysisBudgetMeter !== undefined) {
+      if (!query.analysisBudgetMeter.admitSourceItem()) break;
+      if (!Number.isSafeInteger(fileSize) || fileSize < 0) {
+        query.analysisBudgetMeter.recordSourceFailure();
+        break;
+      }
+      admittedFileBytes = query.analysisBudgetMeter.admitInputBytes(fileSize);
+      if (admittedFileBytes === 0 && fileSize > 0) break;
     }
     let parsed: Session | null;
     try {
       parsed = await parseCodexSession({
         sourcePath: file,
         endedAtMs: query.endedAtMs,
+        ...(admittedFileBytes === undefined
+          ? {}
+          : { budgets: { maxFileBytes: admittedFileBytes } }),
       });
     } catch {
       globalWarnings.push(
@@ -157,12 +188,19 @@ export async function discoverCodexSessions(
           file,
         ),
       );
+      query.analysisBudgetMeter?.recordSourceFailure();
+      if (query.analysisBudgetMeter !== undefined) break;
       continue;
     }
     if (parsed === null) {
       continue;
     }
-    const canonicalSession = await canonicalizeSessionCwds(parsed);
+    const admitted = query.analysisBudgetMeter === undefined
+      ? [parsed]
+      : admitSessionEventPrefix([parsed], query.analysisBudgetMeter);
+    const admittedSession = admitted[0];
+    if (admittedSession === undefined) break;
+    const canonicalSession = await canonicalizeSessionCwds(admittedSession);
     if (!intersects(canonicalSession, query)) {
       continue;
     }
@@ -204,6 +242,7 @@ export async function discoverCodexSessions(
 }
 
 export class CodexSessionSource implements SessionSource {
+  readonly budgetCooperative = true;
   readonly #sessionsDirectory: string | undefined;
   readonly #env: NodeJS.ProcessEnv;
 

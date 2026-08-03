@@ -18,6 +18,7 @@ import type {
   SessionQuery,
   SessionSource,
 } from "../session-source.js";
+import { admitSessionEventPrefix } from "../session-source.js";
 import {
   parseClaudeTranscriptDetailed,
   type ClaudeTranscriptParseResult,
@@ -299,6 +300,7 @@ export async function discoverClaudeSessions(
   const parsedPaths = new Set<string>();
 
   for (const file of files) {
+    if (query.analysisBudgetMeter?.stopped === true) break;
     if (parsedPaths.has(file)) {
       continue;
     }
@@ -306,17 +308,41 @@ export async function discoverClaudeSessions(
     // A transcript's mtime is at or after its last event, so a file last
     // written before the query window opened cannot intersect it. Skipping
     // those files avoids parsing every historical transcript on each run.
+    let fileSize: number | undefined;
     try {
-      if ((await lstat(file)).mtimeMs < query.startedAtMs) {
+      const status = await lstat(file);
+      if (status.mtimeMs < query.startedAtMs) {
         continue;
       }
+      fileSize = status.size;
     } catch {
+      if (query.analysisBudgetMeter !== undefined) {
+        query.analysisBudgetMeter.recordSourceFailure();
+        break;
+      }
       // Fall through to the parse path, which reports unreadable files.
+    }
+    let admittedFileBytes: number | undefined;
+    if (query.analysisBudgetMeter !== undefined) {
+      if (!query.analysisBudgetMeter.admitSourceItem()) break;
+      if (
+        fileSize === undefined ||
+        !Number.isSafeInteger(fileSize) ||
+        fileSize < 0
+      ) {
+        query.analysisBudgetMeter.recordSourceFailure();
+        break;
+      }
+      admittedFileBytes = query.analysisBudgetMeter.admitInputBytes(fileSize);
+      if (admittedFileBytes === 0 && fileSize > 0) break;
     }
     let parsed: ClaudeTranscriptParseResult;
     try {
       parsed = await parseClaudeTranscriptDetailed(file, {
         endedAtMs: query.endedAtMs,
+        ...(admittedFileBytes === undefined
+          ? {}
+          : { budgets: { maxFileBytes: admittedFileBytes } }),
       });
     } catch {
       const readWarning = sourceWarning(
@@ -326,10 +352,13 @@ export async function discoverClaudeSessions(
       );
       sourceFailures.push(readWarning);
       globalSourceWarnings.push(readWarning);
+      query.analysisBudgetMeter?.recordSourceFailure();
+      if (query.analysisBudgetMeter !== undefined) break;
       continue;
     }
     if (parsed.sessions.length === 0 && parsed.warnings.length > 0) {
       sourceFailures.push(...parsed.warnings);
+      query.analysisBudgetMeter?.recordSourceFailure();
       globalSourceWarnings.push(
         sourceWarning(
           "source_parse_error",
@@ -338,7 +367,10 @@ export async function discoverClaudeSessions(
         ),
       );
     }
-    for (const rawSession of parsed.sessions) {
+    const parsedSessions = query.analysisBudgetMeter === undefined
+      ? parsed.sessions
+      : admitSessionEventPrefix(parsed.sessions, query.analysisBudgetMeter);
+    for (const rawSession of parsedSessions) {
       const session = await canonicalizeSession(rawSession);
       if (!intersects(session, query)) {
         continue;
@@ -411,6 +443,7 @@ export async function discoverClaudeSessions(
 }
 
 export class ClaudeSessionSource implements SessionSource {
+  readonly budgetCooperative = true;
   readonly #projectsDirectory: string;
 
   constructor(projectsDirectory: string) {
