@@ -430,6 +430,49 @@ test("budgeted Codex traversal uses locale-independent code-unit order", async (
   assert.equal(meter.result().truncation_reason, "max_source_items");
 });
 
+test("a truncated Codex prefix cannot turn a known branch mismatch into branchless acceptance", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-budget-codex-branch-prefix-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const sessionsRoot = join(root, "sessions");
+  const dayDirectory = join(sessionsRoot, "2026", "07", "31");
+  const repo = join(root, "repo");
+  await Promise.all([
+    mkdir(dayDirectory, { recursive: true }),
+    mkdir(repo, { recursive: true }),
+  ]);
+  const functionCall = (callId: string, at: string): string => rolloutLine({
+    timestamp: at,
+    type: "response_item",
+    payload: {
+      type: "function_call",
+      name: "exec_command",
+      call_id: callId,
+      arguments: JSON.stringify({ cmd: "pwd", workdir: repo }),
+    },
+  });
+  await writeFile(
+    join(dayDirectory, "rollout-wrong-branch-prefix.jsonl"),
+    sessionMeta({ id: "wrong-branch", cwd: repo, branch: "main" }) +
+      functionCall("call-first", "2026-07-31T03:00:01.000Z") +
+      functionCall("call-second", "2026-07-31T03:00:02.000Z"),
+  );
+  const meter = new AnalysisBudgetMeter(
+    analysisBudgets({ max_input_events: 1 }),
+    steadyBudgetClock,
+  );
+
+  const sessions = await discoverCodexSessions(sessionsRoot, {
+    repoRoot: repo,
+    headBranch: "feature/codex",
+    startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+    analysisBudgetMeter: meter,
+  });
+
+  assert.deepEqual(sessions, []);
+  assert.equal(meter.result().truncation_reason, "max_input_events");
+});
+
 test("unbudgeted Codex discovery preserves legacy locale ordering and read errors", async (t) => {
   if (process.platform === "win32") {
     t.skip("Windows chmod does not make a file unreadable.");
