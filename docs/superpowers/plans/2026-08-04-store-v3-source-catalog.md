@@ -37,13 +37,13 @@ Store module. Do not connect discovery or parsing in this PR.
 
 ## Task 2 — Transactional Store v3 migration
 
-- [ ] Set `STORE_SCHEMA_VERSION` to 3 while recognizing v2 as the only migratable
+- [x] Set `STORE_SCHEMA_VERSION` to 3 while recognizing v2 as the only migratable
   predecessor.
-- [ ] Create the catalog DDL once and use it from fresh bootstrap and v2 migration.
-- [ ] Insert `schema-v3-source-catalog` and update `user_version` in the same
+- [x] Create the catalog DDL once and use it from fresh bootstrap and v2 migration.
+- [x] Insert `schema-v3-source-catalog` and update `user_version` in the same
   immediate transaction.
-- [ ] Reject version 1 and future schemas before mutation; close on every failure.
-- [ ] Delegate focused tests GREEN and commit schema/tests without amend.
+- [x] Reject version 1 and future schemas before mutation; close on every failure.
+- [x] Delegate focused tests GREEN and commit schema/tests without amend.
 
 ## Task 3 — RED catalog contract/API tests
 
@@ -57,13 +57,13 @@ Store module. Do not connect discovery or parsing in this PR.
 
 ## Task 4 — Catalog implementation
 
-- [ ] Add the exact `SourceCatalogEntry` and result/error contracts.
-- [ ] Add strict content-free validation that returns detached rows.
-- [ ] Add atomic upsert, deterministic get/list, and fail-closed content-change
+- [x] Add the exact `SourceCatalogEntry` and result/error contracts.
+- [x] Add strict content-free validation that returns detached rows.
+- [x] Add atomic upsert, deterministic get/list, and fail-closed content-change
   comparison without storing source bodies.
 - [ ] Use the TypeScript LanguageService for semantic reference/diagnostic checks;
   record that `ts-rename-helper` is unavailable in this environment.
-- [ ] Delegate focused tests GREEN and commit without amend.
+- [x] Delegate focused tests GREEN and commit without amend.
 
 ## Task 5 — Review, verification, and delivery
 

@@ -12,14 +12,17 @@ import { join } from "node:path";
 
 import type { StorePaths } from "./paths.js";
 
-export const STORE_SCHEMA_VERSION = 2;
+export const STORE_SCHEMA_VERSION = 3;
+export const SOURCE_CATALOG_MIGRATION = "schema-v3-source-catalog";
 
 const BUSY_TIMEOUT_MS = 5_000;
+const STORE_SCHEMA_V2 = 2;
+const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 
 export class UnsupportedStoreSchemaError extends Error {
   constructor(readonly schema_version: number) {
     super(
-      `Unsupported ccprof store schema version ${schema_version}; expected 0 or ${STORE_SCHEMA_VERSION}`,
+      `Unsupported ccprof store schema version ${schema_version}; expected 0, ${STORE_SCHEMA_V2}, or ${STORE_SCHEMA_VERSION}`,
     );
     this.name = "UnsupportedStoreSchemaError";
   }
@@ -34,10 +37,58 @@ function schemaVersion(database: Database.Database): number {
 }
 
 function assertSupportedSchema(version: number): void {
-  if (version !== 0 && version !== STORE_SCHEMA_VERSION) {
+  if (version !== 0 && version !== STORE_SCHEMA_V2 && version !== STORE_SCHEMA_VERSION) {
     throw new UnsupportedStoreSchemaError(version);
   }
 }
+
+const SOURCE_CATALOG_SCHEMA = `
+  CREATE TABLE source_catalog (
+    adapter_id TEXT NOT NULL CHECK (adapter_id IN ('claude', 'codex')),
+    adapter_version TEXT NOT NULL CHECK (adapter_version = '1.0.0'),
+    source_identity TEXT NOT NULL PRIMARY KEY
+      CHECK (length(source_identity) = 71
+        AND substr(source_identity, 1, 7) = 'source-'
+        AND substr(source_identity, 8) NOT GLOB '*[^0-9a-f]*'),
+    canonical_path TEXT NOT NULL
+      CHECK (length(canonical_path) > 0 AND instr(canonical_path, char(0)) = 0),
+    device INTEGER CHECK (device IS NULL OR
+      (typeof(device) = 'integer' AND device BETWEEN 0 AND ${MAX_SAFE_INTEGER})),
+    inode INTEGER CHECK (inode IS NULL OR
+      (typeof(inode) = 'integer' AND inode BETWEEN 0 AND ${MAX_SAFE_INTEGER})),
+    mtime_ms INTEGER NOT NULL CHECK (typeof(mtime_ms) = 'integer'
+      AND mtime_ms BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    size_bytes INTEGER NOT NULL CHECK (typeof(size_bytes) = 'integer'
+      AND size_bytes BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    prefix_hash TEXT NOT NULL CHECK (length(prefix_hash) = 71
+      AND substr(prefix_hash, 1, 7) = 'sha256:'
+      AND substr(prefix_hash, 8) NOT GLOB '*[^0-9a-f]*'),
+    suffix_hash TEXT NOT NULL CHECK (length(suffix_hash) = 71
+      AND substr(suffix_hash, 1, 7) = 'sha256:'
+      AND substr(suffix_hash, 8) NOT GLOB '*[^0-9a-f]*'),
+    content_revision TEXT NOT NULL CHECK (length(content_revision) = 71
+      AND substr(content_revision, 1, 7) = 'sha256:'
+      AND substr(content_revision, 8) NOT GLOB '*[^0-9a-f]*'),
+    discovery_cursor INTEGER NOT NULL CHECK (typeof(discovery_cursor) = 'integer'
+      AND discovery_cursor BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    last_parsed_offset INTEGER NOT NULL CHECK (typeof(last_parsed_offset) = 'integer'
+      AND last_parsed_offset BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    last_normalized_event_index INTEGER NOT NULL
+      CHECK (typeof(last_normalized_event_index) = 'integer'
+        AND last_normalized_event_index BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    parser_version TEXT NOT NULL
+      CHECK (length(parser_version) > 0 AND instr(parser_version, char(0)) = 0),
+    schema_fingerprint TEXT NOT NULL CHECK (length(schema_fingerprint) = 71
+      AND substr(schema_fingerprint, 1, 7) = 'sha256:'
+      AND substr(schema_fingerprint, 8) NOT GLOB '*[^0-9a-f]*'),
+    observed_at_ms INTEGER NOT NULL CHECK (typeof(observed_at_ms) = 'integer'
+      AND observed_at_ms BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    completeness TEXT NOT NULL CHECK (completeness IN ('complete', 'partial')),
+    CHECK ((device IS NULL) = (inode IS NULL)),
+    CHECK (last_parsed_offset <= size_bytes),
+    CHECK (completeness <> 'complete' OR last_parsed_offset = size_bytes)
+  );
+`;
 
 function unsafeStorePath(path: string, reason: string): Error {
   return new Error(`unsafe store path "${path}": ${reason}`);
@@ -125,13 +176,13 @@ function configureConnection(database: Database.Database): void {
   }
 }
 
-function bootstrapSchema(database: Database.Database): void {
-  const bootstrap = database.transaction(() => {
+function migrateSchema(database: Database.Database): void {
+  const migrate = database.transaction(() => {
     const version = schemaVersion(database);
     assertSupportedSchema(version);
     if (version === STORE_SCHEMA_VERSION) return;
 
-    database.exec(`
+    if (version === 0) database.exec(`
       CREATE TABLE store_migrations (
         name TEXT NOT NULL PRIMARY KEY,
         completed_at_ms INTEGER NOT NULL
@@ -174,10 +225,14 @@ function bootstrapSchema(database: Database.Database): void {
         ON adoptions(detected_at_ms);
     `);
 
+    database.exec(SOURCE_CATALOG_SCHEMA);
+    database.prepare(
+      "INSERT INTO store_migrations(name, completed_at_ms) VALUES (?, ?)",
+    ).run(SOURCE_CATALOG_MIGRATION, Date.now());
     database.pragma(`user_version = ${STORE_SCHEMA_VERSION}`);
   });
 
-  bootstrap.immediate();
+  migrate.immediate();
 }
 
 export function openStoreDatabase(paths: StorePaths): Database.Database {
@@ -196,7 +251,7 @@ export function openStoreDatabase(paths: StorePaths): Database.Database {
     }
 
     configureConnection(database);
-    if (version === 0) bootstrapSchema(database);
+    if (version !== STORE_SCHEMA_VERSION) migrateSchema(database);
     return database;
   } catch (error) {
     if (database?.open === true) {
