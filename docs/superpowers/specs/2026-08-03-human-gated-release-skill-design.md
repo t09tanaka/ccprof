@@ -3,8 +3,9 @@
 ## Status
 
 This specification records the user-approved release boundary for `ccprof`.
-Version preparation and npm publication remain human actions. The agent
-validates those actions and automates only the post-publication GitHub work.
+The human chooses the exact target version and performs npm publication. The
+agent owns version/lockfile/changelog preparation, its normal PR lifecycle,
+package preflight, and the post-publication GitHub work.
 
 ## Goal
 
@@ -12,11 +13,12 @@ Add a project-local `ccprof-release` skill that can be invoked with phrases
 such as “release ccprof”, “prepare the next ccprof release”, or “npm publish is
 done; finish the release”. The skill must:
 
-1. guide and validate human-owned release preparation;
-2. prepare and verify the exact tarball without publishing it;
-3. stop for a human to run `npm publish` manually;
-4. verify the published registry artifact; and
-5. automate the tag, attestations, SBOM, checksums, and GitHub Release.
+1. accept, but never infer, the human-selected target version;
+2. update version metadata and changelog through a normal preparation PR;
+3. prepare and verify the exact tarball without publishing it;
+4. stop for a human to run `npm publish` manually;
+5. verify the published registry artifact; and
+6. automate the tag, attestations, SBOM, checksums, and GitHub Release.
 
 The workflow is resumable from observable Git, npm registry, GitHub Actions,
 and GitHub Release state. It does not add a state file, table, lock, queue, or
@@ -26,9 +28,10 @@ other recovery system.
 
 Use two repository-owned components:
 
-- `.claude/skills/ccprof-release/SKILL.md` orchestrates human checkpoints,
-  delegated local verification, registry verification, tag creation, and final
-  GitHub verification.
+- `.claude/skills/ccprof-release/SKILL.md` orchestrates target-version input,
+  a worktree-based preparation PR, human checkpoints, delegated local
+  verification, registry verification, tag creation, and final GitHub
+  verification.
 - `.github/workflows/release-assets.yml` runs after a `v*` tag is pushed. It
   rebuilds and verifies the published artifact, produces attestations and
   release assets, and creates or completes the GitHub Release.
@@ -49,7 +52,8 @@ artifacts.
 ## Protected contracts and scope
 
 - This implementation PR does not edit `package.json`, `package-lock.json`, or
-  `CHANGELOG.md`; those are future human release inputs.
+  `CHANGELOG.md`. A future invocation edits them only after the human supplies
+  an exact target version.
 - Package version `0.2.0`, report schema v2, and store schema v2 remain
   unchanged by this PR.
 - Stable releases only are supported. A version containing a prerelease suffix
@@ -61,45 +65,63 @@ artifacts.
 
 ## State machine
 
-The skill derives one of four states on every invocation. State is never trusted
+The skill derives one of five states on every invocation. State is never trusted
 solely from a previous chat response.
 
-1. `PREPARATION_REQUIRED`: version inputs, branch state, changelog, or checks
-   are not ready.
-2. `AWAITING_HUMAN_PUBLISH`: the exact tarball passed preflight but the npm
+1. `TARGET_VERSION_REQUIRED`: the user has not supplied an exact stable target
+   version. The skill asks for one and does not propose a value.
+2. `PREPARATION_REQUIRED`: the target exists, but its version preparation PR is
+   absent, incomplete, unmerged, or not synchronized to local `main`.
+3. `AWAITING_HUMAN_PUBLISH`: the exact tarball passed preflight but the npm
    registry version does not exist.
-3. `READY_FOR_POSTPROCESSING`: the current user message explicitly confirms
+4. `READY_FOR_POSTPROCESSING`: the current user message explicitly confirms
    manual publication, npm contains the version, and its `dist.integrity`
    matches a tarball rebuilt from the same release commit. Registry presence
    alone never authorizes post-processing.
-4. `COMPLETE`: the tag points to that commit, the workflow succeeded, and the
+5. `COMPLETE`: the tag points to that commit, the workflow succeeded, and the
    GitHub Release and required assets exist.
 
 Conflicting observable state is never guessed around. A mismatched tag,
 registry integrity, release target, or commit stops the skill with evidence and
 a human-readable recovery instruction.
 
-## Phase A: human preparation and automated preflight
+## Phase A: human version choice and agent-owned preparation
 
-### Human-owned preparation
+### Human-owned input
 
-The skill first presents this checklist and stops if any item is incomplete:
+The user supplies the exact next stable semver. The skill does not select,
+increment, recommend, or silently normalize a version. Missing, invalid,
+prerelease, non-increasing, or already-published targets are rejected before a
+worktree or branch is created.
 
-- update the package version and root lockfile version together;
-- update `CHANGELOG.md` for the same stable version;
-- send the preparation through the normal PR and merge it;
-- return to a clean, synchronized local `main`.
+### Agent-owned preparation PR
 
-The skill never writes these files, chooses a version, creates the preparation
-commit, bypasses branch protection, or pushes a version change.
+For a valid human-selected version, the skill uses the repository's
+`worktree-pr-flow` lifecycle from current `origin/main`. In the isolated release
+preparation branch it:
 
-### Agent-owned preflight
+- runs `npm version <target> --no-git-tag-version` so `package.json` and the
+  root package in `package-lock.json` change together without creating a tag;
+- adds a Keep a Changelog entry dated for the release, summarizing merged
+  changes since the previous release tag without inventing claims;
+- shows the version and changelog diff before commit;
+- delegates the required checks, commits normally, opens a PR to `main`, and
+  completes CI/review under the repository's ordinary merge-authorization
+  policy; and
+- cleans the preparation worktree and synchronizes local `main` after merge.
 
-Once preparation exists, the skill verifies:
+It never commits directly to `main`, creates the release tag during version
+preparation, uses `git commit --amend`, or bypasses branch protection. If the
+preparation PR is awaiting merge authorization, the release skill pauses and
+can rediscover that PR on resume.
+
+### Agent-owned package preflight
+
+Once the preparation PR is merged, the skill verifies:
 
 - current branch is `main`, the worktree is clean, and `HEAD == origin/main`;
-- package and lockfile root versions are identical stable semver values;
-- the changelog contains the exact version;
+- package and lockfile root versions equal the user-selected stable version;
+- the changelog contains the exact version, date, and release notes;
 - local and remote `v<version>` tags do not already conflict;
 - a GitHub Release for the tag does not conflict;
 - npm does not already contain the version unless this is a valid resume;
@@ -114,10 +136,11 @@ test. It also confirms that runtime-only SPDX generation succeeds with:
 npm sbom --omit=dev --sbom-format=spdx
 ```
 
-The preflight reports an absolute tarball path, package version, proposed tag,
-release commit OID, npm SRI integrity, SHA-256 digest, and the exact manual
-publish command. If the temporary tarball later disappears, the skill may
-rebuild it only after revalidating the same clean commit.
+The preflight reports the preparation PR, an absolute tarball path, package
+version, proposed tag, release commit OID, npm SRI integrity, SHA-256 digest,
+and the exact manual publish command. If the temporary tarball later
+disappears, the skill may rebuild it only after revalidating the same clean
+commit.
 
 ### Checkpoint output
 
@@ -126,6 +149,7 @@ The skill ends Phase A with a fenced JSON checkpoint for human inspection:
 ```json
 {
   "phase": "awaiting_human_publish",
+  "preparation_pr": "https://github.com/t09tanaka/ccprof/pull/<number>",
   "version": "<package version>",
   "tag": "v<package version>",
   "commit_oid": "<40-hex OID>",
@@ -227,7 +251,11 @@ No npm registry write permission or npm credential is present.
 ## Edge cases
 
 - dirty, detached, non-main, ahead, behind, or diverged worktrees;
-- package/lock version mismatch or missing changelog entry;
+- absent target input; invalid, prerelease, non-increasing, or already-used
+  target versions;
+- version preparation PR conflict, failed CI, missing merge authorization, or
+  interrupted cleanup;
+- package/lock version mismatch or missing/inaccurate changelog entry;
 - unstable semver and prerelease tags;
 - local/remote tags that point to different commits;
 - an existing GitHub Release targeting a different tag or commit;
@@ -261,7 +289,9 @@ instructions cannot express a deterministic validation safely.
   matching live npm registry state.
 - Neither the skill nor workflow can execute npm publication or consume an npm
   publishing token.
-- Version files and changelog are validated but never edited by the skill.
+- The skill never chooses a version. Given an exact human-selected version, it
+  updates package/lock metadata and changelog only in an isolated preparation
+  branch and sends those changes through a normal PR.
 - Registry integrity mismatch prevents tag and GitHub Release mutation.
 - Tag, package version, lockfile version, main ancestry, and release commit are
   tied to one OID and stable version.
@@ -274,8 +304,9 @@ instructions cannot express a deterministic validation safely.
 
 `skill-creator` evaluation uses three realistic prompts:
 
-1. **Preparation:** “Release ccprof. I have not updated the version yet.” The
-   skill must present the human checklist and must not edit version files.
+1. **Preparation:** “Release ccprof as 0.3.0.” In a fixture repository, the
+   skill must use exactly `0.3.0`, prepare version/lock/changelog changes in an
+   isolated PR flow, and must not create a tag or publish npm.
 2. **Successful resume:** “I manually published the tarball; continue the
    release.” With matching simulated registry state, the skill must verify SRI
    before describing tag and GitHub automation.
