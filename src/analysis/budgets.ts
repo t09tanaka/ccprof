@@ -60,6 +60,15 @@ const LIMIT_KEYS = [
   "max_source_items",
 ] as const;
 
+const USAGE_KEYS = [
+  "input_bytes",
+  "input_events",
+  "wall_ms",
+  "cpu_ms",
+  "output_bytes",
+  "source_items",
+] as const;
+
 const REASON_ORDER: readonly AnalysisTruncationReason[] = [
   ...LIMIT_KEYS,
   "source_failure",
@@ -141,6 +150,143 @@ export function normalizeAnalysisBudgets(value: unknown): AnalysisBudgets {
     max_output_bytes: entry("max_output_bytes"),
     max_source_items: entry("max_source_items"),
   });
+}
+
+function exactDataValues(
+  value: unknown,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): Map<string, unknown> {
+  if (value === null || typeof value !== "object") return invalidShape();
+  let array: boolean;
+  let descriptors: PropertyDescriptorMap;
+  let keys: readonly PropertyKey[];
+  try {
+    array = Array.isArray(value);
+    descriptors = Object.getOwnPropertyDescriptors(value);
+    keys = Reflect.ownKeys(descriptors);
+  } catch {
+    return invalidShape();
+  }
+  if (array) return invalidShape();
+
+  const allowed = new Set([...required, ...optional]);
+  if (
+    keys.length < required.length ||
+    keys.length > allowed.size ||
+    keys.some((key) => typeof key !== "string" || !allowed.has(key)) ||
+    required.some((key) => !keys.includes(key))
+  ) {
+    return invalidShape();
+  }
+
+  const result = new Map<string, unknown>();
+  for (const key of keys) {
+    const descriptor = descriptors[key as string];
+    if (
+      typeof key !== "string" ||
+      descriptor === undefined ||
+      descriptor.enumerable !== true ||
+      !("value" in descriptor)
+    ) {
+      return invalidShape();
+    }
+    result.set(key, descriptor.value as unknown);
+  }
+  return result;
+}
+
+function normalizeUsage(value: unknown): AnalysisBudgetUsage {
+  const entries = exactDataValues(value, USAGE_KEYS);
+  const read = (key: (typeof USAGE_KEYS)[number]): number => {
+    const result = entries.get(key);
+    if (
+      typeof result !== "number" ||
+      !Number.isSafeInteger(result) ||
+      result < 0
+    ) {
+      return invalidValue();
+    }
+    return result;
+  };
+  return {
+    input_bytes: read("input_bytes"),
+    input_events: read("input_events"),
+    wall_ms: read("wall_ms"),
+    cpu_ms: read("cpu_ms"),
+    output_bytes: read("output_bytes"),
+    source_items: read("source_items"),
+  };
+}
+
+export function normalizeAnalysisBudgetResult(
+  value: unknown,
+): AnalysisBudgetResult {
+  const entries = exactDataValues(
+    value,
+    ["configured", "consumed", "observed", "completeness", "coverage"],
+    ["truncation_reason"],
+  );
+  const configured = normalizeAnalysisBudgets(entries.get("configured"));
+  const consumed = normalizeUsage(entries.get("consumed"));
+  const observed = normalizeUsage(entries.get("observed"));
+  const completeness = entries.get("completeness");
+  const coverage = entries.get("coverage");
+  const hasReason = entries.has("truncation_reason");
+  const reason = entries.get("truncation_reason");
+
+  if (
+    (completeness !== "complete" && completeness !== "partial") ||
+    typeof coverage !== "number" ||
+    !Number.isFinite(coverage) ||
+    coverage < 0 ||
+    coverage > 1 ||
+    (hasReason &&
+      (typeof reason !== "string" ||
+        !REASON_ORDER.includes(reason as AnalysisTruncationReason))) ||
+    (completeness === "complete" && (hasReason || coverage !== 1)) ||
+    (completeness === "partial" && (!hasReason || coverage >= 1))
+  ) {
+    return invalidValue();
+  }
+
+  const limitForUsage: Record<(typeof USAGE_KEYS)[number], keyof AnalysisBudgets> = {
+    input_bytes: "max_input_bytes",
+    input_events: "max_input_events",
+    wall_ms: "max_wall_ms",
+    cpu_ms: "max_cpu_ms",
+    output_bytes: "max_output_bytes",
+    source_items: "max_source_items",
+  };
+  for (const key of USAGE_KEYS) {
+    if (consumed[key] > observed[key]) return invalidValue();
+    if (
+      completeness === "complete" &&
+      (consumed[key] !== observed[key] ||
+        consumed[key] > configured[limitForUsage[key]])
+    ) {
+      return invalidValue();
+    }
+  }
+  for (const key of [
+    "input_bytes",
+    "input_events",
+    "output_bytes",
+    "source_items",
+  ] as const) {
+    if (consumed[key] > configured[limitForUsage[key]]) return invalidValue();
+  }
+
+  return {
+    configured: { ...configured },
+    consumed,
+    observed,
+    completeness,
+    ...(hasReason
+      ? { truncation_reason: reason as AnalysisTruncationReason }
+      : {}),
+    coverage,
+  };
 }
 
 function validClockReading(value: unknown): value is number {

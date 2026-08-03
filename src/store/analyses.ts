@@ -10,6 +10,10 @@ import { dirname, join } from "node:path";
 
 import { normalizeCommand } from "../analysis/command.js";
 import { commandIdentityKey } from "../analysis/command-identity.js";
+import {
+  normalizeAnalysisBudgetResult,
+  type AnalysisBudgetResult,
+} from "../analysis/budgets.js";
 import { normalizeRepoPath } from "../analysis/test-map.js";
 import { findingCompatibilityMetadata } from "../core/model.js";
 import type {
@@ -53,6 +57,7 @@ export interface AnalysisRecordInput {
   metrics?: Readonly<Record<string, number>>;
   command_costs?: readonly StoredCommandCost[];
   read_observations?: readonly StoredReadObservation[];
+  analysis_budget?: AnalysisBudgetResult;
 }
 
 export interface AnalysisRecord {
@@ -65,6 +70,7 @@ export interface AnalysisRecord {
   metrics: Record<string, number>;
   command_costs: StoredCommandCost[];
   read_observations?: StoredReadObservation[];
+  analysis_budget?: AnalysisBudgetResult;
 }
 
 export interface AnalysisSaveResult {
@@ -417,11 +423,29 @@ function validateInput(input: AnalysisRecordInput): void {
   }
 }
 
+function optionalAnalysisBudget(
+  input: AnalysisRecordInput,
+): AnalysisBudgetResult | undefined {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(input, "analysis_budget");
+  } catch {
+    throw new TypeError("Invalid analysis budget result.");
+  }
+  if (descriptor === undefined) return undefined;
+  if (descriptor.enumerable !== true || !("value" in descriptor)) {
+    throw new TypeError("Invalid analysis budget result.");
+  }
+  if (descriptor.value === undefined) return undefined;
+  return normalizeAnalysisBudgetResult(descriptor.value);
+}
+
 export function makeAnalysisRecord(
   input: AnalysisRecordInput,
 ): AnalysisRecord {
   validateInput(input);
   const findings = snapshotStoredFindings(input.findings);
+  const analysisBudget = optionalAnalysisBudget(input);
   const metrics = {
     ...summaryMetrics(input.summary),
     ...Object.fromEntries(
@@ -447,6 +471,7 @@ export function makeAnalysisRecord(
     command_costs: costs,
     ...(input.read_observations === undefined ? {} :
       { read_observations: normalizedReadObservations(input.read_observations) }),
+    ...(analysisBudget === undefined ? {} : { analysis_budget: analysisBudget }),
   };
   const generatedId = createHash("sha256")
     .update(canonicalJson(content))
@@ -485,6 +510,8 @@ function isRecord(value: unknown): value is AnalysisRecord {
     record.metrics === null ||
     !isObjectRecord(record.metrics) ||
     !Array.isArray(record.command_costs) ||
+    (record.analysis_budget !== undefined &&
+      !isAnalysisBudgetResult(record.analysis_budget)) ||
     (record.read_observations !== undefined &&
       (!Array.isArray(record.read_observations) ||
         !record.read_observations.every(isStoredReadObservation)))
@@ -519,6 +546,15 @@ function isRecord(value: unknown): value is AnalysisRecord {
       (cost.command_identity === undefined ||
         isCommandIdentity(cost.command_identity))
     );
+}
+
+function isAnalysisBudgetResult(value: unknown): value is AnalysisBudgetResult {
+  try {
+    const normalized = normalizeAnalysisBudgetResult(value);
+    return canonicalJson(normalized) === canonicalJson(value);
+  } catch {
+    return false;
+  }
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -618,6 +654,160 @@ function snapshotEnvelope(record: AnalysisRecord, identity?: AnalysisSnapshotIde
 class StoreConflict extends Error {
   constructor(readonly code: "analysis_record_conflict" | "analysis_snapshot_conflict", message: string) { super(message); }
 }
+
+const BUDGET_ROW_COLUMNS = [
+  "execution_id",
+  "max_input_bytes",
+  "max_input_events",
+  "max_wall_ms",
+  "max_cpu_ms",
+  "max_output_bytes",
+  "max_source_items",
+  "consumed_input_bytes",
+  "consumed_input_events",
+  "consumed_wall_ms",
+  "consumed_cpu_ms",
+  "consumed_output_bytes",
+  "consumed_source_items",
+  "observed_input_bytes",
+  "observed_input_events",
+  "observed_wall_ms",
+  "observed_cpu_ms",
+  "observed_output_bytes",
+  "observed_source_items",
+  "completeness",
+  "truncation_reason",
+  "coverage",
+] as const;
+
+interface AnalysisBudgetRow {
+  execution_id: string;
+  max_input_bytes: number;
+  max_input_events: number;
+  max_wall_ms: number;
+  max_cpu_ms: number;
+  max_output_bytes: number;
+  max_source_items: number;
+  consumed_input_bytes: number;
+  consumed_input_events: number;
+  consumed_wall_ms: number;
+  consumed_cpu_ms: number;
+  consumed_output_bytes: number;
+  consumed_source_items: number;
+  observed_input_bytes: number;
+  observed_input_events: number;
+  observed_wall_ms: number;
+  observed_cpu_ms: number;
+  observed_output_bytes: number;
+  observed_source_items: number;
+  completeness: "complete" | "partial";
+  truncation_reason: AnalysisBudgetResult["truncation_reason"] | null;
+  coverage: number;
+}
+
+function budgetRow(
+  executionId: string,
+  result: AnalysisBudgetResult,
+): AnalysisBudgetRow {
+  return {
+    execution_id: executionId,
+    max_input_bytes: result.configured.max_input_bytes,
+    max_input_events: result.configured.max_input_events,
+    max_wall_ms: result.configured.max_wall_ms,
+    max_cpu_ms: result.configured.max_cpu_ms,
+    max_output_bytes: result.configured.max_output_bytes,
+    max_source_items: result.configured.max_source_items,
+    consumed_input_bytes: result.consumed.input_bytes,
+    consumed_input_events: result.consumed.input_events,
+    consumed_wall_ms: result.consumed.wall_ms,
+    consumed_cpu_ms: result.consumed.cpu_ms,
+    consumed_output_bytes: result.consumed.output_bytes,
+    consumed_source_items: result.consumed.source_items,
+    observed_input_bytes: result.observed.input_bytes,
+    observed_input_events: result.observed.input_events,
+    observed_wall_ms: result.observed.wall_ms,
+    observed_cpu_ms: result.observed.cpu_ms,
+    observed_output_bytes: result.observed.output_bytes,
+    observed_source_items: result.observed.source_items,
+    completeness: result.completeness,
+    truncation_reason: result.truncation_reason ?? null,
+    coverage: result.coverage,
+  };
+}
+
+function readBudgetRow(
+  database: StoreDatabase,
+  executionId: string,
+): AnalysisBudgetRow | undefined {
+  return database.prepare(`SELECT ${BUDGET_ROW_COLUMNS.join(", ")}
+    FROM analysis_budget_runs WHERE execution_id = ?`).get(executionId) as
+    AnalysisBudgetRow | undefined;
+}
+
+function assertBudgetMirror(
+  database: StoreDatabase,
+  executionId: string,
+  result: AnalysisBudgetResult | undefined,
+): void {
+  const existing = readBudgetRow(database, executionId);
+  const matches = result === undefined
+    ? existing === undefined
+    : existing !== undefined &&
+      canonicalJson(existing) === canonicalJson(budgetRow(executionId, result));
+  if (!matches) {
+    throw new StoreConflict(
+      "analysis_record_conflict",
+      "An immutable analysis execution has different budget content.",
+    );
+  }
+}
+
+function insertBudgetRow(
+  database: StoreDatabase,
+  executionId: string,
+  result: AnalysisBudgetResult | undefined,
+): void {
+  if (result === undefined) return;
+  const placeholders = BUDGET_ROW_COLUMNS.map((column) => `@${column}`);
+  database.prepare(`INSERT INTO analysis_budget_runs
+    (${BUDGET_ROW_COLUMNS.join(", ")}) VALUES (${placeholders.join(", ")})`)
+    .run(budgetRow(executionId, result));
+}
+
+function budgetResultFromRow(row: AnalysisBudgetRow): AnalysisBudgetResult {
+  return normalizeAnalysisBudgetResult({
+    configured: {
+      max_input_bytes: row.max_input_bytes,
+      max_input_events: row.max_input_events,
+      max_wall_ms: row.max_wall_ms,
+      max_cpu_ms: row.max_cpu_ms,
+      max_output_bytes: row.max_output_bytes,
+      max_source_items: row.max_source_items,
+    },
+    consumed: {
+      input_bytes: row.consumed_input_bytes,
+      input_events: row.consumed_input_events,
+      wall_ms: row.consumed_wall_ms,
+      cpu_ms: row.consumed_cpu_ms,
+      output_bytes: row.consumed_output_bytes,
+      source_items: row.consumed_source_items,
+    },
+    observed: {
+      input_bytes: row.observed_input_bytes,
+      input_events: row.observed_input_events,
+      wall_ms: row.observed_wall_ms,
+      cpu_ms: row.observed_cpu_ms,
+      output_bytes: row.observed_output_bytes,
+      source_items: row.observed_source_items,
+    },
+    completeness: row.completeness,
+    ...(row.truncation_reason === null
+      ? {}
+      : { truncation_reason: row.truncation_reason }),
+    coverage: row.coverage,
+  });
+}
+
 function insertAnalysis(database: StoreDatabase, record: AnalysisRecord,
   identity?: AnalysisSnapshotIdentity): void {
   const envelope = snapshotEnvelope(record, identity);
@@ -629,7 +819,10 @@ function insertAnalysis(database: StoreDatabase, record: AnalysisRecord,
       { snapshot_id: string; executed_at_ms: number; record_json: string } | undefined;
   if (execution !== undefined) {
     if (execution.snapshot_id === snapshotId && execution.executed_at_ms === record.created_at_ms &&
-      execution.record_json === recordJson) return;
+      execution.record_json === recordJson) {
+      assertBudgetMirror(database, record.analysis_id, record.analysis_budget);
+      return;
+    }
     throw new StoreConflict("analysis_record_conflict",
       "An immutable analysis execution already exists with different content.");
   }
@@ -648,6 +841,7 @@ function insertAnalysis(database: StoreDatabase, record: AnalysisRecord,
   database.prepare(`INSERT INTO analysis_executions
     (execution_id, snapshot_id, executed_at_ms) VALUES (?, ?, ?)`)
     .run(record.analysis_id, snapshotId, record.created_at_ms);
+  insertBudgetRow(database, record.analysis_id, record.analysis_budget);
 }
 function migrationWarning(code: string, message: string, path: string): StoreWarning { return { code, message, path }; }
 class CorruptLegacyRecord extends Error {}
@@ -745,8 +939,22 @@ export async function loadAnalyses(paths: StorePaths): Promise<AnalysisHistoryRe
         snapshot_id: string; record_json: string; execution_id: string; executed_at_ms: number }[];
     const records: AnalysisRecord[] = [];
     for (const row of rows) {
-      try { records.push(parseSnapshot(row.record_json, row.snapshot_id,
-        row.execution_id, row.executed_at_ms)); }
+      try {
+        const record = parseSnapshot(row.record_json, row.snapshot_id,
+          row.execution_id, row.executed_at_ms);
+        const storedBudget = readBudgetRow(database, row.execution_id);
+        if (record.analysis_budget === undefined) {
+          if (storedBudget !== undefined) {
+            throw new TypeError("analysis budget mirror does not match snapshot");
+          }
+        } else {
+          if (storedBudget === undefined || canonicalJson(record.analysis_budget) !==
+            canonicalJson(budgetResultFromRow(storedBudget))) {
+            throw new TypeError("analysis budget mirror does not match snapshot");
+          }
+        }
+        records.push(record);
+      }
       catch (error) { warnings.push(migrationWarning("corrupt_analysis_record",
         `Analysis snapshot was skipped: ${errorMessage(error)}`,
         `${storeDatabasePath(paths)}#analysis_snapshots/${row.snapshot_id}`)); }
