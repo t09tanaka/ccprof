@@ -295,7 +295,8 @@ test("selects Claude result evidence conservatively and by precedence", async (t
     '{"type":"user","sessionId":"result-evidence","uuid":"exit","timestamp":"2026-08-03T00:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"exit","content":"failed"}]},"toolUseResult":{"exitCode":3}}',
     '{"type":"user","sessionId":"result-evidence","uuid":"timeout","timestamp":"2026-08-03T00:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"timeout","timedOut":true,"is_error":true}]}}',
     '{"type":"user","sessionId":"result-evidence","uuid":"conflict","timestamp":"2026-08-03T00:00:03.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"conflict","is_error":true}]},"toolUseResult":{"success":true}}',
-    '{"type":"user","sessionId":"result-evidence","uuid":"malformed-exit","timestamp":"2026-08-03T00:00:04.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"malformed-exit","content":"Error: build failed"}]},"toolUseResult":{"exitCode":"2"}}',
+    '{"type":"user","sessionId":"result-evidence","uuid":"exit-conflict","timestamp":"2026-08-03T00:00:04.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"exit-conflict","exitCode":0}]},"toolUseResult":{"exitCode":3}}',
+    '{"type":"user","sessionId":"result-evidence","uuid":"malformed-exit","timestamp":"2026-08-03T00:00:05.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"malformed-exit","content":"Error: build failed"}]},"toolUseResult":{"exitCode":"2"}}',
   ].join("\n");
   await writeFile(path, raw);
 
@@ -304,7 +305,7 @@ test("selects Claude result evidence conservatively and by precedence", async (t
   const results = session.events.filter(
     (event): event is ToolResultEvent => event.kind === "tool_result",
   );
-  assert.equal(results.length, 5);
+  assert.equal(results.length, 6);
   assert.equal(results[0]?.status, "success");
   assertStatusEvidence(results[0]!, "success", "explicit_status", "high");
   assert.equal(results[0]?.exit_code, 9);
@@ -312,10 +313,11 @@ test("selects Claude result evidence conservatively and by precedence", async (t
   assertStatusEvidence(results[1]!, "failure", "exit_code", "high");
   assert.equal(results[1]?.exit_code, 3);
   assertStatusEvidence(results[2]!, "timeout", "explicit_status", "high");
-  assertStatusEvidence(results[3]!, "unknown", "none", "low");
-  assertStatusEvidence(results[4]!, "unknown", "none", "low");
-  assert.equal("exit_code" in results[4]!, false);
-  assert.ok(results.slice(2, 4).every((result) => result.confidence === "high"));
+  assertStatusEvidence(results[3]!, "unknown", "explicit_status", "low");
+  assertStatusEvidence(results[4]!, "unknown", "exit_code", "low");
+  assertStatusEvidence(results[5]!, "unknown", "none", "low");
+  assert.equal("exit_code" in results[5]!, false);
+  assert.ok(results.slice(2, 5).every((result) => result.confidence === "high"));
 });
 
 test("keeps assistant rows without ids and treats compact summaries as compaction", async () => {

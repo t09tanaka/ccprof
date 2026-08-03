@@ -160,10 +160,14 @@ function runSignals(
     const descriptor = classifyCommand(command);
     const classification = classifyCommandResult(descriptor, {
       status: result.status,
+      ...(result.status_evidence === undefined
+        ? {}
+        : { statusEvidence: result.status_evidence }),
       ...(result.exit_code === undefined
         ? {}
         : { exitCode: result.exit_code }),
       output: result.output,
+      outputBytes: result.output_bytes,
     });
     if (
       !classification.definite ||
@@ -579,6 +583,8 @@ export function detectFlakyTests(
           action.confidence,
           action.match_confidence,
         ]),
+        ...failedRuns.map(({ classification }) => classification.confidence),
+        ...passingRuns.map(({ classification }) => classification.confidence),
       ]);
       const historical = historyByIdentity.get(identityKey);
       const candidate = createFindingCandidate({

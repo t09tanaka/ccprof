@@ -60,12 +60,14 @@ interface MutationRecord extends EditRecord {
 interface SuccessfulRun {
   snapshotAtMs: number;
   completedAtMs: number;
+  confidence: Confidence;
 }
 
 interface SuccessfulRead {
   pathRevision: number;
   uncertaintyOrdinal: number;
   completedAtMs: number;
+  confidence: Confidence;
 }
 
 interface ObservedPaths {
@@ -514,23 +516,27 @@ function matchRead(
   successfulReads: Map<string, SuccessfulRead[]>,
 ): MatchedAction {
   observation = { ...observation, action: { ...observation.action, paths: [...paths] } };
-  const successful = resultWasDefinitelySuccessful(observation.toolResult);
-  if (!successful) {
+  const successConfidence = successfulResultConfidence(observation.toolResult);
+  if (successConfidence === undefined) {
     return result(observation.action, "unexplained", "low",
       targetFor(observation, paths),
       ["Read completion was not definitely successful."]);
   }
+  const priorConfidences: Confidence[] = [];
   const duplicate =
     paths.length > 0 &&
     paths.every((path) => {
       const key = successfulReadKey(observation.action, path);
       const previous = successfulReads.get(key) ?? [];
-      return previous.some(
+      const matching = previous.find(
         (read) =>
           read.completedAtMs <= observation.action.interval.start_ms &&
           read.pathRevision === (pathRevisions.get(path) ?? 0) &&
           read.uncertaintyOrdinal === uncertaintyOrdinal,
       );
+      if (matching === undefined) return false;
+      priorConfidences.push(matching.confidence);
+      return true;
     });
   for (const path of paths) {
     const key = successfulReadKey(observation.action, path);
@@ -539,6 +545,7 @@ function matchRead(
       pathRevision: pathRevisions.get(path) ?? 0,
       uncertaintyOrdinal,
       completedAtMs: observation.action.interval.end_ms,
+      confidence: successConfidence,
     });
     successfulReads.set(key, reads);
   }
@@ -546,7 +553,10 @@ function matchRead(
     return result(
       observation.action,
       "duplicate_read",
-      lowerConfidence(observation.action.confidence, "high"),
+      priorConfidences.reduce(
+        lowerConfidence,
+        lowerConfidence(observation.action.confidence, successConfidence),
+      ),
       targetFor(observation, paths),
       [],
     );
@@ -554,7 +564,9 @@ function matchRead(
   return result(
     observation.action,
     "safe_read",
-    paths.length === 0 ? "low" : observation.action.confidence,
+    paths.length === 0
+      ? "low"
+      : lowerConfidence(observation.action.confidence, successConfidence),
     targetFor(observation, paths),
     paths.length === 0
       ? ["Read path was unavailable, so duplicate-read attribution is disabled."]
@@ -649,6 +661,7 @@ function matchRun(
     runs.push({
       snapshotAtMs: observation.action.interval.start_ms,
       completedAtMs: observation.action.interval.end_ms,
+      confidence: commandResult.confidence,
     });
     successfulRuns.set(runKey, runs);
   }
@@ -706,7 +719,12 @@ function matchRun(
     return result(
       observation.action,
       "redundant_run",
-      lowerConfidence(observation.action.confidence, relevance.confidence),
+      lowerConfidence(
+        observation.action.confidence,
+        descriptor.scope === "targeted"
+          ? relevance.confidence
+          : lowerConfidence(relevance.confidence, previous?.confidence ?? "low"),
+      ),
       target,
       [relevance.caveat, ...identityCaveats],
       descriptor.normalized,
@@ -736,10 +754,16 @@ function classifyRunResult(
 ) {
   return classifyCommandResult(descriptor, {
     ...(toolResult?.status === undefined ? {} : { status: toolResult.status }),
+    ...(toolResult?.status_evidence === undefined
+      ? {}
+      : { statusEvidence: toolResult.status_evidence }),
     ...(toolResult?.exit_code === undefined
       ? {}
       : { exitCode: toolResult.exit_code }),
     ...(toolResult?.output === undefined ? {} : { output: toolResult.output }),
+    ...(toolResult?.output_bytes === undefined
+      ? {}
+      : { outputBytes: toolResult.output_bytes }),
   });
 }
 
@@ -771,12 +795,25 @@ function intervalsOverlap(
   );
 }
 
-function resultWasDefinitelySuccessful(
+function successfulResultConfidence(
   toolResult: ToolResultEvent | undefined,
-): boolean {
-  if (toolResult === undefined) return false;
-  if (toolResult.status === "success") return true;
-  return toolResult.status === "unknown" && toolResult.exit_code === 0;
+): Confidence | undefined {
+  if (toolResult === undefined) return undefined;
+  const evidence = toolResult.status_evidence;
+  if (evidence !== undefined && evidence.source !== "none") {
+    if (evidence.status !== "success") return undefined;
+    if (evidence.source === "output_pattern" &&
+      (!Number.isSafeInteger(toolResult.output_bytes) ||
+        toolResult.output_bytes < 0 ||
+        toolResult.output_bytes !== Buffer.byteLength(toolResult.output))) {
+      return undefined;
+    }
+    return evidence.confidence;
+  }
+  if (evidence === undefined && toolResult.status !== "unknown") {
+    return toolResult.status === "success" ? "high" : undefined;
+  }
+  return toolResult.exit_code === 0 ? "high" : undefined;
 }
 
 function observedPaths(
