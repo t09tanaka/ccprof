@@ -17,25 +17,25 @@
 - Modify: `src/rules/capabilities.ts`
 - Test: `test/capability-coverage.test.ts`
 
-- [ ] **Step 1: Write failing contract tests**
+- [x] **Step 1: Write failing contract tests**
 
 Add table-driven tests for all R001-R008 entries, undefined capabilities,
 `0/N`, `N/N`, `0/0`, canonical missing unions, session permutation, and
 warning-code/window truncation. Assert the exact seven-field object shape.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run `npm run build:test && node --test .test-dist/test/capability-coverage.test.js`.
 Expected: compilation fails because `RuleCoverage` and `ruleCoverage` do not
 exist.
 
-- [ ] **Step 3: Implement the minimal contract**
+- [x] **Step 3: Implement the minimal contract**
 
 Add the optional `ReportV2.rule_coverage`, capability eligibility helpers, and
 coverage computation. Use `total === 0 ? 1 : eligible / total`, sorted unique
 missing capabilities, rule order, and warning-code-only truncation.
 
-- [ ] **Step 4: Verify GREEN and commit**
+- [x] **Step 4: Verify GREEN and commit**
 
 Delegate the focused command above; expect all focused tests to pass. Commit
 only the contract, helper, and focused tests as

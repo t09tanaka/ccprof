@@ -37,7 +37,13 @@
  *   edit relevance, not any of the six capabilities.
  */
 
-import type { RuleId, Session, SessionCapability } from "../core/model.js";
+import type {
+  AnalysisWindow,
+  RuleCoverage,
+  RuleId,
+  Session,
+  SessionCapability,
+} from "../core/model.js";
 
 export const RULE_REQUIRED_CAPABILITIES: Readonly<
   Record<RuleId, readonly SessionCapability[]>
@@ -68,6 +74,54 @@ function sessionHasCapability(
   );
 }
 
+export function sessionSupportsRule(
+  session: Session,
+  ruleId: RuleId,
+): boolean {
+  return RULE_REQUIRED_CAPABILITIES[ruleId].every((capability) =>
+    sessionHasCapability(session, capability)
+  );
+}
+
+const PARSER_TRUNCATION_WARNING =
+  /^parser_(?:(?:file|line|node|depth|byte|warning)_budget_exceeded|[a-z0-9_]*truncated)$/u;
+
+function parserEvidenceTruncated(session: Session): boolean {
+  return session.warnings.some(({ code }) =>
+    PARSER_TRUNCATION_WARNING.test(code)
+  );
+}
+
+export function ruleCoverage(
+  sessions: readonly Session[],
+  windowCompleteness: AnalysisWindow["completeness"] = "complete",
+): RuleCoverage[] {
+  const totalSessions = sessions.length;
+  const ruleIds = (Object.keys(RULE_REQUIRED_CAPABILITIES) as RuleId[]).sort();
+  return ruleIds.map((rule_id): RuleCoverage => {
+    const required = RULE_REQUIRED_CAPABILITIES[rule_id];
+    const eligible = sessions.filter((session) =>
+      sessionSupportsRule(session, rule_id)
+    );
+    const missing = [...new Set(sessions.flatMap((session) =>
+      required.filter((capability) =>
+        !sessionHasCapability(session, capability)
+      )
+    ))].sort((left, right) => left.localeCompare(right));
+    const eligibleSessions = eligible.length;
+    return {
+      rule_id,
+      eligible_sessions: eligibleSessions,
+      total_sessions: totalSessions,
+      status: eligibleSessions === totalSessions ? "full" : "partial",
+      missing_capabilities: missing,
+      completeness: totalSessions === 0 ? 1 : eligibleSessions / totalSessions,
+      truncated: windowCompleteness === "partial" ||
+        eligible.some(parserEvidenceTruncated),
+    };
+  });
+}
+
 /**
  * For each rule, a session must have every capability the rule requires.
  * If any session in `sessions` lacks a required capability, the rule is
@@ -76,12 +130,9 @@ function sessionHasCapability(
 export function ruleApplicability(
   sessions: readonly Session[],
 ): RuleApplicability[] {
-  const ruleIds = Object.keys(RULE_REQUIRED_CAPABILITIES) as RuleId[];
-  return ruleIds.map((rule_id) => {
-    const required = RULE_REQUIRED_CAPABILITIES[rule_id];
-    const missing = required.filter((capability) =>
-      sessions.some((session) => !sessionHasCapability(session, capability))
-    );
-    return { rule_id, applicable: missing.length === 0, missing };
-  });
+  return ruleCoverage(sessions).map((entry) => ({
+    rule_id: entry.rule_id,
+    applicable: entry.status === "full",
+    missing: [...entry.missing_capabilities],
+  }));
 }
