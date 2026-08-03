@@ -17,6 +17,32 @@ function compareCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+function compareOptionalCodeUnits(
+  left: string | undefined,
+  right: string | undefined,
+): number {
+  if (left === undefined) return right === undefined ? 0 : -1;
+  if (right === undefined) return 1;
+  return compareCodeUnits(left, right);
+}
+
+function toolUseId(event: Session["events"][number]): string | undefined {
+  return event.kind === "tool_use" || event.kind === "tool_result"
+    ? event.tool_use_id
+    : undefined;
+}
+
+function eventConfidence(
+  events: readonly Session["events"][number][],
+): Session["confidence"] {
+  let confidence: Session["confidence"] = "high";
+  for (const event of events) {
+    if (event.confidence === "low") return "low";
+    if (event.confidence === "medium") confidence = "medium";
+  }
+  return confidence;
+}
+
 export function admitSessionEventPrefix(
   sessions: readonly Session[],
   meter: AnalysisBudgetMeter,
@@ -34,6 +60,10 @@ export function admitSessionEventPrefix(
     compareCodeUnits(left.session.source, right.session.source) ||
     compareCodeUnits(left.event.session_id, right.event.session_id) ||
     compareCodeUnits(left.event.agent_id, right.event.agent_id) ||
+    compareOptionalCodeUnits(
+      toolUseId(left.event),
+      toolUseId(right.event),
+    ) ||
     compareCodeUnits(left.event.session_ref, right.event.session_ref) ||
     compareCodeUnits(left.event.entry_uuid, right.event.entry_uuid) ||
     compareCodeUnits(left.event.kind, right.event.kind) ||
@@ -76,10 +106,16 @@ export function admitSessionEventPrefix(
     ))];
     const warnings = session.warnings.filter((warning) => {
       if (!truncated) return true;
-      if (warning.session_ref !== undefined) {
-        return admittedSessionRefs.has(warning.session_ref);
+      if (
+        warning.session_ref !== undefined &&
+        !admittedSessionRefs.has(warning.session_ref)
+      ) {
+        return false;
       }
-      return warning.line !== undefined && warning.line <= lastSourceLine;
+      if (warning.line !== undefined && warning.line > lastSourceLine) {
+        return false;
+      }
+      return warning.session_ref !== undefined || warning.line !== undefined;
     });
     const baseSession = (() => {
       if (!truncated) return session;
@@ -89,7 +125,11 @@ export function admitSessionEventPrefix(
     return [{
       ...baseSession,
       ...(truncated
-        ? { observed_cwds: observedCwds, observed_branches: observedBranches }
+        ? {
+            observed_cwds: observedCwds,
+            observed_branches: observedBranches,
+            confidence: eventConfidence(events),
+          }
         : {}),
       events,
       started_at_ms: startedAtMs,

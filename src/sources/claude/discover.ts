@@ -166,8 +166,10 @@ async function* findJsonlFilesBudgeted(
       );
       if (meter.stopped) return;
     } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+      if (!meter.admitSourceItem()) return;
       yield await canonicalPath(path);
     } else if (entry.isSymbolicLink() && entry.name.endsWith(".jsonl")) {
+      if (!meter.admitSourceItem()) return;
       let target: string;
       try {
         target = await realpath(path);
@@ -412,7 +414,6 @@ export async function discoverClaudeSessions(
       continue;
     }
     parsedPaths.add(file);
-    if (meter !== undefined && !meter.admitSourceItem()) break;
     // A transcript's mtime is at or after its last event, so a file last
     // written before the query window opened cannot intersect it. Skipping
     // those files avoids parsing every historical transcript on each run.
