@@ -8,6 +8,10 @@ import type {
   RecoverableInterval,
 } from "../core/model.js";
 import {
+  encodeAgentIdentity,
+  evidenceEventIdentity,
+} from "../core/event-identity.js";
+import {
   createFindingCandidate,
   minimumConfidence,
   orderedActions,
@@ -215,7 +219,7 @@ export function detectSerialSlack(
 ) {
   const byAgent = new Map<string, MatchedAction[]>();
   for (const action of orderedActions(actions)) {
-    const key = `${action.session_id}\0${action.agent_id}`;
+    const key = encodeAgentIdentity(evidenceEventIdentity(action));
     const group = byAgent.get(key);
     if (group === undefined) byAgent.set(key, [action]);
     else group.push(action);

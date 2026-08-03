@@ -6,6 +6,13 @@ import type {
   ToolResultEvent,
 } from "../core/model.js";
 import {
+  encodeAgentIdentity,
+  encodeEventIdentity,
+  encodeIdentityScope,
+  encodeInvocationIdentity,
+  evidenceEventIdentity,
+} from "../core/event-identity.js";
+import {
   createFindingCandidate,
   minimumConfidence,
   orderedActions,
@@ -33,19 +40,14 @@ interface ContextSignalGroup {
   compactions: CompactionEvent[];
 }
 
-function eventKey(
-  event: Pick<NormalizedEvent, "agent_id" | "session_id">,
-): string {
-  return `${event.session_id}\0${event.agent_id}`;
+function eventKey(event: NormalizedEvent): string {
+  return encodeAgentIdentity(evidenceEventIdentity(event));
 }
 
 function toolUseKey(
-  value: Pick<
-    MatchedAction | ToolResultEvent,
-    "agent_id" | "session_id" | "tool_use_id"
-  >,
+  value: MatchedAction | ToolResultEvent,
 ): string {
-  return `${value.session_id}\0${value.agent_id}\0${value.tool_use_id ?? ""}`;
+  return encodeInvocationIdentity(evidenceEventIdentity(value));
 }
 
 function targetFor(action: MatchedAction | undefined): string {
@@ -160,6 +162,9 @@ export function detectContextBloat(
       (left, right) =>
         left.result.timestamp_ms - right.result.timestamp_ms ||
         left.result.source_index - right.result.source_index ||
+        encodeEventIdentity(evidenceEventIdentity(left.result)).localeCompare(
+          encodeEventIdentity(evidenceEventIdentity(right.result)),
+        ) ||
         left.target.localeCompare(right.target),
     );
   const compactions = options.events
@@ -169,7 +174,10 @@ export function detectContextBloat(
     .sort(
       (left, right) =>
         left.timestamp_ms - right.timestamp_ms ||
-        left.source_index - right.source_index,
+        left.source_index - right.source_index ||
+        encodeEventIdentity(evidenceEventIdentity(left)).localeCompare(
+          encodeEventIdentity(evidenceEventIdentity(right)),
+        ),
     );
 
   const groups = new Map<string, ContextSignalGroup>();
@@ -206,11 +214,11 @@ export function detectContextBloat(
             inference === undefined
               ? []
               : [[
-                  [
-                    inference.session_id,
-                    inference.agent_id,
+                  encodeIdentityScope(
+                    "context-inference",
+                    encodeEventIdentity(evidenceEventIdentity(inference)),
                     inference.action_id,
-                  ].join("\0"),
+                  ),
                   inference,
                 ] as const]
           ),

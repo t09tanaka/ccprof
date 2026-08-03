@@ -15,7 +15,7 @@
  *   `match === "rework_edit"`, misses genuine rework.
  * - R002 (redundant-runs): none. Operates on already-matched
  *   `redundant_run` actions and command strings/timestamps only.
- * - R003 (rediscovery): none. `estimatedTokensByToolUseId` is optional,
+ * - R003 (rediscovery): none. `estimatedTokensByEventIdentity` is optional,
  *   evidence-only input (see `missingTokenEvidence` caveat); its absence
  *   degrades an evidence field, it does not block detection.
  * - R004 (human-wait): none. Explicit `ToolUseEvent.approval` is one of two

@@ -1,5 +1,12 @@
 import { durationMs } from "../core/intervals.js";
 import type { Confidence, MatchedAction } from "../core/model.js";
+import {
+  encodeAgentIdentity,
+  encodeEventIdentity,
+  encodeIdentityScope,
+  encodeInvocationIdentity,
+  evidenceEventIdentity,
+} from "../core/event-identity.js";
 import { normalizeRepoPath } from "../analysis/test-map.js";
 import type { AnalysisRecord } from "../store/analyses.js";
 import {
@@ -11,7 +18,7 @@ import {
 } from "./shared.js";
 
 export interface RediscoveryOptions {
-  estimatedTokensByToolUseId?: ReadonlyMap<string, number>;
+  estimatedTokensByEventIdentity?: ReadonlyMap<string, number>;
   history?: readonly AnalysisRecord[];
   currentObjectIdsByPath?: ReadonlyMap<string, string>; crossPrEligibleReadKeys?: ReadonlySet<string>;
 }
@@ -65,7 +72,7 @@ function currentReads(
 ): CurrentRead[] {
   const byAgent = new Map<string, MatchedAction[]>();
   for (const action of orderedActions(actions)) {
-    const key = `${action.session_id}\0${action.agent_id}`;
+    const key = encodeAgentIdentity(evidenceEventIdentity(action));
     const group = byAgent.get(key);
     if (group === undefined) byAgent.set(key, [action]);
     else group.push(action);
@@ -88,7 +95,8 @@ function currentReads(
         next.kind === "inference" &&
         next.match === read.match &&
         read.tool_use_id !== undefined &&
-        next.tool_use_id === read.tool_use_id &&
+        encodeInvocationIdentity(evidenceEventIdentity(next)) ===
+          encodeInvocationIdentity(evidenceEventIdentity(read)) &&
         next.interval.start_ms === read.interval.end_ms
           ? next
           : undefined;
@@ -156,13 +164,16 @@ function historicalRediscoveryByPath(
     }));
 }
 
-function readIdentity(read: Pick<CurrentRead, "read">, path?: string): string {
-  return [
-    read.read.session_id,
-    read.read.agent_id,
-    read.read.action_id,
-    ...(path === undefined ? [] : [path]),
-  ].join("\0");
+export function rediscoveryReadIdentityKey(
+  read: MatchedAction,
+  path?: string,
+): string {
+  return encodeIdentityScope(
+    "rediscovery-read",
+    encodeEventIdentity(evidenceEventIdentity(read)),
+    read.action_id,
+    path,
+  );
 }
 
 export function detectRediscovery(
@@ -173,12 +184,12 @@ export function detectRediscovery(
   const historyByPath = historicalRediscoveryByPath(options.history ?? [], options.currentObjectIdsByPath ?? new Map());
   const byTarget = new Map<string, Map<string, CurrentRead>>();
   for (const read of reads) {
-    const exact = (path: string) => historyByPath.has(path) && (options.crossPrEligibleReadKeys === undefined || options.crossPrEligibleReadKeys.has(readIdentity(read, path)));
+    const exact = (path: string) => historyByPath.has(path) && (options.crossPrEligibleReadKeys === undefined || options.crossPrEligibleReadKeys.has(rediscoveryReadIdentityKey(read.read, path)));
     const historicalPath = read.read.match === "duplicate_read" || read.paths.length === 1 ? read.paths.find(exact) : undefined;
     const target = historicalPath ?? (read.read.match === "duplicate_read" ? read.target : undefined);
     if (target === undefined) continue;
     const group = byTarget.get(target) ?? new Map();
-    group.set(readIdentity(read), read);
+    group.set(rediscoveryReadIdentityKey(read.read), read);
     byTarget.set(target, group);
   }
 
@@ -189,7 +200,7 @@ export function detectRediscovery(
       const duplicates = current.filter(
         ({ read }) => read.match === "duplicate_read",
       );
-      const eligible = ({ read, paths }: CurrentRead) => paths.includes(target) && (options.crossPrEligibleReadKeys === undefined || options.crossPrEligibleReadKeys.has(readIdentity({ read }, target)));
+      const eligible = ({ read, paths }: CurrentRead) => paths.includes(target) && (options.crossPrEligibleReadKeys === undefined || options.crossPrEligibleReadKeys.has(rediscoveryReadIdentityKey(read, target)));
       const historical = current.some(eligible) ? historyByPath.get(target) : undefined;
       const claimedReads = current.filter((read) =>
         read.read.match === "duplicate_read" || (historical !== undefined && eligible(read)));
@@ -210,11 +221,22 @@ export function detectRediscovery(
           read.tool_use_id === undefined ? [] : [read.tool_use_id]
         ),
       );
-      const missingTokenEvidence = toolUseIds.some(
-        (id) => options.estimatedTokensByToolUseId?.get(id) === undefined,
+      const resultIdentityKeys = sortedUnique(
+        claimedReads.flatMap(({ read }) =>
+          read.result_identity === undefined
+            ? []
+            : [encodeEventIdentity(read.result_identity)]
+        ),
       );
-      const estimatedTokens = toolUseIds.reduce((total, id) => {
-        const tokens = options.estimatedTokensByToolUseId?.get(id);
+      const missingTokenEvidence = claimedReads.some(({ read }) => {
+        if (read.result_identity === undefined) return true;
+        const tokens = options.estimatedTokensByEventIdentity?.get(
+          encodeEventIdentity(read.result_identity),
+        );
+        return tokens === undefined || !Number.isSafeInteger(tokens) || tokens < 0;
+      });
+      const estimatedTokens = resultIdentityKeys.reduce((total, key) => {
+        const tokens = options.estimatedTokensByEventIdentity?.get(key);
         return total +
           (tokens !== undefined && Number.isSafeInteger(tokens) && tokens >= 0
             ? tokens
