@@ -77,8 +77,8 @@ interface SourceDescriptor {
 - [x] Document the exact descriptor shape, opaque identity/fingerprint domains,
   built-in registry versions, validation behavior, privacy handling, and scope in
   README; mark this plan complete.
-- [ ] Delegate full `npm run check` and applicable local GitHub Actions commands.
-- [ ] Obtain independent spec and quality approval; fix only issues caused by
+- [x] Delegate full `npm run check` and applicable local GitHub Actions commands.
+- [x] Obtain independent spec and quality approval; fix only issues caused by
   this atomic change in new commits.
 - [ ] Push and open `[Sources] feat: add validated source descriptors` against
   `main`, monitor remote CI, merge with a merge commit, sync main, and clean the
