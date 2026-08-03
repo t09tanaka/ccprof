@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { Session } from "../src/core/model.js";
+import {
+  AnalysisBudgetMeter,
+  type AnalysisBudgetClock,
+  type AnalysisBudgets,
+} from "../src/analysis/budgets.js";
 import { CombinedSessionSource } from "../src/sources/combined.js";
 import type { SessionQuery, SessionSource } from "../src/sources/session-source.js";
 
@@ -36,6 +41,23 @@ function throwingSource(error: unknown): SessionSource {
     discover: async () => {
       throw error;
     },
+  };
+}
+
+const clock: AnalysisBudgetClock = {
+  wall_ms: () => 0,
+  cpu_ms: () => 0,
+};
+
+function budgets(overrides: Partial<AnalysisBudgets> = {}): AnalysisBudgets {
+  return {
+    max_input_bytes: 1_000,
+    max_input_events: 100,
+    max_wall_ms: 1_000,
+    max_cpu_ms: 1_000,
+    max_output_bytes: 1_000,
+    max_source_items: 1,
+    ...overrides,
   };
 }
 
@@ -96,4 +118,102 @@ test("discover() never rejects because of a source failure, even without an onSo
   ]);
 
   await assert.doesNotReject(combined.discover(query));
+});
+
+test("unbudgeted combined discovery starts independent sources in parallel", async () => {
+  const order: string[] = [];
+  let releaseFirst = (): void => undefined;
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const first: SessionSource = {
+    discover: async () => {
+      order.push("first:start");
+      await firstGate;
+      order.push("first:end");
+      return [fakeSession("first")];
+    },
+  };
+  const second: SessionSource = {
+    discover: async () => {
+      order.push("second:start");
+      return [fakeSession("second")];
+    },
+  };
+  const pending = new CombinedSessionSource([first, second]).discover(query);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(order, ["first:start", "second:start"]);
+  releaseFirst();
+  await pending;
+});
+
+test("budgeted combined discovery is sequential and stops at the shared source-item boundary", async () => {
+  const meter = new AnalysisBudgetMeter(budgets(), clock);
+  const budgetedQuery = { ...query, analysisBudgetMeter: meter };
+  const order: string[] = [];
+  const cooperative = (
+    name: string,
+  ): SessionSource & { budgetCooperative: true } => ({
+    budgetCooperative: true,
+    discover: async (sourceQuery) => {
+      order.push(`${name}:start`);
+      await Promise.resolve();
+      const admitted = (sourceQuery as SessionQuery & {
+        analysisBudgetMeter: AnalysisBudgetMeter;
+      }).analysisBudgetMeter.admitSourceItem();
+      order.push(`${name}:end`);
+      return admitted ? [fakeSession(name)] : [];
+    },
+  });
+  const errors: unknown[] = [];
+  const combined = new CombinedSessionSource(
+    [cooperative("first"), cooperative("second")],
+    (error) => errors.push(error),
+  );
+
+  const sessions = await combined.discover(budgetedQuery);
+
+  assert.deepEqual(order, [
+    "first:start",
+    "first:end",
+    "second:start",
+    "second:end",
+  ]);
+  assert.deepEqual(sessions.map(({ source_path }) => source_path), ["first"]);
+  assert.deepEqual(errors, []);
+  assert.equal(meter.result().truncation_reason, "max_source_items");
+  assert.equal(meter.result().consumed.source_items, 1);
+  assert.equal(meter.result().observed.source_items, 2);
+});
+
+test("budgeted source failure is content-free and prevents the next source from starting", async () => {
+  const meter = new AnalysisBudgetMeter(budgets(), clock);
+  const started: string[] = [];
+  const failure = new Error("token-canary");
+  const combined = new CombinedSessionSource([
+    {
+      discover: async () => {
+        started.push("first");
+        throw failure;
+      },
+    },
+    {
+      discover: async () => {
+        started.push("second");
+        return [fakeSession("second")];
+      },
+    },
+  ]);
+
+  const budgetedQuery = {
+    ...query,
+    analysisBudgetMeter: meter,
+  };
+  const sessions = await combined.discover(budgetedQuery);
+
+  assert.deepEqual(sessions, []);
+  assert.deepEqual(started, ["first"]);
+  assert.equal(meter.result().truncation_reason, "source_failure");
+  assert.equal(meter.result().coverage, 0);
+  assert.ok(!JSON.stringify(meter.result()).includes("token-canary"));
 });
