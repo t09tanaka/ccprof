@@ -121,6 +121,102 @@ function report(): ReportV2 {
   };
 }
 
+const PRIVACY_REPO = "/Users/alice/SecretCo/ccprof";
+const PRIVACY_SOURCE =
+  "/Users/alice/.claude/projects/SecretCo/session.jsonl";
+const PRIVACY_STORE =
+  "/Users/alice/.ccprof/SecretCo/analyses/private.json";
+const PRIVACY_SESSION = "session-AZ09_SECRET_SESSION";
+const PRIVACY_URL =
+  "https://github.internal.example/SecretCo/tickets/ENG-421";
+const PRIVACY_TICKET = "ENG-421";
+const PRIVACY_TOKEN = "ghp_SECRET_TOKEN_123456789";
+const PRIVACY_COMMAND =
+  `curl -H "Authorization: Bearer ${PRIVACY_TOKEN}" ${PRIVACY_URL}`;
+const PRIVACY_SPACED_PATH = `${PRIVACY_REPO}/private notes/plan.txt`;
+const PRIVACY_EXTERNAL_BASENAME = "log.jsonl";
+const PRIVACY_EXTERNAL_PATH =
+  `/Users/alice/Secret Co/${PRIVACY_EXTERNAL_BASENAME}`;
+const PRIVACY_FLAG_SECRET = "FLAG_SECRET";
+const PRIVACY_DEPLOY_COMMAND =
+  `./scripts/deploy --token ${PRIVACY_FLAG_SECRET}`;
+const PRIVACY_WARNING_MESSAGES = [
+  `Log ${PRIVACY_EXTERNAL_PATH} has session ${PRIVACY_SESSION}`,
+  `Store ${PRIVACY_STORE} referenced ${PRIVACY_TICKET}`,
+];
+
+function privacyReport(): ReportV2 {
+  return {
+    version: 2,
+    unit: {
+      repo: PRIVACY_REPO,
+      pr_ref: `${PRIVACY_URL}?token=${PRIVACY_TOKEN}`,
+      sessions: [PRIVACY_SESSION],
+    },
+    summary: { ...summary, baseline: null },
+    findings: [finding(1, {
+      finding_key: `${PRIVACY_REPO}:${PRIVACY_COMMAND}`,
+      title: `Investigate ${PRIVACY_COMMAND}`,
+      target: `${PRIVACY_REPO}/src/private.ts`,
+      evidence: {
+        session_refs: [`${PRIVACY_SESSION}#entry-RAW`],
+        interval_ids: [`R002:${PRIVACY_SESSION}:interval-RAW`],
+        command: "npm test",
+        paths: ["src/safe.test.ts", `${PRIVACY_REPO}/src/private.ts`],
+        command_identity: {
+          repo_relative_cwd: "packages/api",
+          normalized_argv: ["npm", "test", "src/safe.test.ts"],
+          executor: "shell",
+        },
+        unknown_detail: {
+          source: PRIVACY_SOURCE,
+          store: PRIVACY_STORE,
+          url: PRIVACY_URL,
+          token: PRIVACY_TOKEN,
+          command: PRIVACY_COMMAND,
+          quoted_path: `"${PRIVACY_SPACED_PATH}"`,
+          deploy: PRIVACY_DEPLOY_COMMAND,
+        },
+      },
+      fix_recipe: {
+        suggestion:
+          `Inspect "${PRIVACY_SPACED_PATH}"; then ${PRIVACY_DEPLOY_COMMAND}`,
+        verify: `npm test && ${PRIVACY_COMMAND}`,
+      },
+      caveats: [`Ticket ${PRIVACY_TICKET}; store ${PRIVACY_STORE}`],
+    })],
+    caveats: PRIVACY_WARNING_MESSAGES.map(
+      (message) => `[private-row] ${message}`,
+    ),
+  };
+}
+
+const privacyWarnings = PRIVACY_WARNING_MESSAGES.map((message, index) => ({
+  code: "private-row",
+  message,
+  source: index === 0 ? PRIVACY_EXTERNAL_PATH : PRIVACY_STORE,
+}));
+
+function assertPrivacyCanariesAbsent(value: string): void {
+  for (const canary of [
+    PRIVACY_REPO,
+    PRIVACY_SOURCE,
+    PRIVACY_STORE,
+    PRIVACY_SESSION,
+    PRIVACY_URL,
+    PRIVACY_TICKET,
+    PRIVACY_TOKEN,
+    PRIVACY_COMMAND,
+    PRIVACY_SPACED_PATH,
+    PRIVACY_EXTERNAL_PATH,
+    PRIVACY_EXTERNAL_BASENAME,
+    PRIVACY_FLAG_SECRET,
+    PRIVACY_DEPLOY_COMMAND,
+  ]) {
+    assert.ok(!value.includes(canary), `privacy leak: ${canary}`);
+  }
+}
+
 function terminalAttack(marker: string): string {
   return [
     `\u001b]0;${marker}_OSC\u0007`,
@@ -489,6 +585,28 @@ test("CLI parser accepts direct analyze, optional PR selectors, durations, stats
   );
 });
 
+test("CLI parser accepts privacy profiles once in separated or inline form", () => {
+  for (const privacy of ["strict", "balanced", "raw"] as const) {
+    assert.equal(
+      (parseCliArgs(["--privacy", privacy]) as { privacy?: string }).privacy,
+      privacy,
+    );
+    assert.equal(
+      (parseCliArgs([`--privacy=${privacy}`]) as { privacy?: string }).privacy,
+      privacy,
+    );
+  }
+  for (const args of [
+    ["--privacy"],
+    ["--privacy="],
+    ["--privacy", "unknown"],
+    ["--privacy=STRICT"],
+    ["--privacy=strict", "--privacy", "raw"],
+  ]) {
+    assert.throws(() => parseCliArgs(args), CliUsageError, args.join(" "));
+  }
+});
+
 test("analysis-window CLI options accept strict RFC3339 and duration forms", () => {
   assert.equal(parseRfc3339Ms("1970-01-01T00:00:00Z"), 0);
   assert.equal(
@@ -842,6 +960,244 @@ test("analyze command renders injected analysis without mixing warnings into JSO
 
   assert.equal((JSON.parse(result.stdout) as ReportV2).version, 2);
   assert.deepEqual(result.warnings, ["[fixture] partial data"]);
+});
+
+test("analyze privacy defaults are balanced for JSON/TTY and strict for Markdown", async () => {
+  const analyze = async () => ({ report: privacyReport(), warnings: [] });
+  const json = await runAnalyzeCommand(
+    { cwd: PRIVACY_REPO, format: "json", color: false },
+    { analyze },
+  );
+  const tty = await runAnalyzeCommand(
+    { cwd: PRIVACY_REPO, format: "tty", color: false },
+    { analyze },
+  );
+  const markdown = await runAnalyzeCommand(
+    { cwd: PRIVACY_REPO, format: "markdown", color: false },
+    { analyze },
+  );
+
+  assert.match(json.stdout, /npm test/u);
+  assert.match(json.stdout, /src\/safe\.test\.ts/u);
+  assertPrivacyCanariesAbsent(json.stdout);
+  assertPrivacyCanariesAbsent(tty.stdout);
+  assertPrivacyCanariesAbsent(markdown.stdout);
+  assert.doesNotMatch(markdown.stdout, /src\/safe\.test\.ts/u);
+  assert.doesNotMatch(markdown.stdout, /Evidence command/u);
+});
+
+test("strict privacy covers report, warnings, and the advisory prompt", async () => {
+  let advisoryPrompt = "";
+  const result = await runAnalyzeCommand(
+    {
+      cwd: PRIVACY_REPO,
+      format: "json",
+      color: false,
+      privacy: "strict",
+      advisory: true,
+    },
+    {
+      analyze: async () => ({
+        report: privacyReport(),
+        warnings: privacyWarnings,
+      }),
+      runCommand: async (_command, args) => {
+        advisoryPrompt = args[1] ?? "";
+        return {
+          code: 0,
+          stdout:
+            `- ${PRIVACY_COMMAND} "${PRIVACY_SPACED_PATH}" ${PRIVACY_DEPLOY_COMMAND}\n`,
+          stderr: "",
+        };
+      },
+    },
+  );
+
+  assertPrivacyCanariesAbsent(result.stdout);
+  const warningText = result.warnings.join("\n");
+  assertPrivacyCanariesAbsent(warningText);
+  assertPrivacyCanariesAbsent(advisoryPrompt);
+  assert.equal(result.warnings.length, 1);
+  assert.match(warningText, /private-row/u);
+  assert.match(warningText, /2/u);
+  const projected = JSON.parse(result.stdout) as ReportV2 & {
+    advisory?: { text: string };
+  };
+  assert.equal(
+    projected.advisory?.text,
+    "[advisory hidden by strict privacy]",
+  );
+  const parserCaveats = projected.caveats.filter((caveat) =>
+    caveat.includes("private-row")
+  );
+  assert.equal(parserCaveats.length, 1);
+  assert.match(parserCaveats[0] ?? "", /2/u);
+  for (const message of PRIVACY_WARNING_MESSAGES) {
+    assert.ok(!result.stdout.includes(message));
+    assert.ok(!warningText.includes(message));
+  }
+});
+
+test("balanced privacy preserves safe relative evidence but removes canaries", async () => {
+  const result = await runAnalyzeCommand(
+    {
+      cwd: PRIVACY_REPO,
+      format: "json",
+      color: false,
+      privacy: "balanced",
+    },
+    {
+      analyze: async () => ({
+        report: privacyReport(),
+        warnings: privacyWarnings,
+      }),
+    },
+  );
+
+  assert.match(result.stdout, /npm test/u);
+  assert.match(result.stdout, /src\/safe\.test\.ts/u);
+  assertPrivacyCanariesAbsent(result.stdout);
+  assertPrivacyCanariesAbsent(result.warnings.join("\n"));
+});
+
+test("raw privacy preserves report and warning values without mutating input", async () => {
+  const raw = privacyReport();
+  const before = JSON.stringify(raw);
+  const result = await runAnalyzeCommand(
+    {
+      cwd: PRIVACY_REPO,
+      format: "json",
+      color: false,
+      privacy: "raw",
+    },
+    {
+      analyze: async () => ({ report: raw, warnings: privacyWarnings }),
+    },
+  );
+
+  assert.deepEqual(JSON.parse(result.stdout), raw);
+  assert.equal(JSON.stringify(raw), before);
+  for (const canary of [
+    PRIVACY_REPO,
+    PRIVACY_SOURCE,
+    PRIVACY_STORE,
+    PRIVACY_SESSION,
+    PRIVACY_URL,
+    PRIVACY_TICKET,
+    PRIVACY_TOKEN,
+    PRIVACY_SPACED_PATH,
+    PRIVACY_EXTERNAL_PATH,
+    PRIVACY_EXTERNAL_BASENAME,
+    PRIVACY_FLAG_SECRET,
+    PRIVACY_DEPLOY_COMMAND,
+  ]) {
+    assert.ok(
+      result.stdout.includes(canary) || result.warnings.join("\n").includes(canary),
+      `raw profile removed ${canary}`,
+    );
+  }
+});
+
+test("CI selects strict privacy and scrubs operational error paths", async () => {
+  let dispatchedPrivacy: string | undefined;
+  const quiet = (_value: string): void => undefined;
+  assert.equal(await runCli(["--json"], {
+    ci: true,
+    cwd: PRIVACY_REPO,
+    handlers: handlers(async (options) => {
+      dispatchedPrivacy = options.privacy;
+      return { stdout: "{}", warnings: [] };
+    }),
+    stdout: quiet,
+    stderr: quiet,
+  }), 0);
+  assert.equal(dispatchedPrivacy, "strict");
+
+  let strictParseStderr = "";
+  assert.equal(await runCli([
+    "--privacy=strict",
+    `--unknown=${PRIVACY_EXTERNAL_PATH}`,
+  ], {
+    ci: false,
+    cwd: PRIVACY_REPO,
+    handlers: handlers(),
+    stdout: quiet,
+    stderr: (value) => {
+      strictParseStderr += value;
+    },
+  }), 2);
+  assert.match(
+    strictParseStderr,
+    /analysis failed \(details hidden by strict privacy\)/u,
+  );
+  assertPrivacyCanariesAbsent(strictParseStderr);
+
+  let rawParseStderr = "";
+  const rawParseArgument =
+    `${PRIVACY_EXTERNAL_PATH} ${terminalAttack("RAW_PARSE")}`;
+  assert.equal(await runCli([
+    "--privacy=raw",
+    `--unknown=${rawParseArgument}`,
+  ], {
+    ci: true,
+    cwd: PRIVACY_REPO,
+    handlers: handlers(),
+    stdout: quiet,
+    stderr: (value) => {
+      rawParseStderr += value;
+    },
+  }), 2);
+  assert.ok(rawParseStderr.includes(PRIVACY_EXTERNAL_PATH));
+  assertTerminalAttackRemoved(rawParseStderr, "RAW_PARSE");
+
+  let parseStderr = "";
+  assert.equal(await runCli([`--unknown=${PRIVACY_SPACED_PATH}`], {
+    ci: true,
+    cwd: PRIVACY_REPO,
+    handlers: handlers(),
+    stdout: quiet,
+    stderr: (value) => {
+      parseStderr += value;
+    },
+  }), 2);
+  assertPrivacyCanariesAbsent(parseStderr);
+
+  let stderr = "";
+  assert.equal(await runCli(["--json"], {
+    ci: true,
+    cwd: PRIVACY_REPO,
+    handlers: handlers(async () => {
+      throw new Error(
+        `Could not open ${PRIVACY_SOURCE} ${terminalAttack("STRICT_ERROR")}`,
+      );
+    }),
+    stdout: quiet,
+    stderr: (value) => {
+      stderr += value;
+    },
+  }), 5);
+  assertPrivacyCanariesAbsent(stderr);
+  assert.match(
+    stderr,
+    /analysis failed \(details hidden by strict privacy\)/u,
+  );
+  assert.doesNotMatch(stderr, /[\u001b\u0007]|STRICT_ERROR|painted/u);
+
+  let rawStderr = "";
+  assert.equal(await runCli(["--json", "--privacy=raw"], {
+    ci: true,
+    cwd: PRIVACY_REPO,
+    handlers: handlers(async () => ({
+      stdout: "{}",
+      warnings: [`${PRIVACY_SOURCE} ${terminalAttack("RAW_WARNING")}`],
+    })),
+    stdout: quiet,
+    stderr: (value) => {
+      rawStderr += value;
+    },
+  }), 0);
+  assert.match(rawStderr, new RegExp(PRIVACY_SOURCE, "u"));
+  assertTerminalAttackRemoved(rawStderr, "RAW_WARNING");
 });
 
 const storePaths: StorePaths = {

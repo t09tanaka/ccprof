@@ -87,6 +87,7 @@ ccprof
 ccprof --pr [<number|url|base...head>] [--json|--md]
        [--idle-threshold <duration>] [--test-map <path>]
        [--since <RFC3339>] [--commit-lookback <duration>]
+       [--privacy <strict|balanced|raw>] [--advisory]
 ccprof stats [--json]
 ccprof dismiss <finding-key> [--reason <text>]
 ccprof hook-event [--notify]
@@ -110,6 +111,12 @@ There are three output formats.
 `--json` and `--md` cannot be combined. `--idle-threshold` accepts a bare number
 (minutes) or a duration suffixed with `s`, `m`, or `h`.
 
+Shared output is projected through a privacy profile before rendering. Local TTY
+and JSON output default to `balanced`; Markdown defaults to `strict`, as does any
+format when CI is detected. An explicit `--privacy strict`, `balanced`, or `raw`
+overrides that default. See [Privacy and storage](#privacy-and-storage) before
+using `raw` in logs, PR comments, or automation.
+
 `--since` sets an explicit analysis start and requires an RFC3339 date-time with
 an explicit timezone (`Z`/`z` or `±HH:MM`). Sub-millisecond fractional digits are
 truncated deterministically. Leap seconds and timestamps before the Unix epoch
@@ -118,7 +125,7 @@ boundary by a duration using the same `s`, `m`, or `h` syntax. Both options may
 be provided; `--since` takes precedence over `--commit-lookback`.
 
 `--advisory` opts in to an additional LLM advisory section:
-the rendered report JSON is passed to the locally installed `claude` CLI
+the privacy-projected report JSON is passed to the locally installed `claude` CLI
 (Claude Code, print mode), and up to three judgment-level suggestions come
 back in a section that is clearly separated from the deterministic findings.
 The deterministic report, the stored analysis record, the baseline, and the
@@ -235,8 +242,8 @@ time, but every finding produced by the analysis is written to the store.
 {
   "version": 2,
   "unit": {
-    "repo": "/work/project",
-    "pr_ref": "main...feature",
+    "repo": "repo-1",
+    "pr_ref": "ref-1",
     "sessions": ["session-1"]
   },
   "summary": {
@@ -250,7 +257,7 @@ time, but every finding produced by the analysis is written to the store.
   },
   "findings": [
     {
-      "finding_key": "6d4f...",
+      "finding_key": "finding-1",
       "rule_id": "R002",
       "title": "Redundant test or build runs",
       "classification": "behavior",
@@ -258,8 +265,8 @@ time, but every finding produced by the analysis is written to the store.
       "scope": "this_pr",
       "confidence": "high",
       "evidence": {
-        "session_refs": ["session-1#entry-42"],
-        "interval_ids": ["R002:session-1#entry-42"],
+        "session_refs": ["session-ref-1"],
+        "interval_ids": ["interval-1"],
         "command": "npm test",
         "count": 2
       },
@@ -442,12 +449,27 @@ ccprof never sends or uploads session contents or findings as telemetry.
 Resolving a PR number/URL or the current PR may make an installed `gh pr view`
 fetch metadata from GitHub. Pass `base...head` to avoid the network entirely.
 
+Before JSON, Markdown, or TTY output is rendered, ccprof applies one of three
+display-only privacy profiles:
+
+| Profile | Intended use | Output policy |
+|---|---|---|
+| `strict` | CI logs and PR comments | Replaces repository, finding, session, reference, and interval identities with opaque aliases; drops detailed evidence and all but a small fixed allowlist of safe verification commands; groups warnings by code and count. |
+| `balanced` | Local TTY and JSON inspection | Keeps useful repository-relative evidence and safe commands while redacting absolute paths, raw session identities, URLs, credentials, tokens, and secret-bearing text. |
+| `raw` | Explicit trusted local debugging only | Preserves the previous report and warning values (terminal-control sanitization still applies). Raw output can expose repository paths, session identifiers, commands, URLs, or secrets and must not be pasted into shared systems without review. |
+
+Local TTY/JSON defaults to `balanced`. Markdown and detected CI default to
+`strict`; an explicit `--privacy` value wins, including in CI. Projection never
+changes the deterministic raw report or the analysis record stored on disk.
+
 By default no LLM is contacted either. Only when `--advisory` is passed
-explicitly, the display-report JSON — the same document `--json`
-prints, which can include findings, command names, and file paths — is handed
-to the locally installed `claude` CLI, which sends it to its configured LLM
-provider. Raw session transcripts and logs are never sent; the advisory prompt
-contains nothing beyond fixed instructions and that report JSON.
+explicitly, the already projected display-report JSON is handed to the locally
+installed `claude` CLI, which sends it to its configured LLM provider. The
+advisory therefore receives the selected privacy profile's view, never the raw
+report behind a strict or balanced invocation. Raw session transcripts and logs
+are never sent; the advisory prompt contains nothing beyond fixed instructions
+and that projected report JSON. Selecting `--privacy raw --advisory` explicitly
+accepts the same raw-output disclosure risk.
 
 The store lives outside the repository, in a per-repository directory:
 
@@ -455,6 +477,11 @@ The store lives outside the repository, in a per-repository directory:
 $XDG_DATA_HOME/ccprof/<sha256(canonical-repo-path)>/
 ~/.local/share/ccprof/<sha256(canonical-repo-path)>/
 ```
+
+Store records remain raw so local baselines and history retain their existing
+identity and evidence. Privacy profiles govern rendered output and advisory
+input; they do not rewrite the Store. Protect the data directory as local
+sensitive data.
 
 For verification or unusual layouts, `CCPROF_DATA_DIR` overrides the storage
 root, `CCPROF_CLAUDE_PROJECTS_DIR` overrides the Claude projects directory, and

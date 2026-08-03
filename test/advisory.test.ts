@@ -93,6 +93,7 @@ async function renderWith(
       cwd: "/repo",
       format,
       color: false,
+      privacy: "raw",
       ...(advisory ? { advisory: true } : {}),
     },
     dependencies(runCommand),
