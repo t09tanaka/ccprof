@@ -426,6 +426,59 @@ test("trust loading never uses an unbounded readFile after the size snapshot", a
   }
 });
 
+test("bounded trust reads reuse one allocation across one-byte short reads", async (t) => {
+  const fixture = await signedPolicyFixture(t);
+  type OpenFile = typeof open;
+  const cjsRequire = createRequire(import.meta.url);
+  const promises = cjsRequire("node:fs/promises") as { open: OpenFile };
+  const originalOpen = promises.open;
+  const backingStores = new Set<unknown>();
+  const offsets: number[] = [];
+  const instrumentedOpen = (async (...args: Parameters<OpenFile>) => {
+    const handle = await originalOpen(...args);
+    if (String(args[0]) === fixture.signaturePath) {
+      const originalRead = handle.read.bind(handle) as (
+        buffer: Buffer,
+        offset: number,
+        length: number,
+        position: number | null,
+      ) => Promise<{ bytesRead: number; buffer: Buffer }>;
+      handle.read = (async (...readArgs: unknown[]) => {
+        const [buffer, offset, length, position] = readArgs as [
+          Buffer,
+          number,
+          number,
+          number | null,
+        ];
+        backingStores.add(buffer.buffer);
+        offsets.push(offset);
+        return await originalRead(
+          buffer,
+          offset,
+          Math.min(length, 1),
+          position,
+        );
+      }) as typeof handle.read;
+    }
+    return handle;
+  }) as OpenFile;
+
+  try {
+    promises.open = instrumentedOpen;
+    syncBuiltinESMExports();
+    assert.deepEqual(
+      await loadConfiguredOrganizationPolicy(fixture.environment),
+      fixture.value,
+    );
+    assert.ok(offsets.length > 64);
+    assert.equal(backingStores.size, 1);
+    assert.ok(new Set(offsets).size > 64);
+  } finally {
+    promises.open = originalOpen;
+    syncBuiltinESMExports();
+  }
+});
+
 test("trust loading rejects a path identity change during the read", async (t) => {
   const fixture = await signedPolicyFixture(t);
   type Lstat = typeof lstat;
@@ -544,6 +597,62 @@ test("wrong keys, algorithms, and modified policies never verify", async (t) => 
     loadConfiguredOrganizationPolicy(modified.environment),
     (error: unknown) => assertPolicyError(error, "untrusted_policy"),
   );
+});
+
+test("canonicalization rejects hostile objects with content-free deterministic errors", () => {
+  const sentinel = "CCPROF_HOSTILE_POLICY_SENTINEL_d16fc2";
+  const assertHostile = (value: unknown): void => {
+    assert.throws(
+      () => canonicalOrganizationPolicy(value as OrganizationPolicy),
+      (error: unknown) => assertPolicyError(
+        error,
+        "invalid_policy",
+        [sentinel],
+      ),
+    );
+  };
+
+  let topLevelGetterCalls = 0;
+  const changingTopLevel = { ...policy() } as Record<string, unknown>;
+  Object.defineProperty(changingTopLevel, "allow_raw", {
+    enumerable: true,
+    configurable: true,
+    get() {
+      topLevelGetterCalls += 1;
+      if (topLevelGetterCalls > 1) throw new Error(sentinel);
+      return true;
+    },
+  });
+  assertHostile(changingTopLevel);
+  assert.equal(topLevelGetterCalls, 0);
+
+  let nestedGetterCalls = 0;
+  const changingSwitches = {
+    raw: false,
+    advisory: false,
+    export: false,
+  } as Record<string, unknown>;
+  Object.defineProperty(changingSwitches, "advisory", {
+    enumerable: true,
+    configurable: true,
+    get() {
+      nestedGetterCalls += 1;
+      throw new Error(sentinel);
+    },
+  });
+  assertHostile({ ...policy(), kill_switches: changingSwitches });
+  assert.equal(nestedGetterCalls, 0);
+
+  assertHostile(Object.assign(Object.create({ sentinel }), policy()));
+  assertHostile(new Proxy(policy(), {
+    ownKeys() {
+      throw new Error(sentinel);
+    },
+  }));
+
+  const revoked = Proxy.revocable(policy(), {});
+  revoked.revoke();
+  assertHostile(revoked.proxy);
 });
 
 test("organization constraints cannot be weakened by repository or CLI", () => {
