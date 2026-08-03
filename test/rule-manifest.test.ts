@@ -281,6 +281,56 @@ test("manifest validation fails closed with actionable deterministic codes", () 
   manifestError(invalid((value) => { value[0]!.policy_risk = "critical"; }), "invalid_policy_risk", 0, "policy_risk");
 });
 
+test("manifest validation fails closed for sparse, hidden, and trapped inputs", () => {
+  const sparse = catalog();
+  delete sparse[0];
+  manifestError(sparse, "invalid_entry", 0);
+
+  const hidden = catalog();
+  Object.defineProperty(hidden[0]!, "extra", {
+    configurable: true,
+    enumerable: false,
+    value: true,
+  });
+  manifestError(hidden, "unknown_field", 0, "extra");
+
+  const trappedInputs = [
+    new Proxy(catalog()[0]!, {
+      ownKeys() { throw new Error("token-secret ownKeys trap"); },
+    }),
+    new Proxy(catalog()[0]!, {
+      getOwnPropertyDescriptor() {
+        throw new Error("token-secret descriptor trap");
+      },
+    }),
+    (() => {
+      const entry = catalog()[0]!;
+      Object.defineProperty(entry, "supported_sources", {
+        configurable: true,
+        enumerable: true,
+        get() { throw new Error("token-secret getter trap"); },
+      });
+      return entry;
+    })(),
+  ];
+  for (const trapped of trappedInputs) {
+    const value = catalog();
+    value[0] = trapped;
+    assert.throws(
+      () => validateRuleManifestCatalog(value),
+      (error: unknown) => {
+        if (!(error instanceof Error)) return false;
+        assert.equal(error.constructor, RuleManifestValidationError);
+        const failure = error as RuleManifestValidationError;
+        assert.equal(failure.code, "invalid_entry");
+        assert.equal(failure.index, 0);
+        assert.doesNotMatch(failure.message, /token-secret/u);
+        return true;
+      },
+    );
+  }
+});
+
 test("manifest validation rejects valid-looking deviations from every rule contract", () => {
   for (const [index, expected] of EXPECTED.entries()) {
     manifestError(invalid((value) => {
@@ -311,6 +361,7 @@ test("manifest validation snapshots accessor-backed inputs before returning them
   });
 
   assert.deepEqual(validateRuleManifestCatalog(value), EXPECTED);
+  assert.equal(reads, 1);
 });
 
 test("the capability compatibility map is derived exactly from manifests", () => {
@@ -391,6 +442,56 @@ test("Store records preserve new metadata and legacy findings remain readable", 
     assert.throws(
       () => makeAnalysisRecord({ ...common, findings: [invalid] }),
       /invalid finding compatibility metadata/u,
+    );
+  }
+});
+
+test("Store snapshots compatibility metadata without reading Proxy values", () => {
+  const decorated = withRuleManifest(finding("R001"));
+  const common = {
+    created_at_ms: 1,
+    unit: { repo: "repo-id", pr_ref: "pr-ref", sessions: ["session-id"] },
+    summary: reportWith(decorated).summary,
+  };
+  let metadataGets = 0;
+  const lying = new Proxy(decorated, {
+    get(target, property, receiver) {
+      if (property === "rule_version" || property === "compatibility_epoch") {
+        metadataGets += 1;
+        return property === "rule_version" ? "token-secret" : 99;
+      }
+      return Reflect.get(target, property, receiver) as unknown;
+    },
+    getOwnPropertyDescriptor(target, property) {
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+  });
+  const record = makeAnalysisRecord({ ...common, findings: [lying] });
+  assert.equal(record.findings[0]?.rule_version, "1.0.0");
+  assert.equal(record.findings[0]?.compatibility_epoch, 1);
+  assert.equal(metadataGets, 0);
+
+  for (const trapped of [
+    new Proxy(decorated, {
+      get(target, property, receiver) {
+        if (property === "rule_version") {
+          throw new Error("token-secret metadata get trap");
+        }
+        return Reflect.get(target, property, receiver) as unknown;
+      },
+    }),
+    new Proxy(decorated, {
+      ownKeys() { throw new Error("token-secret metadata ownKeys trap"); },
+    }),
+  ]) {
+    assert.throws(
+      () => makeAnalysisRecord({ ...common, findings: [trapped] }),
+      (error: unknown) => {
+        if (!(error instanceof Error)) return false;
+        assert.equal(error.constructor, TypeError);
+        assert.doesNotMatch(error.message, /token-secret/u);
+        return true;
+      },
     );
   }
 });
@@ -626,6 +727,45 @@ test("rules CLI emits deterministic pretty JSON without handlers or private stat
       assert.equal(stdout, `${JSON.stringify(expected, null, 2)}\n`);
       assert.equal(stderr, "");
       assert.doesNotMatch(stdout, /private|session|token-secret/u);
+    }
+  }
+});
+
+test("rules CLI does not resolve cwd, handlers, or CI state", async () => {
+  const scenarios = [
+    { args: ["rules", "list"], expected: EXPECTED, code: 0 },
+    { args: ["rules", "explain", "R004"], expected: EXPECTED[3], code: 0 },
+    { args: ["rules", "explain", "token-secret"], expected: undefined, code: 2 },
+  ] as const;
+  for (const scenario of scenarios) {
+    let runtimeReads = 0;
+    let stdout = "";
+    let stderr = "";
+    const code = await runCli(scenario.args, {
+      get cwd(): never {
+        runtimeReads += 1;
+        throw new Error("token-secret cwd getter");
+      },
+      get handlers(): never {
+        runtimeReads += 1;
+        throw new Error("token-secret handlers getter");
+      },
+      get ci(): never {
+        runtimeReads += 1;
+        throw new Error("token-secret CI getter");
+      },
+      stdout: (value) => { stdout += value; },
+      stderr: (value) => { stderr += value; },
+    });
+    assert.equal(code, scenario.code);
+    assert.equal(runtimeReads, 0);
+    if (scenario.expected === undefined) {
+      assert.equal(stdout, "");
+      assert.match(stderr, /^ccprof: .+\nUsage: ccprof/u);
+      assert.doesNotMatch(stderr, /token-secret/u);
+    } else {
+      assert.equal(stdout, `${JSON.stringify(scenario.expected, null, 2)}\n`);
+      assert.equal(stderr, "");
     }
   }
 });
