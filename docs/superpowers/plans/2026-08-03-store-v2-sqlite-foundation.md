@@ -63,7 +63,8 @@
 - [x] Have a validation subagent run Node 20 install, typecheck, full tests (515/515), determinism (1/1), build, package smoke, audit, and `git diff --check`.
 - [x] Confirm the native addon is loaded both from source and an isolated packed install, package contents include the runtime dependency contract, and generated artifacts are removed.
 - [x] Confirm six changed files, 211 added production lines, and no package/report version change.
-- [ ] Commit without amend, open a PR against `main`, wait for every check/review, merge under standing authorization, and clean up only this worktree and branch.
+- [x] Commit without amend, open PR #41 against `main`, and wait for every check/review (all seven checks passed; no comments or reviews).
+- [ ] Merge under standing authorization and clean up only this worktree and branch.
 
 ## Follow-up Store v2 PRs
 
