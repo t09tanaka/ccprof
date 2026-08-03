@@ -17,6 +17,7 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { Worker } from "node:worker_threads";
 
 import type {
   AnalysisSummary,
@@ -202,6 +203,151 @@ async function temporaryStore(
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+}
+
+interface ConcurrentStoreWrite {
+  moduleUrl: string;
+  exportName: "saveDismissal" | "saveAdoptions";
+  args: unknown[];
+}
+
+type ConcurrentStoreWorkerReply =
+  | { type: "ready" }
+  | { type: "result"; value: unknown }
+  | { type: "failure"; message: string; stack?: string };
+
+const concurrentStoreWriterSource = String.raw`
+"use strict";
+const { parentPort, workerData } = require("node:worker_threads");
+
+(async () => {
+  try {
+    if (parentPort === null) throw new Error("store worker has no parent port");
+    const storeModule = await import(workerData.moduleUrl);
+    const write = storeModule[workerData.exportName];
+    if (typeof write !== "function") {
+      throw new Error("missing store export: " + workerData.exportName);
+    }
+
+    const startGate = new Int32Array(workerData.startGate);
+    parentPort.postMessage({ type: "ready" });
+    Atomics.wait(startGate, 0, 0);
+
+    const value = await write(workerData.paths, ...workerData.args);
+    parentPort.postMessage({ type: "result", value });
+  } catch (error) {
+    if (parentPort !== null) {
+      parentPort.postMessage({
+        type: "failure",
+        message: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+    }
+  } finally {
+    parentPort?.close();
+  }
+})();
+`;
+
+async function runConcurrentStoreWrites<T>(
+  paths: StorePaths,
+  operations: ConcurrentStoreWrite[],
+): Promise<T[]> {
+  if (operations.length === 0) return [];
+
+  const startBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const startGate = new Int32Array(startBuffer);
+  const workers: Worker[] = [];
+  try {
+    for (const operation of operations) {
+      workers.push(new Worker(concurrentStoreWriterSource, {
+        eval: true,
+        workerData: {
+          ...operation,
+          paths,
+          startGate: startBuffer,
+        },
+      }));
+    }
+  } catch (error) {
+    await Promise.allSettled(workers.map((worker) => worker.terminate()));
+    throw error;
+  }
+
+  return new Promise<T[]>((resolve, reject) => {
+    const ready = operations.map(() => false);
+    const received = operations.map(() => false);
+    const results = new Array<T>(operations.length);
+    let readyCount = 0;
+    let exitCount = 0;
+    let settled = false;
+
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      Atomics.store(startGate, 0, 1);
+      Atomics.notify(startGate, 0, workers.length);
+      void Promise.allSettled(workers.map((worker) => worker.terminate()))
+        .then(() => reject(error));
+    };
+
+    workers.forEach((worker, index) => {
+      worker.on("message", (reply: ConcurrentStoreWorkerReply) => {
+        if (settled) return;
+        if (reply.type === "ready") {
+          if (ready[index]) {
+            fail(new Error(`store worker ${index} reported ready twice`));
+            return;
+          }
+          ready[index] = true;
+          readyCount += 1;
+          if (readyCount === workers.length) {
+            Atomics.store(startGate, 0, 1);
+            Atomics.notify(startGate, 0, workers.length);
+          }
+          return;
+        }
+        if (reply.type === "failure") {
+          const error = new Error(
+            `store worker ${index} failed: ${reply.message}`,
+          );
+          if (reply.stack !== undefined) {
+            error.stack = `${error.stack}\nWorker stack:\n${reply.stack}`;
+          }
+          fail(error);
+          return;
+        }
+        if (reply.type === "result") {
+          results[index] = reply.value as T;
+          received[index] = true;
+          return;
+        }
+        fail(new Error(`store worker ${index} returned an unknown message`));
+      });
+      worker.once("error", (error) => fail(error));
+      worker.once("messageerror", (error) => fail(
+        error instanceof Error
+          ? error
+          : new Error(`store worker ${index} message could not be cloned`),
+      ));
+      worker.once("exit", (code) => {
+        if (settled) return;
+        if (code !== 0) {
+          fail(new Error(`store worker ${index} exited with code ${code}`));
+          return;
+        }
+        if (!received[index]) {
+          fail(new Error(`store worker ${index} exited without a result`));
+          return;
+        }
+        exitCount += 1;
+        if (exitCount === workers.length) {
+          settled = true;
+          resolve(results);
+        }
+      });
+    });
+  });
 }
 
 function git(args: string[], cwd: string): void {
@@ -1174,19 +1320,35 @@ test("dismissals normalize, round-trip, and independently upsert each finding ke
       warnings: [],
     });
 
-    const concurrent = await Promise.all([
-      saveDismissal(paths, {
-        finding_key: "finding-b",
-        target: "cargo test",
-        dismissed_at_ms: 1_500,
-        strength_min: 5,
-      }),
-      saveDismissal(paths, {
-        finding_key: "finding-c",
-        target: "pnpm test",
-        dismissed_at_ms: 1_750,
-        strength_min: 7,
-      }),
+    const concurrent = await runConcurrentStoreWrites<
+      Awaited<ReturnType<typeof saveDismissal>>
+    >(paths, [
+      {
+        moduleUrl: new URL(
+          "../src/store/dismissals.js",
+          import.meta.url,
+        ).href,
+        exportName: "saveDismissal",
+        args: [{
+          finding_key: "finding-b",
+          target: "cargo test",
+          dismissed_at_ms: 1_500,
+          strength_min: 5,
+        }],
+      },
+      {
+        moduleUrl: new URL(
+          "../src/store/dismissals.js",
+          import.meta.url,
+        ).href,
+        exportName: "saveDismissal",
+        args: [{
+          finding_key: "finding-c",
+          target: "pnpm test",
+          dismissed_at_ms: 1_750,
+          strength_min: 7,
+        }],
+      },
     ]);
     assert.ok(concurrent.every(({ warnings }) => warnings.length === 0));
 
@@ -1267,9 +1429,25 @@ test("concurrent adoption batches retain every distinct finding key", async () =
   await temporaryStore(async (paths) => {
     const existing = adoption("finding-a");
     assert.deepEqual(await saveAdoptions(paths, [existing]), []);
-    const warnings = await Promise.all([
-      saveAdoptions(paths, [adoption("finding-b")]),
-      saveAdoptions(paths, [adoption("finding-c")]),
+    const warnings = await runConcurrentStoreWrites<
+      Awaited<ReturnType<typeof saveAdoptions>>
+    >(paths, [
+      {
+        moduleUrl: new URL(
+          "../src/store/adoptions.js",
+          import.meta.url,
+        ).href,
+        exportName: "saveAdoptions",
+        args: [[adoption("finding-b")]],
+      },
+      {
+        moduleUrl: new URL(
+          "../src/store/adoptions.js",
+          import.meta.url,
+        ).href,
+        exportName: "saveAdoptions",
+        args: [[adoption("finding-c")]],
+      },
     ]);
     assert.deepEqual(warnings, [[], []]);
     const loaded = await loadAdoptions(paths);
