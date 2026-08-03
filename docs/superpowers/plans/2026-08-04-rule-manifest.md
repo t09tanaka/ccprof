@@ -16,7 +16,7 @@
 - Create: `src/rules/manifest.ts`
 - Modify: `src/rules/capabilities.ts`
 - Modify: `src/rules/shared.ts`
-- Test: `test/rule-manifest.test.ts`
+- Test: `test/rule-manifest.cases.ts` (registered by `test/capability-coverage.test.ts`)
 
 - [ ] **Step 1: Write failing catalog tests**
 
@@ -28,7 +28,7 @@ codes plus index/field context.
 
 - [ ] **Step 2: Delegate focused RED**
 
-Run `npm run build:test && node --test .test-dist/test/rule-manifest.test.js`.
+Run `npm run build:test && node --test .test-dist/test/capability-coverage.test.js`.
 Expected: TypeScript compilation fails because the manifest APIs do not exist.
 
 - [ ] **Step 3: Implement the validated immutable catalog**
@@ -57,7 +57,7 @@ Commit the production and test changes as
 - Modify: `src/core/model.ts`
 - Modify: `src/core/analyze.ts`
 - Modify: `src/reporters/privacy.ts`
-- Modify: `test/rule-manifest.test.ts`
+- Modify: `test/rule-manifest.cases.ts`
 
 - [ ] **Step 1: Write failing metadata and compatibility tests**
 
@@ -88,7 +88,7 @@ Commit as `feat: version rule finding compatibility`.
 
 **Files:**
 - Modify: `src/cli.ts`
-- Modify: `test/rule-manifest.test.ts`
+- Modify: `test/rule-manifest.cases.ts`
 
 - [ ] **Step 1: Write failing CLI tests**
 
@@ -115,7 +115,7 @@ Run the focused test and existing reporter/CLI tests. Commit as
 
 ### Task 4: Verify and complete the PR lifecycle
 
-- [ ] Confirm exactly ten changed files and fewer than 300 added production
+- [ ] Confirm exactly twelve changed files and fewer than 300 added production
   lines; split or stop before expanding beyond that boundary.
 - [ ] Obtain an independent specification review, then a separate independent
   quality/security review; fix only P0-P2 regressions caused by this change in

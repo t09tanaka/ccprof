@@ -33,6 +33,7 @@ import { parseClaudeTranscript } from "../src/sources/claude/parser.js";
 import { loadAnalyses } from "../src/store/analyses.js";
 import { resolveStorePaths } from "../src/store/paths.js";
 import { openStoreDatabase } from "../src/store/sqlite.js";
+import "./rule-manifest.cases.js";
 
 const NOW_MS = Date.parse("2026-01-01T01:00:00.000Z");
 
