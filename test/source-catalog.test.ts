@@ -151,6 +151,13 @@ test("catalog validation rejects shape tricks, missing, unknown, and raw-content
   Object.defineProperty(hiddenField, "prompt", { value: "SECRET_CANARY" });
   assertCatalogError(() => validateSourceCatalogEntry(hiddenField), "unknown_field", "SECRET_CANARY");
 
+  const hiddenRequired = { ...catalogEntry() };
+  Object.defineProperty(hiddenRequired, "canonical_path", {
+    value: "/hidden-required-field.jsonl",
+    enumerable: false,
+  });
+  assertCatalogError(() => validateSourceCatalogEntry(hiddenRequired), "invalid_shape");
+
   let getterCalled = false;
   const accessor = { ...catalogEntry() };
   Object.defineProperty(accessor, "canonical_path", {

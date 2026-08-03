@@ -100,7 +100,8 @@ export function validateSourceCatalogEntry(value: unknown): SourceCatalogEntry {
   const keys = Reflect.ownKeys(descriptors);
   if (keys.some((key) => !FIELD_SET.has(key))) return fail("unknown_field");
   if (FIELDS.some((field) => descriptors[field] === undefined)) return fail("invalid_shape");
-  if (FIELDS.some((field) => !("value" in descriptors[field]!))) return fail("invalid_shape");
+  if (FIELDS.some((field) => !("value" in descriptors[field]!) ||
+    descriptors[field]!.enumerable !== true)) return fail("invalid_shape");
   const row = Object.fromEntries(FIELDS.map((field) =>
     [field, descriptors[field]!.value]
   )) as Record<keyof SourceCatalogEntry, unknown>;
