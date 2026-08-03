@@ -93,6 +93,7 @@ ccprof explain <finding-key>
 ccprof dismiss <finding-key> [--reason <text>]
 ccprof hook-event [--notify]
 ccprof hooks install|uninstall [--global] [--yes]
+ccprof data gc|delete
 ccprof --version
 ```
 
@@ -524,6 +525,21 @@ is skipped; committed migration markers prevent later rescans. All legacy JSON
 and the analysis index remain untouched. This is a one-way migration, so using
 an older ccprof that still writes those legacy stores afterward is unsupported.
 Hook events remain JSONL.
+
+Store retention is manual and repository-scoped. `ccprof data gc` first
+finishes all three legacy migrations, then retains analysis executions and
+adoptions for 90 days, removes unreferenced analysis snapshots, and removes
+dismissals once their 14-day lifetime is reached. It also compacts hook events
+to the newest valid rows from the last 30 days within a 1 MiB cap, reclaims
+SQLite space, and removes the retained legacy files only after every migration
+marker is committed. Records exactly on the 90-day or 30-day cutoff are kept;
+dismissals exactly 14 days old have expired and are removed.
+
+`ccprof data delete` explicitly removes the complete Store directory for the
+current repository, including SQLite sidecars, hook events, legacy files, and
+unknown remnants. It does not open SQLite, so it can remove an unsupported
+future Store schema. A concurrent writer can recreate data after either
+command; no exact-once or automatic-recovery guarantee is provided.
 
 Store records remain raw so local baselines and history retain their existing
 identity and evidence. Privacy profiles govern rendered output and advisory
