@@ -16,7 +16,6 @@ import type { SessionQuery, SessionSource } from "./session-source.js";
  * into a warning when other sources still produced sessions.
  */
 export class CombinedSessionSource implements SessionSource {
-  readonly budgetCooperative: boolean;
   readonly #sources: readonly SessionSource[];
   readonly #onSourceError: ((error: unknown) => void) | undefined;
 
@@ -26,9 +25,6 @@ export class CombinedSessionSource implements SessionSource {
   ) {
     this.#sources = sources;
     this.#onSourceError = onSourceError;
-    this.budgetCooperative = sources.every(
-      ({ budgetCooperative }) => budgetCooperative === true,
-    );
   }
 
   async discover(query: SessionQuery): Promise<Session[]> {
@@ -36,7 +32,7 @@ export class CombinedSessionSource implements SessionSource {
     if (meter !== undefined) {
       const sessions: Session[] = [];
       for (const source of this.#sources) {
-        if (meter.stopped) break;
+        if (!meter.checkpoint()) break;
         try {
           sessions.push(...await source.discover(query));
         } catch (error) {

@@ -376,13 +376,24 @@ function backstopBudgetedSessions(
   meter: AnalysisBudgetMeter,
 ): Session[] {
   const admitted: Session[] = [];
-  const sourcePaths = new Set<string>();
-  for (const session of sessions) {
-    if (!sourcePaths.has(session.source_path)) {
-      if (!meter.admitSourceItem()) break;
-      sourcePaths.add(session.source_path);
+  const ordered = [...sessions].sort(
+    (left, right) =>
+      left.source_path.localeCompare(right.source_path) ||
+      left.source.localeCompare(right.source) ||
+      left.session_id.localeCompare(right.session_id),
+  );
+  const sessionsBySourcePath = new Map<string, Session[]>();
+  for (const session of ordered) {
+    const group = sessionsBySourcePath.get(session.source_path);
+    if (group === undefined) {
+      sessionsBySourcePath.set(session.source_path, [session]);
+    } else {
+      group.push(session);
     }
-    admitted.push(...admitSessionEventPrefix([session], meter));
+  }
+  for (const sourceSessions of sessionsBySourcePath.values()) {
+    if (!meter.admitSourceItem()) break;
+    admitted.push(...admitSessionEventPrefix(sourceSessions, meter));
     if (meter.stopped) break;
   }
   return admitted;
@@ -1182,6 +1193,7 @@ async function finishBudgetedPartialAnalysis(
 export async function analyze(
   options: AnalyzeOptions,
 ): Promise<AnalyzeResult> {
+  const persist = options.persist ?? true;
   const budgetMeter = options.budgets === undefined
     ? undefined
     : new AnalysisBudgetMeter(
@@ -1214,6 +1226,7 @@ export async function analyze(
   // future custom integration) keeps its original throw-propagates
   // behavior untouched.
   const sourceErrors: unknown[] = [];
+  const usingDefaultSource = options.sessionSource === undefined;
   const source = options.sessionSource ??
     defaultSessionSource(options, (error) => sourceErrors.push(error));
   let discoveredSessions: Session[];
@@ -1225,7 +1238,7 @@ export async function analyze(
         ? 0
         : provisionalWindow.started_at_ms,
       endedAtMs: provisionalWindow.ended_at_ms,
-      ...(budgetMeter === undefined
+      ...(budgetMeter === undefined || !usingDefaultSource
         ? {}
         : { analysisBudgetMeter: budgetMeter }),
     });
@@ -1236,8 +1249,7 @@ export async function analyze(
   }
   if (
     budgetMeter !== undefined &&
-    source.budgetCooperative !== true &&
-    !budgetMeter.stopped
+    !usingDefaultSource
   ) {
     discoveredSessions = backstopBudgetedSessions(
       discoveredSessions,
@@ -1397,11 +1409,17 @@ export async function analyze(
     );
   }
 
-  const [historyResult, dismissalResult, adoptionResult] = await Promise.all([
-    loadAnalyses(paths),
-    loadDismissals(paths),
-    loadAdoptions(paths),
-  ]);
+  const [historyResult, dismissalResult, adoptionResult] = persist
+    ? await Promise.all([
+        loadAnalyses(paths),
+        loadDismissals(paths),
+        loadAdoptions(paths),
+      ])
+    : [
+        { records: [] as AnalysisRecord[], warnings: [] as StoreWarning[] },
+        { records: [], warnings: [] as StoreWarning[] },
+        { records: [] as AdoptionRecord[], warnings: [] as StoreWarning[] },
+      ];
   warnings.push(
     ...historyResult.warnings.map(storeWarning),
     ...dismissalResult.warnings.map(storeWarning),
@@ -1419,7 +1437,6 @@ export async function analyze(
     );
   }
   const history = priorRecords(historyResult.records, context);
-  const persist = options.persist ?? true;
 
   // Adoption detection only exists to feed a save; when persist is false
   // (e.g. a hook-driven `--notify` analysis) skip it entirely rather than

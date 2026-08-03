@@ -155,10 +155,9 @@ test("budgeted combined discovery is sequential and stops at the shared source-i
   const meter = new AnalysisBudgetMeter(budgets(), clock);
   const budgetedQuery = { ...query, analysisBudgetMeter: meter };
   const order: string[] = [];
-  const cooperative = (
+  const budgetAware = (
     name: string,
-  ): SessionSource & { budgetCooperative: true } => ({
-    budgetCooperative: true,
+  ): SessionSource => ({
     discover: async (sourceQuery) => {
       order.push(`${name}:start`);
       await Promise.resolve();
@@ -171,7 +170,7 @@ test("budgeted combined discovery is sequential and stops at the shared source-i
   });
   const errors: unknown[] = [];
   const combined = new CombinedSessionSource(
-    [cooperative("first"), cooperative("second")],
+    [budgetAware("first"), budgetAware("second")],
     (error) => errors.push(error),
   );
 

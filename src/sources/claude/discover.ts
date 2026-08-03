@@ -7,6 +7,7 @@ import {
   sep,
 } from "node:path";
 
+import type { AnalysisBudgetMeter } from "../../analysis/budgets.js";
 import type { Confidence, Session, SourceWarning } from "../../core/model.js";
 import { canonicalPath } from "../../git/common-dir.js";
 import {
@@ -124,6 +125,100 @@ async function findJsonlFiles(
     }
   }
   return files;
+}
+
+async function* findJsonlFilesBudgeted(
+  directory: string,
+  projectsRoot: string,
+  warnings: SourceWarning[],
+  sourceFailures: SourceWarning[],
+  meter: AnalysisBudgetMeter,
+): AsyncGenerator<string> {
+  if (!meter.checkpoint()) return;
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch {
+    const warning = sourceWarning(
+      "source_read_error",
+      "Could not read a Claude projects directory.",
+      directory,
+    );
+    warnings.push(warning);
+    sourceFailures.push(warning);
+    meter.recordSourceFailure();
+    return;
+  }
+
+  entries.sort((left, right) =>
+    left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
+  );
+  for (const entry of entries) {
+    if (!meter.checkpoint()) return;
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      yield* findJsonlFilesBudgeted(
+        path,
+        projectsRoot,
+        warnings,
+        sourceFailures,
+        meter,
+      );
+      if (meter.stopped) return;
+    } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+      yield await canonicalPath(path);
+    } else if (entry.isSymbolicLink() && entry.name.endsWith(".jsonl")) {
+      let target: string;
+      try {
+        target = await realpath(path);
+      } catch {
+        const warning = sourceWarning(
+          "source_read_error",
+          "Could not resolve a Claude JSONL symlink.",
+          path,
+        );
+        warnings.push(warning);
+        sourceFailures.push(warning);
+        meter.recordSourceFailure();
+        return;
+      }
+      if (!isWithin(projectsRoot, target)) {
+        const warning = sourceWarning(
+          "source_symlink_escape",
+          "Skipped a Claude JSONL symlink outside the configured projects directory.",
+          path,
+        );
+        warnings.push(warning);
+        sourceFailures.push(warning);
+        continue;
+      }
+      if (!meter.checkpoint()) return;
+      try {
+        if (!(await lstat(target)).isFile()) {
+          const warning = sourceWarning(
+            "source_read_error",
+            "Claude JSONL symlink target is not a regular file.",
+            path,
+          );
+          warnings.push(warning);
+          sourceFailures.push(warning);
+          meter.recordSourceFailure();
+          return;
+        }
+      } catch {
+        const warning = sourceWarning(
+          "source_read_error",
+          "Could not inspect a Claude JSONL symlink target.",
+          path,
+        );
+        warnings.push(warning);
+        sourceFailures.push(warning);
+        meter.recordSourceFailure();
+        return;
+      }
+      yield target;
+    }
+  }
 }
 
 function isWithin(root: string, candidate: string): boolean {
@@ -274,6 +369,8 @@ export async function discoverClaudeSessions(
   projectsDirectory: string,
   query: SessionQuery,
 ): Promise<Session[]> {
+  const meter = query.analysisBudgetMeter;
+  if (meter !== undefined && !meter.checkpoint()) return [];
   const sourceFailures: SourceWarning[] = [];
   const globalSourceWarnings: SourceWarning[] = [];
   let projectsRoot: string;
@@ -288,19 +385,29 @@ export async function discoverClaudeSessions(
       ),
     ]);
   }
+  if (meter !== undefined && !meter.checkpoint()) return [];
   const repoRoot = await canonicalPath(query.repoRoot);
-  const files = await findJsonlFiles(
-    projectsRoot,
-    projectsRoot,
-    globalSourceWarnings,
-  );
-  sourceFailures.push(...globalSourceWarnings);
+  if (meter !== undefined && !meter.checkpoint()) return [];
+  const files = meter === undefined
+    ? await findJsonlFiles(
+        projectsRoot,
+        projectsRoot,
+        globalSourceWarnings,
+      )
+    : findJsonlFilesBudgeted(
+        projectsRoot,
+        projectsRoot,
+        globalSourceWarnings,
+        sourceFailures,
+        meter,
+      );
+  if (meter === undefined) sourceFailures.push(...globalSourceWarnings);
   const sessions: Session[] = [];
   const seen = new Set<string>();
   const parsedPaths = new Set<string>();
 
-  for (const file of files) {
-    if (query.analysisBudgetMeter?.stopped === true) break;
+  fileLoop: for await (const file of files) {
+    if (meter !== undefined && !meter.checkpoint()) break;
     if (parsedPaths.has(file)) {
       continue;
     }
@@ -316,24 +423,25 @@ export async function discoverClaudeSessions(
       }
       fileSize = status.size;
     } catch {
-      if (query.analysisBudgetMeter !== undefined) {
-        query.analysisBudgetMeter.recordSourceFailure();
+      if (meter !== undefined) {
+        meter.recordSourceFailure();
         break;
       }
       // Fall through to the parse path, which reports unreadable files.
     }
     let admittedFileBytes: number | undefined;
-    if (query.analysisBudgetMeter !== undefined) {
-      if (!query.analysisBudgetMeter.admitSourceItem()) break;
+    if (meter !== undefined) {
+      if (!meter.checkpoint()) break;
+      if (!meter.admitSourceItem()) break;
       if (
         fileSize === undefined ||
         !Number.isSafeInteger(fileSize) ||
         fileSize < 0
       ) {
-        query.analysisBudgetMeter.recordSourceFailure();
+        meter.recordSourceFailure();
         break;
       }
-      admittedFileBytes = query.analysisBudgetMeter.admitInputBytes(fileSize);
+      admittedFileBytes = meter.admitInputBytes(fileSize);
       if (admittedFileBytes === 0 && fileSize > 0) break;
     }
     let parsed: ClaudeTranscriptParseResult;
@@ -352,28 +460,40 @@ export async function discoverClaudeSessions(
       );
       sourceFailures.push(readWarning);
       globalSourceWarnings.push(readWarning);
-      query.analysisBudgetMeter?.recordSourceFailure();
-      if (query.analysisBudgetMeter !== undefined) break;
+      meter?.recordSourceFailure();
+      if (meter !== undefined) break;
       continue;
     }
+    const expectedByteTruncation =
+      admittedFileBytes !== undefined &&
+      fileSize !== undefined &&
+      admittedFileBytes < fileSize;
     if (parsed.sessions.length === 0 && parsed.warnings.length > 0) {
-      sourceFailures.push(...parsed.warnings);
-      query.analysisBudgetMeter?.recordSourceFailure();
-      globalSourceWarnings.push(
-        sourceWarning(
-          "source_parse_error",
-          `Skipped a Claude transcript that produced ${parsed.warnings.length.toString(10)} parse warning(s) and no session.`,
-          file,
-        ),
-      );
+      if (!expectedByteTruncation) {
+        sourceFailures.push(...parsed.warnings);
+        meter?.recordSourceFailure();
+        globalSourceWarnings.push(
+          sourceWarning(
+            "source_parse_error",
+            `Skipped a Claude transcript that produced ${parsed.warnings.length.toString(10)} parse warning(s) and no session.`,
+            file,
+          ),
+        );
+      }
     }
-    const parsedSessions = query.analysisBudgetMeter === undefined
+    const parsedSessions = meter === undefined
       ? parsed.sessions
-      : admitSessionEventPrefix(parsed.sessions, query.analysisBudgetMeter);
+      : admitSessionEventPrefix(parsed.sessions, meter);
     for (const rawSession of parsedSessions) {
+      if (meter !== undefined && !meter.stopped && !meter.checkpoint()) {
+        break fileLoop;
+      }
       const session = await canonicalizeSession(rawSession);
       if (!intersects(session, query)) {
         continue;
+      }
+      if (meter !== undefined && !meter.stopped && !meter.checkpoint()) {
+        break fileLoop;
       }
       if (
         !(await cwdMatchesRepository(repoRoot, session.observed_cwds))
@@ -411,6 +531,9 @@ export async function discoverClaudeSessions(
           continue;
         }
         seen.add(key);
+        if (meter !== undefined && !meter.stopped && !meter.checkpoint()) {
+          break fileLoop;
+        }
         const alignedSession = await alignSessionCwdsToRepository(
           segment,
           repoRoot,
@@ -443,7 +566,6 @@ export async function discoverClaudeSessions(
 }
 
 export class ClaudeSessionSource implements SessionSource {
-  readonly budgetCooperative = true;
   readonly #projectsDirectory: string;
 
   constructor(projectsDirectory: string) {
