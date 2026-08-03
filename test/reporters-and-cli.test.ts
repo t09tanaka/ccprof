@@ -49,6 +49,7 @@ import {
   findingPrivacyReference,
   projectReportPrivacy,
   projectStatsPrivacy,
+  sanitizePrivacyText,
   trustedVerificationCommand,
 } from "../src/reporters/privacy.js";
 import {
@@ -137,7 +138,8 @@ const PRIVACY_SOURCE =
   "/Users/alice/.claude/projects/SecretCo/session.jsonl";
 const PRIVACY_STORE =
   "/Users/alice/.ccprof/SecretCo/analyses/private.json";
-const PRIVACY_SESSION = "session-AZ09_SECRET_SESSION";
+const PRIVACY_SESSION =
+  "session-550e8400-e29b-41d4-a716-446655440001";
 const PRIVACY_URL =
   "https://github.internal.example/SecretCo/tickets/ENG-421";
 const PRIVACY_TICKET = "ENG-421";
@@ -1318,6 +1320,13 @@ test("stats raw privacy returns the report and keeps JSON and TTY bytes unchange
   assert.equal(projected, raw);
   assert.equal(renderStatsJson(projected), renderStatsJson(raw));
   assert.equal(renderStatsTty(projected), renderStatsTty(raw));
+});
+
+test("privacy keeps ordinary session-prefixed prose", () => {
+  const prose = "session-based session-level session-scoped metrics";
+  for (const profile of ["strict", "balanced"] as const) {
+    assert.equal(sanitizePrivacyText(prose, profile, PRIVACY_REPO), prose);
+  }
 });
 
 test("stats display privacy aliases keys, removes canaries, and preserves facts", () => {

@@ -48,62 +48,62 @@ and 300 added implementation lines.
 **Files:** `test/reporters-and-cli.test.ts`, `src/cli.ts`,
 `src/commands/stats.ts`
 
-- [ ] Add parser tests for separated/inline profiles plus missing, empty,
+- [x] Add parser tests for separated/inline profiles plus missing, empty,
   invalid, and duplicate privacy values.
-- [ ] Add dispatch tests for local balanced default, each local explicit
+- [x] Add dispatch tests for local balanced default, each local explicit
   profile, CI-forced strict despite raw/balanced requests, warning protection,
   and strict path-free exceptions.
-- [ ] Ask the sonnet verifier to run the focused tests and record failures
+- [x] Ask the sonnet verifier to run the focused tests and record failures
   caused by the absent implementation.
-- [ ] Add optional privacy to `ParsedStatsCommand`, required effective privacy
+- [x] Add optional privacy to `ParsedStatsCommand`, required effective privacy
   to `StatsCommandOptions`, early active-profile selection, and stats dispatch.
-- [ ] Ask the verifier to confirm focused GREEN.
+- [x] Ask the verifier to confirm focused GREEN.
 
 ## Task 2: RED pure stats projection
 
 **Files:** `test/reporters-and-cli.test.ts`, `src/reporters/privacy.ts`
 
-- [ ] Add a complete `StatsReport` canary fixture and assert raw render byte
+- [x] Add a complete `StatsReport` canary fixture and assert raw render byte
   equivalence.
-- [ ] Assert strict/balanced stable references and removal of repository,
+- [x] Assert strict/balanced stable references and removal of repository,
   POSIX/Windows/UNC paths, URLs, tokens, sessions, and argv secrets.
-- [ ] Assert strict identity omission, safe-command/marker behavior, balanced
+- [x] Assert strict identity omission, safe-command/marker behavior, balanced
   safe `npm test` retention, and unsafe identity omission.
-- [ ] Assert exact numeric/enumeration preservation, deterministic repeats,
+- [x] Assert exact numeric/enumeration preservation, deterministic repeats,
   and no mutation of nested arrays/objects.
-- [ ] Ask the verifier to run focused tests and record RED.
-- [ ] Implement `projectStatsPrivacy` using existing privacy helpers; keep raw
+- [x] Ask the verifier to run focused tests and record RED.
+- [x] Implement `projectStatsPrivacy` using existing privacy helpers; keep raw
   as the unchanged fast path and clone every strict/balanced branch.
-- [ ] Ask the verifier to confirm focused GREEN.
+- [x] Ask the verifier to confirm focused GREEN.
 
 ## Task 3: Integrate Store warnings and rendering
 
 **Files:** `src/commands/stats.ts`, `test/reporters-and-cli.test.ts`
 
-- [ ] Add warning tests for strict code/count aggregation, balanced sanitized
+- [x] Add warning tests for strict code/count aggregation, balanced sanitized
   text/path markers, and raw existing text.
-- [ ] Adapt Store warnings to `privacyWarningTexts`, call stats projection after
+- [x] Adapt Store warnings to `privacyWarningTexts`, call stats projection after
   `summarizeStats`, and render only the projected report.
-- [ ] Add direct command tests for JSON/TTY profile behavior and raw bytes.
-- [ ] Ask the verifier to confirm focused GREEN.
+- [x] Add direct command tests for JSON/TTY profile behavior and raw bytes.
+- [x] Ask the verifier to confirm focused GREEN.
 
 ## Task 4: Documentation and package smoke
 
 **Files:** `README.md`, `.github/workflows/ci.yml`,
 `.github/workflows/release-assets.yml`, `test/release-workflow.test.ts`
 
-- [ ] Document `stats --privacy`, local balanced default, CI-enforced strict,
+- [x] Document `stats --privacy`, local balanced default, CI-enforced strict,
   raw risk, and unchanged Store data.
-- [ ] Make CI and release installed-package smoke invoke
+- [x] Make CI and release installed-package smoke invoke
   `stats --privacy strict --json` and test that workflow contract.
-- [ ] Ask the verifier to run focused docs/workflow tests, typecheck, and the
+- [x] Ask the verifier to run focused docs/workflow tests, typecheck, and the
   full test suite.
 
 ## Task 5: Review, CI, PR, merge, and cleanup
 
-- [ ] Commit implementation and required `docs/superpowers/` artifacts without
+- [x] Commit implementation and required `docs/superpowers/` artifacts without
   amend; exclude worktree-only configuration.
-- [ ] Run independent specification review, then independent code-quality
+- [x] Run independent specification review, then independent code-quality
   review; fix only in-scope defects and re-review until approved.
 - [ ] Delegate the repository's local GitHub Actions equivalent, including
   typecheck, full tests, package smoke, determinism, and CodeQL build phase.

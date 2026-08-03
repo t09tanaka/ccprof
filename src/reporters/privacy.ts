@@ -16,7 +16,7 @@ const SAFE_COMMAND = /^(?:npm test|npm run (?:test|check|lint|typecheck|build)|p
 const COMMANDISH = /(?:^|\s)(?:\.\/scripts(?:\/|\b)|curl|wget|ssh|scp|bash|zsh|sh|rm|git|gh|kubectl|docker|make|aws|az|gcloud|deno|mvn|gradle|npm|pnpm|yarn|bun|cargo|go|pytest|python3?|node|ccprof)\b|&&|\|\||[;|]/u;
 const URL = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'`<>]+/giu;
 const SESSION_IDENTIFIER =
-  /\bsession(?:[-_:#][\p{L}\p{N}._-]+)+\b/giu;
+  /\bsession[-_:][0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/giu;
 const SECRET = /--(?:api[-_]?key|access[-_]?token|auth[-_]?token|client[-_]?secret|password|passwd|secret|token)(?:=|\s+)(?:"[^"]*"|'[^']*'|[^\s,"'`<>]+)|(?:authorization\s*:\s*(?:bearer|basic)\s+|(?:api[-_ ]?key|access[-_ ]?token|auth[-_ ]?token|password|passwd|secret|token)\s*[:=]\s*)[^\s,"'`<>]+|\b(?:gh[pousr]_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|[A-Z][A-Z0-9]{1,9}-\d+)\b|-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/giu;
 
 export function findingPrivacyReference(
