@@ -18,7 +18,7 @@ deterministic report.
 
 ## Requirements and installation
 
-- Node.js 20 or newer
+- Node.js 20 or 22–25
 - `git`
 - `gh`, but only when resolving a PR number/URL or the current PR from GitHub
 
@@ -542,8 +542,9 @@ npm run check
 ```
 
 Individual tests compile TypeScript into a test output directory and then run
-under the Node built-in test runner. There are no runtime dependencies; only
-`git`, and `gh` when needed, are invoked as external processes.
+under the Node built-in test runner. `better-sqlite3` provides the embedded
+SQLite runtime; only `git`, and `gh` when needed, are invoked as external
+processes.
 
 ## License
 
