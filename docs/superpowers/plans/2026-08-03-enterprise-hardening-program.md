@@ -8,7 +8,7 @@ Deliver an enterprise-ready ccprof audit platform with auditable identities and 
 
 ## Architecture
 
-The ingestion boundary canonicalizes every input into a source descriptor and an EventIdentity composed exactly of `source_adapter_id`, `source_instance_id`, `session_id`, `agent_id`, optional `tool_use_id`, and `source_index`. Capability declarations drive rule execution and coverage reporting. Rule Manifest entries define rule contracts, including split R004 and scoped R005. Findings use exact impact/confidence contracts and high-confidence lower-bound floors, with interval accounting and evidence under existing ledger semantics. Report v3 serializes the required producer/analysis/work-unit/window/source/policy/result contract through published JSON Schemas and supports N-2 readers. The Store keeps descriptors, budgets, catalogs, and indexed history summaries under workspace/repository policy controls. Operators use doctor, store, and export tools; CI and quality suites validate behavior, safety, and performance.
+The ingestion boundary canonicalizes every input into a source descriptor and an EventIdentity composed exactly of `source_adapter_id`, `source_instance_id`, `session_id`, `agent_id`, optional `tool_use_id`, and `source_index`. Source descriptors declare `adapter_id`, `adapter_version`, and required capabilities; unknown or undeclared adapters fail closed. Capabilities are evaluated per session lane/evidence group and report eligible/total sessions, partial/full status, and completeness/truncation rather than dropping eligible evidence. Rule Manifest entries define rule contracts, including split R004 and scoped R005. Findings use `ImpactEstimate { lower_ms, expected_ms?, upper_ms, kind }` and `FindingConfidence { evidence, causal, source_completeness }`; only high-confidence lower bounds reduce `estimated_floor`, with interval accounting and evidence under existing ledger semantics. Report v3 serializes the required producer/analysis/work-unit/window/source/policy/result contract through published JSON Schemas and supports N-2 readers. The Store keeps descriptors, budgets, catalogs, and indexed history summaries under workspace/repository policy controls. Operators use doctor, store, and export tools; CI and quality suites validate behavior, safety, and performance.
 
 ## Tech Stack
 
@@ -21,14 +21,14 @@ The ingestion boundary canonicalizes every input into a source descriptor and an
 
 - [ ] Add deterministic `EventIdentity` generation and canonical-event tests.
   - Acceptance criteria: identity contains exactly `source_adapter_id`, `source_instance_id`, `session_id`, `agent_id`, optional `tool_use_id`, and `source_index`; identical canonical events produce identical IDs; IDs contain no raw transcript or secrets; all new event persistence paths store the identity.
-- [ ] Add a source descriptor contract with source kind, provenance, sensitivity, retention class, and canonical fingerprint.
-  - Acceptance criteria: supported sources produce descriptors; unknown fields do not bypass validation; descriptors are available to reports and ledger records.
+- [ ] Add a source descriptor contract with `adapter_id`, `adapter_version`, required capabilities, source kind, provenance, sensitivity, retention class, and canonical fingerprint.
+  - Acceptance criteria: supported sources produce descriptors; unknown or undeclared adapters fail closed; unknown fields do not bypass validation; descriptors are available to reports and existing ledger semantics.
 - [ ] Add a capability model and coverage result for every attempted rule.
-  - Acceptance criteria: rules declare required capabilities; unavailable capabilities produce explicit skipped coverage rather than silent omission; CLI output and machine reports expose coverage.
+  - Acceptance criteria: capabilities are evaluated per session lane/evidence group; only ineligible evidence is filtered; rules declare required capabilities; coverage reports `eligible_sessions`, `total_sessions`, `status` (`partial` or `full`), completeness, and truncation; CLI output and machine reports expose coverage.
 - [ ] Introduce the Rule Manifest and register existing rules plus R004 and R005.
   - Acceptance criteria: each manifest entry declares `id`, `version`, `compatibility_epoch`, `required_capabilities`, `supported_sources`, `impact_kind`, `default_mode`, `aggregation_policy`, `evidence_schema`, and `policy_risk`; duplicate IDs fail validation; R004 is split into `approval_policy_latency` and observe-only `repeated_safe_approval_latency` with a policy-gated allowlist; R005 distinguishes `resource_domain`/`parallel-safe` from investigation candidates.
 - [ ] Add stats privacy projection and terminal PR snapshot aggregation.
-  - Acceptance criteria: projection removes disallowed fields before aggregation; snapshots contain no raw transcript content; aggregate cohorts report median, p50, p75, MAD, and sample count, while cohorts below the configured threshold are suppressed.
+  - Acceptance criteria: projection removes disallowed fields before aggregation; snapshots are keyed by distinct repository, PR, and terminal snapshot; unioned intervals are deduplicated; snapshots separately report `confirmed_critical_path_ms`, `estimated_critical_path_upper_ms`, `resource_cost_ms`, `human_wait_ms`, and `unexplained_ms`; aggregate cohorts report median, p50, p75, MAD, and sample count, while cohorts below the configured threshold are suppressed.
 - [ ] Add advisory execution safeguards for stdin, minimal environment, input/output caps, and process-group kill.
   - Acceptance criteria: safeguards are advisory and observable; stdin behavior, environment minimization, caps, and group termination produce actionable diagnostics without altering unrelated execution semantics.
 - [ ] Add additive Store migrations for source descriptors, event identities, rule catalog metadata, and migration tracking.
@@ -36,8 +36,8 @@ The ingestion boundary canonicalizes every input into a source descriptor and an
 
 ## PR Wave 2 — Findings, confidence, and ledger evidence
 
-- [ ] Extend finding contracts with exact impact and confidence scores, scoring rationale, stable severity mapping, and a high-confidence lower-bound floor.
-  - Acceptance criteria: score ranges, lower-bound floor, and nullability are schema-validated; legacy findings receive compatible defaults; CLI rendering remains readable.
+- [ ] Extend finding contracts with `ImpactEstimate { lower_ms, expected_ms?, upper_ms, kind }`, `FindingConfidence { evidence, causal, source_completeness }`, scoring rationale, stable severity mapping, and a high-confidence lower-bound floor.
+  - Acceptance criteria: each exact field, range, and nullability is schema-validated; only high-confidence lower bounds reduce `estimated_floor`; legacy findings receive compatible defaults; CLI rendering remains readable.
 - [ ] Add interval accounting and evidence integration using existing ledger semantics.
   - Acceptance criteria: each finding links its EventIdentity, source evidence, rule/version, interval, and explanation through existing ledger semantics; no new immutable rule-decision ledger, audit-log subsystem, or ledger table is introduced.
 - [ ] Add capability-coverage and evidence-integrity tests.
@@ -69,8 +69,6 @@ The ingestion boundary canonicalizes every input into a source descriptor and an
 
 - [ ] Expand CI into a platform and compatibility matrix.
   - Acceptance criteria: supported runtime/OS matrix runs unit and integration coverage; report N-2 fixtures, Store v2 migration, manifest validation, and export policy checks are mandatory gates.
-- [ ] Add supply-chain verification to the release pipeline.
-  - Acceptance criteria: existing SBOM/attestation artifacts are verified during release; artifact-to-source linkage is checked; failures block release publication.
 - [ ] Add calibration, property, fuzz, fault-injection, and performance suites.
   - Acceptance criteria: calibration fixtures define expected rule outcomes and confidence bands; property/fuzz tests cover parsers and schemas; fault tests cover interrupted migration and ledger/store failures; performance budgets cover ingestion, query, report generation, and aggregation.
 - [ ] Publish support and governance documentation.
