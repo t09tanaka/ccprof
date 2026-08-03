@@ -79,19 +79,19 @@ to pass. Commit analysis integration as
 - Modify: `src/reporters/privacy.ts`
 - Test: `test/capability-coverage.test.ts`
 
-- [ ] **Step 1: Write failing output tests**
+- [x] **Step 1: Write failing output tests**
 
 Assert explicit deterministic JSON copying, compact TTY and Markdown coverage
 through the shared TTY helper, strict/balanced cloning, raw identity,
 non-mutation, legacy missing-field byte compatibility, and snapshot identity
 changes when coverage changes.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run the focused compiled test. Expected: coverage is absent from reporters,
 privacy projections, or policy snapshot attribution.
 
-- [ ] **Step 3: Implement minimal output plumbing**
+- [x] **Step 3: Implement minimal output plumbing**
 
 Copy coverage explicitly in JSON/privacy. Make the existing shared human-report
 line render ordered coverage for new reports and retain its old skipped text

@@ -56,6 +56,23 @@ function recipeLine(finding: Finding): string {
 }
 
 export function skippedRulesLine(report: ReportV2): string | null {
+  if (report.rule_coverage !== undefined && report.rule_coverage.length > 0) {
+    const detail = [...report.rule_coverage]
+      .sort((left, right) => left.rule_id.localeCompare(right.rule_id))
+      .map((entry) => {
+        const qualifiers = [
+          ...(entry.missing_capabilities.length === 0
+            ? []
+            : [`missing ${entry.missing_capabilities.join(", ")}`]),
+          ...(entry.truncated ? ["truncated"] : []),
+        ];
+        return `${entry.rule_id} ${entry.eligible_sessions}/${entry.total_sessions} ${entry.status}${
+          qualifiers.length === 0 ? "" : ` (${qualifiers.join("; ")})`
+        }`;
+      })
+      .join(", ");
+    return `Rule coverage: ${detail}.`;
+  }
   const skipped = report.skipped_rules ?? [];
   if (skipped.length === 0) return null;
   const detail = skipped

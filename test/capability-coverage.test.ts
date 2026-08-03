@@ -16,6 +16,7 @@ import {
   ALL_SESSION_CAPABILITIES,
   type RuleId,
   type RuleCoverage,
+  type ReportV2,
   type Session,
   type SessionCapability,
 } from "../src/core/model.js";
@@ -24,8 +25,14 @@ import {
   ruleCoverage,
 } from "../src/rules/capabilities.js";
 import { runCommand } from "../src/git/client.js";
+import { renderJsonReport } from "../src/reporters/json.js";
+import { renderMarkdownReport } from "../src/reporters/markdown.js";
+import { projectReportPrivacy } from "../src/reporters/privacy.js";
+import { renderTtyReport } from "../src/reporters/tty.js";
 import { parseClaudeTranscript } from "../src/sources/claude/parser.js";
+import { loadAnalyses } from "../src/store/analyses.js";
 import { resolveStorePaths } from "../src/store/paths.js";
+import { openStoreDatabase } from "../src/store/sqlite.js";
 
 const NOW_MS = Date.parse("2026-01-01T01:00:00.000Z");
 
@@ -499,6 +506,256 @@ test("R005 receives only tool-timestamp-capable session actions", async () => {
     assert.ok(findings.every(({ evidence }) =>
       evidence.session_refs.every((ref) => !ref.startsWith("ineligible#"))
     ));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+function outputCoverage(): RuleCoverage[] {
+  return [
+    {
+      rule_id: "R001",
+      eligible_sessions: 1,
+      total_sessions: 2,
+      status: "partial",
+      missing_capabilities: ["edit_fragments"],
+      completeness: 0.5,
+      truncated: true,
+    },
+    {
+      rule_id: "R006",
+      eligible_sessions: 2,
+      total_sessions: 2,
+      status: "full",
+      missing_capabilities: [],
+      completeness: 1,
+      truncated: false,
+    },
+    {
+      rule_id: "R007",
+      eligible_sessions: 0,
+      total_sessions: 2,
+      status: "partial",
+      missing_capabilities: ["token_usage"],
+      completeness: 0,
+      truncated: false,
+    },
+  ];
+}
+
+function outputReport(includeCoverage = true): ReportV2 {
+  return {
+    version: 2,
+    unit: { repo: "/private/repo", pr_ref: "main...feature", sessions: [] },
+    summary: {
+      measured_min: 0,
+      idle_excluded_min: 0,
+      estimated_floor_min: 0,
+      recoverable_min: 0,
+      human_wait_min: 0,
+      unexplained_min: 0,
+      baseline: null,
+    },
+    findings: [],
+    caveats: [],
+    ...(includeCoverage ? { rule_coverage: outputCoverage() } : {}),
+    skipped_rules: [{ rule_id: "R007", missing: ["token_usage"] }],
+  };
+}
+
+test("JSON and human reporters publish deterministic rule coverage", () => {
+  const report = outputReport();
+  const before = structuredClone(report);
+  const json = renderJsonReport(report);
+  const parsed = JSON.parse(json) as ReportV2;
+
+  assert.deepEqual(parsed.rule_coverage, outputCoverage());
+  for (const entry of parsed.rule_coverage ?? []) {
+    assert.deepEqual(Object.keys(entry), [
+      "rule_id",
+      "eligible_sessions",
+      "total_sessions",
+      "status",
+      "missing_capabilities",
+      "completeness",
+      "truncated",
+    ]);
+  }
+  assert.ok(json.indexOf('"caveats"') < json.indexOf('"rule_coverage"'));
+  assert.ok(json.indexOf('"rule_coverage"') < json.indexOf('"skipped_rules"'));
+  assert.deepEqual(report, before);
+
+  report.rule_coverage = [...(report.rule_coverage ?? [])].reverse();
+  const reversedBefore = structuredClone(report);
+  const expected =
+    "Rule coverage: R001 1/2 partial (missing edit_fragments; truncated), " +
+    "R006 2/2 full, R007 0/2 partial (missing token_usage).";
+  const tty = renderTtyReport(report, { color: false });
+  const markdown = renderMarkdownReport(report);
+  assert.ok(tty.includes(expected));
+  assert.ok(markdown.includes(expected));
+  assert.doesNotMatch(tty, /Skipped rules/u);
+  assert.doesNotMatch(markdown, /Skipped rules/u);
+  assert.deepEqual(report, reversedBefore);
+});
+
+test("privacy clones coverage facts while raw preserves report identity", () => {
+  const report = outputReport();
+  const before = structuredClone(report);
+  const strict = projectReportPrivacy(report, "strict");
+  const balanced = projectReportPrivacy(report, "balanced");
+
+  assert.deepEqual(strict.rule_coverage, report.rule_coverage);
+  assert.deepEqual(balanced.rule_coverage, report.rule_coverage);
+  assert.notEqual(strict.rule_coverage, report.rule_coverage);
+  assert.notEqual(strict.rule_coverage?.[0], report.rule_coverage?.[0]);
+  assert.notEqual(
+    strict.rule_coverage?.[0]?.missing_capabilities,
+    report.rule_coverage?.[0]?.missing_capabilities,
+  );
+  assert.notEqual(balanced.rule_coverage, report.rule_coverage);
+  assert.notEqual(balanced.rule_coverage?.[0], report.rule_coverage?.[0]);
+  assert.notEqual(
+    balanced.rule_coverage?.[0]?.missing_capabilities,
+    report.rule_coverage?.[0]?.missing_capabilities,
+  );
+  strict.rule_coverage?.[0]?.missing_capabilities.push("tool_timestamps");
+  balanced.rule_coverage?.[0]?.missing_capabilities.push("approvals");
+  assert.deepEqual(report, before);
+  assert.equal(projectReportPrivacy(report, "raw"), report);
+});
+
+test("legacy reports without coverage retain reporter bytes and skip fallback", () => {
+  const absent = outputReport(false);
+  const explicitUndefined = outputReport(false);
+  Object.defineProperty(explicitUndefined, "rule_coverage", {
+    value: undefined,
+    enumerable: true,
+  });
+
+  assert.equal(
+    renderJsonReport(absent),
+    `${JSON.stringify(absent, null, 2)}\n`,
+  );
+  assert.equal(renderJsonReport(explicitUndefined), renderJsonReport(absent));
+  assert.equal(
+    renderTtyReport(explicitUndefined, { color: false }),
+    renderTtyReport(absent, { color: false }),
+  );
+  assert.equal(renderMarkdownReport(explicitUndefined), renderMarkdownReport(absent));
+  assert.match(
+    renderTtyReport(absent, { color: false }),
+    /Skipped rules \(source lacks required data\): R007 \(token_usage\)/u,
+  );
+
+  const strict = projectReportPrivacy(absent, "strict");
+  const balanced = projectReportPrivacy(absent, "balanced");
+  assert.deepEqual(strict, balanced);
+  for (const projected of [strict, balanced]) {
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(projected, "rule_coverage"),
+      false,
+    );
+    assert.deepEqual(Object.keys(projected), [
+      "version",
+      "unit",
+      "summary",
+      "findings",
+      "caveats",
+      "skipped_rules",
+    ]);
+  }
+});
+
+test("legacy stored analysis without coverage remains readable", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-capability-legacy-"));
+  try {
+    const repo = await repository(root);
+    const sourceSession = await fixtureSession(root, repo);
+    const legacyRecord = (await analyzeSessions(root, repo, [sourceSession])).record;
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "legacy-data") },
+    });
+    await mkdir(storePaths.analyses_dir, { recursive: true });
+    await writeFile(
+      join(storePaths.analyses_dir, `${legacyRecord.analysis_id}.json`),
+      `${JSON.stringify(legacyRecord, null, 2)}\n`,
+    );
+
+    const loaded = await loadAnalyses(storePaths);
+    assert.deepEqual(loaded.warnings, []);
+    assert.deepEqual(loaded.records, [legacyRecord]);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(loaded.records[0], "rule_coverage"),
+      false,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function persistedPolicyDigest(
+  root: string,
+  repo: string,
+  sourceSession: Session,
+  dataDirectory: string,
+): Promise<string> {
+  const storePaths = await resolveStorePaths(repo, {
+    env: { CCPROF_DATA_DIR: join(root, dataDirectory) },
+  });
+  const result = await analyze({
+    cwd: repo,
+    pr: "main...feature",
+    sinceMs: NOW_MS - 2 * 60 * 60_000,
+    nowMs: NOW_MS,
+    sessionSource: { discover: async () => [sourceSession] },
+    storePaths,
+  });
+  const database = openStoreDatabase(storePaths);
+  try {
+    const row = database.prepare(`SELECT s.record_json
+      FROM analysis_executions e JOIN analysis_snapshots s USING (snapshot_id)
+      WHERE e.execution_id = ?`).get(result.record.analysis_id) as
+      { record_json: string } | undefined;
+    assert.ok(row);
+    const envelope = JSON.parse(row.record_json) as {
+      identity: { policy_digest?: unknown };
+    };
+    assert.match(String(envelope.identity.policy_digest), /^[0-9a-f]{64}$/u);
+    return String(envelope.identity.policy_digest);
+  } finally {
+    database.close();
+  }
+}
+
+test("snapshot policy digest changes with capability coverage and truncation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-capability-snapshot-"));
+  try {
+    const repo = await repository(root);
+    const full = await fixtureSession(root, repo);
+    const partial = relabelSession(
+      full,
+      full.session_id,
+      full.source,
+      ["tool_timestamps"],
+    );
+    const truncated: Session = {
+      ...full,
+      warnings: [{
+        code: "parser_line_budget_exceeded",
+        message: "SECRET parser text",
+        source_path: "/private/SECRET-session.jsonl",
+      }],
+    };
+    const [fullDigest, partialDigest, truncatedDigest] = await Promise.all([
+      persistedPolicyDigest(root, repo, full, "data-full"),
+      persistedPolicyDigest(root, repo, partial, "data-partial"),
+      persistedPolicyDigest(root, repo, truncated, "data-truncated"),
+    ]);
+
+    assert.notEqual(partialDigest, fullDigest);
+    assert.notEqual(truncatedDigest, fullDigest);
+    assert.notEqual(truncatedDigest, partialDigest);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
