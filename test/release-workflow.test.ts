@@ -31,6 +31,14 @@ function stepBlocks(workflow: string): string[] {
   return workflow.split(/(?=^\s+-\s+name:\s)/gmu);
 }
 
+function singleStepContaining(workflow: string, value: string): string {
+  const matches = stepBlocks(workflow).filter((step) => step.includes(value));
+  assert.equal(matches.length, 1, `expected one step containing ${value}`);
+  const step = matches[0];
+  if (step === undefined) throw new Error(`missing step containing ${value}`);
+  return step;
+}
+
 test("release assets workflow is tag-only and cannot publish to npm", async () => {
   const workflow = await readProjectFile(".github/workflows/release-assets.yml");
 
@@ -120,9 +128,17 @@ test("release assets workflow validates the release inputs and package smoke tes
     "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d",
     "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d",
   ]);
-  assert.match(workflow, /node-version:\s*["']?20["']?/u);
-  assert.match(workflow, /fetch-depth:\s*0/u);
-  assert.match(workflow, /persist-credentials:\s*false/u);
+  const checkoutStep = singleStepContaining(
+    workflow,
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+  );
+  assert.match(checkoutStep, /fetch-depth:\s*0/u);
+  assert.match(checkoutStep, /persist-credentials:\s*false/u);
+  const setupNodeStep = singleStepContaining(
+    workflow,
+    "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+  );
+  assert.match(setupNodeStep, /node-version:\s*["']?20["']?/u);
   assert.match(
     workflow,
     /TAG[^\n]*=~[^\n]*\^v\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\$/u,
@@ -143,10 +159,18 @@ test("release assets workflow validates the release inputs and package smoke tes
   assert.match(workflow, /\[ "\$LOCKFILE_VERSION" = "\$VERSION" \]/u);
   assert.match(workflow, /\[ "\$LOCKFILE_ROOT_VERSION" = "\$VERSION" \]/u);
   assert.match(workflow, /npm ci/u);
-  assert.match(workflow, /npm install --global --prefix [^\n]+ "\$TARBALL"/u);
-  assert.match(workflow, /ccprof --version/u);
-  assert.match(workflow, /ccprof --help/u);
-  assert.match(workflow, /ccprof stats --json/u);
+  const packageStep = singleStepContaining(workflow, "id: package");
+  assert.match(
+    packageStep,
+    /npm install --global --prefix "\$PREFIX" "\$TARBALL"/u,
+  );
+  assert.match(packageStep, /export PATH="\$PREFIX\/bin:\$PATH"/u);
+  assert.match(
+    packageStep,
+    /\[ "\$\(ccprof --version\)" = "ccprof \$VERSION" \]/u,
+  );
+  assert.match(packageStep, /ccprof --help/u);
+  assert.match(packageStep, /ccprof stats --json/u);
   const attestations = stepBlocks(workflow).filter((step) =>
     step.includes("actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d"),
   );
