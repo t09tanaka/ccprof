@@ -314,6 +314,28 @@ export interface Finding extends FindingMetadata {
   compatibility_epoch?: number;
 }
 
+export function hasValidFindingCompatibilityMetadata(value: unknown): boolean {
+  if (value === null || typeof value !== "object") return false;
+  const hasVersion = Object.hasOwn(value, "rule_version");
+  const hasEpoch = Object.hasOwn(value, "compatibility_epoch");
+  if (hasVersion !== hasEpoch) return false;
+  if (!hasVersion) return true;
+  const metadata = value as {
+    rule_version?: unknown;
+    compatibility_epoch?: unknown;
+  };
+  if (
+    typeof metadata.rule_version !== "string" ||
+    typeof metadata.compatibility_epoch !== "number" ||
+    !Number.isSafeInteger(metadata.compatibility_epoch) ||
+    metadata.compatibility_epoch <= 0
+  ) return false;
+  const match = /^([1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u
+    .exec(metadata.rule_version);
+  return match !== null && match[0] === metadata.rule_version &&
+    match[1] === String(metadata.compatibility_epoch);
+}
+
 export interface BaselineNotable {
   metric: string;
   value: number;

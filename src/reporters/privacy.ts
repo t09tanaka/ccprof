@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { AnalyzeWarning } from "../core/analyze.js";
+import { hasValidFindingCompatibilityMetadata } from "../core/model.js";
 import type {
   CommandIdentity,
   Finding,
@@ -165,10 +166,14 @@ function projectedFinding(finding: Finding, profile: DisplayProfile,
   return {
     finding_key: findingPrivacyReference(repoRoot, finding.finding_key),
     rule_id: finding.rule_id,
-    ...(finding.rule_version === undefined
-      ? {} : { rule_version: finding.rule_version }),
-    ...(finding.compatibility_epoch === undefined
-      ? {} : { compatibility_epoch: finding.compatibility_epoch }),
+    ...(hasValidFindingCompatibilityMetadata(finding) &&
+        finding.rule_version !== undefined &&
+        finding.compatibility_epoch !== undefined
+      ? {
+          rule_version: finding.rule_version,
+          compatibility_epoch: finding.compatibility_epoch,
+        }
+      : {}),
     title: safeText(finding.title, profile, repoRoot, sessions, copies),
     ...(profile === "balanced" && finding.target !== undefined
       ? { target: safeText(finding.target, profile, repoRoot, sessions, copies) } : {}),
