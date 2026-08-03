@@ -64,7 +64,7 @@ function session(repo: string, eventCount = 3): Session {
     is_sidechain: false,
     confidence: "high" as const,
   };
-  const events: Session["events"] = [
+  const allEvents: Session["events"] = [
     {
       ...shared,
       kind: "genuine_user",
@@ -92,7 +92,8 @@ function session(repo: string, eventCount = 3): Session {
       source_index: 2,
       text: "Done.",
     },
-  ].slice(0, eventCount);
+  ];
+  const events = allEvents.slice(0, eventCount);
   return {
     session_id: "budget-session",
     source: "claude",
