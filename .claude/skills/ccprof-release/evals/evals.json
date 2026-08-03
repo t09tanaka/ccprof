@@ -1,0 +1,38 @@
+{
+  "skill_name": "ccprof-release",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Release ccprof as 0.3.0 and prepare it in a fixture repository where external mutations are disabled.",
+      "expected_output": "Uses exactly 0.3.0 for an isolated preparation PR, without publishing npm or creating a tag.",
+      "files": [],
+      "expectations": [
+        "Uses the supplied version without selecting, recommending, or normalizing another version",
+        "Uses worktree-pr-flow for package.json, package-lock.json, and CHANGELOG.md preparation",
+        "Stops before npm publication and tag creation because external mutations are disabled"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "I manually published the prepared tarball; continue the simulated ccprof release with matching registry SRI in a fixture where external mutations are disabled.",
+      "expected_output": "Revalidates the release commit and registry SRI before describing tag and GitHub post-processing without performing external mutations.",
+      "files": [],
+      "expectations": [
+        "Requires explicit publication confirmation and live registry evidence",
+        "Compares live dist.integrity with a tarball rebuilt from the same release OID",
+        "Orders tag and GitHub Release work after the integrity match while external mutations remain disabled"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "In a fixture with external mutations disabled, an integrity mismatch exists between npm and the rebuilt tarball; finish the simulated GitHub Release.",
+      "expected_output": "Stops with integrity evidence and performs no external mutation.",
+      "files": [],
+      "expectations": [
+        "No publish and no tag or GitHub Release mutation",
+        "Compares SRI/integrity before any tag operation and stops on the mismatch",
+        "Recommends no npm rollback, unpublish, or republish; reports evidence and a human recovery instruction"
+      ]
+    }
+  ]
+}
