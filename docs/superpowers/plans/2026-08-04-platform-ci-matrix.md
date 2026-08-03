@@ -116,7 +116,9 @@ covered by an explicit regression here. The remaining failures are pre-existing
 Windows test-portability blockers (temporary-path regular expressions,
 filesystem/permission semantics, taskkill timing, and an NTFS-invalid fixture).
 
-PR #55 remains open and unweakened: Windows stays blocking, the aggregate
-correctly fails, and neither skips nor `continue-on-error` were added. Work
-resumes after the separate atomic Windows test-portability prerequisite lands;
-then this branch will rebase and all remote matrix checks will rerun.
+PR #55 remained open and unweakened: Windows stayed blocking, the aggregate
+correctly failed, and neither skips nor `continue-on-error` were added. The
+atomic Windows test-portability prerequisite merged through PR #56 at
+`384e7d37`; this branch then rebased onto that commit without conflicts. Fresh
+local verification and the complete remote matrix rerun are required before
+merge.
