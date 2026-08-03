@@ -3,6 +3,13 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
+  CliUsageError,
+  parseCliArgs,
+  runCli,
+  USAGE,
+  type CliHandlers,
+} from "../src/cli.js";
+import {
   ALL_SESSION_CAPABILITIES,
   findingCompatibilityMetadata,
   hasValidFindingCompatibilityMetadata,
@@ -216,6 +223,10 @@ function reportWith(oneFinding: Finding): ReportV2 {
     caveats: [],
   };
 }
+
+const FORBIDDEN_HANDLERS = new Proxy({} as CliHandlers, {
+  get() { throw new Error("rules CLI must not invoke command handlers"); },
+});
 
 test("the built-in manifest registers the exact R001-R008 contracts", () => {
   const manifests = listRuleManifests();
@@ -555,6 +566,85 @@ test("the ordered manifest contract materially contributes to policy identity", 
     analysisDigest("analysis-policy-v1", policy),
     analysisDigest("analysis-policy-v1", changed),
   );
+});
+
+test("rules CLI parsing accepts only list and canonical explain commands", () => {
+  assert.deepEqual(parseCliArgs(["rules", "list"]), {
+    kind: "rules",
+    action: "list",
+  });
+  assert.deepEqual(parseCliArgs(["rules", "explain", "R004"]), {
+    kind: "rules",
+    action: "explain",
+    ruleId: "R004",
+  });
+  for (const args of [
+    ["rules"],
+    ["rules", "delete"],
+    ["rules", "list", "extra"],
+    ["rules", "explain"],
+    ["rules", "explain", "R004", "extra"],
+    ["rules", "explain", "r004"],
+    ["rules", "explain", "R999"],
+  ]) {
+    assert.throws(() => parseCliArgs(args), CliUsageError, args.join(" "));
+  }
+  assert.match(USAGE, /ccprof rules list/u);
+  assert.match(USAGE, /ccprof rules explain <rule-id>/u);
+});
+
+test("rules CLI emits deterministic pretty JSON without handlers or private state", async () => {
+  const scenarios = [
+    { args: ["rules", "list"], expected: EXPECTED },
+    { args: ["rules", "explain", "R004"], expected: EXPECTED[3] },
+  ] as const;
+  for (const { args, expected } of scenarios) {
+    for (const stdoutIsTTY of [false, true]) {
+      let stdout = "";
+      let stderr = "";
+      const code = await runCli(args, {
+        cwd: "/private/repository/token-secret",
+        ci: false,
+        handlers: FORBIDDEN_HANDLERS,
+        stdoutIsTTY,
+        stdout: (value) => { stdout += value; },
+        stderr: (value) => { stderr += value; },
+      });
+      assert.equal(code, 0);
+      assert.equal(stdout, `${JSON.stringify(expected, null, 2)}\n`);
+      assert.equal(stderr, "");
+      assert.doesNotMatch(stdout, /private|session|token-secret/u);
+    }
+  }
+});
+
+test("rules CLI rejects unknown input with actionable sanitized usage", async () => {
+  for (const args of [
+    ["rules", "explain", "R999"],
+    ["rules", "delete"],
+    ["rules", "list", "extra"],
+  ]) {
+    let stdout = "";
+    let stderr = "";
+    const code = await runCli(args, {
+      cwd: "/private/repository/token-secret",
+      ci: false,
+      handlers: FORBIDDEN_HANDLERS,
+      stdout: (value) => { stdout += value; },
+      stderr: (value) => { stderr += value; },
+    });
+    assert.equal(code, 2, args.join(" "));
+    assert.equal(stdout, "");
+    assert.match(stderr, /^ccprof: .+\nUsage: ccprof/u);
+    assert.doesNotMatch(stderr, /\/private\/repository|token-secret/u);
+  }
+  let unknown = "";
+  await runCli(["rules", "explain", "R999"], {
+    handlers: FORBIDDEN_HANDLERS,
+    stdout: () => undefined,
+    stderr: (value) => { unknown += value; },
+  });
+  assert.match(unknown, /unknown rule id R999.*R001.*R008/u);
 });
 
 test("unknown rule lookup fails without a partial result", () => {
