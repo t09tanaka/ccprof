@@ -22,21 +22,44 @@ export interface FindingConfidence {
   causal: "low" | "medium" | "high";
   source_completeness: number;
 }
+
+export type FindingSeverity = "info" | "low" | "medium" | "high";
+
+export type FindingScoringRationale =
+  | "observed_lower_bound"
+  | "estimated_upper_only"
+  | "resource_cost_only"
+  | "policy_dependent"
+  | "partial_source"
+  | "legacy_projection";
 ```
 
-Every newly produced candidate and finding has canonical `impact` and detailed `confidence`. `expected_ms` is present only when supported by detector evidence; it is never synthesized from bounds.
+Every newly produced candidate and finding has canonical `impact`, detailed `finding_confidence`, `severity`, and an exact ordered-unique `scoring_rationale` array. The distinct `finding_confidence` name avoids collision with the Report/Store v2 scalar `confidence` projection. A future Report v3 writer may map `finding_confidence` to its schema field `confidence`; this change does not add that writer. `expected_ms` is present only when supported by detector evidence; it is never synthesized from bounds.
 
 Each detector explicitly assigns the causal rating and a rationale. Severity and scoring remain deterministic and have a stable rationale based on the canonical fields.
 
+Severity uses no arbitrary duration thresholds:
+
+- `info` when `upper_ms` is zero.
+- `high` only for a positive critical-path lower bound with evidence `high`, causal `high`, and source completeness exactly `1`.
+- `medium` for a positive upper bound when evidence and causal are each at least `medium` and completeness is greater than zero.
+- `low` for every other positive upper bound.
+
+Rationale codes are deduplicated and ordered exactly as `observed_lower_bound`, `estimated_upper_only`, `resource_cost_only`, `policy_dependent`, `partial_source`, then `legacy_projection`, including each code only when applicable. They are fixed privacy-safe enum values, not free text.
+
 ## Compatibility boundary
 
-Existing `recoverable` and scalar confidence fields remain Report/Store v2 compatibility projections. They are derived one-way from canonical `impact` and detailed `confidence`; they are not independent inputs for newly produced findings.
+Existing `recoverable` and scalar confidence fields remain Report/Store v2 compatibility projections. They are derived one-way from canonical `impact` and detailed `finding_confidence`; they are not independent inputs for newly produced findings.
+
+- Compatibility `recoverable` uses `upper_ms` and is `point` only when `lower_ms === upper_ms`; otherwise it is `upper`.
+- Scalar confidence is the minimum of evidence, causal, and the completeness band: completeness `0` is low, a value strictly between `0` and `1` is medium, and `1` is high.
 
 Legacy reads normalize conservatively:
 
-- A legacy impact value becomes an upper-only estimate with `lower_ms: 0`.
+- Every legacy impact value, including a legacy `point`, becomes an upper-only estimate with `lower_ms: 0` and its original magnitude as `upper_ms`.
 - No `expected_ms` is fabricated.
 - Legacy confidence never becomes confirmed: causal confidence remains below `high`, and source completeness remains below `1` unless the canonical detailed fields were present and valid.
+- Legacy normalization includes `legacy_projection` and never produces `high` severity.
 - Legacy compatibility projections remain readable through dismissal, adoption, and Store round trips.
 
 This change does not introduce a Report v3 envelope.
@@ -103,7 +126,7 @@ An upper-only detector emits `lower_ms: 0` and omits `expected_ms` unless eviden
 
 - TTY output shows impact as a range (and expected value when present), the impact kind, and detailed confidence.
 - Markdown output presents the same information in stable, readable text.
-- JSON exposes canonical `impact` and detailed `confidence` while retaining the v2 compatibility projections.
+- JSON exposes canonical `impact` and detailed `finding_confidence` while retaining the v2 compatibility projections.
 - Legacy reports without canonical fields remain readable after conservative normalization.
 
 Formatting is deterministic across runs and does not leak hidden or rejected input content into output, digests, or errors.
