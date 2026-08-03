@@ -219,7 +219,7 @@ Include the Codex coauthor and do not amend.
 
 Have the dedicated verifier enumerate changed-file-matching workflows and run the applicable `.github/workflows/ci.yml` jobs locally, preserving workflow order and commands. Expected: typecheck, unit/integration, package smoke, and determinism golden checks pass.
 
-- [ ] **Step 2: Push and open the PR against main**
+- [x] **Step 2: Push and open the PR against main**
 
 Push `feature/advisory-process-hardening` and create a non-draft PR to `main` with Summary, Breaking / Impact, exact Test plan, `Tests: modified`, and `Rollback: revert-safe`.
 
