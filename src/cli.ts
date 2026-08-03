@@ -13,7 +13,9 @@ import {
 import {
   FindingNotFoundError,
   runDismissCommand,
+  runExplainCommand,
   type DismissCommandOptions,
+  type ExplainCommandOptions,
 } from "./commands/dismiss.js";
 import {
   runHookEventCommand,
@@ -47,6 +49,7 @@ export const USAGE = `Usage: ccprof [--pr [<number|url|base...head>]] [--json|--
               [--privacy <strict|balanced|raw>] [--advisory]
        ccprof stats [--json]
        ccprof dismiss <finding-key> [--reason <text>]
+       ccprof explain <finding-key>
        ccprof hook-event [--notify]
        ccprof hooks install|uninstall [--global] [--yes]
        ccprof --version
@@ -114,6 +117,11 @@ export interface ParsedDismissCommand {
   reason?: string;
 }
 
+export interface ParsedExplainCommand {
+  kind: "explain";
+  findingKey: string;
+}
+
 export interface ParsedHookEventCommand {
   kind: "hook-event";
   notify: boolean;
@@ -138,6 +146,7 @@ export type ParsedCliCommand =
   | ParsedAnalyzeCommand
   | ParsedStatsCommand
   | ParsedDismissCommand
+  | ParsedExplainCommand
   | ParsedHookEventCommand
   | ParsedHooksCommand
   | ParsedHelpCommand
@@ -152,6 +161,9 @@ export interface CliHandlers {
   ) => Promise<CommandExecutionResult>;
   dismiss: (
     options: DismissCommandOptions,
+  ) => Promise<CommandExecutionResult>;
+  explain?: (
+    options: ExplainCommandOptions,
   ) => Promise<CommandExecutionResult>;
   hookEvent: (
     options: HookEventCommandOptions,
@@ -181,6 +193,7 @@ const defaultHandlers: CliHandlers = {
   analyze: runAnalyzeCommand,
   stats: runStatsCommand,
   dismiss: runDismissCommand,
+  explain: runExplainCommand,
   hookEvent: runHookEventCommand,
   hooks: runHooksCommand,
 };
@@ -559,6 +572,23 @@ function parseDismissArgs(
   };
 }
 
+function parseExplainArgs(
+  args: readonly string[],
+): ParsedExplainCommand {
+  const findingKey = args[0];
+  if (
+    findingKey === undefined ||
+    findingKey.startsWith("-") ||
+    findingKey.trim() === ""
+  ) {
+    throw new CliUsageError("explain requires a finding key");
+  }
+  if (args.length !== 1) {
+    throw new CliUsageError(`unknown explain argument: ${args[1]}`);
+  }
+  return { kind: "explain", findingKey };
+}
+
 function parseHookEventArgs(
   args: readonly string[],
 ): ParsedHookEventCommand {
@@ -606,6 +636,7 @@ export function parseCliArgs(
   }
   if (args[0] === "stats") return parseStatsArgs(args.slice(1));
   if (args[0] === "dismiss") return parseDismissArgs(args.slice(1));
+  if (args[0] === "explain") return parseExplainArgs(args.slice(1));
   if (args[0] === "hook-event") return parseHookEventArgs(args.slice(1));
   if (args[0] === "hooks") return parseHooksArgs(args.slice(1));
   return parseAnalyzeArgs(args);
@@ -710,9 +741,12 @@ export async function runCli(
       args[index - 1] === "--privacy" ? token : ""
   ).find(isPrivacyProfile);
   let activePrivacy: PrivacyProfile | undefined =
-    ["stats", "dismiss", "hooks"].includes(args[0] ?? "")
-      ? undefined
-      : explicitPrivacy ?? (ci || args.includes("--md") ? "strict" : "balanced");
+    args[0] === "explain" && ci
+      ? "strict"
+      : ["stats", "dismiss", "explain", "hooks"].includes(args[0] ?? "")
+        ? undefined
+        : explicitPrivacy ??
+          (ci || args.includes("--md") ? "strict" : "balanced");
   try {
     const command = parseCliArgs(args);
     if (command.kind === "help") {
@@ -722,6 +756,9 @@ export async function runCli(
     if (command.kind === "version") {
       stdout(`ccprof ${resolvePackageVersion()}\n`);
       return 0;
+    }
+    if (command.kind === "explain" && ci) {
+      throw new CliUsageError("explain is local-only and unavailable in CI");
     }
     let result: CommandExecutionResult;
     if (command.kind === "analyze") {
@@ -759,6 +796,11 @@ export async function runCli(
         findingKey: command.findingKey,
         ...(command.reason === undefined ? {} : { reason: command.reason }),
       });
+    } else if (command.kind === "explain") {
+      result = await (handlers.explain ?? runExplainCommand)({
+        cwd,
+        findingKey: command.findingKey,
+      });
     } else if (command.kind === "hooks") {
       result = await handlers.hooks({
         cwd,
@@ -770,7 +812,7 @@ export async function runCli(
       // command.kind === "hook-event": runCli dispatches hook-event before
       // this try/catch (see below) so its always-exit-0 contract holds even
       // for CLI-level parse errors. Unreachable in practice; kept only so
-      // the analyze/stats/dismiss/hooks narrowing above stays exhaustive.
+      // the analyze/stats/dismiss/explain/hooks narrowing above stays exhaustive.
       throw new CliUsageError("hook-event must be dispatched separately");
     }
     stdout(withTrailingNewline(result.stdout));

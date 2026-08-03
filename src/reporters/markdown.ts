@@ -35,6 +35,7 @@ function findingMarkdown(
   const command = finding.evidence.command;
   return [
     `${index + 1}. **[${finding.rule_id}] ${markdownText(finding.title)}** — ${formatMinutes(finding.recoverable.min)} (${finding.recoverable.bound})`,
+    `   - Finding key: ${markdownText(finding.finding_key)}`,
     `   - Suggestion: ${markdownText(finding.fix_recipe.suggestion)}`,
     `   - Verify: ${markdownText(finding.fix_recipe.verify)}`,
     ...(typeof command === "string" && command.trim() !== ""
