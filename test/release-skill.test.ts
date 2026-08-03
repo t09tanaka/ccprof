@@ -81,6 +81,7 @@ test("README documents deny-safe external setup without a manual publish command
   assert.match(section, /release-assets\.yml/u);
   assert.match(section, /environment `npm`/iu);
   assert.match(section, /required reviewer/iu);
+  assert.match(section, /allowed action `npm publish`/iu);
   assert.match(section, /annotated tag/iu);
   assert.match(section, /GitHub Release/u);
   assert.match(section, /no npm token/iu);

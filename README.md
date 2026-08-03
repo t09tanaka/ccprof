@@ -704,9 +704,10 @@ tag-only workflow uses npm Trusted Publishing after a human approves environment
 `npm`; the agent uses no npm token and never publishes locally. Before release,
 an administrator must configure that environment with a required reviewer and
 configure npm for repository `t09tanaka/ccprof`, workflow
-`release-assets.yml`, and environment `npm`. The workflow reproducibly verifies
-one tarball, publishes those exact bytes with OIDC provenance, and then creates
-the matching GitHub Release assets and attestations.
+`release-assets.yml`, environment `npm`, and allowed action `npm publish`. The
+workflow reproducibly verifies one tarball, publishes those exact bytes with
+OIDC provenance, and then creates the matching GitHub Release assets and
+attestations.
 
 ## License
 
