@@ -350,6 +350,7 @@ function buildFunctionCallEvent(
   sourcePath: string,
   sessionCwd: string | undefined,
   tracker: JsonlBudgetTracker,
+  onBudgetError: (error: ParserBudgetExceededError) => void,
 ): ToolUseEvent | undefined {
   const callId = nonEmptyString(row.payload.call_id);
   const name = nonEmptyString(row.payload.name);
@@ -380,6 +381,7 @@ function buildFunctionCallEvent(
     } catch (error) {
       tracker.throwIfAborted();
       if (error instanceof ParserBudgetExceededError) {
+        onBudgetError(error);
         warnings.push(warn(sourcePath, error.line,
           budgetWarningCode(error), error.message));
         return undefined;
@@ -527,7 +529,7 @@ export async function parseCodexSession(
   options: ParseCodexSessionOptions,
 ): Promise<Session | null> {
   const { sourcePath } = options;
-  const { rows, warnings, tracker, firstBudgetError } = await parseRows(options);
+  let { rows, warnings, tracker, firstBudgetError } = await parseRows(options);
 
   const sessionMetaRow = rows.find((row) => row.type === "session_meta");
   let sessionMetaId: string | undefined;
@@ -582,6 +584,7 @@ export async function parseCodexSession(
         sourcePath,
         sessionMetaCwd,
         tracker,
+        (error) => { firstBudgetError ??= error; },
       );
       if (event !== undefined) {
         events.push(event);

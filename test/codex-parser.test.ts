@@ -662,6 +662,37 @@ test("Codex parser applies budgets to nested function-call arguments", async (t)
   ));
 });
 
+test("Codex parser rejects a rollout whose only event exceeds nested argument depth", async (t) => {
+  let nested: unknown = "deep";
+  for (let depth = 0; depth < 16; depth += 1) nested = { child: nested };
+  const functionCall = JSON.stringify({
+    timestamp: "2026-07-31T19:02:00.000Z",
+    type: "response_item",
+    payload: {
+      type: "function_call",
+      name: "exec_command",
+      call_id: "deep-only-call",
+      arguments: JSON.stringify({ cmd: "true", nested }),
+    },
+  });
+  const path = await tempRollout(
+    t,
+    "sole-nested-argument-budget.jsonl",
+    `${budgetCodexMeta()}\n${functionCall}\n`,
+  );
+
+  await assert.rejects(
+    parseCodexSession({
+      sourcePath: path,
+      budgets: { maxNestingDepth: 4 },
+    }),
+    (error) =>
+      error instanceof ParserBudgetExceededError &&
+      error.budget === "depth" &&
+      error.line === 2,
+  );
+});
+
 test("Codex parser bounds a generated large rollout by retained bytes", async (t) => {
   const metadata = budgetCodexMeta();
   const messages = Array.from({ length: 20_000 }, (_, index) =>

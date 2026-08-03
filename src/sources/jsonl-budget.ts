@@ -126,8 +126,8 @@ export async function* boundedJsonlLines(
     }
     if (partBytes > 0) {
       const raw = Buffer.concat(parts, partBytes);
-      const content = raw.at(-1) === 0x0d ? raw.subarray(0, -1) : raw;
-      yield { text: content.toString("utf8"), bytes: content.byteLength, line };
+      tracker.assertLineBytes(raw.byteLength, line);
+      yield { text: raw.toString("utf8"), bytes: raw.byteLength, line };
     }
   } catch (error) {
     if (tracker.signal?.aborted === true) tracker.throwIfAborted();

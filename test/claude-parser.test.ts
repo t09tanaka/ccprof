@@ -1474,6 +1474,33 @@ test("Claude parser accepts the exact CRLF line-byte limit and stops before an o
   ));
 });
 
+test("Claude parser counts a lone trailing CR at EOF as line content", async (t) => {
+  const row = budgetClaudeRow(0);
+  const exactJsonBytes = Buffer.byteLength(row);
+  const raw = `${row}\r`;
+  assert.equal(Buffer.byteLength(raw), exactJsonBytes + 1);
+  const path = await tempClaudeTranscript(t, "lone-cr-budget.jsonl", raw);
+
+  const exhausted = await parseClaudeTranscriptDetailed(path, {
+    budgets: { maxLineBytes: exactJsonBytes },
+  });
+  assert.deepEqual(exhausted.sessions, []);
+  assert.ok(exhausted.warnings.some(
+    (warning) =>
+      warning.code === "parser_line_budget_exceeded" && warning.line === 1,
+  ));
+
+  const accepted = await parseClaudeTranscriptDetailed(path, {
+    budgets: { maxLineBytes: exactJsonBytes + 1 },
+  });
+  assert.deepEqual(accepted.sessions[0]?.events.map(
+    (event) => event.entry_uuid,
+  ), ["budget-0"]);
+  assert.equal(accepted.warnings.some(
+    (warning) => warning.code === "parser_line_budget_exceeded",
+  ), false);
+});
+
 test("Claude parser skips node-heavy rows while bounding warning growth", async (t) => {
   const wideRows = Array.from({ length: 64 }, (_, index) => JSON.stringify({
     sessionId: "budget-claude",
