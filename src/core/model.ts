@@ -344,6 +344,16 @@ export interface SkippedRule {
   missing: SessionCapability[];
 }
 
+export interface RuleCoverage {
+  rule_id: RuleId;
+  eligible_sessions: number;
+  total_sessions: number;
+  status: "full" | "partial";
+  missing_capabilities: SessionCapability[];
+  completeness: number;
+  truncated: boolean;
+}
+
 export interface ReportV2 {
   version: 2;
   unit: AnalysisUnit;
@@ -356,11 +366,12 @@ export interface ReportV2 {
   summary: AnalysisSummary;
   findings: Finding[];
   caveats: string[];
+  /** Deterministic per-rule source eligibility; absent on legacy v2 reports. */
+  rule_coverage?: RuleCoverage[];
   /**
-   * Rules that were not evaluated because at least one session in this
-   * analysis lacks a capability the rule structurally depends on (see
-   * `src/rules/capabilities.ts`). Additive and omitted entirely when empty,
-   * so existing full-capability (Claude-only) reports are byte-identical.
+   * Rules that were not evaluated because no session supplies every
+   * capability the rule structurally depends on. Additive and omitted when
+   * empty so legacy reports remain readable.
    */
   skipped_rules?: SkippedRule[];
 }

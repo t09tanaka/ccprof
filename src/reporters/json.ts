@@ -52,6 +52,19 @@ function reportForDisplay(
     },
     findings: report.findings.slice(0, 3),
     caveats: [...report.caveats],
+    ...(report.rule_coverage === undefined
+      ? {}
+      : {
+        rule_coverage: report.rule_coverage.map((entry) => ({
+          rule_id: entry.rule_id,
+          eligible_sessions: entry.eligible_sessions,
+          total_sessions: entry.total_sessions,
+          status: entry.status,
+          missing_capabilities: [...entry.missing_capabilities],
+          completeness: entry.completeness,
+          truncated: entry.truncated,
+        })),
+      }),
     ...(report.skipped_rules === undefined
       ? {}
       : {

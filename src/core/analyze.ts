@@ -23,6 +23,8 @@ import type {
   MatchedAction,
   NormalizedEvent,
   ReportV2,
+  RuleCoverage,
+  RuleId,
   Session,
   SkippedRule,
   SourceWarning,
@@ -70,7 +72,10 @@ import {
   resolvePrContext,
   type PrContext,
 } from "../git/pr-context.js";
-import { ruleApplicability } from "../rules/capabilities.js";
+import {
+  ruleCoverage,
+  sessionSupportsRule,
+} from "../rules/capabilities.js";
 import { detectChronicCost } from "../rules/chronic-cost.js";
 import { detectContextBloat } from "../rules/context-bloat.js";
 import {
@@ -273,19 +278,34 @@ function sourceErrorMessage(error: unknown): string {
 }
 
 /**
- * Rules a session's declared capabilities cannot support, derived from
- * `ruleApplicability`. Sorted by rule_id and omitted entirely (empty array)
- * when every session has full capabilities, so a Claude-only analysis is
- * unaffected.
+ * Legacy projection of rules with no eligible sessions. Partially covered
+ * rules stay evaluated and are never reported as skipped.
  */
-function skippedRules(sessions: readonly Session[]): SkippedRule[] {
-  return ruleApplicability(sessions)
-    .filter((entry) => !entry.applicable)
+function skippedRules(coverage: readonly RuleCoverage[]): SkippedRule[] {
+  return coverage
+    .filter((entry) => entry.status === "partial" && entry.eligible_sessions === 0)
     .map((entry): SkippedRule => ({
       rule_id: entry.rule_id,
-      missing: entry.missing,
+      missing: [...entry.missing_capabilities],
     }))
     .sort((left, right) => left.rule_id.localeCompare(right.rule_id));
+}
+
+export function ruleSessionLanes(
+  sessions: readonly Session[],
+): Record<RuleId, Session[]> {
+  const lane = (ruleId: RuleId): Session[] =>
+    sessions.filter((session) => sessionSupportsRule(session, ruleId));
+  return {
+    R001: lane("R001"),
+    R002: lane("R002"),
+    R003: lane("R003"),
+    R004: lane("R004"),
+    R005: lane("R005"),
+    R006: lane("R006"),
+    R007: lane("R007"),
+    R008: lane("R008"),
+  };
 }
 
 function skippedRuleWarning(skipped: SkippedRule): AnalyzeWarning {
@@ -873,46 +893,50 @@ export function resolveAnalysisWindow(
   };
 }
 
+interface RuleEvidenceLane {
+  matched: readonly MatchedAction[];
+  timeline: TimelineResult;
+  events: readonly NormalizedEvent[];
+}
+
 function ruleCandidates(
-  matched: readonly MatchedAction[],
-  timeline: TimelineResult,
-  events: readonly NormalizedEvent[],
+  lanes: Readonly<Record<RuleId, RuleEvidenceLane>>,
   history: readonly AnalysisRecord[],
   currentObjectIdsByPath: ReadonlyMap<string, string>,
   crossPrEligibleReadKeys: ReadonlySet<string>,
   testMap: TestMap,
   externalToolNames: ReadonlySet<string> | undefined,
 ): FindingCandidate[] {
-  const userEvents = events.filter(
+  const userEvents = lanes.R001.events.filter(
     (event): event is Extract<NormalizedEvent, { kind: "genuine_user" }> =>
       event.kind === "genuine_user",
   );
-  const assistantEvents = events.filter(
+  const assistantEvents = lanes.R004.events.filter(
     (event): event is AssistantEvent => event.kind === "assistant",
   );
-  const toolResults = events.filter(
+  const toolResults = lanes.R008.events.filter(
     (event): event is ToolResultEvent => event.kind === "tool_result",
   );
   return [
-    ...detectRework(matched, { userEvents }),
-    ...detectRedundantRuns(matched),
-    ...detectRediscovery(matched, {
-      estimatedTokensByEventIdentity: tokenEstimates(events),
+    ...detectRework(lanes.R001.matched, { userEvents }),
+    ...detectRedundantRuns(lanes.R002.matched),
+    ...detectRediscovery(lanes.R003.matched, {
+      estimatedTokensByEventIdentity: tokenEstimates(lanes.R003.events),
       history,
       currentObjectIdsByPath,
       crossPrEligibleReadKeys,
     }),
-    ...detectHumanWait(timeline.actions, { assistantEvents }),
-    ...detectSerialSlack(matched),
+    ...detectHumanWait(lanes.R004.timeline.actions, { assistantEvents }),
+    ...detectSerialSlack(lanes.R005.matched),
     ...detectChronicCost(history),
-    ...detectContextBloat(matched, {
-      events,
+    ...detectContextBloat(lanes.R007.matched, {
+      events: lanes.R007.events,
       ...(externalToolNames === undefined ? {} : { externalToolNames }),
     }),
-    ...detectFlakyTests(matched, {
+    ...detectFlakyTests(lanes.R008.matched, {
       toolResults,
       additionalTestCommands: mappedTestCommands(testMap),
-      editRelevanceByActionId: buildFlakyEditRelevance(matched, testMap),
+      editRelevanceByActionId: buildFlakyEditRelevance(lanes.R008.matched, testMap),
       history,
     }),
   ];
@@ -959,7 +983,8 @@ function sourceSnapshot(sessions: readonly Session[], repoRoot: string): unknown
 }
 function snapshotIdentity(paths: StorePaths, context: PrContext, window: AnalysisWindow,
   sessions: readonly Session[], testMap: TestMap, options: AnalyzeOptions,
-  history: readonly AnalysisRecord[], inapplicable: readonly SkippedRule[], sourceErrors: readonly unknown[],
+  history: readonly AnalysisRecord[], coverage: readonly RuleCoverage[],
+  inapplicable: readonly SkippedRule[], sourceErrors: readonly unknown[],
   hookWarnings: readonly StoreWarning[]): AnalysisSnapshotIdentity {
   const mappings = testMap.mappings.map((mapping) => ({ source: uniqueSorted(mapping.source),
     tests: uniqueSorted(mapping.tests),
@@ -987,8 +1012,8 @@ function snapshotIdentity(paths: StorePaths, context: PrContext, window: Analysi
         repository_config_schema_version: testMap.config_schema_version,
       }) }),
     policy_digest: analysisDigest("analysis-policy-v1", {
-      fingerprint: "ccprof-rule-policy-2026-08-03-v1",
-      applicability: ruleApplicability(sessions), skipped_rules: inapplicable }),
+      fingerprint: "ccprof-rule-policy-2026-08-04-v2",
+      rule_coverage: coverage, skipped_rules: inapplicable }),
     history_digest: analysisDigest("analysis-history-v1", sortedHistory),
   };
 }
@@ -1131,7 +1156,8 @@ export async function analyze(
     ),
   );
 
-  const inapplicableRules = skippedRules(sessions);
+  const coverage = ruleCoverage(sessions, window.completeness);
+  const inapplicableRules = skippedRules(coverage);
   warnings.push(...inapplicableRules.map(skippedRuleWarning));
 
   const timeline = buildTimeline(sessions, {
@@ -1209,20 +1235,64 @@ export async function analyze(
       repoRoot: context.repoRoot,
     },
   );
+  const laneKey = (laneSessions: readonly Session[]): string =>
+    analysisDigest("rule-session-lane-v1", laneSessions.map((session) => ({
+      source: session.source,
+      source_path: session.source_path,
+      session_id: session.session_id,
+    })).sort((left, right) =>
+      left.source_path.localeCompare(right.source_path) ||
+      left.source.localeCompare(right.source) ||
+      left.session_id.localeCompare(right.session_id)
+    ));
+  const laneCache = new Map<string, RuleEvidenceLane>([[laneKey(sessions), {
+    matched, timeline, events,
+  }]]);
+  const evidenceLane = (laneSessions: readonly Session[]): RuleEvidenceLane => {
+    const key = laneKey(laneSessions);
+    const cached = laneCache.get(key);
+    if (cached !== undefined) return cached;
+    const laneTimeline = buildTimeline(laneSessions, {
+      ...(options.idleThresholdMs === undefined
+        ? {}
+        : { idleThresholdMs: options.idleThresholdMs }),
+    });
+    const laneEvents = orderedEvents(laneSessions);
+    const laneEventIndex = toolEventIndex(laneEvents);
+    const laneMatched = matchTimelineActions(
+      laneTimeline.actions.map((action) =>
+        observationFor(action, laneEventIndex)
+      ),
+      { diff, testMap, repoRoot: context.repoRoot },
+    );
+    const result = {
+      matched: laneMatched,
+      timeline: laneTimeline,
+      events: laneEvents,
+    };
+    laneCache.set(key, result);
+    return result;
+  };
+  const sessionLanes = ruleSessionLanes(sessions);
+  const ruleLanes: Record<RuleId, RuleEvidenceLane> = {
+    R001: evidenceLane(sessionLanes.R001),
+    R002: evidenceLane(sessionLanes.R002),
+    R003: evidenceLane(sessionLanes.R003),
+    R004: evidenceLane(sessionLanes.R004),
+    R005: evidenceLane(sessionLanes.R005),
+    R006: evidenceLane(sessionLanes.R006),
+    R007: evidenceLane(sessionLanes.R007),
+    R008: evidenceLane(sessionLanes.R008),
+  };
   const reads = await readObservations(matched, context, options.runner, warnings);
-  const inapplicableRuleIds = new Set(
-    inapplicableRules.map((skipped) => skipped.rule_id),
-  );
   const candidates = ruleCandidates(
-    matched,
-    timeline,
-    events,
+    ruleLanes,
     history,
     reads.objects,
     reads.eligibleReadKeys,
     testMap,
     options.externalToolNames,
-  ).filter((candidate) => !inapplicableRuleIds.has(candidate.rule_id));
+  );
   const unit = {
     repo: paths.canonical_repo,
     pr_ref: context.prRef,
@@ -1266,7 +1336,8 @@ export async function analyze(
   });
   const saveResult = persist
     ? await saveAnalysis(paths, record, { snapshot: snapshotIdentity(
-        paths, context, window, sessions, testMap, options, history, inapplicableRules,
+        paths, context, window, sessions, testMap, options, history, coverage,
+        inapplicableRules,
         sourceErrors, hookEvents.warnings,
       ) })
     : { record, warnings: [] as StoreWarning[] };
@@ -1292,6 +1363,7 @@ export async function analyze(
       .sort(findingOrder)
       .slice(0, 3),
     caveats,
+    rule_coverage: coverage,
     ...(inapplicableRules.length === 0
       ? {}
       : { skipped_rules: inapplicableRules }),

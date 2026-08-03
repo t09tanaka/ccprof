@@ -1732,7 +1732,7 @@ test("partial source failure creates a distinct snapshot for an otherwise identi
   }
 });
 
-test("skips rules whose required capability is missing from a mixed Codex+Claude session set", async () => {
+test("retains eligible evidence with partial coverage in a mixed Codex+Claude session set", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-skipped-rules-"));
   try {
     const repo = await makeRepository(root);
@@ -1759,29 +1759,33 @@ test("skips rules whose required capability is missing from a mixed Codex+Claude
       "e2e-session",
     ]);
 
-    assert.ok(
-      !result.allFindings.some(({ rule_id }) => rule_id === "R007"),
-      "R007 requires token_usage, which the Codex session lacks",
+    const contextBloat = result.allFindings.filter(
+      ({ rule_id }) => rule_id === "R007",
     );
-    // R005 (tool_timestamps) and R001 (edit_fragments) require only
-    // capabilities the Codex session does declare, so mixing in a Codex
-    // session must not skip either of them.
-    assert.ok(
-      result.report.skipped_rules?.every(
-        (entry) => entry.rule_id !== "R005" && entry.rule_id !== "R001",
-      ) ?? true,
+    assert.ok(contextBloat.length > 0);
+    assert.ok(contextBloat.every(({ evidence }) =>
+      evidence.session_refs.every((ref) => !ref.startsWith("codex-integration#"))
+    ));
+    assert.deepEqual(
+      result.report.rule_coverage?.find(({ rule_id }) => rule_id === "R007"),
+      {
+        rule_id: "R007",
+        eligible_sessions: 1,
+        total_sessions: 2,
+        status: "partial",
+        missing_capabilities: ["token_usage"],
+        completeness: 0.5,
+        truncated: true,
+      },
     );
-
-    assert.deepEqual(result.report.skipped_rules, [
-      { rule_id: "R007", missing: ["token_usage"] },
-    ]);
+    assert.equal(result.report.skipped_rules, undefined);
 
     const skipWarnings = result.warnings.filter(
       (warning) => warning.code === "rule_skipped_missing_capability",
     );
     assert.deepEqual(
       skipWarnings.map((warning) => warning.message).sort(),
-      ["R007 skipped: session source lacks token_usage"],
+      [],
     );
   } finally {
     await rm(root, { recursive: true, force: true });

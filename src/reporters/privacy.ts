@@ -225,6 +225,17 @@ export function projectReportPrivacy(report: ReportV2, profile: PrivacyProfile):
       finding, profile, scope, repoRoot, sessions,
     )),
     caveats: reportCaveats(report, profile, repoRoot, sessions),
+    ...(report.rule_coverage === undefined ? {} : {
+      rule_coverage: report.rule_coverage.map((entry) => ({
+        rule_id: entry.rule_id,
+        eligible_sessions: entry.eligible_sessions,
+        total_sessions: entry.total_sessions,
+        status: entry.status,
+        missing_capabilities: [...entry.missing_capabilities],
+        completeness: entry.completeness,
+        truncated: entry.truncated,
+      })),
+    }),
     ...(report.skipped_rules === undefined ? {} : {
       skipped_rules: report.skipped_rules.map((entry) => ({
         rule_id: entry.rule_id, missing: [...entry.missing],
