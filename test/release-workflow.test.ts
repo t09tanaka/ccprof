@@ -3,6 +3,12 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import test from "node:test";
 
+const CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1";
+const SETUP_NODE_SHA = "820762786026740c76f36085b0efc47a31fe5020";
+const UPLOAD_SHA = "b7c566a772e6b6bfb58ed0dc250532a479d7789f";
+const DOWNLOAD_SHA = "37930b1c2abaa49bbe596cd826c3c89aef350131";
+const ATTEST_SHA = "508db95dd578ae2727ebd6217d5ba78e4fbda05d";
+
 async function readProjectFile(path: string): Promise<string> {
   return readFile(resolve(process.cwd(), path), "utf8");
 }
@@ -11,217 +17,166 @@ function occurrences(text: string, value: string): number {
   return text.split(value).length - 1;
 }
 
+function requiredIndex(text: string, value: string): number {
+  const index = text.indexOf(value);
+  assert.notEqual(index, -1, `missing ${value}`);
+  return index;
+}
+
+function assertBefore(text: string, first: string, second: string): void {
+  assert.ok(
+    requiredIndex(text, first) < requiredIndex(text, second),
+    `${first} must precede ${second}`,
+  );
+}
+
 function blockBefore(text: string, start: string, end: string): string {
-  const startIndex = text.indexOf(start);
+  const startIndex = requiredIndex(text, start);
   const endIndex = text.indexOf(end, startIndex + start.length);
-  assert.notEqual(startIndex, -1, `missing ${start}`);
   assert.notEqual(endIndex, -1, `missing ${end} after ${start}`);
   return text.slice(startIndex, endIndex);
 }
 
 function workflowUses(workflow: string): string[] {
-  return [...workflow.matchAll(/^\s+uses:\s*([^\s#]+)\s*$/gmu)].map((match) => {
-    const action = match[1];
-    if (action === undefined) throw new Error("uses line is missing its action");
-    return action;
-  });
+  return [...workflow.matchAll(/^\s+uses:\s*([^\s#]+)\s*(?:#.*)?$/gmu)].map(
+    (match) => String(match[1]),
+  );
 }
 
-function stepBlocks(workflow: string): string[] {
-  return workflow.split(/(?=^\s+-\s+name:\s)/gmu);
-}
-
-function singleStepContaining(workflow: string, value: string): string {
-  const matches = stepBlocks(workflow).filter((step) => step.includes(value));
-  assert.equal(matches.length, 1, `expected one step containing ${value}`);
-  const step = matches[0];
-  if (step === undefined) throw new Error(`missing step containing ${value}`);
-  return step;
-}
-
-test("release assets workflow is tag-only and cannot publish to npm", async () => {
+test("release workflow has one tag-only path and one environment-gated writer", async () => {
   const workflow = await readProjectFile(".github/workflows/release-assets.yml");
+  const trigger = blockBefore(workflow, "on:", "permissions:");
 
-  const triggerBlock = blockBefore(workflow, "on:", "permissions:");
   assert.deepEqual(
-    triggerBlock
+    trigger
       .split("\n")
       .map((line) => line.trim().replace(/["']/gu, ""))
       .filter(Boolean),
     ["on:", "push:", "tags:", "- v*"],
   );
+  assert.doesNotMatch(workflow, /pull_request:|workflow_dispatch:|workflow_call:/u);
+  assert.match(workflow, /permissions:\s*\n\s+contents:\s*read/u);
 
-  const permissions = blockBefore(workflow, "permissions:", "jobs:");
-  assert.deepEqual(
-    permissions
-      .split("\n")
-      .slice(1)
-      .map((line) => line.trim())
-      .filter(Boolean),
-    [
-    "contents: write",
-    "id-token: write",
-    "attestations: write",
-    "artifact-metadata: write",
-    ],
-  );
+  const build = blockBefore(workflow, "  build-verify:", "  publish-release:");
+  const publish = workflow.slice(requiredIndex(workflow, "  publish-release:"));
+  assert.match(build, /permissions:\s*\n\s+contents:\s*read/u);
+  assert.doesNotMatch(build, /id-token:\s*write|contents:\s*write|attestations:\s*write/u);
+  assert.match(build, /timeout-minutes:\s*[1-9][0-9]*/u);
+  assert.match(publish, /needs:\s*build-verify/u);
+  assert.match(publish, /environment:\s*npm/u);
+  assert.match(publish, /timeout-minutes:\s*[1-9][0-9]*/u);
+  assert.match(publish, /contents:\s*write/u);
+  assert.match(publish, /id-token:\s*write/u);
+  assert.match(publish, /attestations:\s*write/u);
+  assert.match(publish, /artifact-metadata:\s*write/u);
+  assert.equal(occurrences(workflow, "id-token: write"), 1);
+  assert.equal(occurrences(workflow, "environment: npm"), 1);
+  assert.match(workflow, /concurrency:[\s\S]*release-assets-\$\{\{ github\.ref_name \}\}[\s\S]*cancel-in-progress:\s*false/u);
+});
+
+test("release workflow uses only pinned official actions and a supported OIDC toolchain", async () => {
+  const workflow = await readProjectFile(".github/workflows/release-assets.yml");
+  const uses = workflowUses(workflow);
+
+  assert.deepEqual(uses, [
+    `actions/checkout@${CHECKOUT_SHA}`,
+    `actions/setup-node@${SETUP_NODE_SHA}`,
+    `actions/upload-artifact@${UPLOAD_SHA}`,
+    `actions/download-artifact@${DOWNLOAD_SHA}`,
+    `actions/setup-node@${SETUP_NODE_SHA}`,
+    `actions/attest@${ATTEST_SHA}`,
+    `actions/attest@${ATTEST_SHA}`,
+  ]);
+  for (const action of uses) {
+    assert.match(action, /^actions\/[a-z-]+@[0-9a-f]{40}$/u);
+  }
+  assert.match(workflow, /node-version:\s*["']?24["']?/u);
+  assert.equal(occurrences(workflow, "npm install --global npm@11.5.1"), 2);
   assert.doesNotMatch(
     workflow,
-    /npm publish|NPM_TOKEN|NODE_AUTH_TOKEN|registry-url|always-auth|\.npmrc|_authToken|npm config set/u,
+    /NPM_TOKEN|NODE_AUTH_TOKEN|NPM_READ_TOKEN|secrets\.|packages:\s*write|_authToken|npm\s+login|npm\s+config\s+set/u,
   );
 });
 
-test("release assets workflow verifies and attests artifacts in the required order", async () => {
+test("build job gates identity and transfers one twice-reproduced exact artifact", async () => {
   const workflow = await readProjectFile(".github/workflows/release-assets.yml");
+  const build = blockBefore(workflow, "  build-verify:", "  publish-release:");
 
-  assert.equal(occurrences(workflow, "npm pack --json"), 1);
-  assert.match(workflow, /npm run check/u);
-  assert.match(workflow, /npm sbom --omit=dev --sbom-format=spdx/u);
-  assert.match(workflow, /npm view "ccprof@\$VERSION" dist\.integrity/u);
-  assert.match(workflow, /git merge-base --is-ancestor HEAD origin\/main/u);
-  assert.match(workflow, /sha256sum/u);
-  assert.match(workflow, /npm sbom --omit=dev --sbom-format=spdx[^\n]*>\s*"?ccprof-\$VERSION\.spdx\.json"?/u);
-  assert.match(workflow, /sha256sum[^\n]*"?\$TARBALL"?[^\n]*"?ccprof-\$VERSION\.spdx\.json"?[^\n]*>\s*SHA256SUMS/u);
-  assert.match(
-    workflow,
-    /PACK_INTEGRITY:\s*\$\{\{ steps\.package\.outputs\.integrity \}\}/u,
-  );
-  const npmViewStep = stepBlocks(workflow).find((step) =>
-    step.includes('npm view "ccprof@$VERSION" dist.integrity'),
-  );
-  assert.ok(npmViewStep, "missing npm-view step");
-  const npmViewStepId = npmViewStep.match(/^\s*id:\s*([^\s#]+)/mu)?.[1];
-  assert.ok(npmViewStepId, "npm-view step must expose an id");
-  const npmViewIndex = workflow.indexOf(npmViewStep);
-  const registryBinding = `REGISTRY_INTEGRITY: \${{ steps.${npmViewStepId}.outputs.integrity }}`;
-  const registryBindingIndex = workflow.indexOf(registryBinding);
-  assert.notEqual(registryBindingIndex, -1, "registry integrity must use npm-view output");
-  assert.ok(npmViewIndex < registryBindingIndex, "npm-view must precede its integrity binding");
-  assert.match(
-    workflow,
-    /\[ "\$REGISTRY_INTEGRITY" = "\$PACK_INTEGRITY" \]/u,
-  );
-  const integrityIndex = workflow.indexOf(
-    '[ "$REGISTRY_INTEGRITY" = "$PACK_INTEGRITY" ]',
-  );
-  const firstAttestationIndex = workflow.indexOf("actions/attest@");
-  const releaseIndex = workflow.indexOf("gh release");
-  assert.notEqual(integrityIndex, -1, "missing registry integrity equality check");
-  assert.notEqual(firstAttestationIndex, -1, "missing provenance attestation");
-  assert.notEqual(releaseIndex, -1, "missing GitHub Release command");
-  assert.ok(
-    integrityIndex < firstAttestationIndex && integrityIndex < releaseIndex,
-    "registry integrity must be checked before attestation and release creation",
-  );
-  assert.ok(
-    workflow.indexOf("Attest SBOM") <
-      workflow.indexOf("Create or update GitHub Release"),
-  );
+  assert.match(build, /fetch-depth:\s*0/u);
+  assert.match(build, /persist-credentials:\s*false/u);
+  assert.match(build, /\^v\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\$/u);
+  assert.match(build, /require\("\.\/package\.json"\)\.version/u);
+  assert.match(build, /require\("\.\/package-lock\.json"\)\.version/u);
+  assert.match(build, /packages\[""\]\?\.version/u);
+  assert.match(build, /git merge-base --is-ancestor HEAD origin\/main/u);
+  assert.match(build, /npm ci/u);
+  assert.match(build, /npm run check/u);
+
+  assert.equal(occurrences(build, "npm pack --json --pack-destination"), 2);
+  assert.match(build, /PACK_DIR_A=\$\(mktemp -d\)/u);
+  assert.match(build, /PACK_DIR_B=\$\(mktemp -d\)/u);
+  assert.match(build, /INTEGRITY_A/u);
+  assert.match(build, /INTEGRITY_B/u);
+  assert.match(build, /\[ "\$INTEGRITY_A" = "\$INTEGRITY_B" \]/u);
+  assert.match(build, /SHA256_A/u);
+  assert.match(build, /SHA256_B/u);
+  assert.match(build, /\[ "\$SHA256_A" = "\$SHA256_B" \]/u);
+  assert.match(build, /npm install --global --prefix "\$PREFIX" "\$TARBALL"/u);
+  assert.match(build, /ccprof stats --privacy strict --json/u);
+  assert.match(build, /npm sbom --omit=dev --sbom-format=spdx/u);
+  assert.match(build, /sha256sum/u);
+  assert.match(build, /release-metadata\.json/u);
+  assert.match(build, /name:\s*release-bundle/u);
+  assert.match(build, /retention-days:\s*[1-9][0-9]*/u);
 });
 
-test("release assets workflow parses npm pack JSON after lifecycle output", async () => {
+test("publish job fails closed, publishes one explicit tarball, and confirms registry propagation", async () => {
   const workflow = await readProjectFile(".github/workflows/release-assets.yml");
-  const packageStep = singleStepContaining(workflow, "id: package");
+  const publish = workflow.slice(requiredIndex(workflow, "  publish-release:"));
 
+  assert.match(publish, /sha256sum --check SHA256SUMS/u);
+  assert.match(publish, /release-metadata\.json/u);
+  assert.match(publish, /repos\/\$GITHUB_REPOSITORY\/environments\/npm/u);
+  assert.match(publish, /required_reviewers/u);
+  assert.match(publish, /REVIEWER_COUNT/u);
+  assert.match(publish, /\[ "\$REVIEWER_COUNT" -gt 0 \]/u);
+
+  assert.equal(occurrences(workflow, "npm publish"), 1);
   assert.match(
-    packageStep,
-    /PACK_OUTPUT="\$RUNNER_TEMP\/ccprof-pack-output\.txt"/u,
+    publish,
+    /npm publish "\$TARBALL" --access public --provenance/u,
   );
-  assert.match(packageStep, /npm pack --json > "\$PACK_OUTPUT"/u);
-  assert.match(packageStep, /readFileSync\(process\.argv\[1\], "utf8"\)/u);
-  assert.match(packageStep, /match\(\/\^\\\[\\s\*\$\/m\)/u);
-  assert.match(packageStep, /JSON\.parse\(source\.slice\(match\.index\)\)/u);
-  assert.match(packageStep, /!Array\.isArray\(pack\) \|\| pack\.length !== 1/u);
-  assert.match(packageStep, /typeof record\.filename === "string" && record\.filename/u);
-  assert.match(packageStep, /typeof record\.integrity === "string" && record\.integrity/u);
-  assert.doesNotMatch(packageStep, /JSON\.parse\(PACK_RESULT\)/u);
+  assert.doesNotMatch(publish, /npm publish\s+(?:--access|--provenance)/u);
+  assert.match(publish, /npm view "ccprof@\$VERSION" dist\.integrity/u);
+  assert.match(publish, /E404|404 Not Found/u);
+  assert.match(publish, /existing registry integrity mismatch/u);
+  assert.match(publish, /network or non-404 registry failure/u);
+  assert.match(publish, /existing registry integrity matches; skipping publish/u);
+  assert.match(publish, /for ATTEMPT in \$\(seq 1 12\)/u);
+  assert.match(publish, /sleep 10/u);
+  assert.match(publish, /registry propagation timed out/u);
+
+  assertBefore(publish, "sha256sum --check SHA256SUMS", "npm publish");
+  assertBefore(publish, "required_reviewers", "npm publish");
+  assertBefore(publish, "npm publish", "for ATTEMPT in $(seq 1 12)");
+  assertBefore(publish, "for ATTEMPT in $(seq 1 12)", "actions/attest@");
+  assertBefore(publish, "for ATTEMPT in $(seq 1 12)", "gh release");
 });
 
-test("release assets workflow validates the release inputs and package smoke tests", async () => {
+test("attestations and GitHub Release consume the downloaded verified bytes", async () => {
   const workflow = await readProjectFile(".github/workflows/release-assets.yml");
+  const publish = workflow.slice(requiredIndex(workflow, "  publish-release:"));
 
-  assert.deepEqual(workflowUses(workflow), [
-    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-    "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
-    "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d",
-    "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d",
-  ]);
-  const checkoutStep = singleStepContaining(
-    workflow,
-    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-  );
-  assert.match(checkoutStep, /fetch-depth:\s*0/u);
-  assert.match(checkoutStep, /persist-credentials:\s*false/u);
-  const setupNodeStep = singleStepContaining(
-    workflow,
-    "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
-  );
-  assert.match(setupNodeStep, /node-version:\s*["']?20["']?/u);
-  assert.match(
-    workflow,
-    /TAG[^\n]*=~[^\n]*\^v\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\\\.\(0\|\[1-9\]\[0-9\]\*\)\$/u,
-    "the tag check must reject leading-zero and nonstable versions",
-  );
-  assert.match(workflow, /VERSION=\$\(node -p 'require\("\.\/package\.json"\)\.version'\)/u);
-  assert.match(
-    workflow,
-    /LOCKFILE_VERSION=\$\(node -p 'require\("\.\/package-lock\.json"\)\.version'\)/u,
-    "package-lock root version must be checked",
-  );
-  assert.match(
-    workflow,
-    /LOCKFILE_ROOT_VERSION=\$\(node -p 'require\("\.\/package-lock\.json"\)\.packages\[""\]\?\.version'\)/u,
-    "package-lock packages root version must be checked",
-  );
-  assert.match(workflow, /\[ "\$TAG" = "v\$VERSION" \]/u);
-  assert.match(workflow, /\[ "\$LOCKFILE_VERSION" = "\$VERSION" \]/u);
-  assert.match(workflow, /\[ "\$LOCKFILE_ROOT_VERSION" = "\$VERSION" \]/u);
-  assert.match(workflow, /npm ci/u);
-  const packageStep = singleStepContaining(workflow, "id: package");
-  assert.match(
-    packageStep,
-    /npm install --global --prefix "\$PREFIX" "\$TARBALL"/u,
-  );
-  assert.match(packageStep, /export PATH="\$PREFIX\/bin:\$PATH"/u);
-  assert.match(
-    packageStep,
-    /\[ "\$\(ccprof --version\)" = "ccprof \$VERSION" \]/u,
-  );
-  assert.match(packageStep, /ccprof --help/u);
-  assert.match(packageStep, /ccprof stats --privacy strict --json/u);
-  const attestations = stepBlocks(workflow).filter((step) =>
-    step.includes("actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d"),
-  );
-  assert.equal(attestations.length, 2);
-  for (const step of attestations) {
-    assert.match(step, /subject-path:\s*\$\{\{ steps\.package\.outputs\.tarball \}\}/u);
-  }
-  assert.equal(
-    attestations.filter((step) =>
-      /sbom-path:\s*\$\{\{ steps\.package\.outputs\.sbom \}\}/u.test(step),
-    ).length,
-    1,
-  );
-  assert.match(
-    workflow,
-    /if ! gh release view "\$TAG"[^\n]*; then[\s\S]*gh release create "\$TAG"[^\n]*--generate-notes[\s\S]*\bfi\b/u,
-  );
-  assert.match(
-    workflow,
-    /gh release upload "\$TAG"[^\n]*\$\{\{ steps\.package\.outputs\.tarball \}\}[^\n]*\$\{\{ steps\.package\.outputs\.sbom \}\}[^\n]*\$\{\{ steps\.package\.outputs\.checksums \}\}[^\n]*--clobber/u,
-  );
+  assert.equal(occurrences(publish, `actions/attest@${ATTEST_SHA}`), 2);
+  assert.equal(occurrences(publish, "subject-path: ${{ env.TARBALL }}"), 2);
+  assert.equal(occurrences(publish, "sbom-path: ${{ env.SBOM }}"), 1);
+  assert.match(publish, /gh release create "\$TAG"[^\n]*--verify-tag[^\n]*--generate-notes/u);
+  assert.match(publish, /gh release upload "\$TAG" "\$TARBALL" "\$SBOM" "\$CHECKSUMS" --clobber/u);
+  assert.doesNotMatch(workflow, /npm unpublish|npm deprecate|rollback|republish/iu);
 });
 
 test("CI package smoke exercises strict stats privacy", async () => {
   const workflow = await readProjectFile(".github/workflows/ci.yml");
-  const packageJob = blockBefore(
-    workflow,
-    "  package-smoke:",
-    "  determinism-golden:",
-  );
-
-  assert.match(
-    packageJob,
-    /ccprof" stats --privacy strict --json/u,
-  );
+  const packageJob = blockBefore(workflow, "  package-smoke:", "  determinism-golden:");
+  assert.match(packageJob, /ccprof" stats --privacy strict --json/u);
 });
