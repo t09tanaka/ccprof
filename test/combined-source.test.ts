@@ -8,7 +8,11 @@ import {
   type AnalysisBudgets,
 } from "../src/analysis/budgets.js";
 import { CombinedSessionSource } from "../src/sources/combined.js";
-import type { SessionQuery, SessionSource } from "../src/sources/session-source.js";
+import {
+  admitSessionEventPrefix,
+  type SessionQuery,
+  type SessionSource,
+} from "../src/sources/session-source.js";
 
 const query: SessionQuery = {
   repoRoot: "/repo",
@@ -216,4 +220,77 @@ test("budgeted source failure is content-free and prevents the next source from 
   assert.equal(meter.result().truncation_reason, "source_failure");
   assert.equal(meter.result().coverage, 0);
   assert.ok(!JSON.stringify(meter.result()).includes("token-canary"));
+});
+
+test("budgeted combined discovery checkpoints before starting an adapter", async () => {
+  let wallReads = 0;
+  const expiringClock: AnalysisBudgetClock = {
+    wall_ms: () => wallReads++ === 0 ? 0 : 1,
+    cpu_ms: () => 0,
+  };
+  const meter = new AnalysisBudgetMeter(
+    budgets({ max_wall_ms: 0 }),
+    expiringClock,
+  );
+  let sourceCalls = 0;
+  const combined = new CombinedSessionSource([{
+    discover: async () => {
+      sourceCalls += 1;
+      return [fakeSession("must-not-start")];
+    },
+  }]);
+
+  const sessions = await combined.discover({
+    ...query,
+    analysisBudgetMeter: meter,
+  });
+
+  assert.deepEqual(sessions, []);
+  assert.equal(sourceCalls, 0);
+  assert.equal(meter.result().truncation_reason, "max_wall_ms");
+});
+
+test("event admission follows one physical source-index prefix across interleaved sessions", () => {
+  const event = (sessionId: string, sourceIndex: number): Session["events"][number] => ({
+    kind: "assistant",
+    timestamp_ms: sourceIndex + 1,
+    session_id: sessionId,
+    entry_uuid: `${sessionId}-${sourceIndex.toString(10)}`,
+    session_ref: `${sessionId}#${sourceIndex.toString(10)}`,
+    source_index: sourceIndex,
+    agent_id: sessionId,
+    is_sidechain: false,
+    confidence: "high",
+    text: sessionId,
+  });
+  const first: Session = {
+    ...fakeSession("shared.jsonl"),
+    session_id: "first",
+    events: [event("first", 0), event("first", 2)],
+  };
+  const second: Session = {
+    ...fakeSession("shared.jsonl"),
+    session_id: "second",
+    events: [event("second", 1), event("second", 3)],
+  };
+  const meter = new AnalysisBudgetMeter(
+    budgets({ max_input_events: 2 }),
+    clock,
+  );
+
+  const admitted = admitSessionEventPrefix([first, second], meter);
+
+  assert.deepEqual(
+    admitted.map(({ session_id, events }) => ({
+      session_id,
+      source_indices: events.map(({ source_index }) => source_index),
+    })),
+    [
+      { session_id: "first", source_indices: [0] },
+      { session_id: "second", source_indices: [1] },
+    ],
+  );
+  assert.equal(meter.result().consumed.input_events, 2);
+  assert.equal(meter.result().observed.input_events, 4);
+  assert.equal(meter.result().truncation_reason, "max_input_events");
 });

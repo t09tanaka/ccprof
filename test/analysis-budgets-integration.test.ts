@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -16,7 +23,10 @@ import type {
   SessionSource,
 } from "../src/sources/session-source.js";
 import { resolveStorePaths } from "../src/store/paths.js";
-import { openStoreDatabase } from "../src/store/sqlite.js";
+import {
+  openStoreDatabase,
+  storeDatabasePath,
+} from "../src/store/sqlite.js";
 
 const NOW_MS = Date.parse("2026-01-01T01:00:00.000Z");
 
@@ -105,6 +115,26 @@ function session(repo: string, eventCount = 3): Session {
     confidence: "high",
     events,
     warnings: [],
+  };
+}
+
+function identifiedSession(
+  repo: string,
+  sessionId: string,
+  sourcePath: string,
+): Session {
+  const original = session(repo, 1);
+  return {
+    ...original,
+    session_id: sessionId,
+    source_path: sourcePath,
+    events: original.events.map((event) => ({
+      ...event,
+      session_id: sessionId,
+      agent_id: sessionId,
+      entry_uuid: `${sessionId}-${event.entry_uuid}`,
+      session_ref: `${sessionId}#${event.entry_uuid}`,
+    })),
   };
 }
 
@@ -266,6 +296,79 @@ test("custom sources are backstopped to an exact event prefix without empty-resu
     } finally {
       database.close();
     }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("custom sources cannot opt out of deterministic source and event admission", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-budget-custom-backstop-"));
+  try {
+    const repo = await makeRepository(root);
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const first = identifiedSession(repo, "first", join(repo, "a.jsonl"));
+    const later = identifiedSession(repo, "later", join(repo, "z.jsonl"));
+    const sourceWithLegacyBypassFlag = {
+      budgetCooperative: true,
+      discover: async () => [later, first],
+    };
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      sinceMs: NOW_MS - 20 * 60_000,
+      nowMs: NOW_MS,
+      sessionSource: sourceWithLegacyBypassFlag,
+      storePaths,
+      persist: false,
+      budgets: budgets({ max_source_items: 1 }),
+      budgetClock: steadyClock,
+    });
+
+    assert.equal(
+      result.report.analysis_budget?.truncation_reason,
+      "max_source_items",
+    );
+    assert.equal(result.report.analysis_budget?.consumed.source_items, 1);
+    assert.equal(result.report.analysis_budget?.observed.source_items, 2);
+    assert.deepEqual(result.report.unit.sessions, ["first"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a complete budgeted persist:false run never creates or migrates the Store", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-budget-no-store-"));
+  try {
+    const repo = await makeRepository(root);
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const databasePath = storeDatabasePath(storePaths);
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      sinceMs: NOW_MS - 20 * 60_000,
+      nowMs: NOW_MS,
+      sessionSource: { discover: async () => [session(repo)] },
+      storePaths,
+      persist: false,
+      budgets: budgets(),
+      budgetClock: steadyClock,
+    });
+
+    assert.equal(result.report.analysis_budget?.completeness, "complete");
+    await assert.rejects(
+      access(databasePath),
+      (error: unknown) =>
+        error !== null &&
+        typeof error === "object" &&
+        "code" in error &&
+        error.code === "ENOENT",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -479,6 +582,63 @@ test("built-in transcript bytes distinguish exact and one-over prefixes", async 
     assert.equal(oneOver.report.analysis_budget?.consumed.input_bytes, fileBytes - 1);
     assert.equal(oneOver.report.analysis_budget?.observed.input_bytes, fileBytes);
     assert.deepEqual(oneOver.report.unit.sessions, ["claude-budget"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Claude byte truncation over a malformed huge row keeps admitted-byte coverage", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-budget-huge-row-"));
+  try {
+    const repo = await makeRepository(root);
+    const projectsDirectory = join(root, "claude-projects");
+    const transcriptPath = join(projectsDirectory, "huge.jsonl");
+    const codexSessionsDirectory = join(root, "empty-codex");
+    await Promise.all([
+      mkdir(projectsDirectory, { recursive: true }),
+      mkdir(codexSessionsDirectory, { recursive: true }),
+    ]);
+    await writeFile(
+      transcriptPath,
+      `{${"x".repeat(8_192)}\n`,
+      "utf8",
+    );
+    const fileBytes = (await stat(transcriptPath)).size;
+    const admittedBytes = 64;
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      sinceMs: NOW_MS - 20 * 60_000,
+      nowMs: NOW_MS,
+      claudeProjectsDirectory: projectsDirectory,
+      codexSessionsDirectory,
+      storePaths,
+      persist: false,
+      budgets: budgets({ max_input_bytes: admittedBytes }),
+      budgetClock: steadyClock,
+    });
+
+    assert.equal(
+      result.report.analysis_budget?.truncation_reason,
+      "max_input_bytes",
+    );
+    assert.equal(
+      result.report.analysis_budget?.consumed.input_bytes,
+      admittedBytes,
+    );
+    assert.equal(
+      result.report.analysis_budget?.observed.input_bytes,
+      fileBytes,
+    );
+    assert.equal(
+      result.report.analysis_budget?.coverage,
+      admittedBytes / fileBytes,
+    );
+    assert.deepEqual(result.report.unit.sessions, []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
