@@ -374,22 +374,31 @@ function snapshotStoredFinding(value: Finding): Finding {
 
 function snapshotStoredFindings(values: readonly Finding[]): Finding[] {
   try {
-    if (!Array.isArray(values)) throw new TypeError();
+    if (
+      values === null ||
+      typeof values !== "object" ||
+      utilTypes.isProxy(values) ||
+      !Array.isArray(values) ||
+      Object.getPrototypeOf(values) !== Array.prototype
+    ) throw new TypeError();
+    const ownKeys = Reflect.ownKeys(values);
     const lengthDescriptor = Object.getOwnPropertyDescriptor(values, "length");
     if (
       lengthDescriptor === undefined ||
       !("value" in lengthDescriptor) ||
       !Number.isSafeInteger(lengthDescriptor.value) ||
-      lengthDescriptor.value < 0
+      lengthDescriptor.value < 0 ||
+      ownKeys.length !== lengthDescriptor.value + 1
     ) throw new TypeError();
     const snapshots: Finding[] = [];
     for (let index = 0; index < lengthDescriptor.value; index += 1) {
       const descriptor = Object.getOwnPropertyDescriptor(values, String(index));
-      if (descriptor === undefined) throw new TypeError();
-      const value = "value" in descriptor
-        ? descriptor.value
-        : descriptor.get?.call(values);
-      snapshots.push(snapshotStoredFinding(value as Finding));
+      if (
+        descriptor === undefined ||
+        descriptor.enumerable !== true ||
+        !("value" in descriptor)
+      ) throw new TypeError();
+      snapshots.push(snapshotStoredFinding(descriptor.value as Finding));
     }
     return snapshots;
   } catch {
