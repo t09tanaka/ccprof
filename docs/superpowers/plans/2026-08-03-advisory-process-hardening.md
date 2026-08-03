@@ -215,7 +215,7 @@ Include the Codex coauthor and do not amend.
 
 - Verify only; modify implementation/test/docs files only if a failing check or in-scope review finding requires it.
 
-- [ ] **Step 1: Delegate local GitHub Actions equivalence**
+- [x] **Step 1: Delegate local GitHub Actions equivalence**
 
 Have the dedicated verifier enumerate changed-file-matching workflows and run the applicable `.github/workflows/ci.yml` jobs locally, preserving workflow order and commands. Expected: typecheck, unit/integration, package smoke, and determinism golden checks pass.
 
