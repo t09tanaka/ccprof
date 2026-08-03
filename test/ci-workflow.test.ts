@@ -11,9 +11,10 @@ async function readProjectFile(path: string): Promise<string> {
 }
 
 function jobBlocks(workflow: string): Map<string, string> {
-  const jobsAt = workflow.indexOf("\njobs:\n");
+  const normalized = workflow.replaceAll("\r\n", "\n");
+  const jobsAt = normalized.indexOf("\njobs:\n");
   assert.notEqual(jobsAt, -1, "workflow must define jobs");
-  const jobs = workflow.slice(jobsAt + 1);
+  const jobs = normalized.slice(jobsAt + 1);
   const headers = [...jobs.matchAll(/^  ([a-z][a-z0-9-]*):\s*$/gmu)].map(
     (match) => ({ id: match[1] ?? "", index: match.index }),
   );
@@ -108,6 +109,16 @@ function assertRuntimeLane(block: string): void {
   );
   assert.match(block, /^\s+- run:\s*npm test\s*$/mu);
 }
+
+test("workflow job parsing accepts CRLF checkouts", async () => {
+  const workflow = await readProjectFile(".github/workflows/ci.yml");
+  const crlfWorkflow = workflow.replaceAll("\r\n", "\n")
+    .replaceAll("\n", "\r\n");
+  assert.deepEqual(
+    [...jobBlocks(crlfWorkflow).keys()].sort(),
+    [...jobBlocks(workflow).keys()].sort(),
+  );
+});
 
 test("CI keeps explicit permissions, concurrency, pinned actions, and timeouts", async () => {
   const workflow = await readProjectFile(".github/workflows/ci.yml");

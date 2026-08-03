@@ -98,7 +98,7 @@ smoke passed with an isolated temporary cache.
 
 ## Task 5: PR, remote matrix, merge, and cleanup
 
-- [ ] Push `feature/platform-ci-matrix` and open a PR against `main` titled
+- [x] Push `feature/platform-ci-matrix` and open a PR against `main` titled
   `[CI] ci: add platform compatibility matrix` with Summary, Impact, Test
   plan, Tests, and Rollback sections.
 - [ ] Wait for every remote blocking matrix and compatibility job to pass;
@@ -106,3 +106,17 @@ smoke passed with an isolated temporary cache.
   genuine canary incompatibility.
 - [ ] Merge with `gh pr merge --merge`, sync local `main`, and remove this
   worktree and its merged branches.
+
+PR #55's first remote run proved the native addon and supported Unix lanes:
+Ubuntu and macOS Node 22/24, Ubuntu Node 20, Node 26 canary, typecheck, package
+smoke, determinism, and CodeQL all passed. Windows Node 22/24 both installed
+and queried `better-sqlite3`, then exposed the same 15 full-suite failures. Five
+new workflow-contract failures came from a CRLF-only parser assumption and are
+covered by an explicit regression here. The remaining failures are pre-existing
+Windows test-portability blockers (temporary-path regular expressions,
+filesystem/permission semantics, taskkill timing, and an NTFS-invalid fixture).
+
+PR #55 remains open and unweakened: Windows stays blocking, the aggregate
+correctly fails, and neither skips nor `continue-on-error` were added. Work
+resumes after the separate atomic Windows test-portability prerequisite lands;
+then this branch will rebase and all remote matrix checks will rerun.
