@@ -12,6 +12,10 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 
 import { analyze } from "../src/core/analyze.js";
+import {
+  encodeEventIdentity,
+  type EventIdentity,
+} from "../src/core/event-identity.js";
 import type {
   AssistantEvent,
   CommandIdentity,
@@ -43,7 +47,10 @@ import {
 } from "../src/rules/shared.js";
 import { detectRework } from "../src/rules/rework.js";
 import { detectRedundantRuns } from "../src/rules/redundant-runs.js";
-import { detectRediscovery } from "../src/rules/rediscovery.js";
+import {
+  detectRediscovery,
+  rediscoveryReadIdentityKey,
+} from "../src/rules/rediscovery.js";
 import {
   APPROVAL_PROMPT_PHRASES,
   detectHumanWait,
@@ -89,6 +96,23 @@ function matchedAction(
     caveats: [],
     ...overrides,
   };
+}
+
+function tokenEstimatesByResultIdentity(
+  ...entries: readonly (readonly [MatchedAction, number])[]
+): ReadonlyMap<string, number> {
+  return new Map(entries.map(([action, tokens]) => {
+    assert.ok(action.tool_use_id);
+    action.result_identity ??= {
+      source_adapter_id: "claude",
+      source_instance_id: "/test/session.jsonl",
+      session_id: action.session_id,
+      agent_id: action.agent_id,
+      tool_use_id: action.tool_use_id,
+      source_index: action.interval.end_ms,
+    };
+    return [encodeEventIdentity(action.result_identity), tokens] as const;
+  }));
 }
 
 function commandIdentity(
@@ -1055,10 +1079,10 @@ test("R003 claims duplicate reads and only their directly caused post-result inf
   ];
 
   const finding = detectRediscovery(actions, {
-    estimatedTokensByToolUseId: new Map([
-      ["duplicate-1", 120],
-      ["duplicate-2", 80],
-    ]),
+    estimatedTokensByEventIdentity: tokenEstimatesByResultIdentity(
+      [actions[1]!, 120],
+      [actions[4]!, 80],
+    ),
   })[0];
   assert.ok(finding !== undefined);
   assert.equal(finding.rule_id, "R003");
@@ -1082,6 +1106,78 @@ test("R003 claims duplicate reads and only their directly caused post-result inf
   assert.equal(finding.recoverable.estimated_ms, 250);
   assert.notEqual(finding.fix_recipe.suggestion, "");
   assert.notEqual(finding.fix_recipe.verify, "");
+});
+
+test("R003 uses only the selected full result identity for a 120-vs-900 collision", () => {
+  const identity = (
+    sourceInstanceId: string,
+    sourceIndex: number,
+  ): EventIdentity => ({
+    source_adapter_id: "claude",
+    source_instance_id: sourceInstanceId,
+    session_id: "shared-session",
+    agent_id: "shared-agent",
+    tool_use_id: "shared-tool-id",
+    source_index: sourceIndex,
+  });
+  const selectedResult = identity("/logs/selected.jsonl", 2);
+  const collidingResult = identity("/logs/colliding.jsonl", 2);
+  const safeRead = matchedAction("safe-source", 0, 10, "safe_read", {
+    session_id: "shared-session",
+    agent_id: "shared-agent",
+    paths: ["src/a.ts"],
+    target: "src/a.ts",
+    tool_use_id: "shared-tool-id",
+    tool_name: "Read",
+    event_identity: identity("/logs/colliding.jsonl", 1),
+    result_identity: collidingResult,
+  });
+  const duplicateRead = matchedAction(
+    "duplicate-source",
+    20,
+    30,
+    "duplicate_read",
+    {
+      session_id: "shared-session",
+      agent_id: "shared-agent",
+      paths: ["src/a.ts"],
+      target: "src/a.ts",
+      tool_use_id: "shared-tool-id",
+      tool_name: "Read",
+      event_identity: identity("/logs/selected.jsonl", 1),
+      result_identity: selectedResult,
+    },
+  );
+  const options = {
+    estimatedTokensByEventIdentity: new Map([
+      [encodeEventIdentity(selectedResult), 120],
+      [encodeEventIdentity(collidingResult), 900],
+    ]),
+  };
+
+  const forward = detectRediscovery([safeRead, duplicateRead], options);
+  const reversed = detectRediscovery([duplicateRead, safeRead], options);
+
+  assert.equal(forward[0]?.evidence.estimated_tokens, 120);
+  assert.deepEqual(reversed, forward);
+});
+
+test("R003 preserves missing token evidence when a read has no selected result identity", () => {
+  const read = matchedAction("missing-result", 0, 10, "duplicate_read", {
+    paths: ["src/a.ts"],
+    target: "src/a.ts",
+    tool_use_id: "missing-result",
+    tool_name: "Read",
+  });
+  delete read.result_identity;
+
+  const finding = detectRediscovery([read])[0];
+
+  assert.ok(finding);
+  assert.equal(finding.evidence.estimated_tokens, 0);
+  assert.ok(finding.caveats.some((caveat) =>
+    caveat.includes("Token-size evidence was unavailable")
+  ));
 });
 
 test("R003 requires exact blob identity, aggregates analyses per PR, and claims current work", () => {
@@ -1118,7 +1214,9 @@ test("R003 requires exact blob identity, aggregates analyses per PR, and claims 
       ["pkg/src/a.ts", READ_OID_A],
       ["src/a.ts", READ_OID_A],
     ]),
-    estimatedTokensByToolUseId: new Map([["current-read", 250]]),
+    estimatedTokensByEventIdentity: tokenEstimatesByResultIdentity(
+      [currentRead, 250],
+    ),
   })[0];
 
   assert.ok(finding !== undefined);
@@ -1200,8 +1298,7 @@ test("R003 never cross-PR claims a safe multi-path read", () => {
     tool_use_id: "safe-multi",
     tool_name: "Read",
   });
-  const eligible = (path: string) =>
-    ["s1", "root", "safe-multi", path].join("\0");
+  const eligible = (path: string) => rediscoveryReadIdentityKey(read, path);
   const currentObjectIdsByPath = new Map([
     ["src/a.ts", READ_OID_A],
     ["src/b.ts", READ_OID_A],
@@ -1213,7 +1310,9 @@ test("R003 never cross-PR claims a safe multi-path read", () => {
     history: onePathHistory,
     currentObjectIdsByPath,
     crossPrEligibleReadKeys: new Set([eligible("src/a.ts")]),
-    estimatedTokensByToolUseId: new Map([["safe-multi", 300]]),
+    estimatedTokensByEventIdentity: tokenEstimatesByResultIdentity(
+      [read, 300],
+    ),
   }), []);
 
   const findings = detectRediscovery([read], {
@@ -1226,7 +1325,9 @@ test("R003 never cross-PR claims a safe multi-path read", () => {
       eligible("src/a.ts"),
       eligible("src/b.ts"),
     ]),
-    estimatedTokensByToolUseId: new Map([["safe-multi", 300]]),
+    estimatedTokensByEventIdentity: tokenEstimatesByResultIdentity(
+      [read, 300],
+    ),
   });
   assert.deepEqual(findings, []);
 });
@@ -1380,10 +1481,10 @@ test("R003 exact history claims current reads and inference but not historical t
   const finding = detectRediscovery(actions, {
     history,
     currentObjectIdsByPath: new Map([["src/a.ts", READ_OID_A]]),
-    estimatedTokensByToolUseId: new Map([
-      ["first", 1_000],
-      ["duplicate", 200],
-    ]),
+    estimatedTokensByEventIdentity: tokenEstimatesByResultIdentity(
+      [actions[0]!, 1_000],
+      [actions[2]!, 200],
+    ),
   })[0];
 
   assert.ok(finding !== undefined);

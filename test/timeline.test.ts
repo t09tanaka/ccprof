@@ -195,6 +195,7 @@ test("keeps unmatched tool evidence without inventing elapsed time", () => {
   );
   assert.deepEqual(action?.interval, { start_ms: 0, end_ms: 0 });
   assert.equal(action?.confidence, "low");
+  assert.equal(action?.result_identity, undefined);
   assert.ok(timeline.caveats.some((item) => item.includes("missing")));
   assert.ok(timeline.caveats.some((item) => item.includes("orphan")));
 });
@@ -454,6 +455,28 @@ test("pairs tools per agent and leaves both window-crossing directions unknown",
   assert.match(completedRunMatched?.caveats.join(" ") ?? "", /unknown mutation scope/iu);
 });
 
+test("does not pair the same invocation identifiers across source adapters and is input-order deterministic", () => {
+  const useSession = session([toolUse("shared-source-id", 10, 0)]);
+  const resultSession: Session = {
+    ...session([toolResult("shared-source-id", 20, 1)]),
+    source: "codex",
+    source_path: useSession.source_path,
+  };
+
+  const forward = buildTimeline([useSession, resultSession]);
+  const reversed = buildTimeline([resultSession, useSession]);
+
+  assert.deepEqual(forward.toolIntervals, []);
+  assert.deepEqual(reversed, forward);
+  const action = forward.actions.find(
+    ({ tool_use_id }) => tool_use_id === "shared-source-id",
+  );
+  assert.deepEqual(action?.interval, { start_ms: 10, end_ms: 10 });
+  assert.equal(action?.result_identity, undefined);
+  assert.ok(forward.caveats.some((item) => item.includes("no matching result")));
+  assert.ok(forward.caveats.some((item) => item.includes("no matching use")));
+});
+
 test("sidechain activity remains active inside a parent away interval", () => {
   const end = DEFAULT_IDLE_THRESHOLD_MS + 100;
   const timeline = buildTimeline([
@@ -584,6 +607,14 @@ test("ignores prior, equal, and later duplicates around the selected result", ()
     (candidate) => candidate.tool_use_id === "duplicate-result",
   );
   assert.deepEqual(action?.session_refs, ["s1#tu1", "s1#tr3"]);
+  assert.deepEqual(action?.result_identity, {
+    source_adapter_id: "claude",
+    source_instance_id: "/tmp/session.jsonl",
+    session_id: "s1",
+    agent_id: "main",
+    tool_use_id: "duplicate-result",
+    source_index: 3,
+  });
   assert.ok(timeline.caveats.some((item) => item.includes("duplicate")));
 });
 
