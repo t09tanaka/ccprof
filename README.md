@@ -127,12 +127,18 @@ boundary by a duration using the same `s`, `m`, or `h` syntax. Both options may
 be provided; `--since` takes precedence over `--commit-lookback`.
 
 `--advisory` opts in to an additional LLM advisory section:
-the privacy-projected report JSON is passed to the locally installed `claude` CLI
-(Claude Code, print mode), and up to three judgment-level suggestions come
-back in a section that is clearly separated from the deterministic findings.
+the locally installed Claude Code CLI is invoked exactly as `claude -p`, and
+the complete privacy-projected report prompt is sent only over stdin—never in
+argv. A UTF-8 prompt over 1 MiB is rejected before the process starts and is
+never truncated. Stdout and stderr are each captured up to 64 KiB; truncated
+stdout is not used as an advisory, while complete output keeps the existing
+2,000-character display cap. The 60-second timeout terminates the requested
+process tree. Up to three judgment-level suggestions come back in a section
+that is clearly separated from the deterministic findings.
+
 The deterministic report, the stored analysis record, the baseline, and the
-exit code never change; when the `claude` CLI is missing, fails, times out
-(60 seconds), or returns nothing, the report is printed unchanged with an
+exit code never change; when the `claude` CLI is missing, fails, times out,
+exceeds a bound, or returns nothing, the report is printed unchanged with an
 `advisory unavailable` warning on stderr. In `--json` output the section is an
 optional top-level `advisory` field (`{ "source": "llm", "text": ... }`) that
 is omitted entirely without the flag, keeping the JSON byte-identical to
@@ -544,6 +550,15 @@ report behind a strict or balanced invocation. Raw session transcripts and logs
 are never sent; the advisory prompt contains nothing beyond fixed instructions
 and that projected report JSON. Selecting `--privacy raw --advisory` explicitly
 accepts the same raw-output disclosure risk.
+
+The advisory child receives a replacement environment containing only fixed
+operational, home, platform, Claude/Anthropic configuration and authentication,
+temporary-directory, and locale variables. Unrelated GitHub, AWS, npm, proxy,
+and `NODE_OPTIONS` values are excluded. Authentication values can still be
+sensitive; they are passed only to the child environment and are never copied
+into advisory warnings. Signed organization policy and an administrative
+advisory kill switch are intentionally deferred to a later enterprise-policy
+change.
 
 The store lives outside the repository, in a per-repository directory:
 

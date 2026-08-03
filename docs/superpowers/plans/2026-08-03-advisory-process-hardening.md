@@ -28,7 +28,7 @@
 - Modify: `test/git.test.ts`
 - Modify: `src/git/client.ts`
 
-- [ ] **Step 1: Add failing runner tests**
+- [x] **Step 1: Add failing runner tests**
 
 Add focused tests for UTF-8 stdin roundtrip, pre-spawn byte rejection, replace-vs-inherit environment behavior, EPIPE/non-reading-child failure, independent output caps, and descendant timeout termination. The core assertions are:
 
@@ -51,7 +51,7 @@ await assert.rejects(
 
 The descendant test creates a temporary marker path, starts a descendant that would write it after the timeout, runs with `killProcessGroup: true`, waits beyond the write delay, and asserts the marker does not exist.
 
-- [ ] **Step 2: Delegate the focused test and verify RED**
+- [x] **Step 2: Delegate the focused test and verify RED**
 
 Run:
 
@@ -61,7 +61,7 @@ npm run build:test && node --test --test-name-pattern='runCommand' .test-dist/te
 
 Expected: FAIL because `stdin`, `maxStdinBytes`, `envMode`, and `killProcessGroup` are not implemented and descendant termination leaves the marker-writing process alive.
 
-- [ ] **Step 3: Add backward-compatible command options and implementation**
+- [x] **Step 3: Add backward-compatible command options and implementation**
 
 Extend `CommandOptions` without changing the `CommandRunner` signature shape:
 
@@ -82,11 +82,11 @@ Before `spawn`, validate limits and compute stdin bytes using UTF-8 for strings.
 
 On timeout, preserve code 124 and `timedOut: true`. For `killProcessGroup: true`, signal `-child.pid` on POSIX and spawn `taskkill` with literal arguments and `shell: false` on Windows. Do not change existing non-group timeout behavior.
 
-- [ ] **Step 4: Delegate focused tests and verify GREEN**
+- [x] **Step 4: Delegate focused tests and verify GREEN**
 
 Run the same focused command. Expected: all selected runner tests pass with no warnings.
 
-- [ ] **Step 5: Commit the runner contract**
+- [x] **Step 5: Commit the runner contract**
 
 ```sh
 git add src/git/client.ts test/git.test.ts
@@ -102,7 +102,7 @@ Include `Co-Authored-By: Codex <noreply@openai.com>` and do not amend or bypass 
 - Modify: `test/advisory.test.ts`
 - Modify: `src/advisory/advisory.ts`
 
-- [ ] **Step 1: Add failing advisory privacy tests**
+- [x] **Step 1: Add failing advisory privacy tests**
 
 Replace the argv prompt expectation with exact `args: ["-p"]` and assert these options:
 
@@ -117,7 +117,7 @@ assert.equal(call.options?.killProcessGroup, true);
 
 Add a canary report test proving the canary occurs only in stdin, not argv, environment, unavailable reason, or rendered warning. Add a multi-byte prompt that is one byte above 1 MiB and assert the fake runner has zero calls. Add a truncated-stdout case and retain the existing nonzero/timeout/empty/throwing failure matrix and byte-identical no-advisory test.
 
-- [ ] **Step 2: Delegate advisory tests and verify RED**
+- [x] **Step 2: Delegate advisory tests and verify RED**
 
 Run:
 
@@ -127,7 +127,7 @@ npm run build:test && node --test .test-dist/test/advisory.test.js
 
 Expected: FAIL because the prompt is still argv[1], limits/options are missing, over-limit input still calls the runner, and truncated stdout is accepted.
 
-- [ ] **Step 3: Implement advisory constants, environment projection, and failure behavior**
+- [x] **Step 3: Implement advisory constants, environment projection, and failure behavior**
 
 Export:
 
@@ -152,7 +152,7 @@ Build the complete prompt once, preflight with `Buffer.byteLength(prompt, "utf8"
 runner("claude", ["-p"], {
   stdin: prompt,
   maxStdinBytes: ADVISORY_MAX_STDIN_BYTES,
-  env: advisoryEnvironment(),
+  env: buildAdvisoryEnvironment(),
   envMode: "replace",
   timeoutMs: ADVISORY_TIMEOUT_MS,
   maxOutputBytes: ADVISORY_MAX_OUTPUT_BYTES,
@@ -162,11 +162,11 @@ runner("claude", ["-p"], {
 
 Return fixed, content-free reasons for thrown runner errors. Treat `stdoutTruncated` as unavailable before sanitizing/display truncation.
 
-- [ ] **Step 4: Delegate advisory tests and verify GREEN**
+- [x] **Step 4: Delegate advisory tests and verify GREEN**
 
 Run the same advisory command. Expected: all advisory tests pass and no canary appears outside stdin.
 
-- [ ] **Step 5: Commit advisory hardening**
+- [x] **Step 5: Commit advisory hardening**
 
 ```sh
 git add src/advisory/advisory.ts test/advisory.test.ts
@@ -182,15 +182,15 @@ Include the Codex coauthor and do not amend.
 - Modify: `README.md`
 - Modify: `docs/superpowers/plans/2026-08-03-advisory-process-hardening.md`
 
-- [ ] **Step 1: Update documentation**
+- [x] **Step 1: Update documentation**
 
-Document that `claude` is invoked exactly as `claude -p`, receives the privacy-projected prompt only over bounded stdin, inherits only the named operational/config/auth environment allowlist, applies 1 MiB input and per-stream 64 KiB output caps, rejects truncated stdout, keeps the 2,000-character display cap, and kills the requested process tree after 60 seconds. State that signed organization policy is a later PR.
+Document that `claude` is invoked exactly as `claude -p`, receives the privacy-projected prompt only over bounded stdin, receives only the named operational/config/auth environment allowlist, applies 1 MiB input and per-stream 64 KiB output caps, rejects truncated stdout, keeps the 2,000-character display cap, and kills the requested process tree after 60 seconds. State that signed organization policy is a later PR.
 
-- [ ] **Step 2: Mark the focused plan complete**
+- [x] **Step 2: Mark the focused plan complete**
 
 Change completed task checkboxes in this file to `[x]` after their RED/GREEN evidence and commits exist.
 
-- [ ] **Step 3: Delegate full verification**
+- [x] **Step 3: Delegate full verification**
 
 Run:
 
@@ -200,7 +200,7 @@ npm run check
 
 Expected: typecheck and all unit/integration tests pass with zero failures.
 
-- [ ] **Step 4: Commit documentation**
+- [x] **Step 4: Commit documentation**
 
 ```sh
 git add README.md docs/superpowers/plans/2026-08-03-advisory-process-hardening.md
