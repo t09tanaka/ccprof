@@ -400,6 +400,30 @@ function assertConnectionPragmas(database: StoreDatabase): void {
   assert.ok(busyTimeout > 0 && busyTimeout <= 60_000);
 }
 
+function populatedV2Store(paths: StorePaths): StoreDatabase {
+  const database = openStoreDatabase(paths);
+  const downgrade = database.transaction(() => {
+    database.exec("DROP TABLE IF EXISTS source_catalog");
+    database.prepare("DELETE FROM store_migrations WHERE name = ?")
+      .run("schema-v3-source-catalog");
+    database.pragma("user_version = 2");
+  });
+  downgrade.immediate();
+  database.exec(`
+    INSERT INTO store_migrations(name, completed_at_ms)
+      VALUES ('legacy-sentinel', 11);
+    INSERT INTO analysis_snapshots(snapshot_id, created_at_ms, record_json)
+      VALUES ('snapshot-v2', 12, '{"schema":"v2"}');
+    INSERT INTO analysis_executions(execution_id, snapshot_id, executed_at_ms)
+      VALUES ('execution-v2', 'snapshot-v2', 13);
+    INSERT INTO dismissals(finding_key, dismissed_at_ms, record_json)
+      VALUES ('dismissal-v2', 14, '{"dismissal":true}');
+    INSERT INTO adoptions(finding_key, detected_at_ms, record_json)
+      VALUES ('adoption-v2', 15, '{"adoption":true}');
+  `);
+  return database;
+}
+
 test("canonicalRepoPath resolves a linked git worktree to the main worktree's repository root", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-worktree-canon-"));
   try {
@@ -519,17 +543,17 @@ test("SQLite paths are deterministic and shared by linked worktrees", async () =
   }
 });
 
-test("SQLite bootstrap is private, idempotent, and creates the Store v2 schema", async () => {
+test("SQLite bootstrap is private, idempotent, and creates the Store v3 schema", async () => {
   await temporaryStore(async (paths) => {
-    assert.equal(STORE_SCHEMA_VERSION, 2);
+    assert.equal(STORE_SCHEMA_VERSION, 3);
     const databasePath = storeDatabasePath(paths);
     const first = openStoreDatabase(paths);
     const second = openStoreDatabase(paths);
     try {
       assertConnectionPragmas(first);
       assertConnectionPragmas(second);
-      assert.equal(Number(first.pragma("user_version", { simple: true })), 2);
-      assert.equal(Number(second.pragma("user_version", { simple: true })), 2);
+      assert.equal(Number(first.pragma("user_version", { simple: true })), 3);
+      assert.equal(Number(second.pragma("user_version", { simple: true })), 3);
 
       if (process.platform !== "win32") {
         assert.equal((await stat(paths.repo_dir)).mode & 0o777, 0o700);
@@ -544,6 +568,7 @@ test("SQLite bootstrap is private, idempotent, and creates the Store v2 schema",
         "analysis_executions",
         "analysis_snapshots",
         "dismissals",
+        "source_catalog",
         "store_migrations",
       ]);
 
@@ -580,6 +605,26 @@ test("SQLite bootstrap is private, idempotent, and creates the Store v2 schema",
           ["detected_at_ms", "INTEGER", 0],
           ["record_json", "TEXT", 0],
         ],
+        source_catalog: [
+          ["adapter_id", "TEXT", 0],
+          ["adapter_version", "TEXT", 0],
+          ["source_identity", "TEXT", 1],
+          ["canonical_path", "TEXT", 0],
+          ["device", "INTEGER", 0],
+          ["inode", "INTEGER", 0],
+          ["mtime_ms", "INTEGER", 0],
+          ["size_bytes", "INTEGER", 0],
+          ["prefix_hash", "TEXT", 0],
+          ["suffix_hash", "TEXT", 0],
+          ["content_revision", "TEXT", 0],
+          ["discovery_cursor", "INTEGER", 0],
+          ["last_parsed_offset", "INTEGER", 0],
+          ["last_normalized_event_index", "INTEGER", 0],
+          ["parser_version", "TEXT", 0],
+          ["schema_fingerprint", "TEXT", 0],
+          ["observed_at_ms", "INTEGER", 0],
+          ["completeness", "TEXT", 0],
+        ],
       };
       for (const [table, expected] of Object.entries(expectedColumns)) {
         const columns = tableColumns(first, table);
@@ -587,8 +632,16 @@ test("SQLite bootstrap is private, idempotent, and creates the Store v2 schema",
           columns.map(({ name, type, pk }) => [name, type.toUpperCase(), pk]),
           expected,
         );
-        assert.ok(columns.every(({ notnull }) => notnull === 1));
+        const nullable = table === "source_catalog" ? new Set(["device", "inode"]) : new Set();
+        assert.ok(columns.every(({ name, notnull }) =>
+          notnull === (nullable.has(name) ? 0 : 1)
+        ));
       }
+
+      assert.deepEqual(userIndexColumns(first, "source_catalog"), []);
+      assert.equal(first.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("schema-v3-source-catalog"), 1);
 
       const foreignKeys = first
         .prepare("PRAGMA foreign_key_list(analysis_executions)")
@@ -643,7 +696,7 @@ test("SQLite connections share commits and immediate transactions roll back comp
   });
 });
 
-test("opening an existing v2 schema does not contend with an active writer", async () => {
+test("opening an existing v3 schema does not contend with an active writer", async () => {
   await temporaryStore(async (paths) => {
     const writer = openStoreDatabase(paths);
     let reader: StoreDatabase | undefined;
@@ -656,6 +709,100 @@ test("opening an existing v2 schema does not contend with an active writer", asy
       reader?.close();
       if (writer.inTransaction) writer.exec("ROLLBACK");
       writer.close();
+    }
+  });
+});
+
+test("a populated Store v2 migrates transactionally to v3 without data loss", async () => {
+  await temporaryStore(async (paths) => {
+    populatedV2Store(paths).close();
+
+    const migrated = openStoreDatabase(paths);
+    const reopened = openStoreDatabase(paths);
+    try {
+      assert.equal(Number(migrated.pragma("user_version", { simple: true })), 3);
+      assert.equal(Number(reopened.pragma("user_version", { simple: true })), 3);
+      assert.equal(migrated.prepare(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'source_catalog'",
+      ).pluck().get(), 1);
+      const migrations = migrated.prepare(
+        "SELECT name, completed_at_ms FROM store_migrations ORDER BY name",
+      ).all() as { name: string; completed_at_ms: number }[];
+      assert.deepEqual(migrations.map(({ name }) => name), [
+        "legacy-sentinel",
+        "schema-v3-source-catalog",
+      ]);
+      assert.equal(migrations[0]?.completed_at_ms, 11);
+      assert.ok(Number.isSafeInteger(migrations[1]?.completed_at_ms));
+      assert.ok((migrations[1]?.completed_at_ms ?? -1) >= 0);
+      assert.deepEqual(migrated.prepare(
+        "SELECT snapshot_id, created_at_ms, record_json FROM analysis_snapshots",
+      ).get(), {
+        snapshot_id: "snapshot-v2",
+        created_at_ms: 12,
+        record_json: '{"schema":"v2"}',
+      });
+      assert.deepEqual(migrated.prepare(
+        "SELECT execution_id, snapshot_id, executed_at_ms FROM analysis_executions",
+      ).get(), {
+        execution_id: "execution-v2",
+        snapshot_id: "snapshot-v2",
+        executed_at_ms: 13,
+      });
+      assert.equal(migrated.prepare("SELECT count(*) FROM dismissals").pluck().get(), 1);
+      assert.equal(migrated.prepare("SELECT count(*) FROM adoptions").pluck().get(), 1);
+      assert.equal(migrated.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("schema-v3-source-catalog"), 1);
+    } finally {
+      reopened.close();
+      migrated.close();
+    }
+  });
+});
+
+test("Store v2 migration failure rolls back table, marker, version, and preserves rows", async () => {
+  await temporaryStore(async (paths) => {
+    const v2 = populatedV2Store(paths);
+    try {
+      v2.exec(`
+        CREATE TRIGGER fail_source_catalog_migration
+        BEFORE INSERT ON store_migrations
+        WHEN NEW.name = 'schema-v3-source-catalog'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced Store v3 migration failure');
+        END;
+      `);
+
+      assert.throws(
+        () => openStoreDatabase(paths),
+        /forced Store v3 migration failure/u,
+      );
+      assert.equal(Number(v2.pragma("user_version", { simple: true })), 2);
+      assert.equal(v2.prepare(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'source_catalog'",
+      ).pluck().get(), 0);
+      assert.equal(v2.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("schema-v3-source-catalog"), 0);
+      assert.equal(v2.prepare(
+        "SELECT record_json FROM analysis_snapshots WHERE snapshot_id = ?",
+      ).pluck().get("snapshot-v2"), '{"schema":"v2"}');
+
+      v2.exec("DROP TRIGGER fail_source_catalog_migration");
+    } finally {
+      v2.close();
+    }
+
+    const retried = openStoreDatabase(paths);
+    try {
+      assert.equal(Number(retried.pragma("user_version", { simple: true })), 3);
+      assert.equal(retried.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("schema-v3-source-catalog"), 1);
+      assert.equal(retried.prepare("SELECT count(*) FROM analysis_snapshots").pluck().get(), 1);
+    } finally {
+      retried.close();
     }
   });
 });
@@ -750,6 +897,31 @@ test("SQLite bootstrap rejects a symlinked database without touching its target"
       assert.match(String(rejected), /unsafe store path|symbolic link.*not allowed/iu);
     } finally {
       target.close();
+    }
+  });
+});
+
+test("SQLite bootstrap rejects a v1 downgrade without mutation", async () => {
+  await temporaryStore(async (paths) => {
+    const downgraded = openStoreDatabase(paths);
+    try {
+      downgraded.exec(
+        "CREATE TABLE downgrade_sentinel(value TEXT NOT NULL); INSERT INTO downgrade_sentinel VALUES ('preserve-me')",
+      );
+      downgraded.pragma("user_version = 1");
+
+      assert.throws(() => openStoreDatabase(paths), (error: unknown) => {
+        assert.ok(error instanceof UnsupportedStoreSchemaError);
+        assert.equal(error.schema_version, 1);
+        return true;
+      });
+      assert.equal(Number(downgraded.pragma("user_version", { simple: true })), 1);
+      assert.equal(
+        downgraded.prepare("SELECT value FROM downgrade_sentinel").pluck().get(),
+        "preserve-me",
+      );
+    } finally {
+      downgraded.close();
     }
   });
 });

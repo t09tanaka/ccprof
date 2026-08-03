@@ -30,7 +30,11 @@ import {
   resolveStorePaths,
   type StorePaths,
 } from "../src/store/paths.js";
-import { openStoreDatabase, storeDatabasePath } from "../src/store/sqlite.js";
+import {
+  openStoreDatabase,
+  SOURCE_CATALOG_MIGRATION,
+  storeDatabasePath,
+} from "../src/store/sqlite.js";
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const NOW_MS = 200 * DAY_MS;
@@ -251,8 +255,16 @@ test("data gc applies retention boundaries, reachability, and legacy cleanup", a
           .pluck().all() as string[]),
         ["boundary", "future"],
       );
-      assert.equal(after.prepare("SELECT count(*) FROM store_migrations")
-        .pluck().get(), 3);
+      assert.deepEqual(
+        after.prepare("SELECT name FROM store_migrations ORDER BY name")
+          .pluck().all(),
+        [
+          "legacy-adoptions-json-v1",
+          "legacy-analyses-json-v1",
+          "legacy-dismissals-json-v1",
+          SOURCE_CATALOG_MIGRATION,
+        ],
+      );
     } finally {
       after.close();
     }
