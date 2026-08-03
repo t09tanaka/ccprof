@@ -1,11 +1,8 @@
-import { readFile } from "node:fs/promises";
-
 import type { Finding } from "../core/model.js";
-import {
-  type StoreWarning,
-  writeJsonAtomically,
-} from "./analyses.js";
+import type { StoreWarning } from "./analyses.js";
+import { canonicalJson, readLegacyJson } from "./legacy-json.js";
 import type { StorePaths } from "./paths.js";
+import { openStoreDatabase, storeDatabasePath } from "./sqlite.js";
 
 export const DISMISSAL_WINDOW_MS = 14 * 24 * 60 * 60 * 1_000;
 
@@ -50,18 +47,6 @@ export interface AppliedDismissals {
 interface DismissalFile {
   schema_version: 1;
   records: DismissalRecord[];
-}
-
-function errorCode(error: unknown): string | undefined {
-  if (
-    error !== null &&
-    typeof error === "object" &&
-    "code" in error &&
-    typeof error.code === "string"
-  ) {
-    return error.code;
-  }
-  return undefined;
 }
 
 function errorMessage(error: unknown): string {
@@ -127,43 +112,105 @@ function asRecord(input: DismissalInput): DismissalRecord {
   };
 }
 
+type StoreDatabase = ReturnType<typeof openStoreDatabase>;
+type DismissalRow = { finding_key: string; dismissed_at_ms: number; record_json: string };
+const LEGACY_DISMISSALS_MIGRATION = "legacy-dismissals-json-v1";
+
+function closeDatabase(database: StoreDatabase | undefined): void {
+  try { database?.close(); } catch { /* Preserve the operation result. */ }
+}
+
+function storeWarning(code: string, message: string, path: string): StoreWarning {
+  return { code, message, path };
+}
+
+function dedupeLegacy(records: readonly DismissalRecord[]): DismissalRecord[] {
+  const latestByKey = new Map<string, DismissalRecord>();
+  for (const record of [...records].sort(recordOrder)) {
+    const existing = latestByKey.get(record.finding_key);
+    if (existing === undefined || record.dismissed_at_ms >= existing.dismissed_at_ms) {
+      latestByKey.set(record.finding_key, record);
+    }
+  }
+  return [...latestByKey.values()].sort(recordOrder);
+}
+
+function scanLegacyDismissals(paths: StorePaths): DismissalLoadResult {
+  const read = readLegacyJson(paths.dismissals_path);
+  if (read.kind === "missing") return { records: [], warnings: [] };
+  if (read.kind === "corrupt" || !isDismissalFile(read.value)) {
+    const message = read.kind === "corrupt"
+      ? read.message : "unsupported or invalid dismissal file";
+    return { records: [], warnings: [storeWarning("corrupt_dismissals",
+      `Dismissal history was skipped: ${message}`, paths.dismissals_path)] };
+  }
+  return { records: dedupeLegacy(read.value.records), warnings: [] };
+}
+
+function migrationComplete(database: StoreDatabase): boolean {
+  return database.prepare("SELECT 1 FROM store_migrations WHERE name = ?")
+    .get(LEGACY_DISMISSALS_MIGRATION) !== undefined;
+}
+
+function migrateLegacyDismissals(
+  database: StoreDatabase,
+  paths: StorePaths,
+): StoreWarning[] {
+  if (migrationComplete(database)) return [];
+  const scanned = scanLegacyDismissals(paths);
+  return database.transaction(() => {
+    if (migrationComplete(database)) return [];
+    const insert = database.prepare(`INSERT INTO dismissals
+      (finding_key, dismissed_at_ms, record_json) VALUES (?, ?, ?)
+      ON CONFLICT(finding_key) DO NOTHING`);
+    for (const record of scanned.records) {
+      insert.run(record.finding_key, record.dismissed_at_ms, canonicalJson(record));
+    }
+    database.prepare("INSERT INTO store_migrations(name, completed_at_ms) VALUES (?, ?)")
+      .run(LEGACY_DISMISSALS_MIGRATION, Date.now());
+    return scanned.warnings;
+  }).immediate();
+}
+
+function parseDismissalRow(row: DismissalRow): DismissalRecord {
+  const value = JSON.parse(row.record_json) as unknown;
+  if (!isRecord(value) || canonicalJson(value) !== row.record_json ||
+    value.finding_key !== row.finding_key || value.dismissed_at_ms !== row.dismissed_at_ms) {
+    throw new TypeError("unsupported, non-canonical, or mismatched dismissal record");
+  }
+  return value;
+}
+
 export async function loadDismissals(
   paths: StorePaths,
 ): Promise<DismissalLoadResult> {
+  const warnings: StoreWarning[] = [];
+  let database: StoreDatabase | undefined;
   try {
-    const value = JSON.parse(
-      await readFile(paths.dismissals_path, "utf8"),
-    ) as unknown;
-    if (!isDismissalFile(value)) {
-      throw new TypeError("unsupported or invalid dismissal file");
+    database = openStoreDatabase(paths);
+    try { warnings.push(...migrateLegacyDismissals(database, paths)); }
+    catch (error) {
+      warnings.push(storeWarning("corrupt_dismissals",
+        `Dismissal history could not be migrated: ${errorMessage(error)}`,
+        paths.dismissals_path));
     }
-    const latestByKey = new Map<string, DismissalRecord>();
-    for (const record of [...value.records].sort(recordOrder)) {
-      const existing = latestByKey.get(record.finding_key);
-      if (
-        existing === undefined ||
-        record.dismissed_at_ms >= existing.dismissed_at_ms
-      ) {
-        latestByKey.set(record.finding_key, record);
+    const rows = database.prepare(`SELECT finding_key, dismissed_at_ms, record_json
+      FROM dismissals ORDER BY finding_key`).all() as DismissalRow[];
+    const records: DismissalRecord[] = [];
+    for (const row of rows) {
+      try { records.push(parseDismissalRow(row)); }
+      catch (error) {
+        warnings.push(storeWarning("corrupt_dismissals",
+          `Dismissal record was skipped: ${errorMessage(error)}`,
+          `${storeDatabasePath(paths)}#dismissals/${row.finding_key}`));
       }
     }
-    return {
-      records: [...latestByKey.values()].sort(recordOrder),
-      warnings: [],
-    };
+    return { records: records.sort(recordOrder), warnings };
   } catch (error) {
-    if (errorCode(error) === "ENOENT") {
-      return { records: [], warnings: [] };
-    }
-    return {
-      records: [],
-      warnings: [{
-        code: "corrupt_dismissals",
-        message: `Dismissal history was skipped: ${errorMessage(error)}`,
-        path: paths.dismissals_path,
-      }],
-    };
-  }
+    return { records: [], warnings: [...warnings, storeWarning("corrupt_dismissals",
+      `Dismissal history could not be read: ${errorMessage(error)}`,
+      storeDatabasePath(paths))] };
+  } finally { closeDatabase(database); }
 }
 
 export async function saveDismissal(
@@ -171,24 +218,23 @@ export async function saveDismissal(
   input: DismissalInput,
 ): Promise<DismissalSaveResult> {
   const record = asRecord(input);
-  const loaded = await loadDismissals(paths);
-  const warnings = [...loaded.warnings];
-  const records = loaded.records
-    .filter(({ finding_key }) => finding_key !== record.finding_key);
-  records.push(record);
-  records.sort(recordOrder);
+  const warnings: StoreWarning[] = [];
+  const targetPath = storeDatabasePath(paths);
+  let database: StoreDatabase | undefined;
   try {
-    await writeJsonAtomically(paths.dismissals_path, {
-      schema_version: 1,
-      records,
-    } satisfies DismissalFile);
+    database = openStoreDatabase(paths);
+    const store = database;
+    warnings.push(...migrateLegacyDismissals(store, paths));
+    store.transaction(() => store.prepare(`INSERT INTO dismissals
+      (finding_key, dismissed_at_ms, record_json) VALUES (?, ?, ?)
+      ON CONFLICT(finding_key) DO UPDATE SET
+        dismissed_at_ms = excluded.dismissed_at_ms,
+        record_json = excluded.record_json`).run(record.finding_key,
+          record.dismissed_at_ms, canonicalJson(record))).immediate();
   } catch (error) {
-    warnings.push({
-      code: "dismissal_write_failed",
-      message: `Dismissal could not be persisted: ${errorMessage(error)}`,
-      path: paths.dismissals_path,
-    });
-  }
+    warnings.push(storeWarning("dismissal_write_failed",
+      `Dismissal could not be persisted: ${errorMessage(error)}`, targetPath));
+  } finally { closeDatabase(database); }
   return { record, warnings };
 }
 

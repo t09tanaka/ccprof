@@ -13,9 +13,11 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { Worker } from "node:worker_threads";
 
 import type {
   AnalysisSummary,
@@ -173,6 +175,19 @@ function snapshotOptions(sourceDigest = "1".repeat(64)) {
   };
 }
 
+function canonicalJson(value: unknown): string {
+  const stable = (entry: unknown): unknown => {
+    if (Array.isArray(entry)) return entry.map(stable);
+    if (entry !== null && typeof entry === "object") {
+      return Object.fromEntries(Object.entries(entry)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, child]) => [key, stable(child)]));
+    }
+    return entry;
+  };
+  return `${JSON.stringify(stable(value), null, 2)}\n`;
+}
+
 async function temporaryStore(
   callback: (paths: StorePaths, root: string) => Promise<void>,
 ): Promise<void> {
@@ -188,6 +203,151 @@ async function temporaryStore(
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+}
+
+interface ConcurrentStoreWrite {
+  moduleUrl: string;
+  exportName: "saveDismissal" | "saveAdoptions";
+  args: unknown[];
+}
+
+type ConcurrentStoreWorkerReply =
+  | { type: "ready" }
+  | { type: "result"; value: unknown }
+  | { type: "failure"; message: string; stack?: string };
+
+const concurrentStoreWriterSource = String.raw`
+"use strict";
+const { parentPort, workerData } = require("node:worker_threads");
+
+(async () => {
+  try {
+    if (parentPort === null) throw new Error("store worker has no parent port");
+    const storeModule = await import(workerData.moduleUrl);
+    const write = storeModule[workerData.exportName];
+    if (typeof write !== "function") {
+      throw new Error("missing store export: " + workerData.exportName);
+    }
+
+    const startGate = new Int32Array(workerData.startGate);
+    parentPort.postMessage({ type: "ready" });
+    Atomics.wait(startGate, 0, 0);
+
+    const value = await write(workerData.paths, ...workerData.args);
+    parentPort.postMessage({ type: "result", value });
+  } catch (error) {
+    if (parentPort !== null) {
+      parentPort.postMessage({
+        type: "failure",
+        message: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+    }
+  } finally {
+    parentPort?.close();
+  }
+})();
+`;
+
+async function runConcurrentStoreWrites<T>(
+  paths: StorePaths,
+  operations: ConcurrentStoreWrite[],
+): Promise<T[]> {
+  if (operations.length === 0) return [];
+
+  const startBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const startGate = new Int32Array(startBuffer);
+  const workers: Worker[] = [];
+  try {
+    for (const operation of operations) {
+      workers.push(new Worker(concurrentStoreWriterSource, {
+        eval: true,
+        workerData: {
+          ...operation,
+          paths,
+          startGate: startBuffer,
+        },
+      }));
+    }
+  } catch (error) {
+    await Promise.allSettled(workers.map((worker) => worker.terminate()));
+    throw error;
+  }
+
+  return new Promise<T[]>((resolve, reject) => {
+    const ready = operations.map(() => false);
+    const received = operations.map(() => false);
+    const results = new Array<T>(operations.length);
+    let readyCount = 0;
+    let exitCount = 0;
+    let settled = false;
+
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      Atomics.store(startGate, 0, 1);
+      Atomics.notify(startGate, 0, workers.length);
+      void Promise.allSettled(workers.map((worker) => worker.terminate()))
+        .then(() => reject(error));
+    };
+
+    workers.forEach((worker, index) => {
+      worker.on("message", (reply: ConcurrentStoreWorkerReply) => {
+        if (settled) return;
+        if (reply.type === "ready") {
+          if (ready[index]) {
+            fail(new Error(`store worker ${index} reported ready twice`));
+            return;
+          }
+          ready[index] = true;
+          readyCount += 1;
+          if (readyCount === workers.length) {
+            Atomics.store(startGate, 0, 1);
+            Atomics.notify(startGate, 0, workers.length);
+          }
+          return;
+        }
+        if (reply.type === "failure") {
+          const error = new Error(
+            `store worker ${index} failed: ${reply.message}`,
+          );
+          if (reply.stack !== undefined) {
+            error.stack = `${error.stack}\nWorker stack:\n${reply.stack}`;
+          }
+          fail(error);
+          return;
+        }
+        if (reply.type === "result") {
+          results[index] = reply.value as T;
+          received[index] = true;
+          return;
+        }
+        fail(new Error(`store worker ${index} returned an unknown message`));
+      });
+      worker.once("error", (error) => fail(error));
+      worker.once("messageerror", (error) => fail(
+        error instanceof Error
+          ? error
+          : new Error(`store worker ${index} message could not be cloned`),
+      ));
+      worker.once("exit", (code) => {
+        if (settled) return;
+        if (code !== 0) {
+          fail(new Error(`store worker ${index} exited with code ${code}`));
+          return;
+        }
+        if (!received[index]) {
+          fail(new Error(`store worker ${index} exited without a result`));
+          return;
+        }
+        exitCount += 1;
+        if (exitCount === workers.length) {
+          settled = true;
+          resolve(results);
+        }
+      });
+    });
+  });
 }
 
 function git(args: string[], cwd: string): void {
@@ -1139,35 +1299,76 @@ test("dismissals expire exactly at 14 days and revive only strictly over twice s
   assert.match(applied.findings[0]?.caveats[0] ?? "", /Previously dismissed/u);
 });
 
-test("dismissals persist reasons and report write failures as warnings", async () => {
-  await temporaryStore(async (paths, root) => {
-    const saved = await saveDismissal(paths, {
-      finding_key: "finding-a",
-      target: "npm test",
+test("dismissals normalize, round-trip, and independently upsert each finding key", async () => {
+  await temporaryStore(async (paths) => {
+    const first = await saveDismissal(paths, {
+      finding_key: "  finding-a  ",
+      target: "  npm   test  ",
       dismissed_at_ms: 1_000,
       strength_min: 10,
-      reason: "Local trade-off.",
+      reason: "  Local trade-off.  ",
     });
-    assert.deepEqual(saved.warnings, []);
-    const loaded = await loadDismissals(paths);
-    assert.equal(loaded.records[0]?.reason, "Local trade-off.");
+    assert.deepEqual(first, {
+      record: {
+        schema_version: 1,
+        finding_key: "finding-a",
+        target: "npm test",
+        dismissed_at_ms: 1_000,
+        strength_min: 10,
+        reason: "Local trade-off.",
+      },
+      warnings: [],
+    });
 
-    const blockingFile = join(root, "dismissal-block");
-    await writeFile(blockingFile, "not a directory", "utf8");
-    const blocked: StorePaths = {
-      ...paths,
-      repo_dir: blockingFile,
-      dismissals_path: join(blockingFile, "dismissals.json"),
-    };
-    const failed = await saveDismissal(blocked, {
-      finding_key: "finding-b",
-      target: "cargo test",
-      dismissed_at_ms: 2_000,
-      strength_min: 5,
+    const concurrent = await runConcurrentStoreWrites<
+      Awaited<ReturnType<typeof saveDismissal>>
+    >(paths, [
+      {
+        moduleUrl: new URL(
+          "../src/store/dismissals.js",
+          import.meta.url,
+        ).href,
+        exportName: "saveDismissal",
+        args: [{
+          finding_key: "finding-b",
+          target: "cargo test",
+          dismissed_at_ms: 1_500,
+          strength_min: 5,
+        }],
+      },
+      {
+        moduleUrl: new URL(
+          "../src/store/dismissals.js",
+          import.meta.url,
+        ).href,
+        exportName: "saveDismissal",
+        args: [{
+          finding_key: "finding-c",
+          target: "pnpm test",
+          dismissed_at_ms: 1_750,
+          strength_min: 7,
+        }],
+      },
+    ]);
+    assert.ok(concurrent.every(({ warnings }) => warnings.length === 0));
+
+    const replacement = await saveDismissal(paths, {
+      finding_key: "finding-a",
+      target: "node --test",
+      // A later call remains authoritative even if its supplied timestamp is older.
+      dismissed_at_ms: 500,
+      strength_min: 3,
     });
-    assert.ok(
-      failed.warnings.some(({ code }) => code === "dismissal_write_failed"),
-    );
+    assert.deepEqual(replacement.warnings, []);
+
+    const loaded = await loadDismissals(paths);
+    assert.deepEqual(loaded.warnings, []);
+    assert.deepEqual(loaded.records, [
+      replacement.record,
+      concurrent[0]?.record,
+      concurrent[1]?.record,
+    ]);
+    assert.equal((await readdir(paths.repo_dir)).includes("dismissals.json"), false);
   });
 });
 
@@ -1187,53 +1388,462 @@ function adoption(
   };
 }
 
-test("adoptions round-trip through the store", async () => {
+test("adoptions are additive and keep the first record for each finding key", async () => {
   await temporaryStore(async (paths) => {
-    const warnings = await saveAdoptions(paths, [adoption("finding-a")]);
-    assert.deepEqual(warnings, []);
+    const first = adoption("finding-a", { method: "claude_md_edit" });
+    assert.deepEqual(await saveAdoptions(paths, [
+      first,
+      adoption("finding-a", { method: "target_file_edit" }),
+      adoption("finding-b"),
+    ]), []);
+    assert.deepEqual(await saveAdoptions(paths, [
+      adoption("finding-a", {
+        detected_at_ms: 2_000,
+        evidence: { commit: "b".repeat(40), path: "CLAUDE.md" },
+      }),
+      adoption("finding-c"),
+    ]), []);
+
     const loaded = await loadAdoptions(paths);
     assert.deepEqual(loaded.warnings, []);
-    assert.deepEqual(loaded.records, [adoption("finding-a")]);
+    assert.deepEqual(loaded.records, [
+      first,
+      adoption("finding-b"),
+      adoption("finding-c"),
+    ]);
+    assert.equal((await readdir(paths.repo_dir)).includes("adoptions.json"), false);
   });
 });
 
-test("corrupt adoption files degrade to a warning and an empty result", async () => {
+test("saving an empty adoption batch is an additive no-op", async () => {
+  await temporaryStore(async (paths) => {
+    const existing = adoption("finding-a");
+    assert.deepEqual(await saveAdoptions(paths, [existing]), []);
+    assert.deepEqual(await saveAdoptions(paths, []), []);
+    const loaded = await loadAdoptions(paths);
+    assert.deepEqual(loaded, { records: [existing], warnings: [] });
+  });
+});
+
+test("concurrent adoption batches retain every distinct finding key", async () => {
+  await temporaryStore(async (paths) => {
+    const existing = adoption("finding-a");
+    assert.deepEqual(await saveAdoptions(paths, [existing]), []);
+    const warnings = await runConcurrentStoreWrites<
+      Awaited<ReturnType<typeof saveAdoptions>>
+    >(paths, [
+      {
+        moduleUrl: new URL(
+          "../src/store/adoptions.js",
+          import.meta.url,
+        ).href,
+        exportName: "saveAdoptions",
+        args: [[adoption("finding-b")]],
+      },
+      {
+        moduleUrl: new URL(
+          "../src/store/adoptions.js",
+          import.meta.url,
+        ).href,
+        exportName: "saveAdoptions",
+        args: [[adoption("finding-c")]],
+      },
+    ]);
+    assert.deepEqual(warnings, [[], []]);
+    const loaded = await loadAdoptions(paths);
+    assert.deepEqual(loaded, {
+      records: [existing, adoption("finding-b"), adoption("finding-c")],
+      warnings: [],
+    });
+  });
+});
+
+test("legacy dismissal and adoption JSON migrate once with their existing dedupe semantics", async () => {
   await temporaryStore(async (paths) => {
     await mkdir(paths.repo_dir, { recursive: true });
-    await writeFile(paths.adoptions_path, "{not json", "utf8");
-    const loaded = await loadAdoptions(paths);
-    assert.deepEqual(loaded.records, []);
-    assert.ok(
-      loaded.warnings.some(({ code }) => code === "corrupt_adoptions"),
-    );
-  });
-});
+    const earlyDismissal = {
+      schema_version: 1 as const,
+      finding_key: "finding-a",
+      target: "npm test",
+      dismissed_at_ms: 1_000,
+      strength_min: 10,
+    };
+    const latestDismissal = {
+      ...earlyDismissal,
+      target: "node --test",
+      dismissed_at_ms: 2_000,
+      strength_min: 4,
+      reason: "newer decision",
+    };
+    const secondDismissal = {
+      ...earlyDismissal,
+      finding_key: "finding-b",
+      dismissed_at_ms: 1_500,
+    };
+    const firstAdoption = adoption("finding-a", { method: "claude_md_edit" });
+    const secondAdoption = adoption("finding-b");
+    const dismissalJson = `${JSON.stringify({
+      schema_version: 1,
+      records: [earlyDismissal, latestDismissal, secondDismissal],
+    })}\n`;
+    const adoptionJson = `${JSON.stringify({
+      schema_version: 1,
+      adoptions: [
+        firstAdoption,
+        adoption("finding-a", { method: "target_file_edit" }),
+        secondAdoption,
+      ],
+    })}\n`;
+    await writeFile(paths.dismissals_path, dismissalJson, "utf8");
+    await writeFile(paths.adoptions_path, adoptionJson, "utf8");
 
-test("adoptions dedupe by finding_key, keeping the first entry", async () => {
-  await temporaryStore(async (paths) => {
-    await saveAdoptions(paths, [
-      adoption("finding-a", { method: "claude_md_edit" }),
-      adoption("finding-a", { method: "target_file_edit" }),
+    assert.deepEqual(await loadDismissals(paths), {
+      records: [latestDismissal, secondDismissal],
+      warnings: [],
+    });
+    assert.deepEqual(await loadAdoptions(paths), {
+      records: [firstAdoption, secondAdoption],
+      warnings: [],
+    });
+
+    const database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare("SELECT count(*) FROM dismissals").pluck().get(), 2);
+      assert.equal(database.prepare("SELECT count(*) FROM adoptions").pluck().get(), 2);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("legacy-dismissals-json-v1"), 1);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("legacy-adoptions-json-v1"), 1);
+    } finally {
+      database.close();
+    }
+    assert.equal(await readFile(paths.dismissals_path, "utf8"), dismissalJson);
+    assert.equal(await readFile(paths.adoptions_path, "utf8"), adoptionJson);
+
+    await writeFile(paths.dismissals_path, JSON.stringify({
+      schema_version: 1,
+      records: [{ ...earlyDismissal, finding_key: "late-dismissal" }],
+    }), "utf8");
+    await writeFile(paths.adoptions_path, JSON.stringify({
+      schema_version: 1,
+      adoptions: [adoption("late-adoption")],
+    }), "utf8");
+    assert.deepEqual((await loadDismissals(paths)).records, [
+      latestDismissal,
+      secondDismissal,
     ]);
-    const loaded = await loadAdoptions(paths);
-    assert.equal(loaded.records.length, 1);
-    assert.equal(loaded.records[0]?.method, "claude_md_edit");
+    assert.deepEqual((await loadAdoptions(paths)).records, [
+      firstAdoption,
+      secondAdoption,
+    ]);
   });
 });
 
-test("adoption write failures return warnings without throwing", async () => {
+test("malformed and non-regular legacy stores warn once and still complete migration", async () => {
+  await temporaryStore(async (paths) => {
+    await mkdir(paths.repo_dir, { recursive: true });
+    await writeFile(paths.dismissals_path, "{not json", "utf8");
+    await mkdir(paths.adoptions_path);
+
+    const dismissals = await loadDismissals(paths);
+    const adoptions = await loadAdoptions(paths);
+    assert.deepEqual(dismissals.records, []);
+    assert.ok(dismissals.warnings.some(({ code }) => code === "corrupt_dismissals"));
+    assert.deepEqual(adoptions.records, []);
+    assert.ok(adoptions.warnings.some(({ code }) => code === "corrupt_adoptions"));
+
+    const database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("legacy-dismissals-json-v1"), 1);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("legacy-adoptions-json-v1"), 1);
+    } finally {
+      database.close();
+    }
+    assert.deepEqual(await loadDismissals(paths), { records: [], warnings: [] });
+    assert.deepEqual(await loadAdoptions(paths), { records: [], warnings: [] });
+  });
+});
+
+test("a legacy file close failure remains operational and retryable", async () => {
+  await temporaryStore(async (paths) => {
+    await mkdir(paths.repo_dir, { recursive: true });
+    const legacyDismissal = {
+      schema_version: 1 as const,
+      finding_key: "finding-close-failure",
+      target: "npm test",
+      dismissed_at_ms: 1_000,
+      strength_min: 10,
+    };
+    await writeFile(paths.dismissals_path, JSON.stringify({
+      schema_version: 1,
+      records: [legacyDismissal],
+    }), "utf8");
+    openStoreDatabase(paths).close();
+
+    const mutableFs = createRequire(import.meta.url)("node:fs") as {
+      closeSync: typeof import("node:fs").closeSync;
+    };
+    const originalCloseSync = mutableFs.closeSync;
+    mutableFs.closeSync = (descriptor: number): void => {
+      originalCloseSync(descriptor);
+      const error = new Error("forced legacy close failure") as NodeJS.ErrnoException;
+      error.code = "EIO";
+      throw error;
+    };
+    syncBuiltinESMExports();
+    try {
+      const failed = await loadDismissals(paths);
+      assert.deepEqual(failed.records, []);
+      assert.ok(failed.warnings.some(({ code }) => code === "corrupt_dismissals"));
+      const database = openStoreDatabase(paths);
+      try {
+        assert.equal(database.prepare("SELECT count(*) FROM dismissals").pluck().get(), 0);
+        assert.equal(database.prepare(
+          "SELECT count(*) FROM store_migrations WHERE name = ?",
+        ).pluck().get("legacy-dismissals-json-v1"), 0);
+      } finally {
+        database.close();
+      }
+    } finally {
+      mutableFs.closeSync = originalCloseSync;
+      syncBuiltinESMExports();
+    }
+
+    assert.deepEqual(await loadDismissals(paths), {
+      records: [legacyDismissal],
+      warnings: [],
+    });
+    const database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare("SELECT count(*) FROM dismissals").pluck().get(), 1);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("legacy-dismissals-json-v1"), 1);
+    } finally {
+      database.close();
+    }
+  });
+});
+
+test("operational migration failures retain committed rows, block saves, and retry", async () => {
+  await temporaryStore(async (paths) => {
+    await mkdir(paths.repo_dir, { recursive: true });
+    const legacyDismissal = {
+      schema_version: 1 as const,
+      finding_key: "finding-a",
+      target: "npm test",
+      dismissed_at_ms: 1_000,
+      strength_min: 10,
+    };
+    const legacyAdoption = adoption("finding-a");
+    const existingDismissal = {
+      ...legacyDismissal,
+      finding_key: "existing-dismissal",
+      dismissed_at_ms: 500,
+    };
+    const existingAdoption = adoption("existing-adoption");
+    await writeFile(paths.dismissals_path, JSON.stringify({
+      schema_version: 1,
+      records: [legacyDismissal],
+    }), "utf8");
+    await writeFile(paths.adoptions_path, JSON.stringify({
+      schema_version: 1,
+      adoptions: [legacyAdoption],
+    }), "utf8");
+
+    let database = openStoreDatabase(paths);
+    try {
+      database.prepare(
+        "INSERT INTO dismissals(finding_key, dismissed_at_ms, record_json) VALUES (?, ?, ?)",
+      ).run(existingDismissal.finding_key, existingDismissal.dismissed_at_ms,
+        canonicalJson(existingDismissal));
+      database.prepare(
+        "INSERT INTO adoptions(finding_key, detected_at_ms, record_json) VALUES (?, ?, ?)",
+      ).run(existingAdoption.finding_key, existingAdoption.detected_at_ms,
+        canonicalJson(existingAdoption));
+      database.exec(`CREATE TRIGGER reject_legacy_dismissal
+        BEFORE INSERT ON dismissals WHEN NEW.finding_key = 'finding-a' BEGIN
+          SELECT RAISE(ABORT, 'forced dismissal migration failure');
+        END`);
+      database.exec(`CREATE TRIGGER reject_legacy_adoption
+        BEFORE INSERT ON adoptions WHEN NEW.finding_key = 'finding-a' BEGIN
+          SELECT RAISE(ABORT, 'forced adoption migration failure');
+        END`);
+    } finally {
+      database.close();
+    }
+
+    const failedDismissals = await loadDismissals(paths);
+    const failedAdoptions = await loadAdoptions(paths);
+    assert.deepEqual(failedDismissals.records, [existingDismissal]);
+    assert.ok(failedDismissals.warnings.some(({ code }) => code === "corrupt_dismissals"));
+    assert.deepEqual(failedAdoptions.records, [existingAdoption]);
+    assert.ok(failedAdoptions.warnings.some(({ code }) => code === "corrupt_adoptions"));
+
+    const blockedDismissal = await saveDismissal(paths, {
+      finding_key: "save-must-not-run",
+      target: "node --test",
+      dismissed_at_ms: 3_000,
+      strength_min: 1,
+    });
+    assert.ok(blockedDismissal.warnings.some(
+      ({ code }) => code === "dismissal_write_failed"));
+    const blockedAdoption = await saveAdoptions(paths, [adoption("save-must-not-run")]);
+    assert.ok(blockedAdoption.some(({ code }) => code === "adoption_write_failed"));
+
+    database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare("SELECT count(*) FROM dismissals").pluck().get(), 1);
+      assert.equal(database.prepare("SELECT count(*) FROM adoptions").pluck().get(), 1);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM dismissals WHERE finding_key = ?",
+      ).pluck().get("save-must-not-run"), 0);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM adoptions WHERE finding_key = ?",
+      ).pluck().get("save-must-not-run"), 0);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("legacy-dismissals-json-v1"), 0);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("legacy-adoptions-json-v1"), 0);
+      database.exec("DROP TRIGGER reject_legacy_dismissal");
+      database.exec("DROP TRIGGER reject_legacy_adoption");
+    } finally {
+      database.close();
+    }
+
+    assert.deepEqual(await loadDismissals(paths), {
+      records: [existingDismissal, legacyDismissal],
+      warnings: [],
+    });
+    assert.deepEqual(await loadAdoptions(paths), {
+      records: [existingAdoption, legacyAdoption],
+      warnings: [],
+    });
+  });
+});
+
+test("completed dismissal and adoption migrations stay readable under a writer lock", async () => {
+  await temporaryStore(async (paths) => {
+    assert.deepEqual(await loadDismissals(paths), { records: [], warnings: [] });
+    assert.deepEqual(await loadAdoptions(paths), { records: [], warnings: [] });
+
+    const writer = openStoreDatabase(paths);
+    try {
+      assert.equal(writer.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name IN (?, ?)",
+      ).pluck().get("legacy-dismissals-json-v1", "legacy-adoptions-json-v1"), 2);
+      writer.exec("BEGIN IMMEDIATE");
+      const startedAtMs = Date.now();
+      const [dismissals, adoptions] = await Promise.all([
+        loadDismissals(paths),
+        loadAdoptions(paths),
+      ]);
+      const elapsedMs = Date.now() - startedAtMs;
+      assert.deepEqual(dismissals, { records: [], warnings: [] });
+      assert.deepEqual(adoptions, { records: [], warnings: [] });
+      assert.ok(elapsedMs < 2_000, `marker fast paths waited ${elapsedMs}ms`);
+    } finally {
+      if (writer.inTransaction) writer.exec("ROLLBACK");
+      writer.close();
+    }
+  });
+});
+
+test("non-canonical and mismatched SQLite records cannot disable healthy keys", async () => {
+  await temporaryStore(async (paths) => {
+    assert.deepEqual(await loadDismissals(paths), { records: [], warnings: [] });
+    assert.deepEqual(await loadAdoptions(paths), { records: [], warnings: [] });
+    const healthyDismissal = {
+      schema_version: 1 as const,
+      finding_key: "dismissal-healthy",
+      target: "npm test",
+      dismissed_at_ms: 1_000,
+      strength_min: 5,
+    };
+    const healthyAdoption = adoption("adoption-healthy");
+
+    const database = openStoreDatabase(paths);
+    try {
+      database.prepare(
+        "INSERT INTO dismissals(finding_key, dismissed_at_ms, record_json) VALUES (?, ?, ?)",
+      ).run(healthyDismissal.finding_key, healthyDismissal.dismissed_at_ms,
+        canonicalJson(healthyDismissal));
+      database.prepare(
+        "INSERT INTO dismissals(finding_key, dismissed_at_ms, record_json) VALUES (?, ?, ?)",
+      ).run("dismissal-mismatch", 2_000, canonicalJson({
+        ...healthyDismissal,
+        finding_key: "different-dismissal-key",
+        dismissed_at_ms: 2_000,
+      }));
+      const noncanonicalDismissal = {
+        ...healthyDismissal,
+        finding_key: "dismissal-noncanonical",
+        dismissed_at_ms: 2_500,
+      };
+      database.prepare(
+        "INSERT INTO dismissals(finding_key, dismissed_at_ms, record_json) VALUES (?, ?, ?)",
+      ).run(noncanonicalDismissal.finding_key, noncanonicalDismissal.dismissed_at_ms,
+        JSON.stringify(noncanonicalDismissal));
+      database.prepare(
+        "INSERT INTO adoptions(finding_key, detected_at_ms, record_json) VALUES (?, ?, ?)",
+      ).run(healthyAdoption.finding_key, healthyAdoption.detected_at_ms,
+        canonicalJson(healthyAdoption));
+      database.prepare(
+        "INSERT INTO adoptions(finding_key, detected_at_ms, record_json) VALUES (?, ?, ?)",
+      ).run("adoption-mismatch", 2_000, canonicalJson({
+        ...adoption("adoption-mismatch"),
+        detected_at_ms: 3_000,
+      }));
+      const noncanonicalAdoption = adoption("adoption-noncanonical");
+      database.prepare(
+        "INSERT INTO adoptions(finding_key, detected_at_ms, record_json) VALUES (?, ?, ?)",
+      ).run(noncanonicalAdoption.finding_key, noncanonicalAdoption.detected_at_ms,
+        JSON.stringify(noncanonicalAdoption));
+    } finally {
+      database.close();
+    }
+
+    const dismissals = await loadDismissals(paths);
+    const adoptions = await loadAdoptions(paths);
+    assert.deepEqual(dismissals.records, [healthyDismissal]);
+    assert.ok(dismissals.warnings.some(({ code }) => code === "corrupt_dismissals"));
+    assert.deepEqual(adoptions.records, [healthyAdoption]);
+    assert.ok(adoptions.warnings.some(({ code }) => code === "corrupt_adoptions"));
+  });
+});
+
+test("blocked SQLite store paths retain dismissal and adoption warning codes", async () => {
   await temporaryStore(async (paths, root) => {
-    const blockingFile = join(root, "adoption-block");
+    const blockingFile = join(root, "store-block");
     await writeFile(blockingFile, "not a directory", "utf8");
     const blocked: StorePaths = {
       ...paths,
       repo_dir: blockingFile,
+      dismissals_path: join(blockingFile, "dismissals.json"),
       adoptions_path: join(blockingFile, "adoptions.json"),
     };
-    const warnings = await saveAdoptions(blocked, [adoption("finding-a")]);
-    assert.ok(
-      warnings.some(({ code }) => code === "adoption_write_failed"),
-    );
+    assert.ok((await loadDismissals(blocked)).warnings.some(
+      ({ code }) => code === "corrupt_dismissals"));
+    assert.ok((await loadAdoptions(blocked)).warnings.some(
+      ({ code }) => code === "corrupt_adoptions"));
+    const dismissal = await saveDismissal(blocked, {
+      finding_key: "finding-a",
+      target: "npm test",
+      dismissed_at_ms: 1_000,
+      strength_min: 1,
+    });
+    assert.ok(dismissal.warnings.some(
+      ({ code }) => code === "dismissal_write_failed"));
+    assert.ok((await saveAdoptions(blocked, [adoption("finding-a")])).some(
+      ({ code }) => code === "adoption_write_failed"));
   });
 });
 

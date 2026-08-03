@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readdirSync } from "node:fs";
+import { lstatSync, readdirSync } from "node:fs";
 import {
   mkdir,
   open,
@@ -19,6 +19,7 @@ import type {
   Confidence,
   Finding,
 } from "../core/model.js";
+import { canonicalJson, readLegacyJson } from "./legacy-json.js";
 import type { StorePaths } from "./paths.js";
 import { openStoreDatabase, storeDatabasePath } from "./sqlite.js";
 
@@ -90,27 +91,11 @@ function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-function stableJsonValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stableJsonValue);
-  if (value !== null && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value)
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([key, entry]) => [key, stableJsonValue(entry)]),
-    );
-  }
-  return value;
-}
-
-function stableStringify(value: unknown): string {
-  return `${JSON.stringify(stableJsonValue(value), null, 2)}\n`;
-}
-
 export function analysisDigest(domain: string, value: unknown): string {
   if (domain === "" || domain.includes("\0"))
     throw new TypeError("digest domain must be non-empty and contain no NUL");
   return createHash("sha256").update(`ccprof\0${domain}\0`)
-    .update(stableStringify(value)).digest("hex");
+    .update(canonicalJson(value)).digest("hex");
 }
 
 function sortedUnique(values: readonly string[]): string[] {
@@ -395,7 +380,7 @@ export function makeAnalysisRecord(
       { read_observations: normalizedReadObservations(input.read_observations) }),
   };
   const generatedId = createHash("sha256")
-    .update(stableStringify(content))
+    .update(canonicalJson(content))
     .digest("hex");
   return {
     ...content,
@@ -496,7 +481,7 @@ export async function writeJsonAtomically(
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
     handle = await open(temporaryPath, "wx", 0o600);
-    await handle.writeFile(stableStringify(value), "utf8");
+    await handle.writeFile(canonicalJson(value), "utf8");
     await handle.sync();
     await handle.close();
     handle = undefined;
@@ -561,7 +546,7 @@ class StoreConflict extends Error {
 function insertAnalysis(database: StoreDatabase, record: AnalysisRecord,
   identity?: AnalysisSnapshotIdentity): void {
   const envelope = snapshotEnvelope(record, identity);
-  const recordJson = stableStringify(envelope);
+  const recordJson = canonicalJson(envelope);
   const snapshotId = analysisDigest("analysis-snapshot-v1", envelope);
   const execution = database.prepare(`SELECT e.snapshot_id, e.executed_at_ms, s.record_json
     FROM analysis_executions e JOIN analysis_snapshots s USING (snapshot_id)
@@ -592,25 +577,11 @@ function insertAnalysis(database: StoreDatabase, record: AnalysisRecord,
 function migrationWarning(code: string, message: string, path: string): StoreWarning { return { code, message, path }; }
 class CorruptLegacyRecord extends Error {}
 function readLegacyRecord(path: string): AnalysisRecord {
-  const before = lstatSync(path);
-  if (before.isSymbolicLink() || !before.isFile()) throw new CorruptLegacyRecord("not a regular file");
-  const descriptor = openSync(path,
-    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  try {
-    const opened = fstatSync(descriptor);
-    if (!opened.isFile()) throw new CorruptLegacyRecord("not a regular file");
-    if (opened.dev !== before.dev || opened.ino !== before.ino)
-      throw new Error("legacy analysis file changed while opening");
-    const text = readFileSync(descriptor, "utf8");
-    const after = fstatSync(descriptor);
-    if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino)
-      throw new Error("legacy analysis file changed while reading");
-    let value: unknown;
-    try { value = JSON.parse(text) as unknown; }
-    catch (error) { throw new CorruptLegacyRecord(errorMessage(error)); }
-    if (!isRecord(value)) throw new CorruptLegacyRecord("unsupported or invalid analysis record");
-    return value;
-  } finally { closeSync(descriptor); }
+  const read = readLegacyJson(path);
+  if (read.kind === "missing") throw new Error("legacy analysis file disappeared while scanning");
+  if (read.kind === "corrupt") throw new CorruptLegacyRecord(read.message);
+  if (!isRecord(read.value)) throw new CorruptLegacyRecord("unsupported or invalid analysis record");
+  return read.value;
 }
 function scanLegacyAnalyses(paths: StorePaths): { records: AnalysisRecord[]; warnings: StoreWarning[] } {
   let directory;
@@ -665,7 +636,7 @@ function parseSnapshot(recordJson: string, snapshotId: string,
   if (!isObjectRecord(value) || value.schema_version !== 1 ||
     !isObjectRecord(value.payload) || "analysis_id" in value.payload ||
     "created_at_ms" in value.payload || !isObjectRecord(value.identity) ||
-    stableStringify(value) !== recordJson ||
+    canonicalJson(value) !== recordJson ||
     analysisDigest("analysis-snapshot-v1", value) !== snapshotId) {
     throw new TypeError("unsupported or invalid analysis snapshot");
   }
@@ -673,7 +644,7 @@ function parseSnapshot(recordJson: string, snapshotId: string,
     if (Object.keys(value.identity).length !== 1) throw new TypeError("invalid fallback identity");
   } else {
     const normalized = normalizeSnapshotIdentity(value.identity as unknown as AnalysisSnapshotIdentity);
-    if (stableStringify(normalized) !== stableStringify(value.identity))
+    if (canonicalJson(normalized) !== canonicalJson(value.identity))
       throw new TypeError("non-canonical snapshot identity");
   }
   const record = { ...value.payload, analysis_id: executionId, created_at_ms: executedAtMs };

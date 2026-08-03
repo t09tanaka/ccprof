@@ -509,19 +509,21 @@ $XDG_DATA_HOME/ccprof/<sha256(canonical-repo-path)>/
 ~/.local/share/ccprof/<sha256(canonical-repo-path)>/
 ```
 
-Analysis history is stored transactionally in the repository-scoped
-`store.sqlite3` database, with SQLite running in WAL mode. Deterministic
-analysis snapshots are stored separately from their executions. A snapshot is
-reused only when the repository and Git OIDs, effective analysis window,
-source, configuration, policy, history, and normalized analysis payload are
-all identical; each rerun still records its execution without inflating stats
-or baselines.
+Analysis history, dismissals, and adoptions are stored transactionally in the
+repository-scoped `store.sqlite3` database, with SQLite running in WAL mode.
+Deterministic analysis snapshots are stored separately from their executions.
+A snapshot is reused only when the repository and Git OIDs, effective analysis
+window, source, configuration, policy, history, and normalized analysis payload
+are all identical; each rerun still records its execution without inflating
+stats or baselines. Adoption saves are additive: the first record for a finding
+key is immutable, while later saves can add other finding keys.
 
-On first access, legacy `analyses/*.json` records are imported once. Corrupt
-entries produce warnings and are skipped; a committed migration marker prevents
-later rescans. The legacy JSON records and index remain untouched. This is a
-one-way migration, so concurrently running an older ccprof that still writes
-legacy analysis files is unsupported. Hook events remain JSONL.
+On first access, legacy `analyses/*.json`, `dismissals.json`, and
+`adoptions.json` records are imported once. Corrupt input produces warnings and
+is skipped; committed migration markers prevent later rescans. All legacy JSON
+and the analysis index remain untouched. This is a one-way migration, so using
+an older ccprof that still writes those legacy stores afterward is unsupported.
+Hook events remain JSONL.
 
 Store records remain raw so local baselines and history retain their existing
 identity and evidence. Privacy profiles govern rendered output and advisory
