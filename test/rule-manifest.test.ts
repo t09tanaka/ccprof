@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   ALL_SESSION_CAPABILITIES,
+  findingCompatibilityMetadata,
   hasValidFindingCompatibilityMetadata,
   type Finding,
   type ReportV2,
@@ -396,6 +397,14 @@ test("Report v2 privacy keeps static metadata and never invents it for legacy fi
 });
 
 test("stored and private compatibility metadata accepts only a canonical complete pair", () => {
+  assert.deepEqual(findingCompatibilityMetadata({}), { valid: true });
+  assert.deepEqual(findingCompatibilityMetadata({
+    rule_version: "1.0.0",
+    compatibility_epoch: 1,
+  }), {
+    valid: true,
+    metadata: { rule_version: "1.0.0", compatibility_epoch: 1 },
+  });
   assert.equal(hasValidFindingCompatibilityMetadata({}), true);
   assert.equal(hasValidFindingCompatibilityMetadata({
     rule_version: "1.0.0",
@@ -454,6 +463,49 @@ test("stored and private compatibility metadata accepts only a canonical complet
   const accessorStrict = projectReportPrivacy(reportWith(accessorFinding), "strict");
   assert.equal(Object.hasOwn(accessorStrict.findings[0] ?? {}, "rule_version"), false);
   assert.equal(Object.hasOwn(accessorStrict.findings[0] ?? {}, "compatibility_epoch"), false);
+
+  let metadataGets = 0;
+  const lyingFinding = new Proxy(finding("R001"), {
+    get(target, property, receiver) {
+      if (property === "rule_version" || property === "compatibility_epoch") {
+        metadataGets += 1;
+        return property === "rule_version" ? "token-secret" : 99;
+      }
+      return Reflect.get(target, property, receiver) as unknown;
+    },
+    getOwnPropertyDescriptor(target, property) {
+      if (property === "rule_version") {
+        return { configurable: true, enumerable: false, value: "1.0.0" };
+      }
+      if (property === "compatibility_epoch") {
+        return { configurable: true, enumerable: false, value: 1 };
+      }
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+  });
+  for (const profile of ["strict", "balanced"] as const) {
+    const projected = projectReportPrivacy(reportWith(lyingFinding), profile);
+    assert.equal(projected.findings[0]?.rule_version, "1.0.0");
+    assert.equal(projected.findings[0]?.compatibility_epoch, 1);
+    assert.doesNotMatch(JSON.stringify(projected), /token-secret/u);
+  }
+  assert.equal(metadataGets, 0);
+
+  const throwingDescriptor = new Proxy(finding("R001"), {
+    getOwnPropertyDescriptor(target, property) {
+      if (property === "rule_version" || property === "compatibility_epoch") {
+        throw new Error("token-secret descriptor trap");
+      }
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+  });
+  assert.deepEqual(findingCompatibilityMetadata(throwingDescriptor), { valid: false });
+  for (const profile of ["strict", "balanced"] as const) {
+    const projected = projectReportPrivacy(reportWith(throwingDescriptor), profile);
+    assert.equal(Object.hasOwn(projected.findings[0] ?? {}, "rule_version"), false);
+    assert.equal(Object.hasOwn(projected.findings[0] ?? {}, "compatibility_epoch"), false);
+    assert.doesNotMatch(JSON.stringify(projected), /token-secret/u);
+  }
 });
 
 test("a compatibility epoch change isolates dismissal and adoption identities", () => {
