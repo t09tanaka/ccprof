@@ -31,8 +31,8 @@ The ingestion boundary canonicalizes every input into a source descriptor and an
   - Acceptance criteria: one projection is applied by analyze, stats, explain, diagnose, export, warnings, errors, and advisory input; `stats --privacy strict --json` applies it; CI and collection strict mode cannot be weakened; snapshots are keyed by distinct repository, PR, and terminal snapshot; unioned intervals are deduplicated; snapshots separately report `confirmed_critical_path_ms`, `estimated_critical_path_upper_ms`, `resource_cost_ms`, `human_wait_ms`, and `unexplained_ms`; comparable baseline and R006 cohorts require the same repository/workspace, similar changed-file count and diff size, the same command identity, and observable cache state; qualifying cohorts report median, p50, p75, MAD, and sample count, while cohorts below the configured threshold are suppressed.
 - [ ] Add advisory execution safeguards for stdin, minimal environment, input/output caps, and process-group kill.
   - Acceptance criteria: safeguards are advisory and observable; stdin behavior, environment minimization, caps, and group termination produce actionable diagnostics without altering unrelated execution semantics.
-- [ ] Add additive Store migrations for source descriptors, event identities, rule catalog metadata, and migration tracking.
-  - Acceptance criteria: migrations are idempotent and transactional; a populated Store v2 opens without data loss; migration state is inspectable.
+- [ ] Add additive Store migrations for source descriptors, event identities, `AnalysisBudgets`, incremental `source_catalog`, rule catalog metadata, and migration tracking.
+  - Acceptance criteria: `AnalysisBudgets` records exactly `max_input_bytes`, `max_input_events`, `max_wall_ms`, `max_cpu_ms`, `max_output_bytes`, and `max_source_items`, and reports partial/truncation coverage; `source_catalog` incrementally records adapter/version, source identity, content revision, discovery cursor, observed time, and completeness; migrations are idempotent and transactional; a populated Store v2 opens without data loss; migration state is inspectable.
 
 ## PR Wave 2 — Findings, confidence, and ledger evidence
 
@@ -61,18 +61,20 @@ The ingestion boundary canonicalizes every input into a source descriptor and an
 - [ ] Add signed organization policy configuration for privacy, advisory, raw data, retention, quotas, encryption, deletion, and export authorization.
   - Acceptance criteria: schema includes `minimum_privacy`, `allow_raw`, `allow_advisory`, `allow_export`, `raw_retention_days_max`, and `required_source_coverage`; precedence is organization constraints over repository policy over CLI settings and lower layers can only tighten; an administrative advisory kill switch overrides lower layers; deny-by-default behavior; `raw_evidence_retention_days` and `aggregate_retention_days` are distinct; quota includes `max_bytes`; storage mode is `os_keychain`, `enterprise_key`, or `none` with platform key providers; quota violations stop safely with an audit record.
 - [ ] Add logical repository and workspace scoping.
-  - Acceptance criteria: records are scoped to logical workspace/repository IDs; policy inheritance is deterministic; cross-workspace queries require authorization and create ledger evidence.
-- [ ] Deliver doctor and store operational commands.
-  - Acceptance criteria: doctor reports migration, capability, budget, policy, encryption, and store-health status; store inspect/migrate/compact/verify commands are documented and fail safely.
+  - Acceptance criteria: logical repository IDs resolve by configured provider order and remain distinct from local filesystem IDs; workspace adapters define workspace model/policy scope; policy inheritance is deterministic; cross-workspace queries require authorization and create ledger evidence.
+- [ ] Deliver the audit CLI family.
+  - Acceptance criteria: doctor, diagnose, policy, config, schema, export, import, store verify/backup/restore, source, and rules commands are documented and fail safely; doctor reports migration, capability, budget, policy, encryption, and store-health status.
 
 ## PR Wave 5 — Delivery assurance and support
 
 - [ ] Expand CI into a platform and compatibility matrix.
-  - Acceptance criteria: supported runtime/OS matrix runs unit and integration coverage; report N-2 fixtures, Store v2 migration, manifest validation, and export policy checks are mandatory gates.
+  - Acceptance criteria: Node 22/24 on Linux, macOS, and Windows run unit/integration coverage; Node 26 canary and native-addon coverage run; report N-2 fixtures, Store v2 migration, manifest validation, and export policy checks are mandatory gates.
+- [ ] Add npm Trusted Publishing/OIDC, npm provenance, and reproducible release verification.
+  - Acceptance criteria: release artifacts prove source-to-registry provenance and reproduce verification output; npm registry/organization enablement is documented as an external prerequisite.
 - [ ] Add calibration, property, fuzz, fault-injection, and performance suites.
-  - Acceptance criteria: calibration fixtures define expected rule outcomes and confidence bands; property/fuzz tests cover parsers and schemas; fault tests cover interrupted migration and ledger/store failures; performance budgets cover ingestion, query, report generation, and aggregation.
+  - Acceptance criteria: documented fixtures and SLOs define calibration rule outcomes/confidence bands and performance budgets; property/fuzz tests cover parsers and schemas; fault tests cover interrupted migration and ledger/store failures; performance gates cover ingestion, query, report generation, and aggregation.
 - [ ] Publish support and governance documentation.
-  - Acceptance criteria: operator runbook covers doctor/store/export recovery; user documentation explains capability coverage, report compatibility, privacy behavior, retention, and migrations; release checklist names policy, legal/privacy, security/key-management, incident-response, accessibility, and change-management owners.
+  - Acceptance criteria: operator runbook covers doctor/store/export recovery; user documentation explains capability coverage, report compatibility, privacy behavior, retention, and migrations; data governance prohibits employee performance assessment, surveillance, and unrelated model training; release checklist names policy, legal/privacy, security/key-management, incident-response, accessibility, and change-management owners.
 
 ## Program-wide acceptance criteria
 
