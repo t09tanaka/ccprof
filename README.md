@@ -690,6 +690,12 @@ under the Node built-in test runner. `better-sqlite3` provides the embedded
 SQLite runtime; only `git`, and `gh` when needed, are invoked as external
 processes.
 
+CI keeps Node 20 as a blocking compatibility floor. Node 22 and 24 run in a
+blocking matrix on Ubuntu, macOS, and Windows; every lane loads and queries the
+native `better-sqlite3` addon before running the full suite. Node 26 is a
+non-blocking canary; Node 26 is not a support claim. The package's `engines`
+field remains authoritative for supported runtimes.
+
 ### Maintainer release
 
 Use [`ccprof-release`](.claude/skills/ccprof-release/SKILL.md) to prepare the
