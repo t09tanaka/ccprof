@@ -122,8 +122,24 @@ it.
    marker-protected one-way migration.
 5. [x] Replace adoption JSON persistence with SQLite load/additive insert and its
    marker-protected one-way migration.
-6. [ ] Update README Store documentation and run focused tests, local GitHub
-   Actions equivalents, independent reviews, PR checks, merge, and cleanup.
+6. [x] Update README Store documentation and pass focused tests, local GitHub
+   Actions equivalents, independent reviews, and the initial PR pre-merge gate.
+
+## Validation
+
+- Focused Store suite: 41/41 passing on Node 20.
+- Full local GitHub Actions equivalent: 529/529 passing on the official
+  Node 20.20.2 image as a non-root user; build, determinism golden, package and
+  native SQLite smoke tests also pass.
+- `npm audit`: zero vulnerabilities; `git diff --check`: clean.
+- Independent specification, SQLite/security/concurrency, and analysis
+  serialization regression reviews: clean after adding the close-failure
+  rollback-and-retry regression test and replacing same-thread pseudo-
+  concurrency with barrier-synchronized worker tests.
+- PR #43 initial head: all seven visible checks passing, with no review,
+  inline, thread, or conversation comments.
+- Package version remains 0.2.0, Store schema remains 2, and Report schema
+  remains v2.
 
 ## Change budget
 
