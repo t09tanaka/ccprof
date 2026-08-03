@@ -10,6 +10,8 @@ import {
 } from "node:fs/promises";
 import { types as utilTypes } from "node:util";
 
+import { loadRepositoryPolicyPreferences } from
+  "../analysis/repository-config.js";
 import type { PrivacyProfile } from "../reporters/privacy.js";
 
 const POLICY_MAX_BYTES = 64 * 1024;
@@ -70,6 +72,11 @@ export interface PolicyRequest {
   privacy: PrivacyProfile;
   advisory: boolean;
 }
+
+export type RepositoryPolicyResolver = (
+  repoRoot: string,
+  request: PolicyRequest,
+) => Promise<EffectivePolicy>;
 
 export interface EffectivePolicy {
   governed: boolean;
@@ -490,4 +497,20 @@ export function resolveEffectivePolicy(input: {
       repository?.required_source_coverage ?? 0,
     ),
   };
+}
+
+export async function resolveRepositoryPolicy(
+  repoRoot: string,
+  request: PolicyRequest,
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<EffectivePolicy> {
+  const [organization, repository] = await Promise.all([
+    loadConfiguredOrganizationPolicy(environment),
+    loadRepositoryPolicyPreferences(repoRoot),
+  ]);
+  return resolveEffectivePolicy({
+    ...(organization === undefined ? {} : { organization }),
+    repository,
+    request,
+  });
 }

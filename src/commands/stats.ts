@@ -28,6 +28,10 @@ import {
   type StorePaths,
 } from "../store/paths.js";
 import type { CommandExecutionResult } from "./analyze.js";
+import {
+  resolveRepositoryPolicy,
+  type RepositoryPolicyResolver,
+} from "../policy/organization-policy.js";
 
 export interface StatsCommandOptions {
   cwd: string;
@@ -44,6 +48,7 @@ export interface StatsCommandDependencies {
   loadAdoptions?: (
     paths: StorePaths,
   ) => Promise<AdoptionLoadResult>;
+  resolvePolicy?: RepositoryPolicyResolver;
 }
 
 export async function resolveCurrentRepoRoot(
@@ -77,6 +82,10 @@ export async function runStatsCommand(
   const repoRoot = await (
     dependencies.resolveRepoRoot ?? resolveCurrentRepoRoot
   )(options.cwd);
+  const effectivePolicy = await (
+    dependencies.resolvePolicy ?? resolveRepositoryPolicy
+  )(repoRoot, { privacy: options.privacy, advisory: false });
+  const privacy = effectivePolicy.privacy;
   const paths = await (
     dependencies.resolveStorePaths ?? resolveStorePaths
   )(repoRoot);
@@ -88,7 +97,7 @@ export async function runStatsCommand(
   )(paths);
   const stats = projectStatsPrivacy(
     summarizeStats(history.records, adoptions.records),
-    options.privacy,
+    privacy,
     repoRoot,
   );
   const warnings = [...history.warnings, ...adoptions.warnings].map(
@@ -102,6 +111,6 @@ export async function runStatsCommand(
     stdout: options.json
       ? renderStatsJson(stats)
       : renderStatsTty(stats),
-    warnings: privacyWarningTexts(warnings, options.privacy, repoRoot),
+    warnings: privacyWarningTexts(warnings, privacy, repoRoot),
   };
 }
