@@ -94,4 +94,5 @@ Added production code must stay below 300 lines. Do not modify `ReportV2`, core 
 - [x] Have a separate validation subagent run Node 20 `npm ci`, `npm run check` (497/497), determinism (1/1), build, and isolated package smoke.
 - [x] Run the repository's local GitHub Actions equivalent before push because output policy and CLI logic changed; every locally reproducible CI job passed.
 - [x] Confirm exactly seven changed files, 297 added production lines, no Report/Store/parser/rule/package/version/changelog diff, and no generated artifact contamination.
-- [ ] Commit without amend, push, open a PR against `main`, wait for every remote check and actionable review, merge under the user's standing authorization, then clean up only this worktree and its local/remote branch.
+- [x] Commit without amend, push, open PR #39 against `main`, and wait for every remote check and actionable review; all seven checks passed and no actionable review was posted.
+- After the PR is merged under the user's standing authorization, clean up only this worktree and its local/remote branch.
