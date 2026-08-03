@@ -16,7 +16,7 @@ import {
   NoAnalyzableTimestampsError,
   NoMatchingSessionsError,
 } from "../src/core/analyze.js";
-import type { Session } from "../src/core/model.js";
+import type { Interval, Session } from "../src/core/model.js";
 import {
   discoverManifestTestMap,
   parseExplicitTestMap,
@@ -327,17 +327,24 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
       ) > 50_000,
     );
     const flaky = first.allFindings.find(({ rule_id }) => rule_id === "R008");
-    assert.equal(flaky?.confidence, "medium");
+    assert.equal(flaky?.confidence, "low");
     assert.equal(flaky?.evidence.unrelated_edit_count, 1);
     assert.deepEqual(flaky?.evidence.unrelated_edit_paths, [
       "docs/readme.md",
     ]);
 
+    const severityRank = { info: 0, low: 1, medium: 2, high: 3 } as const;
+    const confidenceRank = { low: 0, medium: 1, high: 2 } as const;
     const expectedTop = [...first.allFindings]
       .filter(({ recoverable }) => recoverable.min > 0)
       .sort(
         (left, right) =>
-          right.recoverable.min - left.recoverable.min ||
+          (right.impact?.upper_ms ?? right.recoverable.min * 60_000) -
+            (left.impact?.upper_ms ?? left.recoverable.min * 60_000) ||
+          (right.impact?.lower_ms ?? 0) - (left.impact?.lower_ms ?? 0) ||
+          severityRank[right.severity ?? "info"] -
+            severityRank[left.severity ?? "info"] ||
+          confidenceRank[right.confidence] - confidenceRank[left.confidence] ||
           left.rule_id.localeCompare(right.rule_id) ||
           left.finding_key.localeCompare(right.finding_key),
       )
@@ -360,10 +367,15 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
       first.report.summary.measured_min +
         first.report.summary.idle_excluded_min,
     );
+    assert.deepEqual(
+      (first.ledger as typeof first.ledger & {
+        highConfidenceLowerBoundIntervals?: Interval[];
+      }).highConfidenceLowerBoundIntervals,
+      [],
+    );
     assert.equal(
       first.report.summary.estimated_floor_min,
-      first.report.summary.measured_min -
-        first.report.summary.recoverable_min,
+      first.report.summary.measured_min,
     );
 
     const stored = await loadAnalyses(storePaths);

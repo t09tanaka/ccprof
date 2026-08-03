@@ -5,12 +5,25 @@ import {
   reconcileLedger,
   type LedgerResult,
 } from "../src/core/ledger.js";
+import {
+  findingScoringRationale,
+  findingSeverity,
+  projectFindingConfidence,
+} from "../src/core/model.js";
 import type {
   Bound,
   FindingCandidate,
+  FindingConfidence,
+  ImpactEstimate,
   Interval,
   RuleId,
 } from "../src/core/model.js";
+
+interface CandidateContractOverrides {
+  impact?: ImpactEstimate;
+  findingConfidence?: FindingConfidence;
+  intervalIds?: readonly string[];
+}
 
 function candidate(
   ruleId: RuleId,
@@ -21,11 +34,22 @@ function candidate(
     (total, interval) => total + interval.end_ms - interval.start_ms,
     0,
   ),
+  overrides: CandidateContractOverrides = {},
 ): FindingCandidate {
   const kind = ruleId === "R005" || ruleId === "R006"
     ? "resource_cost" as const
     : "critical_path_latency" as const;
   const lowerMs = bound === "point" ? estimatedMs : 0;
+  const impact: ImpactEstimate = overrides.impact ?? {
+    lower_ms: lowerMs,
+    upper_ms: estimatedMs,
+    kind,
+  };
+  const findingConfidence: FindingConfidence = overrides.findingConfidence ?? {
+    evidence: "high",
+    causal: "high",
+    source_completeness: 1,
+  };
   return {
     finding_key: key,
     rule_id: ruleId,
@@ -33,41 +57,24 @@ function candidate(
     classification: "behavior",
     cause: ruleId === "R001" ? "unknown" : null,
     scope: "separate_issue",
-    confidence: "high",
-    impact: {
-      lower_ms: lowerMs,
-      upper_ms: estimatedMs,
-      kind,
-    },
-    finding_confidence: {
-      evidence: "high",
-      causal: "high",
-      source_completeness: 1,
-    },
-    severity: estimatedMs === 0
-      ? "info"
-      : kind === "critical_path_latency" && lowerMs > 0
-        ? "high"
-        : "medium",
-    scoring_rationale: [
-      ...(lowerMs > 0
-        ? ["observed_lower_bound" as const]
-        : estimatedMs > 0
-          ? ["estimated_upper_only" as const]
-          : []),
-      ...(kind === "resource_cost" ? ["resource_cost_only" as const] : []),
-    ],
+    confidence: projectFindingConfidence(findingConfidence),
+    impact,
+    finding_confidence: findingConfidence,
+    severity: findingSeverity(impact, findingConfidence),
+    scoring_rationale: findingScoringRationale(impact, findingConfidence),
     target: key,
     evidence: {
       session_refs: [`s1#${key}`],
-      interval_ids: intervals.map((_, index) => `${key}-${index}`),
+      interval_ids: intervals.map((_, index) =>
+        overrides.intervalIds?.[index] ?? `${key}-${index}`
+      ),
     },
     recoverable: {
       bound,
       estimated_ms: estimatedMs,
       intervals: intervals.map((interval, index) => ({
         ...interval,
-        interval_id: `${key}-${index}`,
+        interval_id: overrides.intervalIds?.[index] ?? `${key}-${index}`,
         target: key,
       })),
     },
@@ -412,4 +419,309 @@ test("the four-way partition identity holds after rounding", () => {
   ]) {
     assert.ok(value >= 0);
   }
+});
+
+test("estimated floor accepts only strict high-confidence critical lower bounds", async (t) => {
+  const cases: readonly {
+    name: string;
+    impact: ImpactEstimate;
+    confidence: FindingConfidence;
+    expectedIntervals: Interval[];
+    expectedFloorMin: number;
+  }[] = [
+    {
+      name: "strict critical lower bound",
+      impact: {
+        lower_ms: 30_000,
+        upper_ms: 60_000,
+        kind: "critical_path_latency",
+      },
+      confidence: {
+        evidence: "high",
+        causal: "high",
+        source_completeness: 1,
+      },
+      expectedIntervals: [{ start_ms: 0, end_ms: 30_000 }],
+      expectedFloorMin: 0.5,
+    },
+    {
+      name: "resource cost",
+      impact: {
+        lower_ms: 30_000,
+        upper_ms: 60_000,
+        kind: "resource_cost",
+      },
+      confidence: {
+        evidence: "high",
+        causal: "high",
+        source_completeness: 1,
+      },
+      expectedIntervals: [],
+      expectedFloorMin: 1,
+    },
+    {
+      name: "upper only",
+      impact: {
+        lower_ms: 0,
+        upper_ms: 60_000,
+        kind: "critical_path_latency",
+      },
+      confidence: {
+        evidence: "high",
+        causal: "high",
+        source_completeness: 1,
+      },
+      expectedIntervals: [],
+      expectedFloorMin: 1,
+    },
+    {
+      name: "medium evidence",
+      impact: {
+        lower_ms: 30_000,
+        upper_ms: 60_000,
+        kind: "critical_path_latency",
+      },
+      confidence: {
+        evidence: "medium",
+        causal: "high",
+        source_completeness: 1,
+      },
+      expectedIntervals: [],
+      expectedFloorMin: 1,
+    },
+    {
+      name: "medium causal confidence",
+      impact: {
+        lower_ms: 30_000,
+        upper_ms: 60_000,
+        kind: "critical_path_latency",
+      },
+      confidence: {
+        evidence: "high",
+        causal: "medium",
+        source_completeness: 1,
+      },
+      expectedIntervals: [],
+      expectedFloorMin: 1,
+    },
+    {
+      name: "partial source",
+      impact: {
+        lower_ms: 30_000,
+        upper_ms: 60_000,
+        kind: "critical_path_latency",
+      },
+      confidence: {
+        evidence: "high",
+        causal: "high",
+        source_completeness: 0.5,
+      },
+      expectedIntervals: [],
+      expectedFloorMin: 1,
+    },
+    {
+      name: "legacy conservative projection",
+      impact: {
+        lower_ms: 0,
+        upper_ms: 60_000,
+        kind: "critical_path_latency",
+      },
+      confidence: {
+        evidence: "medium",
+        causal: "medium",
+        source_completeness: 0.5,
+      },
+      expectedIntervals: [],
+      expectedFloorMin: 1,
+    },
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, () => {
+      const bound = entry.impact.lower_ms === entry.impact.upper_ms
+        ? "point"
+        : "upper";
+      const result = reconcileLedger({
+        rawIntervals: [{ start_ms: 0, end_ms: 60_000 }],
+        activeIntervals: [{ start_ms: 0, end_ms: 60_000 }],
+        contributingIntervals: [],
+        candidates: [candidate(
+          "R002",
+          entry.name,
+          bound,
+          [{ start_ms: 0, end_ms: 60_000 }],
+          entry.impact.upper_ms,
+          {
+            impact: entry.impact,
+            findingConfidence: entry.confidence,
+          },
+        )],
+      });
+      const withConfirmed = result as LedgerResult & {
+        highConfidenceLowerBoundIntervals?: Interval[];
+      };
+      assert.deepEqual(
+        withConfirmed.highConfidenceLowerBoundIntervals,
+        entry.expectedIntervals,
+      );
+      assert.equal(result.summary.estimated_floor_min, entry.expectedFloorMin);
+    });
+  }
+});
+
+test("confirmed lower-bound intervals clip, cap, union, and deduplicate deterministically", () => {
+  const first = candidate(
+    "R001",
+    "first",
+    "upper",
+    [
+      { start_ms: 0, end_ms: 15_000 },
+      { start_ms: 15_000, end_ms: 30_000 },
+      { start_ms: 5_000, end_ms: 25_000 },
+      { start_ms: 40_000, end_ms: 70_000 },
+      { start_ms: 40_000, end_ms: 70_000 },
+    ],
+    70_000,
+    {
+      impact: {
+        lower_ms: 35_000,
+        upper_ms: 70_000,
+        kind: "critical_path_latency",
+      },
+      intervalIds: ["same", "same", "nested", "tail", "tail"],
+    },
+  );
+  const second = candidate(
+    "R002",
+    "second",
+    "upper",
+    [{ start_ms: 50_000, end_ms: 100_000 }],
+    50_000,
+    {
+      impact: {
+        lower_ms: 30_000,
+        upper_ms: 50_000,
+        kind: "critical_path_latency",
+      },
+    },
+  );
+  const excludedOverlap = candidate(
+    "R003",
+    "excluded-overlap",
+    "point",
+    [{ start_ms: 10_000, end_ms: 90_000 }],
+    80_000,
+    {
+      findingConfidence: {
+        evidence: "high",
+        causal: "low",
+        source_completeness: 1,
+      },
+    },
+  );
+  const resourceOverlap = candidate(
+    "R005",
+    "resource-overlap",
+    "point",
+    [{ start_ms: 30_000, end_ms: 90_000 }],
+    60_000,
+  );
+  const input = {
+    rawIntervals: [{ start_ms: 0, end_ms: 100_000 }],
+    activeIntervals: [{ start_ms: 10_000, end_ms: 90_000 }],
+    contributingIntervals: [],
+    candidates: [first, second, excludedOverlap, resourceOverlap],
+  };
+  const forward = reconcileLedger(input) as LedgerResult & {
+    highConfidenceLowerBoundIntervals?: Interval[];
+  };
+  const reversed = reconcileLedger({
+    ...input,
+    candidates: [
+      resourceOverlap,
+      excludedOverlap,
+      { ...second, recoverable: {
+        ...second.recoverable,
+        intervals: [...second.recoverable.intervals].reverse(),
+      } },
+      { ...first, recoverable: {
+        ...first.recoverable,
+        intervals: [...first.recoverable.intervals].reverse(),
+      } },
+    ],
+  }) as LedgerResult & { highConfidenceLowerBoundIntervals?: Interval[] };
+
+  assert.deepEqual(forward.highConfidenceLowerBoundIntervals, [
+    { start_ms: 10_000, end_ms: 30_000 },
+    { start_ms: 40_000, end_ms: 80_000 },
+  ]);
+  assert.deepEqual(
+    reversed.highConfidenceLowerBoundIntervals,
+    forward.highConfidenceLowerBoundIntervals,
+  );
+  assert.equal(forward.summary.measured_min, 1.33);
+  assert.equal(forward.summary.estimated_floor_min, 0.33);
+  assert.equal(
+    reversed.summary.estimated_floor_min,
+    forward.summary.estimated_floor_min,
+  );
+});
+
+test("confirmed floor rounds once, clamps, and handles zero measured time", () => {
+  const rounded = reconcileLedger({
+    rawIntervals: [{ start_ms: 0, end_ms: 1_201 }],
+    activeIntervals: [{ start_ms: 0, end_ms: 1_201 }],
+    contributingIntervals: [],
+    candidates: [candidate(
+      "R008",
+      "rounded",
+      "upper",
+      [{ start_ms: 0, end_ms: 1_201 }],
+      1_201,
+      {
+        impact: {
+          lower_ms: 901,
+          upper_ms: 1_201,
+          kind: "critical_path_latency",
+        },
+      },
+    )],
+  }) as LedgerResult & { highConfidenceLowerBoundIntervals?: Interval[] };
+  assert.deepEqual(rounded.highConfidenceLowerBoundIntervals, [
+    { start_ms: 0, end_ms: 901 },
+  ]);
+  assert.equal(rounded.summary.measured_min, 0.02);
+  assert.equal(rounded.summary.estimated_floor_min, 0);
+
+  const evidenceLimited = reconcileLedger({
+    rawIntervals: [{ start_ms: 0, end_ms: 1_201 }],
+    activeIntervals: [{ start_ms: 0, end_ms: 1_201 }],
+    contributingIntervals: [],
+    candidates: [candidate(
+      "R001",
+      "evidence-limited",
+      "point",
+      [{ start_ms: 0, end_ms: 1_201 }],
+      2_000,
+    )],
+  }) as LedgerResult & { highConfidenceLowerBoundIntervals?: Interval[] };
+  assert.deepEqual(evidenceLimited.highConfidenceLowerBoundIntervals, [
+    { start_ms: 0, end_ms: 1_201 },
+  ]);
+  assert.equal(evidenceLimited.summary.estimated_floor_min, 0);
+
+  const zero = reconcileLedger({
+    rawIntervals: [],
+    activeIntervals: [],
+    contributingIntervals: [],
+    candidates: [candidate(
+      "R001",
+      "outside-zero",
+      "point",
+      [{ start_ms: 0, end_ms: 2_000 }],
+    )],
+  }) as LedgerResult & { highConfidenceLowerBoundIntervals?: Interval[] };
+  assert.deepEqual(zero.highConfidenceLowerBoundIntervals, []);
+  assert.equal(zero.summary.measured_min, 0);
+  assert.equal(zero.summary.estimated_floor_min, 0);
 });
