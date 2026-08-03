@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -83,6 +83,45 @@ async function resolveReflogFixture(options: {
   const context = await resolvePrContext({ cwd: "/repo", input: "7",
     runner: fixture.runner, nowMs: 1_000_000 });
   return { context, calls: fixture.calls, head };
+}
+
+async function withFakeWindowsTaskkill(
+  options: { delayMs: number; exitCode: number },
+  run: () => Promise<void>,
+): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-taskkill-"));
+  const taskkillPath = join(root, "taskkill");
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  const previousPath = process.env.PATH;
+  assert.ok(platformDescriptor?.configurable);
+  await writeFile(
+    taskkillPath,
+    [
+      "#!/usr/bin/env node",
+      'const pidIndex = process.argv.indexOf("/PID");',
+      "const pid = Number(process.argv[pidIndex + 1]);",
+      `setTimeout(() => {`,
+      `  if (${options.exitCode} === 0) {`,
+      '    try { process.kill(pid, "SIGKILL"); } catch {}',
+      "  }",
+      `  process.exit(${options.exitCode});`,
+      `}, ${options.delayMs});`,
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  Object.defineProperty(process, "platform", {
+    ...platformDescriptor,
+    value: "win32",
+  });
+  process.env.PATH = `${root}:${previousPath ?? ""}`;
+  try {
+    await run();
+  } finally {
+    Object.defineProperty(process, "platform", platformDescriptor);
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await rm(root, { recursive: true, force: true });
+  }
 }
 
 test("runCommand passes metacharacters literally, bounds output, and times out", async () => {
@@ -225,6 +264,38 @@ test("runCommand kills timed-out descendants when process-group termination is r
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("runCommand waits for delayed Windows taskkill completion", async () => {
+  await withFakeWindowsTaskkill({ delayMs: 250, exitCode: 0 }, async () => {
+    const startedAt = Date.now();
+    const result = await runCommand(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1_000)"],
+      { timeoutMs: 20, killProcessGroup: true },
+    );
+
+    assert.equal(result.code, 124);
+    assert.equal(result.timedOut, true);
+    assert.ok(
+      Date.now() - startedAt >= 225,
+      "timeout result settled before taskkill completed",
+    );
+  });
+});
+
+test("runCommand reports a delayed Windows taskkill failure before settling", async () => {
+  await withFakeWindowsTaskkill({ delayMs: 250, exitCode: 7 }, async () => {
+    const result = await runCommand(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1_000)"],
+      { timeoutMs: 20, killProcessGroup: true },
+    );
+
+    assert.equal(result.code, 124);
+    assert.equal(result.timedOut, true);
+    assert.match(result.stderr, /process termination failed: TASKKILL_7/u);
+  });
 });
 
 test("runCommand rejects a zero timeout instead of disabling its bound", async () => {

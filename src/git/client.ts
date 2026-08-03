@@ -3,6 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 export const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 export const DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const COMMAND_TIMEOUT_SETTLE_GRACE_MS = 100;
+const COMMAND_TERMINATION_GRACE_MS = 1_000;
 
 export interface CommandOptions {
   cwd?: string;
@@ -60,7 +61,7 @@ function killProcess(
   child: ChildProcess,
   processGroup: boolean,
   onFailure: (code: string) => void,
-): void {
+): Promise<void> {
   const pid = child.pid;
   if (!processGroup || pid === undefined) {
     try {
@@ -68,7 +69,7 @@ function killProcess(
     } catch (error) {
       onFailure(errorCode(error));
     }
-    return;
+    return Promise.resolve();
   }
   if (process.platform !== "win32") {
     try {
@@ -76,30 +77,68 @@ function killProcess(
     } catch (error) {
       onFailure(errorCode(error));
     }
-    return;
+    return Promise.resolve();
   }
 
-  const taskkill = spawn(
-    "taskkill",
-    ["/PID", String(pid), "/T", "/F"],
-    { shell: false, stdio: "ignore", windowsHide: true },
-  );
-  taskkill.once("error", (error) => {
+  const fallbackKill = (): void => {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // The process may already have exited while taskkill was running.
+    }
+  };
+  let taskkill: ChildProcess;
+  try {
+    taskkill = spawn(
+      "taskkill",
+      ["/PID", String(pid), "/T", "/F"],
+      { shell: false, stdio: "ignore", windowsHide: true },
+    );
+  } catch (error) {
     onFailure(errorCode(error));
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // The process may already have exited while taskkill was starting.
-    }
-  });
-  taskkill.once("close", (code) => {
-    if (code === 0) return;
-    onFailure(`TASKKILL_${code ?? "UNKNOWN"}`);
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // The process may already have exited after taskkill returned.
-    }
+    fallbackKill();
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    let completed = false;
+    let terminationTimer: ReturnType<typeof setTimeout> | undefined;
+    const complete = (): void => {
+      if (completed) return;
+      completed = true;
+      if (terminationTimer !== undefined) clearTimeout(terminationTimer);
+      taskkill.off("error", onTaskkillError);
+      taskkill.off("close", onTaskkillClose);
+      resolve();
+    };
+    const onTaskkillError = (error: Error): void => {
+      if (completed) return;
+      onFailure(errorCode(error));
+      fallbackKill();
+      complete();
+    };
+    const onTaskkillClose = (code: number | null): void => {
+      if (completed) return;
+      if (code !== 0) {
+        onFailure(`TASKKILL_${code ?? "UNKNOWN"}`);
+        fallbackKill();
+      }
+      complete();
+    };
+
+    taskkill.once("error", onTaskkillError);
+    taskkill.once("close", onTaskkillClose);
+    terminationTimer = setTimeout(() => {
+      if (completed) return;
+      onFailure("TASKKILL_TIMEOUT");
+      try {
+        taskkill.kill("SIGKILL");
+      } catch {
+        // A concurrently exiting taskkill process needs no further handling.
+      }
+      fallbackKill();
+      complete();
+    }, COMMAND_TERMINATION_GRACE_MS);
   });
 }
 
@@ -174,6 +213,8 @@ export const runCommand: CommandRunner = async (
     let timedOut = false;
     let stdinFailed = false;
     let settled = false;
+    let terminationPending = false;
+    let childEndedWhileTerminating = false;
     let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
     let hardSettleTimer: ReturnType<typeof setTimeout> | undefined;
     const readStdout = (chunk: Buffer): void => {
@@ -213,12 +254,20 @@ export const runCommand: CommandRunner = async (
     const onError = (error: Error): void => {
       captureChunk(stderr, Buffer.from(error.message), maxBytes);
       if (timedOut) {
-        forceFinish();
+        if (terminationPending) {
+          childEndedWhileTerminating = true;
+        } else {
+          forceFinish();
+        }
       } else {
         finish(127);
       }
     };
     const onClose = (code: number | null): void => {
+      if (timedOut && terminationPending) {
+        childEndedWhileTerminating = true;
+        return;
+      }
       finish(
         timedOut
           ? 124
@@ -251,16 +300,26 @@ export const runCommand: CommandRunner = async (
     }
     timeoutTimer = setTimeout(() => {
       timedOut = true;
-      killProcess(child, killProcessGroup, (code) => {
+      terminationPending = true;
+      void killProcess(child, killProcessGroup, (code) => {
         captureChunk(
           stderr,
           Buffer.from(`process termination failed: ${code}`),
           maxBytes,
         );
-      });
-      if (!settled) {
-        hardSettleTimer = setTimeout(forceFinish, COMMAND_TIMEOUT_SETTLE_GRACE_MS);
-      }
+      })
+        .then(() => {
+          terminationPending = false;
+          if (settled) return;
+          if (childEndedWhileTerminating) {
+            finish(124);
+            return;
+          }
+          hardSettleTimer = setTimeout(
+            forceFinish,
+            COMMAND_TIMEOUT_SETTLE_GRACE_MS,
+          );
+        });
     }, timeoutMs);
   });
 };
