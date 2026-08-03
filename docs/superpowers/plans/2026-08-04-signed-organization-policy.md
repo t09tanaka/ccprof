@@ -48,6 +48,32 @@ runner.
 - Repository config keeps its existing test-map API and safe-file guarantees.
 - CI strict remains strict; ungoverned output bytes do not change.
 
+## Baseline and semantic impact evidence
+
+An independent verifier established the clean `11a53b8` baseline before
+implementation: production build exit 0, typecheck exit 0, full suite 670/670,
+and TypeScript LanguageService analysis over 95 roots with zero diagnostics.
+
+LanguageService semantic references are:
+
+- `AnalyzeCommandDependencies`: 3 references;
+- `AnalyzeCommandOptions`: 3 references;
+- `StatsCommandDependencies`: 1 reference;
+- `StatsCommandOptions`: 3 references;
+- `runAnalyzeCommand`: 15 references;
+- `runStatsCommand`: 6 references;
+- `loadRepositoryConfig`: 11 references;
+- `PrivacyProfile`: 18 references;
+- `projectReportPrivacy`: 25 references;
+- `projectStatsPrivacy`: 9 references;
+- `requestAdvisory`: 6 references; and
+- `runCli`: 49 references.
+
+The result supports adding optional resolver seams only to the two dependency
+interfaces. Options, command functions, privacy/advisory APIs, and the existing
+`loadRepositoryConfig` wrapper remain unchanged; repository policy receives a
+new separate loader.
+
 ### Task 1: Lock the signed policy and precedence contracts
 
 **Files:**
@@ -154,7 +180,7 @@ Run the two focused tests and semantic diagnostics. Commit as
 - Modify: `src/commands/stats.ts`
 - Modify: `test/organization-policy.test.ts`
 
-- [ ] **Step 1: Inspect shared signatures semantically**
+- [x] **Step 1: Inspect shared signatures semantically**
 
 Before edits, delegate TypeScript LanguageService reference discovery for
 `AnalyzeCommandDependencies`, `AnalyzeCommandOptions`,
