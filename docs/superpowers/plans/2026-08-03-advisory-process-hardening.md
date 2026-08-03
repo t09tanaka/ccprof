@@ -225,8 +225,8 @@ Push `feature/advisory-process-hardening` and create a non-draft PR to `main` wi
 
 - [ ] **Step 3: Run PR completion semantics**
 
-Run `ccprof --pr --json` when available, address only `scope: this_pr`, monitor all GitHub checks, then perform independent spec-compliance review followed by code-quality review. Fix Critical/Important in-scope findings in new commits, re-run delegated local verification, push, and repeat both reviews until approved.
+Run `ccprof --pr --json` when available, address only `scope: this_pr`, and monitor all GitHub checks. The final implementation commit must already have independent spec-compliance and code-quality approvals; if this step changes implementation, re-run delegated local verification and both reviews before merging.
 
-- [ ] **Step 4: Clean up the worktree**
+- [ ] **Step 4: Merge and clean up the worktree**
 
-After remote CI is green and both reviews approve, verify a clean worktree, zero unpushed commits, and an existing PR; remove `.worktrees/advisory-process-hardening` and delete only the local `feature/advisory-process-hardening` branch. Leave the remote branch and PR untouched for user merge with **Create a merge commit**.
+After remote CI is green and both reviews approve, merge the PR with **Create a merge commit**, synchronize the main checkout, then verify a clean worktree and zero unpushed commits. Remove `.worktrees/advisory-process-hardening` and delete only the local `feature/advisory-process-hardening` branch.
