@@ -82,13 +82,14 @@ export async function runStatsCommand(
   const repoRoot = await (
     dependencies.resolveRepoRoot ?? resolveCurrentRepoRoot
   )(options.cwd);
-  const effectivePolicy = await (
-    dependencies.resolvePolicy ?? resolveRepositoryPolicy
-  )(repoRoot, { privacy: options.privacy, advisory: false });
-  const privacy = effectivePolicy.privacy;
   const paths = await (
     dependencies.resolveStorePaths ?? resolveStorePaths
   )(repoRoot);
+  const policyRepoRoot = paths.canonical_repo;
+  const effectivePolicy = await (
+    dependencies.resolvePolicy ?? resolveRepositoryPolicy
+  )(policyRepoRoot, { privacy: options.privacy, advisory: false });
+  const privacy = effectivePolicy.privacy;
   const history = await (
     dependencies.loadAnalyses ?? loadAnalyses
   )(paths);
@@ -98,7 +99,7 @@ export async function runStatsCommand(
   const stats = projectStatsPrivacy(
     summarizeStats(history.records, adoptions.records),
     privacy,
-    repoRoot,
+    policyRepoRoot,
   );
   const warnings = [...history.warnings, ...adoptions.warnings].map(
     (warning) => ({
@@ -111,6 +112,6 @@ export async function runStatsCommand(
     stdout: options.json
       ? renderStatsJson(stats)
       : renderStatsTty(stats),
-    warnings: privacyWarningTexts(warnings, privacy, repoRoot),
+    warnings: privacyWarningTexts(warnings, privacy, policyRepoRoot),
   };
 }
