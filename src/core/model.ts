@@ -316,24 +316,23 @@ export interface Finding extends FindingMetadata {
 
 export function hasValidFindingCompatibilityMetadata(value: unknown): boolean {
   if (value === null || typeof value !== "object") return false;
-  const hasVersion = Object.hasOwn(value, "rule_version");
-  const hasEpoch = Object.hasOwn(value, "compatibility_epoch");
-  if (hasVersion !== hasEpoch) return false;
-  if (!hasVersion) return true;
-  const metadata = value as {
-    rule_version?: unknown;
-    compatibility_epoch?: unknown;
-  };
+  const versionDescriptor = Object.getOwnPropertyDescriptor(value, "rule_version");
+  const epochDescriptor = Object.getOwnPropertyDescriptor(value, "compatibility_epoch");
+  if ((versionDescriptor === undefined) !== (epochDescriptor === undefined)) return false;
+  if (versionDescriptor === undefined || epochDescriptor === undefined) return true;
+  if (!("value" in versionDescriptor) || !("value" in epochDescriptor)) return false;
+  const ruleVersion = versionDescriptor.value;
+  const compatibilityEpoch = epochDescriptor.value;
   if (
-    typeof metadata.rule_version !== "string" ||
-    typeof metadata.compatibility_epoch !== "number" ||
-    !Number.isSafeInteger(metadata.compatibility_epoch) ||
-    metadata.compatibility_epoch <= 0
+    typeof ruleVersion !== "string" ||
+    typeof compatibilityEpoch !== "number" ||
+    !Number.isSafeInteger(compatibilityEpoch) ||
+    compatibilityEpoch <= 0
   ) return false;
   const match = /^([1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u
-    .exec(metadata.rule_version);
-  return match !== null && match[0] === metadata.rule_version &&
-    match[1] === String(metadata.compatibility_epoch);
+    .exec(ruleVersion);
+  return match !== null && match[0] === ruleVersion &&
+    match[1] === String(compatibilityEpoch);
 }
 
 export interface BaselineNotable {
