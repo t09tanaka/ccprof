@@ -263,6 +263,7 @@ test("data gc applies retention boundaries, reachability, and legacy cleanup", a
           "legacy-analyses-json-v1",
           "legacy-dismissals-json-v1",
           SOURCE_CATALOG_MIGRATION,
+          "schema-v4-analysis-budgets",
         ],
       );
     } finally {
