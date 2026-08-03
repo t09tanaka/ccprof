@@ -26,7 +26,8 @@ interface SourceDescriptor {
 ```
 
 - `source_instance_id` is `source-<sha256>` over a domain-separated adapter ID
-  and NFC-normalized `Session.source_path`; raw paths never enter the descriptor.
+  and NFC-normalized `Session.session_id`; raw session IDs and paths never enter
+  the descriptor. Logical sessions stay stable across linked-worktree copies.
 - `canonical_fingerprint` is `sha256:<hex>` over a domain-separated canonical
   tuple of the other nine fields.
 - Built-in registry entries are `claude@1.0.0` and `codex@1.0.0`. Both require
@@ -52,28 +53,28 @@ interface SourceDescriptor {
 
 ## Task 1 — Descriptor contract and validation
 
-- [ ] Add focused RED tests for deterministic/order-independent derivation,
+- [x] Add focused RED tests for deterministic/order-independent derivation,
   Claude/Codex registry data, adapter separation, Unicode/NUL/path/token canaries,
   strict unknown-field/version/adapter/metadata/fingerprint validation, and
   duplicate descriptors.
-- [ ] Implement `src/core/source-descriptor.ts` with canonical hashing, registry,
+- [x] Implement `src/core/source-descriptor.ts` with canonical hashing, registry,
   strict single/list validators, stable content-free errors, and session-derived
   deduplicated descriptors.
-- [ ] Delegate focused verification and commit implementation/tests.
+- [x] Delegate focused verification and commit implementation/tests.
 
 ## Task 2 — Report and privacy integration
 
-- [ ] Add RED tests for optional `ReportV2.sources`, deterministic JSON, compact
+- [x] Add RED tests for optional `ReportV2.sources`, deterministic JSON, compact
   TTY/Markdown source summaries, all privacy profiles, and legacy reports with no
   `sources` field.
-- [ ] Populate descriptors in `analyze()`, copy them deterministically in JSON,
+- [x] Populate descriptors in `analyze()`, copy them deterministically in JSON,
   render opaque adapter/version/count summaries in TTY and Markdown, and clone
   them unchanged through strict/balanced privacy projection.
-- [ ] Delegate focused verification and commit report integration/tests.
+- [x] Delegate focused verification and commit report integration/tests.
 
 ## Task 3 — Documentation and completion gates
 
-- [ ] Document the exact descriptor shape, opaque identity/fingerprint domains,
+- [x] Document the exact descriptor shape, opaque identity/fingerprint domains,
   built-in registry versions, validation behavior, privacy handling, and scope in
   README; mark this plan complete.
 - [ ] Delegate full `npm run check` and applicable local GitHub Actions commands.
