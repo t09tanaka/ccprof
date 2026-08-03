@@ -23,10 +23,14 @@ import type {
   AnalysisSummary,
   CommandIdentity,
   Finding,
+  FindingConfidence,
+  ImpactEstimate,
+  ReportV2,
 } from "../src/core/model.js";
 import type { AnalysisBudgetResult } from "../src/analysis/budgets.js";
 import { commandIdentityKey } from "../src/analysis/command-identity.js";
 import { detectChronicCost } from "../src/rules/chronic-cost.js";
+import { projectReportPrivacy } from "../src/reporters/privacy.js";
 import { findingKey } from "../src/rules/shared.js";
 import {
   loadAdoptions,
@@ -34,6 +38,7 @@ import {
   type AdoptionRecord,
 } from "../src/store/adoptions.js";
 import {
+  analysisDigest,
   computeBaseline,
   loadAnalyses,
   makeAnalysisRecord,
@@ -87,6 +92,7 @@ function finding(
   command = "npm test",
   recoverableMin = 10,
 ): Finding {
+  const impactMs = recoverableMin * 60_000;
   return {
     finding_key: key,
     rule_id: "R002",
@@ -95,6 +101,18 @@ function finding(
     cause: null,
     scope: "this_pr",
     confidence: "high",
+    impact: {
+      lower_ms: impactMs,
+      upper_ms: impactMs,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "high",
+      source_completeness: 1,
+    },
+    severity: impactMs === 0 ? "info" : "high",
+    scoring_rationale: impactMs === 0 ? [] : ["observed_lower_bound"],
     evidence: {
       session_refs: [`session#${key}`],
       interval_ids: [`R002:${key}`],
@@ -107,6 +125,33 @@ function finding(
       verify: command,
     },
     caveats: [],
+  };
+}
+
+function legacyFinding(
+  key: string,
+  options: {
+    ruleId?: Finding["rule_id"];
+    confidence?: Finding["confidence"];
+    bound?: Finding["recoverable"]["bound"];
+    recoverableMin?: number;
+  } = {},
+): Finding {
+  const {
+    impact: _impact,
+    finding_confidence: _findingConfidence,
+    severity: _severity,
+    scoring_rationale: _scoringRationale,
+    ...legacy
+  } = finding(key, "npm test", options.recoverableMin ?? 10);
+  return {
+    ...legacy,
+    rule_id: options.ruleId ?? legacy.rule_id,
+    confidence: options.confidence ?? legacy.confidence,
+    recoverable: {
+      ...legacy.recoverable,
+      bound: options.bound ?? legacy.recoverable.bound,
+    },
   };
 }
 
@@ -2783,5 +2828,325 @@ test("loads a legacy analysis record without human_wait_min and no warnings", as
     assert.equal("command_identity" in loaded.records[0]!.command_costs[0]!, false);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("normalizes legacy finding bounds, domains, and confidence conservatively", () => {
+  const input = record("legacy-finding-contracts", 1);
+  const normalized = makeAnalysisRecord({
+    ...input,
+    findings: [
+      legacyFinding("legacy-point-high", {
+        confidence: "high",
+        bound: "point",
+        recoverableMin: 2,
+      }),
+      legacyFinding("legacy-upper-medium", {
+        ruleId: "R005",
+        confidence: "medium",
+        bound: "upper",
+        recoverableMin: 3,
+      }),
+      legacyFinding("legacy-upper-low", {
+        ruleId: "R006",
+        confidence: "low",
+        bound: "upper",
+        recoverableMin: 4,
+      }),
+    ],
+  });
+  const byKey = new Map(
+    normalized.findings.map((entry) => [entry.finding_key, entry]),
+  );
+
+  assert.deepEqual(byKey.get("legacy-point-high"), {
+    ...legacyFinding("legacy-point-high", {
+      confidence: "high",
+      bound: "point",
+      recoverableMin: 2,
+    }),
+    confidence: "medium",
+    impact: {
+      lower_ms: 0,
+      upper_ms: 120_000,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "medium",
+      source_completeness: 0.5,
+    },
+    severity: "medium",
+    scoring_rationale: [
+      "estimated_upper_only",
+      "partial_source",
+      "legacy_projection",
+    ],
+    recoverable: { min: 2, bound: "upper" },
+  });
+  assert.deepEqual(byKey.get("legacy-upper-medium")?.impact, {
+    lower_ms: 0,
+    upper_ms: 180_000,
+    kind: "resource_cost",
+  });
+  assert.deepEqual(byKey.get("legacy-upper-medium")?.finding_confidence, {
+    evidence: "medium",
+    causal: "medium",
+    source_completeness: 0.5,
+  });
+  assert.equal(byKey.get("legacy-upper-medium")?.confidence, "medium");
+  assert.equal(byKey.get("legacy-upper-medium")?.severity, "medium");
+  assert.deepEqual(byKey.get("legacy-upper-medium")?.scoring_rationale, [
+    "estimated_upper_only",
+    "resource_cost_only",
+    "partial_source",
+    "legacy_projection",
+  ]);
+  assert.deepEqual(byKey.get("legacy-upper-low")?.finding_confidence, {
+    evidence: "low",
+    causal: "low",
+    source_completeness: 0,
+  });
+  assert.equal(byKey.get("legacy-upper-low")?.confidence, "low");
+  assert.equal(byKey.get("legacy-upper-low")?.severity, "low");
+  assert.deepEqual(byKey.get("legacy-upper-low")?.scoring_rationale, [
+    "estimated_upper_only",
+    "resource_cost_only",
+    "partial_source",
+    "legacy_projection",
+  ]);
+});
+
+test("canonical finding snapshots derive v2 projections and stabilize nested key order", async () => {
+  const canonical = finding("canonical-range", "npm test", 2);
+  canonical.confidence = "low";
+  canonical.recoverable = { min: 999, bound: "point" };
+  canonical.impact = {
+    lower_ms: 60_000,
+    expected_ms: 90_000,
+    upper_ms: 120_000,
+    kind: "critical_path_latency",
+  };
+  canonical.finding_confidence = {
+    evidence: "high",
+    causal: "high",
+    source_completeness: 1,
+  };
+  canonical.severity = "high";
+  canonical.scoring_rationale = ["observed_lower_bound"];
+  const reordered = {
+    ...canonical,
+    impact: {
+      kind: "critical_path_latency",
+      upper_ms: 120_000,
+      expected_ms: 90_000,
+      lower_ms: 60_000,
+    },
+    finding_confidence: {
+      source_completeness: 1,
+      causal: "high",
+      evidence: "high",
+    },
+  } as Finding;
+  const { analysis_id: _id, ...base } = record("ignored", 10);
+  const first = makeAnalysisRecord({ ...base, findings: [canonical] });
+  const second = makeAnalysisRecord({ ...base, findings: [reordered] });
+
+  assert.equal(first.analysis_id, second.analysis_id);
+  assert.deepEqual(first.findings, second.findings);
+  assert.equal(first.findings[0]?.confidence, "high");
+  assert.deepEqual(first.findings[0]?.recoverable, {
+    min: 2,
+    bound: "upper",
+  });
+  assert.deepEqual(first.findings[0]?.impact, {
+    lower_ms: 60_000,
+    expected_ms: 90_000,
+    upper_ms: 120_000,
+    kind: "critical_path_latency",
+  });
+  canonical.impact.lower_ms = 0;
+  canonical.finding_confidence.evidence = "low";
+  assert.equal(first.findings[0]?.impact?.lower_ms, 60_000);
+  assert.equal(first.findings[0]?.finding_confidence?.evidence, "high");
+
+  await temporaryStore(async (paths) => {
+    assert.deepEqual((await saveAnalysis(paths, first)).warnings, []);
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded.warnings, []);
+    assert.deepEqual(loaded.records, [first]);
+  });
+});
+
+test("validates an existing snapshot digest before normalizing its legacy finding", async () => {
+  await temporaryStore(async (paths) => {
+    const legacy = {
+      ...record("legacy-snapshot-execution", 20),
+      findings: [legacyFinding("legacy-snapshot-finding", {
+        confidence: "high",
+        bound: "point",
+        recoverableMin: 2,
+      })],
+    };
+    const {
+      analysis_id: executionId,
+      created_at_ms: executedAtMs,
+      ...payload
+    } = legacy;
+    const envelope = {
+      schema_version: 1 as const,
+      identity: { mode: "content-fallback" as const },
+      payload,
+    };
+    const recordJson = canonicalJson(envelope);
+    const snapshotId = analysisDigest("analysis-snapshot-v1", envelope);
+    const database = openStoreDatabase(paths);
+    try {
+      database.prepare(`INSERT INTO analysis_snapshots
+        (snapshot_id, created_at_ms, record_json) VALUES (?, ?, ?)`)
+        .run(snapshotId, executedAtMs, recordJson);
+      database.prepare(`INSERT INTO analysis_executions
+        (execution_id, snapshot_id, executed_at_ms) VALUES (?, ?, ?)`)
+        .run(executionId, snapshotId, executedAtMs);
+    } finally {
+      database.close();
+    }
+
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded.warnings, []);
+    assert.equal(loaded.records[0]?.analysis_id, executionId);
+    assert.equal(
+      loaded.records[0]?.findings[0]?.finding_key,
+      "legacy-snapshot-finding",
+    );
+    assert.deepEqual(loaded.records[0]?.findings[0]?.impact, {
+      lower_ms: 0,
+      upper_ms: 120_000,
+      kind: "critical_path_latency",
+    });
+    assert.deepEqual(loaded.records[0]?.findings[0]?.recoverable, {
+      min: 2,
+      bound: "upper",
+    });
+  });
+});
+
+test("rejects hostile canonical finding shapes without invoking or disclosing them", () => {
+  const source = finding("hostile-canonical", "npm test", 2);
+  const canary = "ATTACKER_CANARY";
+  let getterCalled = false;
+  const accessorImpact = {
+    upper_ms: 120_000,
+    kind: "critical_path_latency",
+  } as unknown as ImpactEstimate;
+  Object.defineProperty(accessorImpact, "lower_ms", {
+    enumerable: true,
+    get() {
+      getterCalled = true;
+      throw new Error(canary);
+    },
+  });
+  const hiddenImpact: ImpactEstimate = {
+    lower_ms: 120_000,
+    upper_ms: 120_000,
+    kind: "critical_path_latency",
+  };
+  Object.defineProperty(hiddenImpact, canary, { value: 1, enumerable: false });
+  const throwingImpactTarget: ImpactEstimate = {
+    lower_ms: 120_000,
+    upper_ms: 120_000,
+    kind: "critical_path_latency",
+  };
+  const throwingImpact = new Proxy(throwingImpactTarget, {
+    ownKeys() {
+      throw new Error(canary);
+    },
+  });
+  const revocableTarget: ImpactEstimate = {
+    lower_ms: 120_000,
+    upper_ms: 120_000,
+    kind: "critical_path_latency",
+  };
+  const revocable = Proxy.revocable(revocableTarget, {});
+  revocable.revoke();
+  const hostileValues: Finding[] = [
+    { ...source, impact: {
+      lower_ms: 120_000,
+      upper_ms: 120_000,
+    } as unknown as ImpactEstimate },
+    { ...source, impact: {
+      ...source.impact!,
+      [canary]: true,
+    } as unknown as ImpactEstimate },
+    { ...source, impact: hiddenImpact },
+    { ...source, impact: accessorImpact },
+    { ...source, impact: Object.create({ inherited: canary }) as ImpactEstimate },
+    { ...source, impact: new Proxy(source.impact!, {}) },
+    { ...source, impact: throwingImpact },
+    { ...source, impact: revocable.proxy },
+    { ...source, finding_confidence: {
+      ...source.finding_confidence!,
+      [canary]: true,
+    } as unknown as FindingConfidence },
+    { ...source, finding_confidence: new Proxy(
+      source.finding_confidence!,
+      {},
+    ) },
+    { ...source, scoring_rationale: new Proxy(
+      source.scoring_rationale!,
+      {},
+    ) },
+  ];
+  const topLevelAccessor = { ...source };
+  Object.defineProperty(topLevelAccessor, "impact", {
+    enumerable: true,
+    get() {
+      getterCalled = true;
+      throw new Error(canary);
+    },
+  });
+  hostileValues.push(topLevelAccessor);
+
+  for (const hostile of hostileValues) {
+    assert.throws(
+      () => makeAnalysisRecord({
+        ...record("hostile-record", 30),
+        findings: [hostile],
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof TypeError);
+        assert.equal(error.message, "invalid finding");
+        assert.equal(error.message.includes(canary), false);
+        return true;
+      },
+    );
+  }
+  assert.equal(getterCalled, false);
+});
+
+test("privacy projections preserve canonical numeric and fixed finding fields", () => {
+  const canonical = finding("privacy-canonical", "npm test", 2);
+  const report: ReportV2 = {
+    version: 2,
+    unit: { repo: "/repo", pr_ref: "main...feature", sessions: ["s1"] },
+    summary,
+    findings: [canonical],
+    caveats: [],
+  };
+  for (const profile of ["strict", "balanced"] as const) {
+    const projected = projectReportPrivacy(report, profile).findings[0];
+    assert.deepEqual(projected?.impact, canonical.impact);
+    assert.deepEqual(
+      projected?.finding_confidence,
+      canonical.finding_confidence,
+    );
+    assert.equal(projected?.severity, canonical.severity);
+    assert.deepEqual(projected?.scoring_rationale, canonical.scoring_rationale);
+    assert.notEqual(projected?.impact, canonical.impact);
+    assert.notEqual(
+      projected?.finding_confidence,
+      canonical.finding_confidence,
+    );
+    assert.notEqual(projected?.scoring_rationale, canonical.scoring_rationale);
   }
 });

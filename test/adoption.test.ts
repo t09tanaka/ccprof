@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
+import type { AnalysisSummary, Finding } from "../src/core/model.js";
+
 import {
   detectability,
   detectAdoptions,
@@ -11,6 +13,7 @@ import {
   suggestionKeywords,
   type AdoptionCandidateFinding,
 } from "../src/analysis/adoption.js";
+import { makeAnalysisRecord } from "../src/store/analyses.js";
 import {
   runCommand,
   type CommandOptions,
@@ -189,6 +192,50 @@ test("findingFingerprint treats a missing target as an empty string", () => {
     target: "",
   });
   assert.equal(withoutTarget, withEmptyTarget);
+});
+
+test("legacy finding normalization preserves adoption and compatibility identity", () => {
+  const legacy: Finding = {
+    finding_key: "stable-adoption-key",
+    rule_id: "R002",
+    rule_version: "1.0.0",
+    compatibility_epoch: 1,
+    title: "Repeated command",
+    target: "src/a.ts",
+    classification: "behavior",
+    cause: null,
+    scope: "claude_md",
+    confidence: "high",
+    evidence: { session_refs: ["s1#e1"], interval_ids: ["R002:e1"] },
+    recoverable: { min: 2, bound: "point" },
+    fix_recipe: {
+      suggestion: "Add the focused command to CLAUDE.md.",
+      verify: "npm test",
+    },
+    caveats: [],
+  };
+  const summary: AnalysisSummary = {
+    measured_min: 2,
+    idle_excluded_min: 0,
+    estimated_floor_min: 2,
+    recoverable_min: 0,
+    human_wait_min: 0,
+    unexplained_min: 2,
+    baseline: null,
+  };
+  const normalized = makeAnalysisRecord({
+    analysis_id: "identity-roundtrip",
+    created_at_ms: 1,
+    unit: { repo: "/repo", pr_ref: "main...feature", sessions: ["s1"] },
+    summary,
+    findings: [legacy],
+  }).findings[0];
+
+  assert.ok(normalized !== undefined);
+  assert.equal(normalized.finding_key, legacy.finding_key);
+  assert.equal(normalized.rule_version, legacy.rule_version);
+  assert.equal(normalized.compatibility_epoch, legacy.compatibility_epoch);
+  assert.equal(findingFingerprint(normalized), findingFingerprint(legacy));
 });
 
 // --- detectability --------------------------------------------------------
