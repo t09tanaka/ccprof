@@ -105,7 +105,7 @@ and 300 added implementation lines.
   amend; exclude worktree-only configuration.
 - [x] Run independent specification review, then independent code-quality
   review; fix only in-scope defects and re-review until approved.
-- [ ] Delegate the repository's local GitHub Actions equivalent, including
+- [x] Delegate the repository's local GitHub Actions equivalent, including
   typecheck, full tests, package smoke, determinism, and CodeQL build phase.
 - [ ] Push `feature/stats-privacy-projection` and open a PR against the default
   branch titled `[Privacy] feat: project stats through privacy profiles` with
