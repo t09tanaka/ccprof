@@ -295,7 +295,7 @@ time, but every finding produced by the analysis is written to the store.
     {
       "adapter_id": "claude",
       "adapter_version": "1.0.0",
-      "source_instance_id": "source-0000000000000000000000000000000000000000000000000000000000000000",
+      "source_instance_id": "source-0e596344ad7c80946741116ed2a54665d0a55027b6a78d6bfb4f1c9dd2872a6d",
       "source_kind": "claude_transcript_jsonl",
       "provided_capabilities": [
         "approvals",
@@ -309,7 +309,7 @@ time, but every finding produced by the analysis is written to the store.
       "provenance": "local_filesystem",
       "sensitivity": "sensitive",
       "retention_class": "raw_evidence",
-      "canonical_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      "canonical_fingerprint": "sha256:d2a320e97e2dd44189283e8d839c346dbcadac97eb0100200e27e23bafe24278"
     }
   ],
   "summary": {

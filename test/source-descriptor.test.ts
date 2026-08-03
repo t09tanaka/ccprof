@@ -95,16 +95,19 @@ test("source descriptors use the exact built-in contract and sorted capabilities
 
 test("derivation is deterministic, order independent, deduplicated, and adapter separated", () => {
   const path = "/private/logs/café.jsonl";
-  const decomposed = path.normalize("NFD");
+  const logicalSession = "session-café";
   const first = session({
+    sessionId: logicalSession,
     sourcePath: path,
     capabilities: ["token_usage", "edit_fragments", "token_usage"],
   });
   const equivalent = session({
-    sourcePath: decomposed,
+    sessionId: logicalSession.normalize("NFD"),
+    sourcePath: "/a/different/worktree/session.jsonl",
     capabilities: ["edit_fragments", "token_usage"],
   });
   const codex = session({
+    sessionId: logicalSession,
     source: "codex",
     sourcePath: path,
     capabilities: ["edit_fragments", "tool_timestamps"],
@@ -130,20 +133,34 @@ test("derivation is deterministic, order independent, deduplicated, and adapter 
 });
 
 test("opaque descriptor values never contain path, Unicode, transcript, or token canaries", () => {
+  const sessionCanary = "SESSION_ID_CANARY";
   const canaries = [
     "PRIVATE_PATH_CANARY",
     "秘密の会話",
     "ghp_SOURCE_DESCRIPTOR_TOKEN_12345678",
-    "SESSION_ID_CANARY",
+    sessionCanary,
   ];
   const descriptor = deriveSourceDescriptor(session({
-    sessionId: `session-${canaries[3]}`,
+    sessionId: `session-${sessionCanary}`,
     sourcePath: `/Users/alice/${canaries.join("/")}.jsonl`,
   }));
   const encoded = JSON.stringify(descriptor);
   for (const canary of canaries) {
     assert.doesNotMatch(encoded, new RegExp(canary, "u"));
   }
+});
+
+test("derivation rejects NUL-bearing session and source identities without echoing them", () => {
+  assertContentFreeError(
+    () => deriveSourceDescriptor(session({ sessionId: "SESSION\0CANARY" })),
+    "invalid_field",
+    ["SESSION", "CANARY"],
+  );
+  assertContentFreeError(
+    () => deriveSourceDescriptor(session({ sourcePath: "/PATH\0CANARY" })),
+    "invalid_field",
+    ["PATH", "CANARY"],
+  );
 });
 
 test("strict validation accepts only canonical registered descriptors", () => {
