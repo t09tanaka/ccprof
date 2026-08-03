@@ -13,6 +13,10 @@ export interface SessionSource {
   discover(query: SessionQuery): Promise<Session[]>;
 }
 
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 export function admitSessionEventPrefix(
   sessions: readonly Session[],
   meter: AnalysisBudgetMeter,
@@ -21,14 +25,23 @@ export function admitSessionEventPrefix(
     session.events.map((event, eventIndex) => ({
       event,
       eventIndex,
+      session,
       sessionIndex,
     }))
   ).sort((left, right) =>
     left.event.source_index - right.event.source_index ||
+    compareCodeUnits(left.session.source_path, right.session.source_path) ||
+    compareCodeUnits(left.session.source, right.session.source) ||
+    compareCodeUnits(left.event.session_id, right.event.session_id) ||
+    compareCodeUnits(left.event.agent_id, right.event.agent_id) ||
+    compareCodeUnits(left.event.session_ref, right.event.session_ref) ||
+    compareCodeUnits(left.event.entry_uuid, right.event.entry_uuid) ||
+    compareCodeUnits(left.event.kind, right.event.kind) ||
     left.sessionIndex - right.sessionIndex ||
     left.eventIndex - right.eventIndex
   );
   const admittedCount = meter.admitInputEvents(physicalOrder.length);
+  const truncated = admittedCount < physicalOrder.length;
   const admittedBySession = new Map<number, Session["events"]>();
   for (const { event, sessionIndex } of physicalOrder.slice(0, admittedCount)) {
     const events = admittedBySession.get(sessionIndex);
@@ -38,12 +51,50 @@ export function admitSessionEventPrefix(
   return sessions.flatMap((session, sessionIndex) => {
     const events = admittedBySession.get(sessionIndex);
     if (events === undefined || events.length === 0) return [];
-    const timestamps = events.map(({ timestamp_ms }) => timestamp_ms);
+    let startedAtMs = events[0]!.timestamp_ms;
+    let endedAtMs = startedAtMs;
+    for (const { timestamp_ms: timestampMs } of events) {
+      if (timestampMs < startedAtMs) startedAtMs = timestampMs;
+      if (timestampMs > endedAtMs) endedAtMs = timestampMs;
+    }
+    const admittedSessionRefs = new Set(
+      events.map(({ session_ref }) => session_ref),
+    );
+    const lastSourceIndex = events.reduce(
+      (last, { source_index }) => Math.max(last, source_index),
+      -1,
+    );
+    const lastSourceLine =
+      lastSourceIndex + (session.source === "claude" ? 1 : 0);
+    const observedCwds = [...new Set(events.flatMap((event) =>
+      event.kind === "tool_use" && event.cwd !== undefined && event.cwd !== ""
+        ? [event.cwd]
+        : []
+    ))];
+    const observedBranches = [...new Set(events.flatMap(({ branch }) =>
+      branch === undefined ? [] : [branch]
+    ))];
+    const warnings = session.warnings.filter((warning) => {
+      if (!truncated) return true;
+      if (warning.session_ref !== undefined) {
+        return admittedSessionRefs.has(warning.session_ref);
+      }
+      return warning.line !== undefined && warning.line <= lastSourceLine;
+    });
+    const baseSession = (() => {
+      if (!truncated) return session;
+      const { verified_ended_at_ms: _verifiedEndedAtMs, ...rest } = session;
+      return rest;
+    })();
     return [{
-      ...session,
+      ...baseSession,
+      ...(truncated
+        ? { observed_cwds: observedCwds, observed_branches: observedBranches }
+        : {}),
       events,
-      started_at_ms: Math.min(...timestamps),
-      ended_at_ms: Math.max(...timestamps),
+      started_at_ms: startedAtMs,
+      ended_at_ms: endedAtMs,
+      warnings,
     }];
   });
 }

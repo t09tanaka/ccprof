@@ -371,17 +371,31 @@ function orderedEvents(sessions: readonly Session[]): NormalizedEvent[] {
     );
 }
 
+function compareBudgetCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function backstopBudgetedSessions(
   sessions: readonly Session[],
   meter: AnalysisBudgetMeter,
 ): Session[] {
   const admitted: Session[] = [];
-  const ordered = [...sessions].sort(
+  const ordered = sessions.map((session, inputIndex) => ({
+    inputIndex,
+    session,
+  })).sort(
     (left, right) =>
-      left.source_path.localeCompare(right.source_path) ||
-      left.source.localeCompare(right.source) ||
-      left.session_id.localeCompare(right.session_id),
-  );
+      compareBudgetCodeUnits(
+        left.session.source_path,
+        right.session.source_path,
+      ) ||
+      compareBudgetCodeUnits(left.session.source, right.session.source) ||
+      compareBudgetCodeUnits(
+        left.session.session_id,
+        right.session.session_id,
+      ) ||
+      left.inputIndex - right.inputIndex,
+  ).map(({ session }) => session);
   const sessionsBySourcePath = new Map<string, Session[]>();
   for (const session of ordered) {
     const group = sessionsBySourcePath.get(session.source_path);

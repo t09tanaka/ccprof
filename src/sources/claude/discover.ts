@@ -412,6 +412,7 @@ export async function discoverClaudeSessions(
       continue;
     }
     parsedPaths.add(file);
+    if (meter !== undefined && !meter.admitSourceItem()) break;
     // A transcript's mtime is at or after its last event, so a file last
     // written before the query window opened cannot intersect it. Skipping
     // those files avoids parsing every historical transcript on each run.
@@ -432,7 +433,6 @@ export async function discoverClaudeSessions(
     let admittedFileBytes: number | undefined;
     if (meter !== undefined) {
       if (!meter.checkpoint()) break;
-      if (!meter.admitSourceItem()) break;
       if (
         fileSize === undefined ||
         !Number.isSafeInteger(fileSize) ||
