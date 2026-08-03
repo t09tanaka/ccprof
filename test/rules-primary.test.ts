@@ -280,11 +280,11 @@ async function makeReadRepository(root: string): Promise<string> {
   ]);
   await writeReadTestFile(join(repo, "package.json"), "{\"private\":true}\n");
   await writeReadTestFile(
-    join(repo, "src/ value.ts "),
+    join(repo, "src/value name.ts"),
     "export const rootValue = 1;\n",
   );
   await writeReadTestFile(
-    join(repo, "pkg/src/ value.ts "),
+    join(repo, "pkg/src/value name.ts"),
     "export const nestedValue = 1;\n",
   );
   await gitForReadTest(repo, ["add", "."]);
@@ -299,7 +299,7 @@ async function makeReadRepository(root: string): Promise<string> {
   await gitForReadTest(repo, ["switch", "main"]);
   await gitForReadTest(repo, ["switch", "-c", "feature-c"]);
   await writeReadTestFile(
-    join(repo, "pkg/src/ value.ts "),
+    join(repo, "pkg/src/value name.ts"),
     "export const nestedValue = 2;\n",
   );
   await gitForReadTest(repo, ["add", "."]);
@@ -307,7 +307,7 @@ async function makeReadRepository(root: string): Promise<string> {
   await gitForReadTest(repo, ["switch", "main"]);
   await gitForReadTest(repo, ["switch", "-c", "feature-g"]);
   await writeReadTestFile(
-    join(repo, "pkg/src/ value.ts "),
+    join(repo, "pkg/src/value name.ts"),
     "export const nestedValue = 2;\n",
   );
   await gitForReadTest(repo, ["add", "."]);
@@ -322,8 +322,8 @@ function readSession(
 ): Session {
   const absoluteRead = sessionId === "read-b";
   const rawPath = absoluteRead
-    ? join(repo, "pkg/src/ value.ts ")
-    : "src/ value.ts ";
+    ? join(repo, "pkg/src/value name.ts")
+    : "src/value name.ts";
   const cwd = absoluteRead ? undefined : join(repo, "pkg");
   const eventBase = {
     session_id: sessionId,
@@ -416,8 +416,8 @@ function readThenEditSession(
       {
         ...use("edit-use", ANALYZE_NOW_MS - 220_000, 2, "edit"),
         tool_name: "Edit",
-        input: { file_path: "src/ value.ts " },
-        paths: ["src/ value.ts "],
+        input: { file_path: "src/value name.ts" },
+        paths: ["src/value name.ts"],
         edit_fragments: ["export const nestedValue = 2;"],
       },
       result("edit-result", ANALYZE_NOW_MS - 180_000, 3, "edit"),
@@ -1609,10 +1609,10 @@ test("analyze stores frozen-head reads, caps session confidence, and omits unver
     const first = await analyzeBranch("feature-a", "read-a", "high");
     const blobOid = await gitForReadTest(repo, [
       "rev-parse",
-      "feature-a:pkg/src/ value.ts ",
+      "feature-a:pkg/src/value name.ts",
     ]);
     assert.deepEqual(first.record.read_observations, [{
-      path: "pkg/src/ value.ts ",
+      path: "pkg/src/value name.ts",
       object_id: blobOid,
       duration_min: 1,
       session_refs: ["read-a#result", "read-a#use"],
@@ -1620,7 +1620,7 @@ test("analyze stores frozen-head reads, caps session confidence, and omits unver
     }]);
     assert.equal(
       first.record.read_observations?.some(
-        ({ path }) => path === "src/ value.ts ",
+        ({ path }) => path === "src/value name.ts",
       ),
       false,
     );
@@ -1652,10 +1652,10 @@ test("analyze stores frozen-head reads, caps session confidence, and omits unver
       },
     });
     assert.deepEqual(edited.record.read_observations, [{
-      path: "pkg/src/ value.ts ",
+      path: "pkg/src/value name.ts",
       object_id: await gitForReadTest(repo, [
         "rev-parse",
-        "feature-g:pkg/src/ value.ts ",
+        "feature-g:pkg/src/value name.ts",
       ]),
       duration_min: 1,
       session_refs: ["edited#post-result", "edited#post-use"],
@@ -1689,7 +1689,7 @@ test("analyze stores frozen-head reads, caps session confidence, and omits unver
       if (command === "git" && args.includes("ls-tree")) {
         return {
           code: 0,
-          stdout: "100644 blob truncated\tpkg/src/ value.ts \0",
+          stdout: "100644 blob truncated\tpkg/src/value name.ts\0",
           stderr: "",
         };
       }
@@ -1716,7 +1716,7 @@ test("analyze stores frozen-head reads, caps session confidence, and omits unver
       if (command === "git" && args.includes("ls-tree")) {
         return {
           code: 0,
-          stdout: `120000 blob ${blobOid}\tpkg/src/ value.ts \0`,
+          stdout: `120000 blob ${blobOid}\tpkg/src/value name.ts\0`,
           stderr: "",
         };
       }
