@@ -2,7 +2,14 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 
-import { ALL_SESSION_CAPABILITIES } from "../src/core/model.js";
+import {
+  ALL_SESSION_CAPABILITIES,
+  type Finding,
+  type ReportV2,
+  type RuleId,
+} from "../src/core/model.js";
+import { renderJsonReport } from "../src/reporters/json.js";
+import { projectReportPrivacy } from "../src/reporters/privacy.js";
 import { RULE_REQUIRED_CAPABILITIES } from "../src/rules/capabilities.js";
 import {
   listRuleManifests,
@@ -10,11 +17,14 @@ import {
   RuleManifestValidationError,
   type RuleManifest,
   validateRuleManifestCatalog,
+  withRuleManifest,
 } from "../src/rules/manifest.js";
 import {
   findingKey,
   findingKeyForCompatibility,
 } from "../src/rules/shared.js";
+import { analysisDigest, makeAnalysisRecord } from "../src/store/analyses.js";
+import { applyDismissals } from "../src/store/dismissals.js";
 
 const SOURCES = ["claude", "codex"] as const;
 
@@ -167,6 +177,44 @@ function manifestError(
   );
 }
 
+function finding(ruleId: RuleId = "R001", target = "npm test"): Finding {
+  return {
+    finding_key: findingKey(ruleId, target),
+    rule_id: ruleId,
+    title: "Repeated test command",
+    target,
+    classification: "behavior",
+    cause: null,
+    scope: "this_pr",
+    confidence: "high",
+    evidence: {
+      session_refs: ["session-private"],
+      interval_ids: ["interval-private"],
+    },
+    recoverable: { min: 1, bound: "point" },
+    fix_recipe: { suggestion: "Run the focused test", verify: "npm test" },
+    caveats: [],
+  };
+}
+
+function reportWith(oneFinding: Finding): ReportV2 {
+  return {
+    version: 2,
+    unit: { repo: "/private/repository", pr_ref: "feature/private", sessions: ["session-private"] },
+    summary: {
+      measured_min: 1,
+      idle_excluded_min: 0,
+      estimated_floor_min: 1,
+      recoverable_min: 1,
+      human_wait_min: 0,
+      unexplained_min: 0,
+      baseline: null,
+    },
+    findings: [oneFinding],
+    caveats: [],
+  };
+}
+
 test("the built-in manifest registers the exact R001-R008 contracts", () => {
   const manifests = listRuleManifests();
   assert.deepEqual(manifests, EXPECTED);
@@ -290,6 +338,108 @@ test("epoch one preserves legacy finding keys while later epochs isolate series"
   assert.throws(
     () => findingKeyForCompatibility("R002", target, 0),
     /compatibility epoch must be a positive safe integer/u,
+  );
+});
+
+test("new findings publish manifest compatibility metadata without mutating inputs", () => {
+  for (const manifest of EXPECTED) {
+    const input = finding(manifest.id);
+    const before = structuredClone(input);
+    const decorated = withRuleManifest(input);
+
+    assert.notEqual(decorated, input);
+    assert.deepEqual(input, before);
+    assert.equal(decorated.rule_version, manifest.version);
+    assert.equal(decorated.compatibility_epoch, manifest.compatibility_epoch);
+  }
+});
+
+test("Store records preserve new metadata and legacy findings remain readable", () => {
+  const legacy = finding("R002");
+  const decorated = withRuleManifest(finding("R001"));
+  const common = {
+    created_at_ms: 1,
+    unit: { repo: "repo-id", pr_ref: "pr-ref", sessions: ["session-id"] },
+    summary: reportWith(legacy).summary,
+  };
+  const current = makeAnalysisRecord({ ...common, findings: [decorated] });
+  const old = makeAnalysisRecord({ ...common, findings: [legacy] });
+
+  assert.equal(current.findings[0]?.rule_version, "1.0.0");
+  assert.equal(current.findings[0]?.compatibility_epoch, 1);
+  assert.deepEqual(old.findings[0], legacy);
+  assert.equal(Object.hasOwn(old.findings[0] ?? {}, "rule_version"), false);
+  assert.equal(Object.hasOwn(old.findings[0] ?? {}, "compatibility_epoch"), false);
+});
+
+test("Report v2 privacy keeps static metadata and never invents it for legacy findings", () => {
+  const legacyReport = reportWith(finding("R002"));
+  const legacyJson = JSON.parse(renderJsonReport(legacyReport)) as ReportV2;
+  for (const report of [
+    legacyJson,
+    projectReportPrivacy(legacyReport, "strict"),
+    projectReportPrivacy(legacyReport, "balanced"),
+  ]) {
+    assert.equal(Object.hasOwn(report.findings[0] ?? {}, "rule_version"), false);
+    assert.equal(Object.hasOwn(report.findings[0] ?? {}, "compatibility_epoch"), false);
+  }
+
+  const currentReport = reportWith(withRuleManifest(finding("R001")));
+  for (const profile of ["strict", "balanced"] as const) {
+    const projected = projectReportPrivacy(currentReport, profile);
+    assert.equal(projected.findings[0]?.rule_version, "1.0.0");
+    assert.equal(projected.findings[0]?.compatibility_epoch, 1);
+    assert.doesNotMatch(JSON.stringify(projected), /session-private|\/private\/repository/u);
+  }
+  assert.equal(projectReportPrivacy(currentReport, "raw"), currentReport);
+});
+
+test("a compatibility epoch change isolates dismissal and adoption identities", () => {
+  const target = "npm test";
+  const epochOne = findingKeyForCompatibility("R002", target, 1);
+  const epochTwo = findingKeyForCompatibility("R002", target, 2);
+  const futureFinding: Finding = {
+    ...finding("R002", target),
+    finding_key: epochTwo,
+    rule_version: "2.0.0",
+    compatibility_epoch: 2,
+  };
+  const dismissal = {
+    schema_version: 1 as const,
+    finding_key: epochOne,
+    target,
+    dismissed_at_ms: 10,
+    strength_min: 1,
+  };
+
+  assert.deepEqual(applyDismissals([futureFinding], [dismissal], 11), {
+    findings: [futureFinding],
+    suppressed_keys: [],
+  });
+  assert.deepEqual(applyDismissals([
+    { ...futureFinding, finding_key: epochOne },
+  ], [dismissal], 11).suppressed_keys, [epochOne]);
+  assert.equal(new Set([epochOne, epochTwo]).size, 2);
+});
+
+test("the ordered manifest contract materially contributes to policy identity", () => {
+  const policy = {
+    fingerprint: "ccprof-rule-policy-2026-08-04-v2",
+    rule_coverage: [],
+    skipped_rules: [],
+    rule_manifest: listRuleManifests(),
+  };
+  const changed = structuredClone(policy);
+  changed.rule_manifest[0]!.version = "1.0.1";
+
+  assert.deepEqual(policy.rule_manifest.map(({ id }) => id), EXPECTED.map(({ id }) => id));
+  assert.equal(
+    analysisDigest("analysis-policy-v1", policy),
+    analysisDigest("analysis-policy-v1", structuredClone(policy)),
+  );
+  assert.notEqual(
+    analysisDigest("analysis-policy-v1", policy),
+    analysisDigest("analysis-policy-v1", changed),
   );
 });
 
