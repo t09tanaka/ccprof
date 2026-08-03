@@ -179,6 +179,18 @@ function projectedFinding(finding: Finding, profile: DisplayProfile,
     confidence: finding.confidence,
     evidence,
     recoverable: { ...finding.recoverable },
+    ...(finding.impact === undefined
+      ? {}
+      : { impact: { ...finding.impact } }),
+    ...(finding.finding_confidence === undefined
+      ? {}
+      : { finding_confidence: { ...finding.finding_confidence } }),
+    ...(finding.severity === undefined
+      ? {}
+      : { severity: finding.severity }),
+    ...(finding.scoring_rationale === undefined
+      ? {}
+      : { scoring_rationale: [...finding.scoring_rationale] }),
     fix_recipe: {
       suggestion: safeText(finding.fix_recipe.suggestion, profile, repoRoot, sessions, copies),
       verify: trustedVerificationCommand(finding) ?? REDACTED_COMMAND,
