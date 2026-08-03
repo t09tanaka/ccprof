@@ -44,19 +44,14 @@ import type {
   Session,
   SessionCapability,
 } from "../core/model.js";
+import { listRuleManifests } from "./manifest.js";
 
 export const RULE_REQUIRED_CAPABILITIES: Readonly<
   Record<RuleId, readonly SessionCapability[]>
-> = {
-  R001: ["edit_fragments"],
-  R002: [],
-  R003: [],
-  R004: [],
-  R005: ["tool_timestamps"],
-  R006: [],
-  R007: ["token_usage"],
-  R008: [],
-};
+> = Object.freeze(Object.fromEntries(listRuleManifests().map((manifest) => [
+  manifest.id,
+  Object.freeze([...manifest.required_capabilities]),
+]))) as Readonly<Record<RuleId, readonly SessionCapability[]>>;
 
 export interface RuleApplicability {
   rule_id: RuleId;

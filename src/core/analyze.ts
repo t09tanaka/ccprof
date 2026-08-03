@@ -91,6 +91,10 @@ import {
 import { detectRedundantRuns } from "../rules/redundant-runs.js";
 import { detectRework } from "../rules/rework.js";
 import { detectSerialSlack } from "../rules/serial-slack.js";
+import {
+  listRuleManifests,
+  withRuleManifest,
+} from "../rules/manifest.js";
 import { minimumConfidence } from "../rules/shared.js";
 import {
   ClaudeDiscoveryError,
@@ -1013,7 +1017,8 @@ function snapshotIdentity(paths: StorePaths, context: PrContext, window: Analysi
       }) }),
     policy_digest: analysisDigest("analysis-policy-v1", {
       fingerprint: "ccprof-rule-policy-2026-08-04-v2",
-      rule_coverage: coverage, skipped_rules: inapplicable }),
+      rule_coverage: coverage, skipped_rules: inapplicable,
+      rule_manifest: listRuleManifests() }),
     history_digest: analysisDigest("analysis-history-v1", sortedHistory),
   };
 }
@@ -1324,7 +1329,7 @@ export async function analyze(
   const ledger = baseline === null
     ? preliminaryLedger
     : reconcileLedger({ ...ledgerInput, baseline });
-  const allFindings = [...ledger.findings].sort(findingOrder);
+  const allFindings = ledger.findings.map(withRuleManifest).sort(findingOrder);
   const record = makeAnalysisRecord({
     created_at_ms: context.resolvedAtMs,
     unit,

@@ -11,6 +11,7 @@ import { dirname, join } from "node:path";
 import { normalizeCommand } from "../analysis/command.js";
 import { commandIdentityKey } from "../analysis/command-identity.js";
 import { normalizeRepoPath } from "../analysis/test-map.js";
+import { findingCompatibilityMetadata } from "../core/model.js";
 import type {
   AnalysisSummary,
   AnalysisUnit,
@@ -196,8 +197,75 @@ function isStoredFinding(value: unknown): value is Finding {
     fixRecipe.suggestion !== "" &&
     typeof fixRecipe.verify === "string" &&
     fixRecipe.verify !== "" &&
-    isStringArray(value.caveats)
+    isStringArray(value.caveats) &&
+    findingCompatibilityMetadata(value).valid
   );
+}
+
+function snapshotStoredFinding(value: Finding): Finding {
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const compatibilitySource: Record<string, unknown> = {};
+    for (const field of ["rule_version", "compatibility_epoch"] as const) {
+      const descriptor = descriptors[field];
+      if (descriptor !== undefined) {
+        Object.defineProperty(compatibilitySource, field, descriptor);
+      }
+    }
+    const compatibility = findingCompatibilityMetadata(compatibilitySource);
+    if (!compatibility.valid) throw new TypeError();
+    const read = (field: keyof Finding): unknown => {
+      const descriptor = descriptors[field] as PropertyDescriptor | undefined;
+      if (descriptor === undefined) return undefined;
+      return "value" in descriptor
+        ? descriptor.value
+        : descriptor.get?.call(value);
+    };
+    const snapshot = cloneJson({
+      finding_key: read("finding_key"),
+      rule_id: read("rule_id"),
+      title: read("title"),
+      target: read("target"),
+      classification: read("classification"),
+      cause: read("cause"),
+      scope: read("scope"),
+      confidence: read("confidence"),
+      evidence: read("evidence"),
+      recoverable: read("recoverable"),
+      fix_recipe: read("fix_recipe"),
+      caveats: read("caveats"),
+      ...(compatibility.metadata ?? {}),
+    });
+    if (!isStoredFinding(snapshot)) throw new TypeError();
+    return snapshot;
+  } catch {
+    throw new TypeError("invalid finding compatibility metadata");
+  }
+}
+
+function snapshotStoredFindings(values: readonly Finding[]): Finding[] {
+  try {
+    if (!Array.isArray(values)) throw new TypeError();
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(values, "length");
+    if (
+      lengthDescriptor === undefined ||
+      !("value" in lengthDescriptor) ||
+      !Number.isSafeInteger(lengthDescriptor.value) ||
+      lengthDescriptor.value < 0
+    ) throw new TypeError();
+    const snapshots: Finding[] = [];
+    for (let index = 0; index < lengthDescriptor.value; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(values, String(index));
+      if (descriptor === undefined) throw new TypeError();
+      const value = "value" in descriptor
+        ? descriptor.value
+        : descriptor.get?.call(values);
+      snapshots.push(snapshotStoredFinding(value as Finding));
+    }
+    return snapshots;
+  } catch {
+    throw new TypeError("invalid finding compatibility metadata");
+  }
 }
 
 function summaryMetrics(summary: AnalysisSummary): Record<string, number> {
@@ -353,6 +421,7 @@ export function makeAnalysisRecord(
   input: AnalysisRecordInput,
 ): AnalysisRecord {
   validateInput(input);
+  const findings = snapshotStoredFindings(input.findings);
   const metrics = {
     ...summaryMetrics(input.summary),
     ...Object.fromEntries(
@@ -362,7 +431,7 @@ export function makeAnalysisRecord(
     ),
   };
   const costs = normalizedCommandCosts(
-    input.command_costs ?? findingCommandCosts(input.findings),
+    input.command_costs ?? findingCommandCosts(findings),
   );
   const content = {
     schema_version: 1 as const,
@@ -373,7 +442,7 @@ export function makeAnalysisRecord(
       sessions: sortedUnique(input.unit.sessions),
     },
     summary: cloneJson(input.summary),
-    findings: cloneJson([...input.findings]),
+    findings,
     metrics,
     command_costs: costs,
     ...(input.read_observations === undefined ? {} :
@@ -498,7 +567,13 @@ export async function writeJsonAtomically(
 function asRecord(
   input: AnalysisRecord | AnalysisRecordInput,
 ): AnalysisRecord {
-  return isRecord(input) ? cloneJson(input) : makeAnalysisRecord(input);
+  try {
+    const record = makeAnalysisRecord(input);
+    if (!isRecord(record)) throw new TypeError();
+    return record;
+  } catch {
+    throw new TypeError("invalid analysis record");
+  }
 }
 
 type StoreDatabase = ReturnType<typeof openStoreDatabase>;
