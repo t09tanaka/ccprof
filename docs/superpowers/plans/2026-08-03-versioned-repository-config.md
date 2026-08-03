@@ -65,17 +65,17 @@ inspected before implementation:
 **Files:**
 - Modify: `test/command-and-matcher.test.ts`
 
-- [ ] Add a missing-config test expecting an empty map with no config schema
+- [x] Add a missing-config test expecting an empty map with no config schema
   version.
-- [ ] Add a valid v1 test that writes `.ccprof/config.json`, includes `$schema`,
+- [x] Add a valid v1 test that writes `.ccprof/config.json`, includes `$schema`,
   and verifies normalized paths/commands, `origin: "config"`, and schema version 1.
-- [ ] Add table-driven rejection tests for malformed JSON, version 2, unknown
+- [x] Add table-driven rejection tests for malformed JSON, version 2, unknown
   keys at all levels, wrong `$schema` type, traversal/absolute paths, and invalid
   commands.
-- [ ] Add symlink and non-regular-file rejection tests.
-- [ ] Add a packaged-schema test that checks its closed-object shape and the npm
+- [x] Add symlink and non-regular-file rejection tests.
+- [x] Add a packaged-schema test that checks its closed-object shape and the npm
   `files` allowlist.
-- [ ] Defer execution to the independent validator as explicitly required; the
+- [x] Defer execution to the independent validator as explicitly required; the
   expected initial failure is the missing repository-config module/schema.
 
 ### Task 2: Add config provenance and precedence RED tests
@@ -83,12 +83,12 @@ inspected before implementation:
 **Files:**
 - Modify: `test/command-and-matcher.test.ts`
 
-- [ ] Construct explicit, config, and manifest mappings for the same command with
+- [x] Construct explicit, config, and manifest mappings for the same command with
   disjoint source globs.
-- [ ] Assert explicit wins when present, config wins without explicit, and
+- [x] Assert explicit wins when present, config wins without explicit, and
   manifest wins without either higher origin.
-- [ ] Assert merge order and propagated config schema version are deterministic.
-- [ ] Defer the focused RED execution to the validator; expected failure is that
+- [x] Assert merge order and propagated config schema version are deterministic.
+- [x] Defer the focused RED execution to the validator; expected failure is that
   `config` is not a valid `TestMapOrigin` and no precedence tier exists.
 
 ### Task 3: Implement the strict config loader and published schema
@@ -98,16 +98,16 @@ inspected before implementation:
 - Create: `schemas/config.schema.json`
 - Modify: `package.json`
 
-- [ ] Add `RepositoryConfigError` and `loadRepositoryConfig(repoRoot)`.
-- [ ] Open only `<repoRoot>/.ccprof/config.json` with `O_RDONLY | O_NOFOLLOW`,
+- [x] Add `RepositoryConfigError` and `loadRepositoryConfig(repoRoot)`.
+- [x] Open only `<repoRoot>/.ccprof/config.json` with `O_RDONLY | O_NOFOLLOW`,
   verify `FileHandle.stat().isFile()`, read UTF-8, and close on every path.
-- [ ] Return an empty map only for `ENOENT`; convert all other I/O and validation
+- [x] Return an empty map only for `ENOENT`; convert all other I/O and validation
   failures to stable repository-relative errors.
-- [ ] Validate exact allowed keys and scalar/container types before passing the
+- [x] Validate exact allowed keys and scalar/container types before passing the
   test-map payload to the existing parser for path/glob/command normalization.
-- [ ] Add the draft-2020-12 JSON Schema with `const: 1`, closed objects, and the
+- [x] Add the draft-2020-12 JSON Schema with `const: 1`, closed objects, and the
   same array/string constraints as runtime validation.
-- [ ] Add `schemas` to package `files` without changing package version or lockfile
+- [x] Add `schemas` to package `files` without changing package version or lockfile
   metadata.
 
 ### Task 4: Implement origin precedence and config loading
@@ -116,16 +116,16 @@ inspected before implementation:
 - Modify: `src/analysis/test-map.ts`
 - Modify: `src/core/analyze.ts`
 
-- [ ] Extend `TestMapOrigin` with `config` and `TestMap` with optional
+- [x] Extend `TestMapOrigin` with `config` and `TestMap` with optional
   `config_schema_version: 1`.
-- [ ] Let the repository loader relabel normalized explicit mappings as config
+- [x] Let the repository loader relabel normalized explicit mappings as config
   mappings with a config-specific caveat.
-- [ ] Update `mergeTestMaps` to retain the single supported schema version.
-- [ ] Select applicable mappings by explicit/config/manifest precedence in
+- [x] Update `mergeTestMaps` to retain the single supported schema version.
+- [x] Select applicable mappings by explicit/config/manifest precedence in
   `evaluateTestRelevance`.
-- [ ] Load repository config alongside root manifests in `resolveTestMap`, always
+- [x] Load repository config alongside root manifests in `resolveTestMap`, always
   validate it, and merge CLI/injected, config, and manifest layers.
-- [ ] Add `repository_config_schema_version` to the existing config-digest input
+- [x] Add `repository_config_schema_version` to the existing config-digest input
   only when config exists; keep absent-config digest bytes unchanged.
 
 ### Task 5: Prove snapshot attribution
@@ -133,32 +133,43 @@ inspected before implementation:
 **Files:**
 - Modify: `test/analyze-integration.test.ts`
 
-- [ ] Analyze the same repository/session before and after adding a valid empty v1
+- [x] Analyze the same repository/session before and after adding a valid empty v1
   config, using the existing SQLite test store.
-- [ ] Read the canonical snapshot envelopes and assert their `config_digest`
+- [x] Read the canonical snapshot envelopes and assert their `config_digest`
   values differ while package/report/store versions remain untouched.
-- [ ] Defer RED/GREEN runs and the full suite to the independent validator.
+- [x] Defer RED/GREEN runs and the full suite to the independent validator.
 
 ### Task 6: Document the repository-owned contract
 
 **Files:**
 - Modify: `README.md`
 
-- [ ] Replace the external-only test-map section with automatic root manifests,
+- [x] Replace the external-only test-map section with automatic root manifests,
   `.ccprof/config.json` v1 example, strict failure behavior, precedence, schema
   location, and retained `--test-map` override.
-- [ ] State that nested workspace adapters are not yet inferred and require
+- [x] State that nested workspace adapters are not yet inferred and require
   explicit mappings until the follow-up PR.
-- [ ] Reassert package `0.2.0`, JSON Report v2, and Store schema v2 are unchanged.
+- [x] Reassert package `0.2.0`, JSON Report v2, and Store schema v2 are unchanged.
 
 ### Task 7: Delegated validation and handoff
 
-- [ ] Independent validator runs focused tests, typecheck, complete Node test
+- [x] Independent validator runs focused tests, typecheck, complete Node test
   suite, build, `git diff --check`, and package smoke showing the schema in the
   tarball.
-- [ ] Reassert no package/report/store version changes and no workspace adapter
+- [x] Reassert no package/report/store version changes and no workspace adapter
   implementation leaked into this PR.
-- [ ] Review changed-file count and production additions; stop and split if the
+- [x] Review changed-file count and production additions; stop and split if the
   approved budget is exceeded.
-- [ ] Only after validation, the root agent handles commit, push, PR, CI, review,
-  merge, and worktree cleanup through `worktree-pr-flow`.
+- [x] After validation, the root agent handled commit, push, PR creation, initial
+  CI, and review, and retained merge/cleanup responsibility through
+  `worktree-pr-flow`.
+
+## Validation
+
+- Official Node.js 20.20.2: `npm ci` completed with 0 vulnerabilities;
+  `CI=true npm run check` passed 549/549 tests; production build passed.
+- `npm pack` passed and the tarball includes
+  `package/schemas/config.schema.json`.
+- Package `0.2.0`, JSON Report v2, and Store schema v2 are unchanged.
+- Independent specification, security, and regression reviews are clean.
+- PR #45 initial CI passed all 7 visible checks and all 6 required checks.
