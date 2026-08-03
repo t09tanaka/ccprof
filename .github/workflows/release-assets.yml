@@ -67,7 +67,7 @@ jobs:
           SMOKE_REPO=$(mktemp -d)
           SMOKE_DATA=$(mktemp -d)
           git -C "$SMOKE_REPO" init
-          (cd "$SMOKE_REPO" && CCPROF_DATA_DIR="$SMOKE_DATA" ccprof stats --json)
+          (cd "$SMOKE_REPO" && CCPROF_DATA_DIR="$SMOKE_DATA" ccprof stats --privacy strict --json)
           npm sbom --omit=dev --sbom-format=spdx > "ccprof-$VERSION.spdx.json"
           RELEASE_DIR="$RUNNER_TEMP/release-assets"
           mkdir -p "$RELEASE_DIR"

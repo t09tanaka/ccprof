@@ -188,7 +188,7 @@ test("release assets workflow validates the release inputs and package smoke tes
     /\[ "\$\(ccprof --version\)" = "ccprof \$VERSION" \]/u,
   );
   assert.match(packageStep, /ccprof --help/u);
-  assert.match(packageStep, /ccprof stats --json/u);
+  assert.match(packageStep, /ccprof stats --privacy strict --json/u);
   const attestations = stepBlocks(workflow).filter((step) =>
     step.includes("actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d"),
   );
@@ -209,5 +209,19 @@ test("release assets workflow validates the release inputs and package smoke tes
   assert.match(
     workflow,
     /gh release upload "\$TAG"[^\n]*\$\{\{ steps\.package\.outputs\.tarball \}\}[^\n]*\$\{\{ steps\.package\.outputs\.sbom \}\}[^\n]*\$\{\{ steps\.package\.outputs\.checksums \}\}[^\n]*--clobber/u,
+  );
+});
+
+test("CI package smoke exercises strict stats privacy", async () => {
+  const workflow = await readProjectFile(".github/workflows/ci.yml");
+  const packageJob = blockBefore(
+    workflow,
+    "  package-smoke:",
+    "  determinism-golden:",
+  );
+
+  assert.match(
+    packageJob,
+    /ccprof" stats --privacy strict --json/u,
   );
 });

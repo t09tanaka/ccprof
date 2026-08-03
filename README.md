@@ -88,7 +88,7 @@ ccprof --pr [<number|url|base...head>] [--json|--md]
        [--idle-threshold <duration>] [--test-map <path>]
        [--since <RFC3339>] [--commit-lookback <duration>]
        [--privacy <strict|balanced|raw>] [--advisory]
-ccprof stats [--json]
+ccprof stats [--json] [--privacy <strict|balanced|raw>]
 ccprof explain <finding-key>
 ccprof dismiss <finding-key> [--reason <text>]
 ccprof hook-event [--notify]
@@ -113,7 +113,7 @@ There are three output formats.
 `--json` and `--md` cannot be combined. `--idle-threshold` accepts a bare number
 (minutes) or a duration suffixed with `s`, `m`, or `h`.
 
-Shared output is projected through a privacy profile before rendering. Local TTY
+Analysis output is projected through a privacy profile before rendering. Local TTY
 and JSON output default to `balanced`; Markdown defaults to `strict`, as does any
 format when CI is detected. An explicit `--privacy strict`, `balanced`, or `raw`
 overrides that default. See [Privacy and storage](#privacy-and-storage) before
@@ -207,7 +207,14 @@ under-reported.
 ```sh
 ccprof stats
 ccprof stats --json
+ccprof stats --privacy strict --json
 ```
+
+Local stats output defaults to `balanced`; an explicit local `--privacy`
+selection wins. Detected CI always enforces `strict` for stats, so
+`--privacy balanced` or `--privacy raw` cannot weaken shared-log protection.
+The projection is display-only and does not alter analysis history or adoption
+records in the Store.
 
 ### Dismissing a finding
 
@@ -538,9 +545,11 @@ display-only privacy profiles:
 | `balanced` | Local TTY and JSON inspection | Keeps useful repository-relative evidence and safe commands while redacting absolute paths, raw session identities, URLs, credentials, tokens, and secret-bearing text. |
 | `raw` | Explicit trusted local debugging only | Preserves the previous report and warning values (terminal-control sanitization still applies). Raw output can expose repository paths, session identifiers, commands, URLs, or secrets and must not be pasted into shared systems without review. |
 
-Local TTY/JSON defaults to `balanced`. Markdown and detected CI default to
-`strict`; an explicit `--privacy` value wins, including in CI. Projection never
-changes the deterministic raw report or the analysis record stored on disk.
+Local TTY/JSON defaults to `balanced`. Analysis Markdown and detected CI default
+to `strict`; an explicit analysis `--privacy` value wins, including in CI.
+Stats also defaults to `balanced` locally, but detected CI always enforces
+`strict` even when `balanced` or `raw` is requested. Projection never changes
+the deterministic raw report or the analysis record stored on disk.
 
 By default no LLM is contacted either. Only when `--advisory` is passed
 explicitly, the already projected display-report JSON is handed to the locally
