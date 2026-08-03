@@ -242,6 +242,57 @@ test("repository config schema publishes a closed optional policy section", asyn
   ]);
 });
 
+test("README documents the signed organization policy operator contract", async () => {
+  const readme = await readFile(resolve(process.cwd(), "README.md"), "utf8");
+
+  for (const setting of Object.values(ENVIRONMENT_KEYS)) {
+    assert.ok(readme.includes(setting), `README is missing ${setting}`);
+  }
+  for (const field of [
+    "policy_schema_version",
+    "organization",
+    "minimum_privacy",
+    "allow_raw",
+    "allow_advisory",
+    "allow_export",
+    "raw_retention_days_max",
+    "required_source_coverage",
+    "kill_switches",
+  ]) {
+    assert.ok(readme.includes(field), `README is missing ${field}`);
+  }
+
+  assert.ok(readme.includes("schemas/organization-policy.schema.json"));
+  assert.ok(readme.includes("openssl pkeyutl -sign -rawin"));
+  assert.match(readme, /canonical.*JSON/isu);
+  assert.match(readme, /strongest.*privacy/isu);
+  assert.match(readme, /logical AND/iu);
+  assert.match(readme, /minimum.*retention/isu);
+  assert.match(readme, /maximum.*source coverage/isu);
+  assert.match(readme, /all four.*absent.*ungoverned/isu);
+  assert.match(readme, /fail(?:s)? closed/iu);
+  assert.match(readme, /not yet consumed.*allow_export/isu);
+  assert.match(readme, /not yet consumed.*raw_retention_days_max/isu);
+  assert.match(readme, /not yet consumed.*required_source_coverage/isu);
+});
+
+test("the npm package includes both policy schemas", async () => {
+  const manifest = JSON.parse(await readFile(
+    resolve(process.cwd(), "package.json"),
+    "utf8",
+  )) as { files?: unknown };
+  assert.ok(Array.isArray(manifest.files));
+  assert.ok(manifest.files.includes("schemas"));
+
+  for (const schema of [
+    "schemas/config.schema.json",
+    "schemas/organization-policy.schema.json",
+  ]) {
+    const contents = await readFile(resolve(process.cwd(), schema), "utf8");
+    assert.doesNotThrow(() => JSON.parse(contents));
+  }
+});
+
 test("repository policy preferences preserve the existing config result", async (t) => {
   const repoRoot = await temporaryRepository(t);
   assert.deepEqual(await loadRepositoryPolicyPreferences(repoRoot), {});
