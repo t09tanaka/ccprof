@@ -404,6 +404,47 @@ test("custom source evidence is not admitted after its discovery clock expires",
   }
 });
 
+test("timeline-time exhaustion returns a partial result before the no-interval error", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-budget-timeline-clock-"));
+  try {
+    const repo = await makeRepository(root);
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    let timelineStarted = false;
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      sinceMs: NOW_MS - 20 * 60_000,
+      nowMs: NOW_MS,
+      sessionSource: { discover: async () => [session(repo, 1)] },
+      storePaths,
+      persist: false,
+      budgets: budgets({ max_wall_ms: 0 }),
+      budgetClock: {
+        wall_ms: () => timelineStarted ? 1 : 0,
+        cpu_ms: () => 0,
+      },
+      get idleThresholdMs() {
+        timelineStarted = true;
+        return 30 * 60_000;
+      },
+    });
+
+    assert.equal(timelineStarted, true);
+    assert.equal(
+      result.report.analysis_budget?.truncation_reason,
+      "max_wall_ms",
+    );
+    assert.deepEqual(result.report.unit.sessions, ["budget-session"]);
+    assert.equal(result.report.summary.measured_min, 0);
+    assert.deepEqual(result.allFindings, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a complete budgeted persist:false run never creates or migrates the Store", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-budget-no-store-"));
   try {
