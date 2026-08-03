@@ -648,21 +648,25 @@ test("rules CLI rejects unknown input with actionable sanitized usage", async ()
     stdout: () => undefined,
     stderr: (value) => { unknown += value; },
   });
-  assert.match(unknown, /unknown rule id R999.*R001.*R008/u);
+  assert.match(unknown, /unknown rule id; expected R001.*R008/u);
+  assert.doesNotMatch(unknown, /R999/u);
 });
 
 test("unknown rule lookup fails without a partial result", () => {
-  assert.throws(
-    () => ruleManifest("R999"),
-    /unknown rule id.*R001.*R008/u,
-  );
-  assert.throws(
-    () => ruleManifest("/private/repository/token-secret"),
-    (error: unknown) => {
+  const messages = [
+    "R999",
+    "/private/repository/token-secret",
+    "ghp_token-secret",
+  ].map((id) => {
+    try {
+      ruleManifest(id);
+      assert.fail("unknown rule lookup must throw");
+    } catch (error) {
       assert.ok(error instanceof Error);
-      assert.match(error.message, /unknown rule id.*R001.*R008/u);
-      assert.doesNotMatch(error.message, /private|token-secret/u);
-      return true;
-    },
-  );
+      return error.message;
+    }
+  });
+  assert.ok(messages.every((message) => message === messages[0]));
+  assert.match(messages[0] ?? "", /unknown rule id; expected R001.*R008/u);
+  assert.doesNotMatch(messages[0] ?? "", /R999|private|token-secret/u);
 });
