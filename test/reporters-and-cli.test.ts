@@ -35,7 +35,13 @@ import type {
   AnalysisSummary,
   CommandIdentity,
   Finding,
+  FindingConfidence,
+  ImpactEstimate,
   ReportV2,
+} from "../src/core/model.js";
+import {
+  findingScoringRationale,
+  findingSeverity,
 } from "../src/core/model.js";
 import { commandIdentityKey } from "../src/analysis/command-identity.js";
 import {
@@ -208,6 +214,18 @@ function privacyReport(): ReportV2 {
       finding_key: `${PRIVACY_REPO}:${PRIVACY_COMMAND}`,
       title: `Investigate ${PRIVACY_COMMAND}`,
       target: `${PRIVACY_REPO}/src/private.ts`,
+      impact: {
+        lower_ms: 210_000,
+        upper_ms: 210_000,
+        kind: "critical_path_latency",
+      },
+      finding_confidence: {
+        evidence: "high",
+        causal: "high",
+        source_completeness: 1,
+      },
+      severity: "high",
+      scoring_rationale: ["observed_lower_bound"],
       evidence: {
         session_refs: [`${PRIVACY_SESSION}#entry-RAW`],
         interval_ids: [`R002:${PRIVACY_SESSION}:interval-RAW`],
@@ -558,6 +576,115 @@ test("Markdown reporter escapes dynamic pipes and never emits ANSI", () => {
   assert.match(output, /Timestamp \\\| precision/u);
   assert.match(output, /\| Human wait \| 2 \|/u);
   assert.doesNotMatch(output, /\u001b\[/u);
+});
+
+test("TTY, Markdown, and JSON render canonical finding ranges and confidence", () => {
+  const canonicalReport = report();
+  canonicalReport.findings = [finding(1, {
+    confidence: "high",
+    recoverable: { min: 2, bound: "upper" },
+    impact: {
+      lower_ms: 60_000,
+      expected_ms: 90_000,
+      upper_ms: 120_000,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "high",
+      source_completeness: 1,
+    },
+    severity: "high",
+    scoring_rationale: ["observed_lower_bound"],
+  })];
+
+  const tty = renderTtyReport(canonicalReport, { color: false });
+  assert.match(tty, /Impact 1m–2m \(expected 1\.5m; critical path\)/u);
+  assert.match(tty, /severity high/u);
+  assert.match(
+    tty,
+    /confidence evidence=high causal=high completeness=1/u,
+  );
+  assert.match(tty, /rationale observed_lower_bound/u);
+  assert.ok(tty.trimEnd().split("\n").length <= TTY_MAX_LINES);
+
+  const markdown = renderMarkdownReport(canonicalReport);
+  assert.match(markdown, /Impact: 1m–2m \(expected 1\.5m; critical path\)/u);
+  assert.match(markdown, /Severity: high/u);
+  assert.match(
+    markdown,
+    /Confidence: evidence=high; causal=high; completeness=1/u,
+  );
+  assert.match(markdown, /Rationale: observed_lower_bound/u);
+
+  const json = JSON.parse(renderJsonReport(canonicalReport)) as ReportV2;
+  assert.deepEqual(json.findings[0]?.impact, {
+    lower_ms: 60_000,
+    expected_ms: 90_000,
+    upper_ms: 120_000,
+    kind: "critical_path_latency",
+  });
+  assert.deepEqual(json.findings[0]?.finding_confidence, {
+    evidence: "high",
+    causal: "high",
+    source_completeness: 1,
+  });
+  assert.equal(json.findings[0]?.severity, "high");
+  assert.deepEqual(json.findings[0]?.scoring_rationale, [
+    "observed_lower_bound",
+  ]);
+  assert.equal(json.findings[0]?.confidence, "high");
+  assert.deepEqual(json.findings[0]?.recoverable, {
+    min: 2,
+    bound: "upper",
+  });
+});
+
+test("all report formats conservatively normalize legacy findings", () => {
+  const legacyReport = report();
+  legacyReport.findings = [finding(2, {
+    rule_id: "R006",
+    confidence: "high",
+    recoverable: { min: 2, bound: "point" },
+  })];
+  const before = structuredClone(legacyReport);
+
+  const tty = renderTtyReport(legacyReport, { color: false });
+  const markdown = renderMarkdownReport(legacyReport);
+  const json = JSON.parse(renderJsonReport(legacyReport)) as ReportV2;
+  for (const output of [tty, markdown]) {
+    assert.match(output, /0m–2m/u);
+    assert.match(output, /resource cost/u);
+    assert.doesNotMatch(output, /expected /u);
+    assert.match(output, /evidence=high/u);
+    assert.match(output, /causal=medium/u);
+    assert.match(output, /completeness=0\.5/u);
+    assert.match(output, /[Ss]everity:? medium/u);
+    assert.match(output, /legacy_projection/u);
+  }
+  assert.deepEqual(json.findings[0]?.impact, {
+    lower_ms: 0,
+    upper_ms: 120_000,
+    kind: "resource_cost",
+  });
+  assert.deepEqual(json.findings[0]?.finding_confidence, {
+    evidence: "high",
+    causal: "medium",
+    source_completeness: 0.5,
+  });
+  assert.equal(json.findings[0]?.severity, "medium");
+  assert.deepEqual(json.findings[0]?.scoring_rationale, [
+    "estimated_upper_only",
+    "resource_cost_only",
+    "partial_source",
+    "legacy_projection",
+  ]);
+  assert.equal(json.findings[0]?.confidence, "medium");
+  assert.deepEqual(json.findings[0]?.recoverable, {
+    min: 2,
+    bound: "upper",
+  });
+  assert.deepEqual(legacyReport, before);
 });
 
 test("human report renderers remove terminal control strings without changing JSON values", () => {
@@ -2197,10 +2324,31 @@ function recurringFinding(
   title = `Title ${key}`,
   bound: Finding["recoverable"]["bound"] = "point",
 ): Finding {
+  const upperMs = min * 60_000;
+  const impact: ImpactEstimate = {
+    lower_ms: bound === "point" ? upperMs : 0,
+    upper_ms: upperMs,
+    kind: ruleId === "R005" || ruleId === "R006"
+      ? "resource_cost"
+      : "critical_path_latency",
+  };
+  const detailedConfidence: FindingConfidence = {
+    evidence: "high",
+    causal: "high",
+    source_completeness: 1,
+  };
   return finding(1, {
     finding_key: key,
     rule_id: ruleId,
     title,
+    impact,
+    finding_confidence: detailedConfidence,
+    severity: findingSeverity(impact, detailedConfidence),
+    scoring_rationale: findingScoringRationale(
+      impact,
+      detailedConfidence,
+      ruleId === "R004" ? { policy_dependent: true } : {},
+    ),
     recoverable: { min, bound },
   });
 }
