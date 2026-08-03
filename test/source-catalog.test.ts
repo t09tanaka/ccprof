@@ -139,6 +139,18 @@ test("catalog validation rejects shape tricks, missing, unknown, and raw-content
     "invalid_shape",
   );
 
+  for (const traps of [
+    { getPrototypeOf: () => { throw new Error("SECRET_PROXY_CANARY"); } },
+    { ownKeys: () => { throw new Error("SECRET_PROXY_CANARY"); } },
+    { getOwnPropertyDescriptor: () => { throw new Error("SECRET_PROXY_CANARY"); } },
+  ] satisfies ProxyHandler<SourceCatalogEntry>[]) {
+    assertCatalogError(
+      () => validateSourceCatalogEntry(new Proxy(catalogEntry(), traps)),
+      "invalid_shape",
+      "SECRET_PROXY_CANARY",
+    );
+  }
+
   const missing = { ...catalogEntry() } as Record<string, unknown>;
   delete missing.parser_version;
   assertCatalogError(() => validateSourceCatalogEntry(missing), "invalid_shape");
@@ -186,6 +198,7 @@ test("catalog validation rejects invalid text, identity, hashes, and completenes
     ["source_identity", "", "invalid_text"],
     ["source_identity", `source-${"A".repeat(64)}`, "invalid_text"],
     ["source_identity", `source-${"a".repeat(63)}`, "invalid_text"],
+    ["source_identity", `source-${"a".repeat(64)}\n`, "invalid_text"],
     ["canonical_path", "", "invalid_text"],
     ["canonical_path", "/sessions/evil\0body", "invalid_text"],
     ["parser_version", "", "invalid_text"],
@@ -205,6 +218,10 @@ test("catalog validation rejects invalid text, identity, hashes, and completenes
     );
     assertCatalogError(
       () => validateSourceCatalogEntry({ ...catalogEntry(), [field]: "raw-content" }),
+      "invalid_hash",
+    );
+    assertCatalogError(
+      () => validateSourceCatalogEntry({ ...catalogEntry(), [field]: `${HASH_A}\n` }),
       "invalid_hash",
     );
   }

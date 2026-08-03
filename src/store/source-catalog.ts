@@ -91,13 +91,19 @@ function validSourceIdentity(value: unknown): string {
 }
 
 export function validateSourceCatalogEntry(value: unknown): SourceCatalogEntry {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+  if (value === null || typeof value !== "object") return fail("invalid_shape");
+  let prototype: object | null;
+  let descriptors: PropertyDescriptorMap;
+  let keys: PropertyKey[];
+  try {
+    if (Array.isArray(value)) return fail("invalid_shape");
+    prototype = Object.getPrototypeOf(value) as object | null;
+    descriptors = Object.getOwnPropertyDescriptors(value);
+    keys = Reflect.ownKeys(descriptors);
+  } catch {
     return fail("invalid_shape");
   }
-  const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) return fail("invalid_shape");
-  const descriptors = Object.getOwnPropertyDescriptors(value);
-  const keys = Reflect.ownKeys(descriptors);
   if (keys.some((key) => !FIELD_SET.has(key))) return fail("unknown_field");
   if (FIELDS.some((field) => descriptors[field] === undefined)) return fail("invalid_shape");
   if (FIELDS.some((field) => !("value" in descriptors[field]!) ||
