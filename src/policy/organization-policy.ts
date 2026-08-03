@@ -212,6 +212,33 @@ function sameSnapshot(left: Stats, right: Stats): boolean {
     left.ctimeMs === right.ctimeMs;
 }
 
+async function readBounded(
+  handle: FileHandle,
+  maxBytes: number,
+  code: Extract<
+    OrganizationPolicyErrorCode,
+    "policy_unreadable" | "signature_unreadable" | "public_key_unreadable"
+  >,
+): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  while (total <= maxBytes) {
+    const remaining = maxBytes + 1 - total;
+    const chunk = Buffer.allocUnsafe(Math.min(16 * 1024, remaining));
+    const { bytesRead } = await handle.read(
+      chunk,
+      0,
+      chunk.byteLength,
+      null,
+    );
+    if (bytesRead === 0) return Buffer.concat(chunks, total);
+    total += bytesRead;
+    if (total > maxBytes) throw new OrganizationPolicyError(code);
+    chunks.push(chunk.subarray(0, bytesRead));
+  }
+  throw new OrganizationPolicyError(code);
+}
+
 async function readTrustFile(
   path: string,
   maxBytes: number,
@@ -249,7 +276,7 @@ async function readTrustFile(
     ) {
       throw new OrganizationPolicyError(code);
     }
-    const content = await handle.readFile();
+    const content = await readBounded(handle, maxBytes, code);
     const after = await lstat(path);
     if (
       !after.isFile() ||

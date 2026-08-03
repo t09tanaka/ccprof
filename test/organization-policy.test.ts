@@ -3,8 +3,11 @@ import {
   generateKeyPairSync,
   sign,
 } from "node:crypto";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import {
+  lstat,
   mkdtemp,
+  open,
   readFile,
   rm,
   symlink,
@@ -328,6 +331,141 @@ test("configured trust files are bounded regular files and never fall back", asy
       [fixture.policyPath, realPolicyPath, sentinel],
     ),
   );
+});
+
+test("signature and public key enforce equivalent missing, size, and symlink guards", async (t) => {
+  const cases = [
+    {
+      label: "signature",
+      path: (fixture: SignedPolicyFixture) => fixture.signaturePath,
+      maxBytes: 1024,
+      code: "signature_unreadable" as const,
+    },
+    {
+      label: "public-key",
+      path: (fixture: SignedPolicyFixture) => fixture.publicKeyPath,
+      maxBytes: 16 * 1024,
+      code: "public_key_unreadable" as const,
+    },
+  ];
+
+  for (const definition of cases) {
+    const missing = await signedPolicyFixture(t);
+    const missingPath = definition.path(missing);
+    await rm(missingPath);
+    await assert.rejects(
+      loadConfiguredOrganizationPolicy(missing.environment),
+      (error: unknown) => assertPolicyError(
+        error,
+        definition.code,
+        [missingPath],
+      ),
+    );
+
+    const oversized = await signedPolicyFixture(t);
+    const oversizedPath = definition.path(oversized);
+    await writeFile(
+      oversizedPath,
+      Buffer.alloc(definition.maxBytes + 1),
+    );
+    await assert.rejects(
+      loadConfiguredOrganizationPolicy(oversized.environment),
+      (error: unknown) => assertPolicyError(
+        error,
+        definition.code,
+        [oversizedPath],
+      ),
+    );
+
+    const linked = await signedPolicyFixture(t);
+    const linkedPath = definition.path(linked);
+    const externalPath = join(linked.root, `external-${definition.label}`);
+    await writeFile(externalPath, await readFile(linkedPath));
+    await rm(linkedPath);
+    await symlink(externalPath, linkedPath);
+    await assert.rejects(
+      loadConfiguredOrganizationPolicy(linked.environment),
+      (error: unknown) => assertPolicyError(
+        error,
+        definition.code,
+        [linkedPath, externalPath],
+      ),
+    );
+  }
+});
+
+test("trust loading never uses an unbounded readFile after the size snapshot", async (t) => {
+  const fixture = await signedPolicyFixture(t);
+  type OpenFile = typeof open;
+  const cjsRequire = createRequire(import.meta.url);
+  const promises = cjsRequire("node:fs/promises") as { open: OpenFile };
+  const originalOpen = promises.open;
+  let unboundedReadCalled = false;
+  const instrumentedOpen = (async (...args: Parameters<OpenFile>) => {
+    const handle = await originalOpen(...args);
+    if (String(args[0]) === fixture.policyPath) {
+      handle.readFile = (async () => {
+        unboundedReadCalled = true;
+        return Buffer.alloc(65_537);
+      }) as typeof handle.readFile;
+    }
+    return handle;
+  }) as OpenFile;
+
+  try {
+    promises.open = instrumentedOpen;
+    syncBuiltinESMExports();
+    assert.deepEqual(
+      await loadConfiguredOrganizationPolicy(fixture.environment),
+      fixture.value,
+    );
+    assert.equal(unboundedReadCalled, false);
+  } finally {
+    promises.open = originalOpen;
+    syncBuiltinESMExports();
+  }
+});
+
+test("trust loading rejects a path identity change during the read", async (t) => {
+  const fixture = await signedPolicyFixture(t);
+  type Lstat = typeof lstat;
+  const cjsRequire = createRequire(import.meta.url);
+  const promises = cjsRequire("node:fs/promises") as { lstat: Lstat };
+  const originalLstat = promises.lstat;
+  let policyStats = 0;
+  const changingLstat = (async (...args: Parameters<Lstat>) => {
+    const stat = await originalLstat(...args);
+    if (String(args[0]) !== fixture.policyPath || ++policyStats === 1) {
+      return stat;
+    }
+    return new Proxy(stat, {
+      get(target, property) {
+        if (property === "ino") {
+          return typeof target.ino === "bigint"
+            ? target.ino + 1n
+            : target.ino + 1;
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }) as Lstat;
+
+  try {
+    promises.lstat = changingLstat;
+    syncBuiltinESMExports();
+    await assert.rejects(
+      loadConfiguredOrganizationPolicy(fixture.environment),
+      (error: unknown) => assertPolicyError(
+        error,
+        "policy_unreadable",
+        [fixture.policyPath],
+      ),
+    );
+  } finally {
+    promises.lstat = originalLstat;
+    syncBuiltinESMExports();
+  }
 });
 
 test("invalid and untrusted policy material has content-free failures", async (t) => {
