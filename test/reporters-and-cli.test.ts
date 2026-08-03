@@ -803,6 +803,7 @@ test("CLI sanitizes warnings and caught errors before writing stderr", async () 
   let warningStdout = "";
   let warningStderr = "";
   const warningCode = await runCli(["--json"], {
+    ci: false,
     handlers: handlers(async () => ({
       stdout: renderJsonReport(report()),
       warnings: [warningAttack],
@@ -838,6 +839,7 @@ test("CLI sanitizes warnings and caught errors before writing stderr", async () 
     let stdout = "";
     let stderr = "";
     const code = await runCli(scenario.args, {
+      ci: false,
       handlers: scenario.scenarioHandlers,
       stdout: (value) => {
         stdout += value;
@@ -898,6 +900,7 @@ test("CLI maps an invalid analysis window to exit 2 and prints usage", async () 
   let stdout = "";
   let stderr = "";
   const code = await runCli([], {
+    ci: false,
     handlers: handlers(async () => {
       throw new InvalidAnalysisWindowError(
         "explicit analysis start must not be after analysis resolution",
@@ -924,6 +927,7 @@ test("CLI maps no analyzable timestamps to exit 4 with empty stdout", async () =
   let stdout = "";
   let stderr = "";
   const code = await runCli([], {
+    ci: false,
     handlers: handlers(async () => {
       throw new NoAnalyzableTimestampsError();
     }),
