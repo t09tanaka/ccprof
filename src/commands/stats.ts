@@ -10,7 +10,11 @@ import {
   renderStatsTty,
   summarizeStats,
 } from "../reporters/stats.js";
-import type { PrivacyProfile } from "../reporters/privacy.js";
+import {
+  privacyWarningTexts,
+  projectStatsPrivacy,
+  type PrivacyProfile,
+} from "../reporters/privacy.js";
 import {
   loadAnalyses,
   type AnalysisHistoryResult,
@@ -66,12 +70,6 @@ export async function resolveCurrentRepoRoot(
   return resolve(root);
 }
 
-function warningText(
-  warning: AnalysisHistoryResult["warnings"][number],
-): string {
-  return `[${warning.code}] ${warning.message} (${warning.path})`;
-}
-
 export async function runStatsCommand(
   options: StatsCommandOptions,
   dependencies: StatsCommandDependencies = {},
@@ -88,14 +86,22 @@ export async function runStatsCommand(
   const adoptions = await (
     dependencies.loadAdoptions ?? loadAdoptions
   )(paths);
-  const stats = summarizeStats(history.records, adoptions.records);
+  const stats = projectStatsPrivacy(
+    summarizeStats(history.records, adoptions.records),
+    options.privacy,
+    repoRoot,
+  );
+  const warnings = [...history.warnings, ...adoptions.warnings].map(
+    (warning) => ({
+      code: warning.code,
+      message: warning.message,
+      source: warning.path,
+    }),
+  );
   return {
     stdout: options.json
       ? renderStatsJson(stats)
       : renderStatsTty(stats),
-    warnings: [
-      ...history.warnings.map(warningText),
-      ...adoptions.warnings.map(warningText),
-    ],
+    warnings: privacyWarningTexts(warnings, options.privacy, repoRoot),
   };
 }

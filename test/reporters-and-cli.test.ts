@@ -2649,3 +2649,88 @@ test("runStatsCommand loads adoptions and threads them into the summary", async 
     "recurred-key",
   ]);
 });
+
+test("runStatsCommand projects reports and Store warnings without mutation", async () => {
+  const records = adoptionFixtureRecords();
+  const adoptions = adoptionFixtureAdoptions();
+  const privateWarning = [
+    PRIVACY_EXTERNAL_PATH,
+    STATS_PRIVACY_WINDOWS_PATH,
+    STATS_PRIVACY_UNC_PATH,
+    PRIVACY_URL,
+    PRIVACY_TOKEN,
+    STATS_PRIVACY_SESSION,
+  ].join(" ");
+  const historyWarnings = [{
+    code: "private-row",
+    message: `history ${privateWarning}`,
+    path: PRIVACY_SOURCE,
+  }];
+  const adoptionWarnings = [{
+    code: "private-row",
+    message: `adoption ${privateWarning}`,
+    path: PRIVACY_STORE,
+  }];
+  const before = structuredClone({
+    records,
+    adoptions,
+    historyWarnings,
+    adoptionWarnings,
+  });
+  const dependencies = {
+    resolveRepoRoot: async () => PRIVACY_REPO,
+    resolveStorePaths: async () => storePaths,
+    loadAnalyses: async () => ({ records, warnings: historyWarnings }),
+    loadAdoptions: async () => ({ records: adoptions, warnings: adoptionWarnings }),
+  };
+
+  const raw = await runStatsCommand(
+    { cwd: PRIVACY_REPO, json: true, privacy: "raw" },
+    dependencies,
+  );
+  assert.equal(raw.stdout, renderStatsJson(summarizeStats(records, adoptions)));
+  assert.deepEqual(raw.warnings, [
+    `[private-row] history ${privateWarning} (${PRIVACY_SOURCE})`,
+    `[private-row] adoption ${privateWarning} (${PRIVACY_STORE})`,
+  ]);
+
+  for (const profile of ["strict", "balanced"] as const) {
+    const result = await runStatsCommand(
+      { cwd: PRIVACY_REPO, json: true, privacy: profile },
+      dependencies,
+    );
+    const projected = JSON.parse(result.stdout) as StatsReport;
+    const reference = findingPrivacyReference(PRIVACY_REPO, "recurred-key");
+    assert.equal(
+      projected.recurring_findings.find((entry) =>
+        entry.rule_id === "R002"
+      )?.finding_key,
+      reference,
+    );
+    assert.equal(
+      projected.adoptions.find((entry) => entry.rule_id === "R002")?.finding_key,
+      reference,
+    );
+    assert.doesNotMatch(result.stdout, /recurred-key/u);
+    if (profile === "strict") {
+      assert.deepEqual(result.warnings, ["[private-row] 2 warnings"]);
+    } else {
+      assert.equal(result.warnings.length, 2);
+      assert.ok(result.warnings.every((warning) => warning.includes("[path]")));
+    }
+    for (const canary of [
+      PRIVACY_EXTERNAL_PATH,
+      STATS_PRIVACY_WINDOWS_PATH,
+      STATS_PRIVACY_UNC_PATH,
+      PRIVACY_URL,
+      PRIVACY_TOKEN,
+      STATS_PRIVACY_SESSION,
+      PRIVACY_SOURCE,
+      PRIVACY_STORE,
+    ]) {
+      assert.ok(!result.warnings.join("\n").includes(canary), `${profile} warning leaked ${canary}`);
+    }
+  }
+
+  assert.deepEqual({ records, adoptions, historyWarnings, adoptionWarnings }, before);
+});
