@@ -241,22 +241,23 @@ test("runCommand kills timed-out descendants when process-group termination is r
   const marker = join(root, "descendant-survived");
   const descendantScript = [
     'const { writeFileSync } = require("node:fs");',
-    `setTimeout(() => writeFileSync(${JSON.stringify(marker)}, "alive"), 500);`,
+    'setTimeout(() => writeFileSync(process.argv[1], "alive"), 500);',
     "setInterval(() => {}, 1_000);",
   ].join("\n");
   const parentScript = [
     'const { spawn } = require("node:child_process");',
-    `spawn(process.execPath, ["-e", ${JSON.stringify(descendantScript)}], {`,
+    `spawn(process.execPath, ["-e", ${JSON.stringify(descendantScript)}, process.argv[1]], {`,
     '  stdio: ["ignore", "ignore", "ignore"],',
     "});",
     "setInterval(() => {}, 1_000);",
   ].join("\n");
 
   try {
-    const result = await runCommand(process.execPath, ["-e", parentScript], {
-      timeoutMs: 100,
-      killProcessGroup: true,
-    });
+    const result = await runCommand(
+      process.execPath,
+      ["-e", parentScript, marker],
+      { timeoutMs: 100, killProcessGroup: true },
+    );
     assert.equal(result.code, 124);
     assert.equal(result.timedOut, true);
     await delay(700);
