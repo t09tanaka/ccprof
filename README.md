@@ -383,11 +383,42 @@ for a user answer (human wait) rather than as tool execution time, and is
 separated into `idle_excluded_min` as away time when it strictly exceeds the idle
 threshold.
 
-## Overriding test relevance
+## Configuring test relevance
 
-`package.json` for JS/TS, `Cargo.toml` for Rust, and common test paths are
-detected automatically. To raise precision explicitly, save the following JSON
-outside the repository and pass it with `--test-map`.
+Root `package.json` scripts for JS/TS, root `Cargo.toml` conventions for Rust,
+and common test paths are detected automatically. A repository can keep more
+precise mappings under version control in `.ccprof/config.json`:
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/config.schema.json",
+  "schema_version": 1,
+  "test_map": {
+    "mappings": [
+      {
+        "source": ["src/**"],
+        "tests": ["test/**"],
+        "commands": ["npm test", "npm run test:unit"]
+      }
+    ]
+  }
+}
+```
+
+The v1 contract is strict. Unknown versions or keys, malformed JSON, unsafe
+repository paths, symlinks, and non-regular config files stop analysis instead
+of silently falling back. The published JSON Schema is included in the npm
+package as `schemas/config.schema.json`; `$schema` is optional and does not
+affect analysis or its config digest.
+
+For each command, an explicit `--test-map` mapping takes precedence over a
+repository config mapping, which takes precedence over an inferred manifest
+mapping. Lower-precedence mappings remain available for commands not covered by
+a higher-precedence layer. Nested workspace manifests are not inferred yet; use
+repository or explicit mappings for them until workspace-scoped adapters land.
+
+For a one-off or externally managed override, save the test-map object itself
+and pass it with `--test-map`:
 
 ```json
 {
@@ -406,7 +437,8 @@ ccprof --pr --test-map /absolute/path/to/test-map.json --json
 ```
 
 Command strings recorded in the logs are used for classification only; they are
-never re-executed.
+never re-executed. This repository-config addition leaves the package at 0.2.0,
+the JSON Report contract at v2, and the Store schema at v2.
 
 ## Detection rules
 

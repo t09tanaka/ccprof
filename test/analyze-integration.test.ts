@@ -17,7 +17,10 @@ import {
   NoMatchingSessionsError,
 } from "../src/core/analyze.js";
 import type { Session } from "../src/core/model.js";
-import { parseExplicitTestMap } from "../src/analysis/test-map.js";
+import {
+  discoverManifestTestMap,
+  parseExplicitTestMap,
+} from "../src/analysis/test-map.js";
 import {
   runCommand,
   type CommandRunner,
@@ -31,6 +34,7 @@ import { CodexSessionSource } from "../src/sources/codex/discover.js";
 import { alignSessionCwdsToRepository } from "../src/sources/cwd.js";
 import type { SessionQuery, SessionSource } from "../src/sources/session-source.js";
 import {
+  analysisDigest,
   loadAnalyses,
   saveAnalysis,
 } from "../src/store/analyses.js";
@@ -1861,6 +1865,87 @@ function hookEventSession(sessionId: string, repo: string): Session {
     ],
   };
 }
+
+test("repository config digest is legacy-compatible and ignores $schema", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-config-digest-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const repo = await realpath(await makeRepository(root));
+  const storePaths = await resolveStorePaths(repo, {
+    env: { CCPROF_DATA_DIR: join(root, "data") },
+  });
+  const session = hookEventSession("config-digest-session", repo);
+  const run = async (nowMs: number) => await analyze({
+    cwd: repo,
+    pr: "main...feature",
+    nowMs,
+    idleThresholdMs: 123_000,
+    storePaths,
+    sessionSource: { discover: async () => [session] },
+  });
+
+  const absent = await run(NOW_MS);
+  await write(
+    join(repo, ".ccprof", "config.json"),
+    '{"$schema":"https://schema-a.invalid/config.json","schema_version":1}\n',
+  );
+  const schemaA = await run(NOW_MS + 60_000);
+  await write(
+    join(repo, ".ccprof", "config.json"),
+    '{"$schema":"https://schema-b.invalid/config.json","schema_version":1}\n',
+  );
+  const schemaB = await run(NOW_MS + 120_000);
+
+  const manifest = await discoverManifestTestMap(repo);
+  assert.equal(manifest.mappings.length, 1);
+  const mapping = manifest.mappings[0];
+  assert.ok(mapping);
+  const sortedUnique = (values: readonly string[]): string[] =>
+    [...new Set(values.filter((value) => value !== ""))].sort(
+      (left, right) => left.localeCompare(right),
+    );
+  const legacyDigest = analysisDigest("analysis-config-v1", {
+    idle_threshold_ms: 123_000,
+    mappings: [{
+      source: sortedUnique(mapping.source),
+      tests: sortedUnique(mapping.tests),
+      commands: sortedUnique(mapping.commands),
+      confidence: mapping.confidence,
+      origin: mapping.origin,
+      caveat: mapping.caveat,
+    }],
+    caveats: sortedUnique(manifest.caveats),
+    external_tool_names: [],
+  });
+
+  const database = openStoreDatabase(storePaths);
+  try {
+    const digestFor = (executionId: string): unknown => {
+      const row = database.prepare(`SELECT s.record_json
+        FROM analysis_executions e JOIN analysis_snapshots s USING (snapshot_id)
+        WHERE e.execution_id = ?`).get(executionId) as
+        { record_json: string } | undefined;
+      assert.ok(row);
+      const envelope = JSON.parse(row.record_json) as {
+        identity: { config_digest?: unknown };
+      };
+      return envelope.identity.config_digest;
+    };
+    const absentDigest = digestFor(absent.record.analysis_id);
+    const schemaADigest = digestFor(schemaA.record.analysis_id);
+    const schemaBDigest = digestFor(schemaB.record.analysis_id);
+    assert.equal(absentDigest, legacyDigest);
+    assert.notEqual(schemaADigest, absentDigest);
+    assert.equal(schemaBDigest, schemaADigest);
+    assert.equal(database.prepare(
+      "SELECT count(*) FROM analysis_snapshots",
+    ).pluck().get(), 2);
+    assert.equal(database.prepare(
+      "SELECT count(*) FROM analysis_executions",
+    ).pluck().get(), 3);
+  } finally {
+    database.close();
+  }
+});
 
 test("a hook-events.jsonl file with a matching, in-window Stop row is read without a warning and measurably extends the timeline", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-hook-events-inwindow-"));

@@ -1,5 +1,17 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import {
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import test, { type TestContext } from "node:test";
 
 import {
   classifyCommand,
@@ -15,7 +27,13 @@ import {
   parseExplicitTestMap,
   pathMatchesGlob,
   TestMapError,
+  type TestMap,
+  type TestMapOrigin,
 } from "../src/analysis/test-map.js";
+import {
+  loadRepositoryConfig,
+  RepositoryConfigError,
+} from "../src/analysis/repository-config.js";
 import {
   matchTimelineActions,
   type ActionObservation,
@@ -32,6 +50,25 @@ import type {
 } from "../src/core/model.js";
 
 const fixtureDir = `${process.cwd()}/test/fixtures/manifests`;
+
+async function temporaryConfigRepository(t: TestContext): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-config-test-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  return root;
+}
+
+async function writeRepositoryConfig(
+  repoRoot: string,
+  value: unknown,
+): Promise<void> {
+  const path = join(repoRoot, ".ccprof", "config.json");
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(
+    path,
+    typeof value === "string" ? value : `${JSON.stringify(value, null, 2)}\n`,
+    "utf8",
+  );
+}
 
 test("normalizes whitespace and leading wrappers without reordering arguments", () => {
   assert.equal(
@@ -181,6 +218,272 @@ test("validates explicit maps and rejects path/glob traversal", async () => {
   );
 });
 
+test("missing repository config preserves the empty-map behavior", async (t) => {
+  const repoRoot = await temporaryConfigRepository(t);
+  assert.deepEqual(await loadRepositoryConfig(repoRoot), {
+    mappings: [],
+    caveats: [],
+  });
+});
+
+test("loads and normalizes a strict repository config v1", async (t) => {
+  const repoRoot = await temporaryConfigRepository(t);
+  await writeRepositoryConfig(repoRoot, {
+    $schema:
+      "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/config.schema.json",
+    schema_version: 1,
+    test_map: {
+      mappings: [{
+        source: ["./src/**", "src/**"],
+        tests: ["./test/**"],
+        commands: ["  npm   test  ", "npm test"],
+      }],
+    },
+  });
+
+  assert.deepEqual(await loadRepositoryConfig(repoRoot), {
+    mappings: [{
+      source: ["src/**"],
+      tests: ["test/**"],
+      commands: ["npm test"],
+      confidence: "high",
+      origin: "config",
+      caveat: "Relevance is based on .ccprof/config.json.",
+    }],
+    caveats: [],
+    config_schema_version: 1,
+  });
+});
+
+test("repository config rejects malformed and non-closed contracts", async (t) => {
+  const repoRoot = await temporaryConfigRepository(t);
+  const cases: readonly [string, unknown][] = [
+    ["malformed JSON", "{"],
+    ["missing schema version", { test_map: { mappings: [] } }],
+    ["future schema version", { schema_version: 2 }],
+    ["unknown top-level key", { schema_version: 1, retention: {} }],
+    ["invalid schema URI", { schema_version: 1, $schema: 7 }],
+    [
+      "unknown test-map key",
+      { schema_version: 1, test_map: { mappings: [], extra: true } },
+    ],
+    [
+      "unknown mapping key",
+      {
+        schema_version: 1,
+        test_map: {
+          mappings: [{
+            source: ["src/**"], tests: ["test/**"],
+            commands: ["npm test"], cwd: ".",
+          }],
+        },
+      },
+    ],
+    [
+      "missing nested required key",
+      {
+        schema_version: 1,
+        test_map: {
+          mappings: [{ source: ["src/**"], tests: ["test/**"] }],
+        },
+      },
+    ],
+    [
+      "path traversal",
+      {
+        schema_version: 1,
+        test_map: {
+          mappings: [{
+            source: ["../outside/**"], tests: ["test/**"],
+            commands: ["npm test"],
+          }],
+        },
+      },
+    ],
+    [
+      "absolute path",
+      {
+        schema_version: 1,
+        test_map: {
+          mappings: [{
+            source: ["/outside/**"], tests: ["test/**"],
+            commands: ["npm test"],
+          }],
+        },
+      },
+    ],
+    [
+      "shell composition",
+      {
+        schema_version: 1,
+        test_map: {
+          mappings: [{
+            source: ["src/**"], tests: ["test/**"],
+            commands: ["npm test && touch sentinel"],
+          }],
+        },
+      },
+    ],
+  ];
+
+  for (const [label, value] of cases) {
+    await writeRepositoryConfig(repoRoot, value);
+    await assert.rejects(
+      loadRepositoryConfig(repoRoot),
+      (error: unknown) => {
+        assert.ok(error instanceof RepositoryConfigError, label);
+        assert.match(error.message, /^\.ccprof\/config\.json:/u, label);
+        assert.doesNotMatch(error.message, new RegExp(repoRoot, "u"), label);
+        return true;
+      },
+    );
+  }
+});
+
+test("repository config errors never echo rejected paths, commands, or keys", async (t) => {
+  const repoRoot = await temporaryConfigRepository(t);
+  const sentinel = "CCPROF_PRIVATE_SENTINEL_92f73b";
+  const absolutePath = `/Users/${sentinel}/private-repo/**`;
+  const cases: readonly unknown[] = [
+    { schema_version: 1, [sentinel]: true },
+    {
+      schema_version: 1,
+      test_map: {
+        mappings: [{
+          source: [absolutePath], tests: ["test/**"], commands: ["npm test"],
+        }],
+      },
+    },
+    {
+      schema_version: 1,
+      test_map: {
+        mappings: [{
+          source: ["src/**"], tests: ["test/**"],
+          commands: [`npm test && touch ${sentinel}`],
+        }],
+      },
+    },
+  ];
+
+  for (const value of cases) {
+    await writeRepositoryConfig(repoRoot, value);
+    await assert.rejects(
+      loadRepositoryConfig(repoRoot),
+      (error: unknown) => {
+        assert.ok(error instanceof RepositoryConfigError);
+        assert.doesNotMatch(error.message, new RegExp(sentinel, "u"));
+        assert.ok(!error.message.includes(absolutePath));
+        return true;
+      },
+    );
+  }
+});
+
+test("repository config rejects symlinks and non-regular files", async (t) => {
+  const repoRoot = await temporaryConfigRepository(t);
+  const configPath = join(repoRoot, ".ccprof", "config.json");
+  const targetPath = join(repoRoot, "outside-config.json");
+  await mkdir(dirname(configPath), { recursive: true });
+  await writeFile(targetPath, '{"schema_version":1}\n', "utf8");
+  await symlink(targetPath, configPath);
+
+  await assert.rejects(loadRepositoryConfig(repoRoot), RepositoryConfigError);
+  await rm(configPath);
+  await mkdir(configPath);
+  await assert.rejects(loadRepositoryConfig(repoRoot), RepositoryConfigError);
+});
+
+test("repository config rejects a symlinked .ccprof parent without reading outside the repository", async (t) => {
+  const repoRoot = await temporaryConfigRepository(t);
+  const externalDirectory = await mkdtemp(
+    join(tmpdir(), "ccprof-external-config-"),
+  );
+  t.after(async () => rm(externalDirectory, { recursive: true, force: true }));
+  const canaryPath = join(externalDirectory, "canary.txt");
+  const canary = "external-canary-must-not-change\n";
+  await writeFile(
+    join(externalDirectory, "config.json"),
+    '{"schema_version":1}\n',
+    "utf8",
+  );
+  await writeFile(canaryPath, canary, "utf8");
+  await symlink(externalDirectory, join(repoRoot, ".ccprof"), "dir");
+
+  await assert.rejects(loadRepositoryConfig(repoRoot), RepositoryConfigError);
+  assert.equal(await readFile(canaryPath, "utf8"), canary);
+});
+
+test("repository config surfaces a file close failure", async (t) => {
+  const repoRoot = await temporaryConfigRepository(t);
+  await writeRepositoryConfig(repoRoot, { schema_version: 1 });
+  type OpenFile = typeof open;
+  const cjsRequire = createRequire(import.meta.url);
+  const promises = cjsRequire("node:fs/promises") as {
+    open: OpenFile;
+  };
+  const originalOpen = promises.open;
+  const failingOpen = (async (...args: Parameters<OpenFile>) => {
+    const handle = await originalOpen(...args);
+    const originalClose = handle.close.bind(handle);
+    handle.close = async (): Promise<void> => {
+      await originalClose();
+      throw Object.assign(
+        new Error("synthetic close failure"),
+        { code: "EIO" },
+      );
+    };
+    return handle;
+  }) as OpenFile;
+
+  try {
+    promises.open = failingOpen;
+    syncBuiltinESMExports();
+    await assert.rejects(
+      loadRepositoryConfig(repoRoot),
+      (error: unknown) => {
+        assert.ok(error instanceof RepositoryConfigError);
+        assert.match(error.message, /cannot be closed \(EIO\)$/u);
+        return true;
+      },
+    );
+  } finally {
+    promises.open = originalOpen;
+    syncBuiltinESMExports();
+  }
+});
+
+test("the published config schema is closed and included in the npm package", async () => {
+  const [schemaText, packageText] = await Promise.all([
+    readFile(resolve(process.cwd(), "schemas/config.schema.json"), "utf8"),
+    readFile(resolve(process.cwd(), "package.json"), "utf8"),
+  ]);
+  const schema = JSON.parse(schemaText) as {
+    additionalProperties?: unknown;
+    required?: unknown;
+    properties?: Record<string, unknown>;
+  };
+  const manifest = JSON.parse(packageText) as { files?: unknown };
+
+  assert.equal(schema.additionalProperties, false);
+  assert.deepEqual(schema.required, ["schema_version"]);
+  assert.ok(schema.properties?.schema_version);
+  assert.ok(schema.properties?.test_map);
+  const testMapSchema = schema.properties?.test_map as {
+    required?: unknown;
+    properties?: {
+      mappings?: { items?: { required?: unknown } };
+    };
+  };
+  assert.deepEqual(testMapSchema.required, ["mappings"]);
+  assert.deepEqual(testMapSchema.properties?.mappings?.items?.required, [
+    "source",
+    "tests",
+    "commands",
+  ]);
+  assert.ok(Array.isArray(manifest.files));
+  assert.ok(manifest.files.includes("schemas"));
+});
+
 test("explicit mappings take priority over manifest mappings and retain evidence", async () => {
   const explicit = await loadExplicitTestMap(`${fixtureDir}/test-map.json`);
   const manifests = await discoverManifestTestMap(fixtureDir);
@@ -194,6 +497,65 @@ test("explicit mappings take priority over manifest mappings and retain evidence
   assert.equal(relevance.confidence, "high");
   assert.equal(relevance.origin, "explicit");
   assert.match(relevance.caveat, /explicit/i);
+});
+
+test("test-map origins resolve explicit before config before manifest", () => {
+  const map = (
+    origin: TestMapOrigin,
+    source: string,
+    confidence: "high" | "medium",
+  ): TestMap => ({
+    mappings: [{
+      source: [`${source}/**`],
+      tests: [`${source}-test/**`],
+      commands: ["npm test"],
+      confidence,
+      origin,
+      caveat: `${origin} mapping`,
+    }],
+    caveats: [],
+    ...(origin === "config" ? { config_schema_version: 1 as const } : {}),
+  });
+  const explicit = map("explicit", "explicit", "high");
+  const config = map("config", "config", "high");
+  const manifest = map("manifest", "manifest", "medium");
+  const descriptor = classifyCommand("npm test");
+
+  const explicitResult = evaluateTestRelevance(
+    descriptor,
+    ["config/widget.ts"],
+    mergeTestMaps(explicit, config, manifest),
+  );
+  assert.equal(explicitResult.origin, "explicit");
+  assert.equal(explicitResult.relevant, false);
+
+  const configResult = evaluateTestRelevance(
+    descriptor,
+    ["config/widget.ts"],
+    mergeTestMaps(config, manifest),
+  );
+  assert.equal(configResult.origin, "config");
+  assert.equal(configResult.confidence, "high");
+  assert.equal(configResult.relevant, true);
+
+  const manifestResult = evaluateTestRelevance(
+    descriptor,
+    ["manifest/widget.ts"],
+    manifest,
+  );
+  assert.equal(manifestResult.origin, "manifest");
+  assert.equal(manifestResult.confidence, "medium");
+  assert.equal(manifestResult.relevant, true);
+
+  assert.deepEqual(mergeTestMaps(manifest, config, explicit), {
+    mappings: [
+      ...manifest.mappings,
+      ...config.mappings,
+      ...explicit.mappings,
+    ],
+    caveats: [],
+    config_schema_version: 1,
+  });
 });
 
 test("does not pretend a non-path test filter maps to edited files", () => {
