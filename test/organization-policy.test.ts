@@ -1049,7 +1049,9 @@ test("analyze applies effective privacy and denies advisory before spawning", as
 
 test("stats applies the same effective privacy floor before warning projection", async (t) => {
   const repoRoot = await temporaryRepository(t);
+  const canonicalRepo = join(repoRoot, "canonical-main");
   const privatePath = "/private/stats/policy-warning";
+  let resolvedRepo = "";
   let resolvedRequest: PolicyRequest | undefined;
   const output = await runStatsCommand({
     cwd: repoRoot,
@@ -1057,12 +1059,13 @@ test("stats applies the same effective privacy floor before warning projection",
     privacy: "raw",
   }, {
     resolveRepoRoot: async () => repoRoot,
-    resolvePolicy: async (_resolved: string, request: PolicyRequest) => {
+    resolvePolicy: async (resolved: string, request: PolicyRequest) => {
+      resolvedRepo = resolved;
       resolvedRequest = request;
       return effectivePolicy({ privacy: "strict" });
     },
     resolveStorePaths: async () => ({
-      canonical_repo: repoRoot,
+      canonical_repo: canonicalRepo,
       repo_hash: "hash",
       root_dir: repoRoot,
       repo_dir: repoRoot,
@@ -1083,6 +1086,7 @@ test("stats applies the same effective privacy floor before warning projection",
     loadAdoptions: async () => ({ records: [], warnings: [] }),
   });
 
+  assert.equal(resolvedRepo, canonicalRepo);
   assert.deepEqual(resolvedRequest, { privacy: "raw", advisory: false });
   assert.deepEqual(output.warnings, ["[private_stats_warning] 1 warning"]);
   assert.doesNotMatch(output.warnings.join("\n"), /private\/stats/u);

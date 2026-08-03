@@ -2709,7 +2709,10 @@ test("runStatsCommand projects reports and Store warnings without mutation", asy
       dependencies,
     );
     const projected = JSON.parse(result.stdout) as StatsReport;
-    const reference = findingPrivacyReference(PRIVACY_REPO, "recurred-key");
+    const reference = findingPrivacyReference(
+      storePaths.canonical_repo,
+      "recurred-key",
+    );
     assert.equal(
       projected.recurring_findings.find((entry) =>
         entry.rule_id === "R002"
