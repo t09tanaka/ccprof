@@ -392,7 +392,9 @@ function backstopBudgetedSessions(
     }
   }
   for (const sourceSessions of sessionsBySourcePath.values()) {
+    if (!meter.checkpoint()) break;
     if (!meter.admitSourceItem()) break;
+    if (!meter.checkpoint()) break;
     admitted.push(...admitSessionEventPrefix(sourceSessions, meter));
     if (meter.stopped) break;
   }
@@ -1251,10 +1253,9 @@ export async function analyze(
     budgetMeter !== undefined &&
     !usingDefaultSource
   ) {
-    discoveredSessions = backstopBudgetedSessions(
-      discoveredSessions,
-      budgetMeter,
-    );
+    discoveredSessions = budgetMeter.checkpoint()
+      ? backstopBudgetedSessions(discoveredSessions, budgetMeter)
+      : [];
   }
   const transitionAtMs = provisionalWindow.start_source ===
       "commit_anchor_lookback" && sourceErrors.length === 0
@@ -1409,7 +1410,8 @@ export async function analyze(
     );
   }
 
-  const [historyResult, dismissalResult, adoptionResult] = persist
+  const [historyResult, dismissalResult, adoptionResult] =
+    persist || budgetMeter === undefined
     ? await Promise.all([
         loadAnalyses(paths),
         loadDismissals(paths),

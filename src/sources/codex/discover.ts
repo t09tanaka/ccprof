@@ -20,6 +20,7 @@ import type {
   SessionSource,
 } from "../session-source.js";
 import { admitSessionEventPrefix } from "../session-source.js";
+import { ParserBudgetExceededError } from "../jsonl-budget.js";
 import { parseCodexSession } from "./parser.js";
 
 export interface CodexDiscoverOptions {
@@ -224,11 +225,13 @@ export async function discoverCodexSessions(
           ? {}
           : { budgets: { maxFileBytes: admittedFileBytes } }),
       });
-    } catch {
+    } catch (error) {
       const expectedByteTruncation =
         admittedFileBytes !== undefined &&
         fileSize !== undefined &&
-        admittedFileBytes < fileSize;
+        admittedFileBytes < fileSize &&
+        error instanceof ParserBudgetExceededError &&
+        error.budget === "file";
       if (!expectedByteTruncation) {
         globalWarnings.push(
           sourceWarning(
