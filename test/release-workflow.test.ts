@@ -119,6 +119,24 @@ test("release assets workflow verifies and attests artifacts in the required ord
   );
 });
 
+test("release assets workflow parses npm pack JSON after lifecycle output", async () => {
+  const workflow = await readProjectFile(".github/workflows/release-assets.yml");
+  const packageStep = singleStepContaining(workflow, "id: package");
+
+  assert.match(
+    packageStep,
+    /PACK_OUTPUT="\$RUNNER_TEMP\/ccprof-pack-output\.txt"/u,
+  );
+  assert.match(packageStep, /npm pack --json > "\$PACK_OUTPUT"/u);
+  assert.match(packageStep, /readFileSync\(process\.argv\[1\], "utf8"\)/u);
+  assert.match(packageStep, /match\(\/\^\\\[\\s\*\$\/m\)/u);
+  assert.match(packageStep, /JSON\.parse\(source\.slice\(match\.index\)\)/u);
+  assert.match(packageStep, /!Array\.isArray\(pack\) \|\| pack\.length !== 1/u);
+  assert.match(packageStep, /typeof record\.filename === "string" && record\.filename/u);
+  assert.match(packageStep, /typeof record\.integrity === "string" && record\.integrity/u);
+  assert.doesNotMatch(packageStep, /JSON\.parse\(PACK_RESULT\)/u);
+});
+
 test("release assets workflow validates the release inputs and package smoke tests", async () => {
   const workflow = await readProjectFile(".github/workflows/release-assets.yml");
 

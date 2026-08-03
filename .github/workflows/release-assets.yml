@@ -54,9 +54,11 @@ jobs:
       - name: Build and smoke-test release assets
         id: package
         run: |
-          PACK_RESULT=$(npm pack --json)
-          TARBALL=$(node -e 'process.stdout.write(JSON.parse(process.argv[1])[0].filename)' "$PACK_RESULT")
-          INTEGRITY=$(node -e 'process.stdout.write(JSON.parse(process.argv[1])[0].integrity)' "$PACK_RESULT")
+          PACK_OUTPUT="$RUNNER_TEMP/ccprof-pack-output.txt"
+          npm pack --json > "$PACK_OUTPUT"
+          PACK_JSON=$(node -e 'const { readFileSync } = require("node:fs"); const source = readFileSync(process.argv[1], "utf8"); const match = source.match(/^\[\s*$/m); if (!match || match.index === undefined) throw new Error("npm pack JSON array not found"); const pack = JSON.parse(source.slice(match.index)); if (!Array.isArray(pack) || pack.length !== 1) throw new Error("npm pack must produce exactly one record"); const record = pack[0]; const valid = record && typeof record.filename === "string" && record.filename && typeof record.integrity === "string" && record.integrity; if (!valid) throw new Error("npm pack record is missing filename or integrity"); process.stdout.write(JSON.stringify(record));' "$PACK_OUTPUT")
+          TARBALL=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).filename)' "$PACK_JSON")
+          INTEGRITY=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).integrity)' "$PACK_JSON")
           PREFIX=$(mktemp -d)
           npm install --global --prefix "$PREFIX" "$TARBALL"
           export PATH="$PREFIX/bin:$PATH"
