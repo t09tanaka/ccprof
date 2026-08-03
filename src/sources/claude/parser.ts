@@ -448,7 +448,7 @@ function classifyResultStatus(
       return [{ status: "cancelled", source: "explicit_status", confidence: "high" }, true];
     }
     if (explicitStatuses.has("failure") && explicitStatuses.has("success")) {
-      return [{ status: "unknown", source: "none", confidence: "low" }, true];
+      return [{ status: "unknown", source: "explicit_status", confidence: "low" }, true];
     }
     const status = explicitStatuses.has("failure") ? "failure" : "success";
     return [{ status, source: "explicit_status", confidence: "high" }, true];
@@ -482,7 +482,7 @@ function classifyResultStatus(
       }, true];
     }
     if (statuses.size > 1) {
-      return [{ status: "unknown", source: "none", confidence: "low" }, true];
+      return [{ status: "unknown", source: group.source, confidence: "low" }, true];
     }
   }
   return [{ status: "unknown", source: "none", confidence: "low" }, false];

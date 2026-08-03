@@ -1,4 +1,4 @@
-import type { ToolResultStatus } from "../core/model.js";
+import type { ResultStatusEvidence, ToolResultStatus } from "../core/model.js";
 
 export type CommandFamily =
   | "test"
@@ -49,16 +49,15 @@ export interface CommandDescriptor extends CommandTokenization {
 }
 
 export interface CommandResultSignal {
+  statusEvidence?: ResultStatusEvidence;
   status?: ToolResultStatus;
   exitCode?: number;
-  exit_code?: number;
   output?: string;
+  outputBytes?: number;
 }
 
-export interface CommandResultClassification {
-  status: ToolResultStatus;
+export interface CommandResultClassification extends ResultStatusEvidence {
   definite: boolean;
-  source: "metadata" | "exit_code" | "output" | "unknown";
 }
 
 type QuoteState = "unquoted" | "single" | "double";
@@ -836,7 +835,7 @@ export function classifyCommandResult(
   if (separators.some((separator) => separator !== "&&")) {
     // With `|`, `;`, or `||`, the overall result reflects only one segment,
     // so neither success nor failure can be attributed to the test segment.
-    return { status: "unknown", definite: false, source: "unknown" };
+    return unknownResult();
   }
   // All-`&&`: overall success proves every segment succeeded, but an overall
   // failure cannot name the failing segment.
@@ -847,25 +846,31 @@ function classifySegmentAgnosticResult(
   command: CommandDescriptor,
   signal: CommandResultSignal,
 ): CommandResultClassification {
-  if (
-    signal.status === "success" ||
-    signal.status === "failure"
-  ) {
-    return { status: signal.status, definite: true, source: "metadata" };
+  const evidence = signal.statusEvidence;
+  if (evidence !== undefined && evidence.source !== "none") {
+    if (evidence.source === "output_pattern" && !hasCompleteOutput(signal)) {
+      return unknownResult();
+    }
+    return {
+      ...evidence,
+      definite: evidence.status === "success" || evidence.status === "failure",
+    };
   }
-  if (signal.status === "timeout" || signal.status === "cancelled") {
-    return { status: signal.status, definite: false, source: "metadata" };
-  }
-  const exitCode = signal.exitCode ?? signal.exit_code;
+  if (evidence === undefined && signal.status !== undefined && signal.status !== "unknown") return {
+    status: signal.status, source: "explicit_status", confidence: "high",
+    definite: signal.status === "success" || signal.status === "failure",
+  };
+  const exitCode = signal.exitCode;
   if (exitCode !== undefined && Number.isSafeInteger(exitCode)) {
     return {
       status: exitCode === 0 ? "success" : "failure",
       definite: true,
       source: "exit_code",
+      confidence: "high",
     };
   }
-  if (command.opaque) {
-    return { status: "unknown", definite: false, source: "unknown" };
+  if (command.opaque || !hasCompleteOutput(signal)) {
+    return unknownResult();
   }
   const output = signal.output ?? "";
   if (
@@ -875,7 +880,8 @@ function classifySegmentAgnosticResult(
     return {
       status: /\b(?:timed out|timeout)\b/iu.test(output) ? "timeout" : "cancelled",
       definite: false,
-      source: "output",
+      source: "output_pattern",
+      confidence: "medium",
     };
   }
   if (
@@ -884,16 +890,43 @@ function classifySegmentAgnosticResult(
     /test result:\s*FAILED/iu.test(output) ||
     /^npm ERR!/mu.test(output)
   ) {
-    return { status: "failure", definite: true, source: "output" };
+    return {
+      status: "failure",
+      definite: true,
+      source: "output_pattern",
+      confidence: "medium",
+    };
   }
   if (
     hasPositiveCount(output, "passed") ||
     /test result:\s*ok\b/iu.test(output) ||
     /\bbuild succeeded\b/iu.test(output)
   ) {
-    return { status: "success", definite: true, source: "output" };
+    return {
+      status: "success",
+      definite: true,
+      source: "output_pattern",
+      confidence: "medium",
+    };
   }
-  return { status: "unknown", definite: false, source: "unknown" };
+  return unknownResult();
+}
+
+function hasCompleteOutput(signal: CommandResultSignal): boolean {
+  return signal.output !== undefined &&
+    signal.outputBytes !== undefined &&
+    Number.isSafeInteger(signal.outputBytes) &&
+    signal.outputBytes >= 0 &&
+    signal.outputBytes === Buffer.byteLength(signal.output);
+}
+
+function unknownResult(): CommandResultClassification {
+  return {
+    status: "unknown",
+    definite: false,
+    source: "none",
+    confidence: "low",
+  };
 }
 
 function unique(values: readonly string[]): string[] {

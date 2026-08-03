@@ -121,6 +121,9 @@ function toolResult(
     kind: "tool_result",
     tool_use_id: toolUseId,
     status,
+    status_evidence: status === "unknown"
+      ? { status, source: "none", confidence: "low" }
+      : { status, source: "explicit_status", confidence: "high" },
     output: "",
     output_bytes: 0,
     estimated_tokens: 0,
@@ -615,6 +618,77 @@ test("R008 claims a definite unchanged fail-to-pass investigation as point time"
   assert.notStrictEqual(finding.evidence.command_identity, identity);
   assert.match(finding.fix_recipe.suggestion, /packages\/api/u);
   assert.equal(finding.fix_recipe.verify, "npm test");
+});
+
+test("R008 requires valid, complete endpoint evidence", () => {
+  const actions = [
+    matchedAction("failed", 0, 100, "contributing_run", {
+      tool_name: "Bash",
+      tool_use_id: "failed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+    matchedAction("passed", 200, 260, "redundant_run", {
+      tool_name: "Bash",
+      tool_use_id: "passed",
+      command: "npm test",
+      normalized_command: "npm test",
+    }),
+  ];
+  const validFailure = toolResult("failed", 100, "failure");
+  const validSuccess = toolResult("passed", 260, "success");
+  const unknownEvidence = {
+    status: "unknown" as const,
+    source: "none" as const,
+    confidence: "low" as const,
+  };
+  const invalidEndpoints: [string, ToolResultEvent, ToolResultEvent][] = [
+    ["scalar failure", toolResult("failed", 100, "failure", {
+      status_evidence: unknownEvidence,
+    }), validSuccess],
+    ["scalar success", validFailure, toolResult("passed", 260, "success", {
+      status_evidence: unknownEvidence,
+    })],
+    ["truncated failure pattern", toolResult("failed", 100, "unknown", {
+      output: "1 failed",
+      output_bytes: Buffer.byteLength("1 failed") + 1,
+    }), validSuccess],
+    ["truncated success pattern", validFailure,
+      toolResult("passed", 260, "unknown", {
+        output: "1 passed",
+        output_bytes: Buffer.byteLength("1 passed") + 1,
+      })],
+  ];
+
+  for (const [name, failed, passed] of invalidEndpoints) {
+    assert.deepEqual(
+      detectFlakyTests(actions, { toolResults: [failed, passed] }),
+      [],
+      name,
+    );
+  }
+  assert.equal(
+    detectFlakyTests(actions, {
+      toolResults: [validFailure, validSuccess],
+    }).length,
+    1,
+  );
+  const completePatternFindings = detectFlakyTests(actions, {
+    toolResults: [
+      toolResult("failed", 100, "unknown", {
+        status_evidence: unknownEvidence,
+        output: "1 failed",
+        output_bytes: Buffer.byteLength("1 failed"),
+      }),
+      toolResult("passed", 260, "unknown", {
+        status_evidence: unknownEvidence,
+        output: "1 passed",
+        output_bytes: Buffer.byteLength("1 passed"),
+      }),
+    ],
+  });
+  assert.equal(completePatternFindings.length, 1);
+  assert.equal(completePatternFindings[0]?.confidence, "medium");
 });
 
 test("R008 isolates exact command-identity lanes deterministically", () => {

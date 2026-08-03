@@ -122,36 +122,29 @@ test("recognizes required test, build, and check command families", () => {
   assert.equal(classifyCommand("pytest tests/test_a.py::test_one").scope, "targeted");
 });
 
-test("classifies only definite result signals and never guesses from opaque output", () => {
-  assert.deepEqual(
-    classifyCommandResult(classifyCommand("npm test"), {
-      status: "unknown",
-      exitCode: 1,
-      output: "",
-    }),
-    { status: "failure", definite: true, source: "exit_code" },
-  );
-  assert.equal(
-    classifyCommandResult(classifyCommand("pytest"), {
-      status: "unknown",
-      output: "12 passed in 1.2s",
-    }).status,
-    "success",
-  );
-  assert.equal(
-    classifyCommandResult(classifyCommand("cargo test"), {
-      status: "timeout",
-      output: "1 failed",
-    }).definite,
-    false,
-  );
-  assert.equal(
-    classifyCommandResult(classifyCommand("npm test | tee out"), {
-      status: "unknown",
-      output: "12 passed",
-    }).status,
-    "unknown",
-  );
+test("classifies only complete provenance-aware result signals", () => {
+  const output = "✓ 2 passed";
+  const outputBytes = Buffer.byteLength(output);
+  const unknown = { status: "unknown", source: "none", confidence: "low", definite: false } as const;
+  const cases = [
+    ["explicit conflict is authoritative", { statusEvidence: { status: "unknown", source: "explicit_status", confidence: "low" }, exitCode: 0, output, outputBytes }, { status: "unknown", source: "explicit_status", confidence: "low", definite: false }],
+    ["adapter evidence outranks raw fields", { statusEvidence: { status: "success", source: "tool_adapter", confidence: "medium" }, exitCode: 1 }, { status: "success", source: "tool_adapter", confidence: "medium", definite: true }],
+    ["exit code is the fallback", { statusEvidence: { status: "unknown", source: "none", confidence: "low" }, exitCode: 1 }, { status: "failure", source: "exit_code", confidence: "high", definite: true }],
+    ["arbitrary text stays unknown", { output: "fatal error", outputBytes: Buffer.byteLength("fatal error") }, unknown],
+    ["complete UTF-8 pattern", { output, outputBytes }, { status: "success", source: "output_pattern", confidence: "medium", definite: true }],
+    ["UTF-16 length is not byte completeness", { output, outputBytes: output.length }, unknown],
+    ["complete precomputed pattern", { statusEvidence: { status: "success", source: "output_pattern", confidence: "medium" }, output, outputBytes }, { status: "success", source: "output_pattern", confidence: "medium", definite: true }],
+    ["truncated precomputed pattern", { statusEvidence: { status: "success", source: "output_pattern", confidence: "medium" }, output, outputBytes: outputBytes + 1 }, unknown],
+    ["legacy scalar is accepted without evidence", { status: "success" }, { status: "success", source: "explicit_status", confidence: "high", definite: true }],
+    ["present none evidence ignores scalar", { statusEvidence: { status: "unknown", source: "none", confidence: "low" }, status: "success" }, unknown],
+  ] as const;
+  for (const [label, signal, expected] of cases) {
+    assert.deepEqual(classifyCommandResult(classifyCommand("pytest"), signal as unknown as Parameters<typeof classifyCommandResult>[1]), expected, label);
+  }
+  for (const bytes of [undefined, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, outputBytes - 1, outputBytes + 1]) {
+    const signal = bytes === undefined ? { output } : { output, outputBytes: bytes };
+    assert.deepEqual(classifyCommandResult(classifyCommand("pytest"), signal), unknown, `outputBytes=${String(bytes)}`);
+  }
 });
 
 test("validates explicit maps and rejects path/glob traversal", async () => {
@@ -446,6 +439,48 @@ test("matches the first relevant full run and a repeated unchanged successful ru
   assert.deepEqual(matched[2]?.relevance_paths, []);
   assert.equal(matched[2]?.normalized_command, "npm test");
   assert.match(matched[2]?.caveats.join(" ") ?? "", /explicit/i);
+});
+
+test("only valid result evidence seeds successful-run snapshots", () => {
+  const scalar = observe("scalar", 0, "Bash", { command: "npm test", cwd: "/repo" });
+  if (scalar.toolResult !== undefined) delete scalar.toolResult.exit_code;
+  scalar.toolResult!.status_evidence = { status: "unknown", source: "none", confidence: "low" };
+  const truncated = observe("truncated", 200, "Bash", {
+    command: "npm test",
+    cwd: "/repo",
+    status: "unknown",
+  });
+  Object.assign(truncated.toolResult!, {
+    status_evidence: { status: "success", source: "output_pattern", confidence: "medium" },
+    output: "1 passed",
+    output_bytes: Buffer.byteLength("1 passed") + 1,
+  });
+  const valid = observe("valid", 400, "Bash", {
+    command: "npm test",
+    cwd: "/repo",
+    status: "unknown",
+  });
+  Object.assign(valid.toolResult!, {
+    status_evidence: { status: "success", source: "output_pattern", confidence: "medium" },
+    output: "1 passed",
+    output_bytes: Buffer.byteLength("1 passed"),
+  });
+  const matched = matchTimelineActions(
+    [
+      scalar,
+      truncated,
+      valid,
+      observe("repeat", 600, "Bash", { command: "npm test", cwd: "/repo" }),
+    ],
+    { diff: diff([]), testMap: explicitMap, repoRoot: "/repo" },
+  );
+  assert.deepEqual(matched.map(({ match }) => match), [
+    "unexplained",
+    "unexplained",
+    "unexplained",
+    "redundant_run",
+  ]);
+  assert.equal(matched[3]?.match_confidence, "medium");
 });
 
 test("scopes successful-run reuse by command identity CWD and executor", () => {
@@ -1222,6 +1257,20 @@ test("detects successful duplicate reads but excludes a read after an edit", () 
   ]);
 });
 
+test("caps duplicate-read confidence by complete output-pattern evidence", () => {
+  const reads = ["first", "repeat"].map((id, index) => observe(
+    id, index * 200, "Read", { paths: ["src/widget.ts"], status: "unknown" },
+  ));
+  for (const read of reads) Object.assign(read.toolResult!, {
+    status_evidence: { status: "success", source: "output_pattern", confidence: "medium" },
+    output: "read complete",
+    output_bytes: Buffer.byteLength("read complete"),
+  });
+  const matched = matchTimelineActions(reads, { diff: diff([]), testMap: explicitMap });
+  assert.deepEqual(matched.map(({ match }) => match), ["safe_read", "duplicate_read"]);
+  assert.deepEqual(matched.map(({ match_confidence }) => match_confidence), ["medium", "medium"]);
+});
+
 test("scopes duplicate reads to the same session and agent context", () => {
   const matched = matchTimelineActions(
     [
@@ -1381,45 +1430,32 @@ test("keeps writable variants of find, sort, and awk unrecognized", () => {
 
 test("only all-and composites keep a definite success and never a definite failure", () => {
   const piped = classifyCommand("npm test 2>&1 | tail -1");
-  assert.deepEqual(
-    classifyCommandResult(piped, { status: "success", exitCode: 0 }),
-    { status: "unknown", definite: false, source: "unknown" },
-  );
-  assert.deepEqual(
-    classifyCommandResult(piped, { status: "unknown", output: "12 passed" }),
-    { status: "unknown", definite: false, source: "unknown" },
-  );
-  assert.equal(
-    classifyCommandResult(piped, { status: "timeout" }).status,
-    "timeout",
-  );
-  for (const raw of ["npm test ; true", "npm test || true"]) {
+  const unknown = { status: "unknown", definite: false, source: "none", confidence: "low" } as const;
+  for (const raw of [piped, classifyCommand("npm test ; true"), classifyCommand("npm test || true")]) {
     assert.deepEqual(
-      classifyCommandResult(classifyCommand(raw), {
-        status: "success",
-        exitCode: 0,
-      }),
-      { status: "unknown", definite: false, source: "unknown" },
-      raw,
+      classifyCommandResult(raw, { exitCode: 0 }),
+      unknown,
+      raw.raw,
     );
   }
+  assert.deepEqual(
+    classifyCommandResult(piped, { statusEvidence: { status: "timeout", source: "explicit_status", confidence: "high" } }),
+    { status: "timeout", definite: false, source: "explicit_status", confidence: "high" },
+  );
 
   const allAnd = classifyCommand("npm test && npm run build");
   assert.deepEqual(
-    classifyCommandResult(allAnd, { status: "success" }),
-    { status: "success", definite: true, source: "metadata" },
+    classifyCommandResult(allAnd, { statusEvidence: { status: "success", source: "tool_adapter", confidence: "medium" } }),
+    { status: "success", definite: true, source: "tool_adapter", confidence: "medium" },
   );
-  const failed = classifyCommandResult(allAnd, {
-    status: "failure",
-    exitCode: 1,
-  });
+  const failed = classifyCommandResult(allAnd, { exitCode: 1 });
   assert.equal(failed.status, "failure");
   assert.equal(failed.definite, false);
 
   const redirectOnly = classifyCommand("npm test 2>&1");
   assert.deepEqual(
-    classifyCommandResult(redirectOnly, { status: "failure", exitCode: 1 }),
-    { status: "failure", definite: true, source: "metadata" },
+    classifyCommandResult(redirectOnly, { exitCode: 1 }),
+    { status: "failure", definite: true, source: "exit_code", confidence: "high" },
   );
 });
 
