@@ -1162,6 +1162,68 @@ test("R003 uses only the selected full result identity for a 120-vs-900 collisio
   assert.deepEqual(reversed, forward);
 });
 
+test("R003 keeps source-distinct reads with the same action id", () => {
+  const read = (
+    sourceInstanceId: string,
+    startMs: number,
+    endMs: number,
+  ): MatchedAction => {
+    const eventIdentity: EventIdentity = {
+      source_adapter_id: "claude",
+      source_instance_id: sourceInstanceId,
+      session_id: "shared-session",
+      agent_id: "shared-agent",
+      tool_use_id: "shared-tool-id",
+      source_index: 1,
+    };
+    return matchedAction(
+      "shared-action-id",
+      startMs,
+      endMs,
+      "duplicate_read",
+      {
+        session_id: "shared-session",
+        agent_id: "shared-agent",
+        paths: ["src/a.ts"],
+        target: "src/a.ts",
+        tool_use_id: "shared-tool-id",
+        tool_name: "Read",
+        event_identity: eventIdentity,
+        result_identity: { ...eventIdentity, source_index: 2 },
+      },
+    );
+  };
+  const reads = [
+    read("/logs/a.jsonl", 0, 10),
+    read("/logs/b.jsonl", 0, 10),
+    read("/logs/c.jsonl", 20, 30),
+  ];
+  const options = {
+    estimatedTokensByEventIdentity: tokenEstimatesByResultIdentity(
+      [reads[0]!, 10],
+      [reads[1]!, 20],
+      [reads[2]!, 30],
+    ),
+  };
+
+  const forward = detectRediscovery(reads, options)[0];
+  const reversed = detectRediscovery([...reads].reverse(), options)[0];
+  const unique = recoverableClaim("R003", "src/a.ts", [reads[0]!]);
+
+  assert.ok(forward);
+  assert.deepEqual(reversed, forward);
+  assert.equal(unique.intervals[0]?.interval_id, "R003:shared-action-id");
+  assert.equal(forward.recoverable.estimated_ms, 20);
+  assert.equal(forward.recoverable.intervals.length, 3);
+  assert.equal(forward.evidence.estimated_tokens, 60);
+  assert.equal(forward.evidence.interval_ids.length, 3);
+  assert.equal(new Set(forward.evidence.interval_ids).size, 3);
+  assert.ok(forward.evidence.interval_ids.every((intervalId) =>
+    /^R003:shared-action-id:[0-9a-f]{32}$/u.test(intervalId)
+  ));
+  assert.equal(JSON.stringify(forward).includes("/logs/"), false);
+});
+
 test("R003 preserves missing token evidence when a read has no selected result identity", () => {
   const read = matchedAction("missing-result", 0, 10, "duplicate_read", {
     paths: ["src/a.ts"],
