@@ -749,6 +749,28 @@ test("a verified_ended_at_ms past the last event adds a low-confidence inference
   assert.deepEqual(timeline.idleIntervals, []);
 });
 
+test("verified tail ordering is deterministic across source instances", () => {
+  const left: Session = {
+    ...session([assistant(20, 1)], 20, 40),
+    source_path: "/tmp/a-session.jsonl",
+  };
+  const right: Session = {
+    ...session([assistant(20, 1)], 20, 40),
+    source_path: "/tmp/b-session.jsonl",
+  };
+
+  const forward = buildTimeline([left, right]);
+  const reversed = buildTimeline([right, left]);
+
+  assert.deepEqual(reversed, forward);
+  assert.deepEqual(
+    forward.actions.map((action) =>
+      action.event_identity?.source_instance_id
+    ),
+    ["/tmp/a-session.jsonl", "/tmp/b-session.jsonl"],
+  );
+});
+
 test("verified tails use one Claude main lane and ignore later sidechain events", () => {
   const timeline = buildTimeline([session([
     user(0, 0), assistant(20, 1), assistant(30, 2, "side"),

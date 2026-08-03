@@ -8,6 +8,7 @@ import {
   encodeIdentityScope,
   encodeInvocationIdentity,
   encodeSessionIdentity,
+  evidenceEventIdentity,
   eventIdentity,
   type EventIdentity,
 } from "../core/event-identity.js";
@@ -709,7 +710,10 @@ function sortedActions(
         left.agent_id.localeCompare(right.agent_id) ||
         (kindOrder.get(left.kind) ?? 99) -
           (kindOrder.get(right.kind) ?? 99) ||
-        left.action_id.localeCompare(right.action_id),
+        left.action_id.localeCompare(right.action_id) ||
+        encodeEventIdentity(evidenceEventIdentity(left)).localeCompare(
+          encodeEventIdentity(evidenceEventIdentity(right)),
+        ),
     );
 }
 
