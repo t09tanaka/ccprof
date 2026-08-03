@@ -47,25 +47,25 @@ only the contract, helper, and focused tests as
 - Modify: `src/core/analyze.ts`
 - Test: `test/capability-coverage.test.ts`
 
-- [ ] **Step 1: Write failing integration tests**
+- [x] **Step 1: Write failing integration tests**
 
 Add real-pipeline fixtures proving mixed Claude+Codex R007 keeps Claude
 evidence at `1/2 partial`, R001/R005 cannot consume ineligible actions, zero
 eligible rules become legacy skips, and required-empty rules remain full.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run the focused compiled test. Expected: mixed lanes are globally skipped or
 ineligible evidence changes detector output.
 
-- [ ] **Step 3: Implement cached isolated lanes**
+- [x] **Step 3: Implement cached isolated lanes**
 
 Build events/timeline/matches from eligible sessions before rule execution,
 cache equal session sets, route each R001-R008 detector to its lane, derive
 zero-eligible `skipped_rules`, and include coverage in the policy digest.
 Preserve the global lane for ledger/metrics and R003 reads.
 
-- [ ] **Step 4: Verify GREEN and commit**
+- [x] **Step 4: Verify GREEN and commit**
 
 Delegate the focused test and relevant existing analyze/model tests; expect all
 to pass. Commit analysis integration as
