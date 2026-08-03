@@ -81,4 +81,5 @@ TypeScript LanguageService using `tsconfig.test.json` found:
 - [x] Have a validation subagent run Node 20 `npm ci`, `npm run check` (508/508), determinism (1/1), build, isolated package smoke, and `git diff --check`.
 - [x] Confirm nine files, 258 added production lines, no schema/rule/parser/package/version/lockfile/changelog diff, and no generated artifacts.
 - [x] Run every locally reproducible GitHub Actions equivalent before push; all passed on Node 20.
-- [ ] Commit without amend, open a PR against `main`, wait for every check/review, merge under standing authorization, and clean up only this worktree and branch.
+- [x] Commit without amend, open PR #40 against `main`, and wait for every check/review (all seven checks passed; no comments or reviews).
+- [ ] Merge under standing authorization and clean up only this worktree and branch.
