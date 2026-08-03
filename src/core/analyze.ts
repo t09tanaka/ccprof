@@ -1380,13 +1380,6 @@ export async function analyze(
       ? {}
       : { idleThresholdMs: options.idleThresholdMs }),
   });
-  warnings.push(
-    ...timeline.caveats.map((message) => textWarning("timeline", message)),
-  );
-  if (timeline.rawIntervals.length === 0) {
-    throw new NoAnalyzableTimestampsError();
-  }
-
   if (budgetMeter !== undefined && !budgetMeter.checkpoint()) {
     return finishBudgetedPartialAnalysis(
       options,
@@ -1397,6 +1390,12 @@ export async function analyze(
       warnings,
       paths,
     );
+  }
+  warnings.push(
+    ...timeline.caveats.map((message) => textWarning("timeline", message)),
+  );
+  if (timeline.rawIntervals.length === 0) {
+    throw new NoAnalyzableTimestampsError();
   }
 
   const [diff, testMap] = await Promise.all([
