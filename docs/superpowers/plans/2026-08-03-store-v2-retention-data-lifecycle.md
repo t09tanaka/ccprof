@@ -136,8 +136,23 @@ stable.
 4. [x] Add the `data gc|delete` parser, usage, optional handler fallback, and
    dispatch in `src/cli.ts` without changing existing handler fixtures.
 5. [x] Document the fixed, manual-only retention and deletion policy in README.
-6. [ ] Run focused tests, local GitHub Actions equivalents, independent
-   reviews, PR checks, merge, and worktree/branch cleanup.
+6. [x] Pass focused tests, local GitHub Actions equivalents, independent
+   reviews, and the initial PR pre-merge gate.
+
+## Validation
+
+- Node 20 focused suites: data lifecycle 10/10 and hook events 22/22 passing.
+- Full local GitHub Actions equivalent: 539/539 passing on the official
+  Node 20.20.2 image as a non-root user; build, determinism golden, package and
+  native SQLite smoke tests also pass.
+- `npm audit`: zero vulnerabilities; tracked and untracked whitespace checks:
+  clean.
+- Independent security and data-lifecycle review: clean after adding the
+  fd-based no-follow hook read and fail-closed unknown-action regressions.
+- PR #44 initial head: all seven visible checks passing, with no review,
+  inline, thread, or conversation comments.
+- Package version remains 0.2.0, Store schema remains 2, and Report schema
+  remains v2.
 
 ## Change budget
 
