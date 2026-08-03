@@ -616,6 +616,35 @@ test("CLI parser accepts privacy profiles once in separated or inline form", () 
   }
 });
 
+test("stats CLI parser accepts privacy profiles with analyze-equivalent errors", () => {
+  for (const privacy of ["strict", "balanced", "raw"] as const) {
+    assert.deepEqual(parseCliArgs(["stats", "--privacy", privacy, "--json"]), {
+      kind: "stats",
+      json: true,
+      privacy,
+    });
+    assert.deepEqual(parseCliArgs(["stats", `--privacy=${privacy}`]), {
+      kind: "stats",
+      json: false,
+      privacy,
+    });
+  }
+
+  for (const [args, message] of [
+    [["--privacy"], "--privacy requires a value"],
+    [["--privacy="], "--privacy requires a value"],
+    [["--privacy", "unknown"], "--privacy must be strict, balanced, or raw"],
+    [["--privacy=STRICT"], "--privacy must be strict, balanced, or raw"],
+    [["--privacy=strict", "--privacy", "raw"], "--privacy was specified twice"],
+  ] as const) {
+    assert.throws(
+      () => parseCliArgs(["stats", ...args]),
+      (error) => error instanceof CliUsageError && error.message === message,
+      args.join(" "),
+    );
+  }
+});
+
 test("CLI parser accepts exactly one finding reference for explain", () => {
   assert.deepEqual(parseCliArgs(["explain", "finding-reference"]), {
     kind: "explain",
@@ -1360,6 +1389,83 @@ test("CI selects strict privacy and scrubs operational error paths", async () =>
   }), 0);
   assert.match(rawStderr, new RegExp(PRIVACY_SOURCE, "u"));
   assertTerminalAttackRemoved(rawStderr, "RAW_WARNING");
+});
+
+test("stats privacy defaults locally, honors local selection, and cannot weaken CI", async () => {
+  const quiet = (_value: string): void => undefined;
+  const scenarios = [
+    { args: ["stats", "--json"], ci: false, expected: "balanced" },
+    { args: ["stats", "--privacy=strict"], ci: false, expected: "strict" },
+    { args: ["stats", "--privacy=balanced"], ci: false, expected: "balanced" },
+    { args: ["stats", "--privacy=raw"], ci: false, expected: "raw" },
+    { args: ["stats", "--json"], ci: true, expected: "strict" },
+    { args: ["stats", "--privacy=balanced"], ci: true, expected: "strict" },
+    { args: ["stats", "--privacy=raw"], ci: true, expected: "strict" },
+  ] as const;
+
+  for (const scenario of scenarios) {
+    let dispatchedPrivacy: string | undefined;
+    const code = await runCli(scenario.args, {
+      ci: scenario.ci,
+      handlers: {
+        ...handlers(),
+        stats: async (options) => {
+          dispatchedPrivacy = (options as { privacy?: string }).privacy;
+          return { stdout: "{}", warnings: [] };
+        },
+      },
+      stdout: quiet,
+      stderr: quiet,
+    });
+    assert.equal(code, 0, scenario.args.join(" "));
+    assert.equal(dispatchedPrivacy, scenario.expected, scenario.args.join(" "));
+  }
+});
+
+test("stats active privacy covers warnings, parser failures, and operational failures", async () => {
+  const quiet = (_value: string): void => undefined;
+  let balancedWarning = "";
+  assert.equal(await runCli(["stats", "--json"], {
+    ci: false,
+    cwd: PRIVACY_REPO,
+    handlers: {
+      ...handlers(),
+      stats: async () => ({
+        stdout: "{}",
+        warnings: [`could not read ${PRIVACY_EXTERNAL_PATH}`],
+      }),
+    },
+    stdout: quiet,
+    stderr: (value) => {
+      balancedWarning += value;
+    },
+  }), 0);
+  assert.doesNotMatch(balancedWarning, new RegExp(PRIVACY_EXTERNAL_PATH, "u"));
+  assert.match(balancedWarning, /\[path\]/u);
+
+  for (const scenario of ["parser", "handler"] as const) {
+    let stderr = "";
+    const args = scenario === "parser"
+      ? ["stats", "--privacy=raw", `--unknown=${PRIVACY_EXTERNAL_PATH}`]
+      : ["stats", "--privacy=balanced"];
+    const code = await runCli(args, {
+      ci: true,
+      cwd: PRIVACY_REPO,
+      handlers: {
+        ...handlers(),
+        stats: async () => {
+          throw new Error(`could not read ${PRIVACY_EXTERNAL_PATH}`);
+        },
+      },
+      stdout: quiet,
+      stderr: (value) => {
+        stderr += value;
+      },
+    });
+    assert.equal(code, scenario === "parser" ? 2 : 5);
+    assert.match(stderr, /analysis failed \(details hidden by strict privacy\)/u);
+    assert.doesNotMatch(stderr, new RegExp(PRIVACY_EXTERNAL_PATH, "u"));
+  }
 });
 
 const storePaths: StorePaths = {
@@ -2294,7 +2400,7 @@ test("runStatsCommand loads adoptions and threads them into the summary", async 
   let loadAdoptionsCalledWith: StorePaths | undefined;
 
   const result = await runStatsCommand(
-    { cwd: "/repo", json: true },
+    { cwd: "/repo", json: true, privacy: "raw" },
     {
       resolveRepoRoot: async () => "/repo",
       resolveStorePaths: async () => paths,

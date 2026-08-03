@@ -10,6 +10,7 @@ import {
   renderStatsTty,
   summarizeStats,
 } from "../reporters/stats.js";
+import type { PrivacyProfile } from "../reporters/privacy.js";
 import {
   loadAnalyses,
   type AnalysisHistoryResult,
@@ -27,6 +28,7 @@ import type { CommandExecutionResult } from "./analyze.js";
 export interface StatsCommandOptions {
   cwd: string;
   json: boolean;
+  privacy: PrivacyProfile;
 }
 
 export interface StatsCommandDependencies {

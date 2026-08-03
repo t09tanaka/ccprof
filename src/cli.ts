@@ -51,7 +51,7 @@ export const USAGE = `Usage: ccprof [--pr [<number|url|base...head>]] [--json|--
               [--idle-threshold <duration>] [--test-map <path>] [--color]
               [--since <RFC3339>] [--commit-lookback <duration>]
               [--privacy <strict|balanced|raw>] [--advisory]
-       ccprof stats [--json]
+       ccprof stats [--json] [--privacy <strict|balanced|raw>]
        ccprof dismiss <finding-key> [--reason <text>]
        ccprof explain <finding-key>
        ccprof hook-event [--notify]
@@ -114,6 +114,7 @@ export interface ParsedAnalyzeCommand {
 export interface ParsedStatsCommand {
   kind: "stats";
   json: boolean;
+  privacy?: PrivacyProfile;
 }
 
 export interface ParsedDismissCommand {
@@ -535,13 +536,43 @@ function parseStatsArgs(
   args: readonly string[],
 ): ParsedStatsCommand {
   let json = false;
-  for (const token of args) {
-    if (token !== "--json" || json) {
-      throw new CliUsageError(`unknown stats argument: ${token}`);
+  let privacy: PrivacyProfile | undefined;
+  let sawPrivacy = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index] as string;
+    if (token === "--json") {
+      if (json) throw new CliUsageError(`unknown stats argument: ${token}`);
+      json = true;
+      continue;
     }
-    json = true;
+    if (token === "--privacy") {
+      if (sawPrivacy) {
+        throw new CliUsageError("--privacy was specified twice");
+      }
+      sawPrivacy = true;
+      const selected = requiredOptionValue(args, index, "--privacy");
+      privacy = parsePrivacyProfile(selected.value);
+      index = selected.nextIndex;
+      continue;
+    }
+    const inlinePrivacy = token.startsWith("--privacy=")
+      ? inlineOptionValue(token, "--privacy")
+      : null;
+    if (inlinePrivacy !== null) {
+      if (sawPrivacy) {
+        throw new CliUsageError("--privacy was specified twice");
+      }
+      sawPrivacy = true;
+      privacy = parsePrivacyProfile(inlinePrivacy);
+      continue;
+    }
+    throw new CliUsageError(`unknown stats argument: ${token}`);
   }
-  return { kind: "stats", json };
+  return {
+    kind: "stats",
+    json,
+    ...(privacy === undefined ? {} : { privacy }),
+  };
 }
 
 function parseDismissArgs(
@@ -763,8 +794,9 @@ export async function runCli(
     token.startsWith("--privacy=") ? token.slice(10) :
       args[index - 1] === "--privacy" ? token : ""
   ).find(isPrivacyProfile);
-  let activePrivacy: PrivacyProfile | undefined =
-    args[0] === "explain" && ci
+  let activePrivacy: PrivacyProfile | undefined = args[0] === "stats"
+    ? ci ? "strict" : explicitPrivacy ?? "balanced"
+    : args[0] === "explain" && ci
       ? "strict"
       : ["stats", "dismiss", "explain", "hooks", "data"].includes(args[0] ?? "")
         ? undefined
@@ -809,9 +841,11 @@ export async function runCli(
           : { testMapPath: command.testMapPath }),
       });
     } else if (command.kind === "stats") {
+      activePrivacy = ci ? "strict" : command.privacy ?? "balanced";
       result = await handlers.stats({
         cwd,
         json: command.json,
+        privacy: activePrivacy,
       });
     } else if (command.kind === "dismiss") {
       result = await handlers.dismiss({
