@@ -313,9 +313,13 @@ export async function discoverCodexSessions(
     if (parsed === null) {
       continue;
     }
+    const knownBranchMismatch = parsed.observed_branches.some(
+      (branch) => branch !== query.headBranch,
+    );
     const admitted = admitSessionEventPrefix([parsed], meter);
     const admittedSession = admitted[0];
     if (admittedSession === undefined) break;
+    if (knownBranchMismatch) continue;
     if (!meter.stopped && !meter.checkpoint()) break;
     const canonicalSession = await canonicalizeSessionCwds(admittedSession);
     if (!intersects(canonicalSession, query)) {
