@@ -142,9 +142,17 @@ function registryEntry(adapterId: string): RegistryEntry {
 }
 
 export function deriveSourceDescriptor(
-  session: Pick<Session, "capabilities" | "source" | "source_path">,
+  session: Pick<
+    Session,
+    "capabilities" | "session_id" | "source" | "source_path"
+  >,
 ): SourceDescriptor {
-  if (session.source_path === "" || session.source_path.includes("\0")) {
+  if (
+    session.session_id === "" ||
+    session.session_id.includes("\0") ||
+    session.source_path === "" ||
+    session.source_path.includes("\0")
+  ) {
     return fail("invalid_field");
   }
   const registry = registryEntry(session.source);
@@ -153,7 +161,7 @@ export function deriveSourceDescriptor(
   );
   const sourceInstanceId = `source-${digest("ccprof:source-instance:v1", [
     registry.adapter_id,
-    session.source_path.normalize("NFC"),
+    session.session_id.normalize("NFC"),
   ])}`;
   const base: Omit<SourceDescriptor, "canonical_fingerprint"> = {
     adapter_id: registry.adapter_id,
@@ -266,7 +274,10 @@ export function validateSourceDescriptors(value: unknown): SourceDescriptor[] {
 }
 
 export function sourceDescriptorsForSessions(
-  sessions: readonly Pick<Session, "capabilities" | "source" | "source_path">[],
+  sessions: readonly Pick<
+    Session,
+    "capabilities" | "session_id" | "source" | "source_path"
+  >[],
 ): SourceDescriptor[] {
   const descriptors = new Map<string, SourceDescriptor>();
   for (const session of sessions) {

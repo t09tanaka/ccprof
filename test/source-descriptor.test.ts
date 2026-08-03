@@ -16,12 +16,13 @@ import {
 } from "../src/core/source-descriptor.js";
 
 function session(options: {
+  sessionId?: string;
   source?: Session["source"];
   sourcePath?: string;
   capabilities?: readonly SessionCapability[];
 } = {}): Session {
   return {
-    session_id: "session-1",
+    session_id: options.sessionId ?? "session-1",
     source: options.source ?? "claude",
     source_path: options.sourcePath ?? "/private/logs/session.jsonl",
     observed_cwds: ["/repo"],
@@ -114,6 +115,14 @@ test("derivation is deterministic, order independent, deduplicated, and adapter 
     deriveSourceDescriptor(first).source_instance_id,
     deriveSourceDescriptor(codex).source_instance_id,
   );
+  assert.notEqual(
+    deriveSourceDescriptor(first).source_instance_id,
+    deriveSourceDescriptor(session({
+      sessionId: "session-2",
+      sourcePath: path,
+      capabilities: ["edit_fragments", "token_usage"],
+    })).source_instance_id,
+  );
   const forward = sourceDescriptorsForSessions([first, equivalent, codex]);
   const reverse = sourceDescriptorsForSessions([codex, equivalent, first]);
   assert.deepEqual(forward, reverse);
@@ -125,8 +134,10 @@ test("opaque descriptor values never contain path, Unicode, transcript, or token
     "PRIVATE_PATH_CANARY",
     "秘密の会話",
     "ghp_SOURCE_DESCRIPTOR_TOKEN_12345678",
+    "SESSION_ID_CANARY",
   ];
   const descriptor = deriveSourceDescriptor(session({
+    sessionId: `session-${canaries[3]}`,
     sourcePath: `/Users/alice/${canaries.join("/")}.jsonl`,
   }));
   const encoded = JSON.stringify(descriptor);

@@ -7,6 +7,7 @@
  */
 
 import type { EventIdentity } from "./event-identity.js";
+import type { SourceDescriptor } from "./source-descriptor.js";
 
 export type JsonPrimitive = boolean | number | string | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | JsonObject;
@@ -346,6 +347,12 @@ export interface SkippedRule {
 export interface ReportV2 {
   version: 2;
   unit: AnalysisUnit;
+  /**
+   * Validated, privacy-safe descriptors for source instances used by this
+   * analysis. Additive so older stored and constructed v2 reports remain
+   * readable when the field is absent.
+   */
+  sources?: SourceDescriptor[];
   summary: AnalysisSummary;
   findings: Finding[];
   caveats: string[];
