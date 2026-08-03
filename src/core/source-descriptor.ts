@@ -266,7 +266,7 @@ export function validateSourceDescriptors(value: unknown): SourceDescriptor[] {
   const descriptors = value.map(validateSourceDescriptor);
   const identities = new Set<string>();
   for (const descriptor of descriptors) {
-    const identity = `${descriptor.adapter_id}\0${descriptor.source_instance_id}`;
+    const identity = descriptor.source_instance_id;
     if (identities.has(identity)) return fail("duplicate_source");
     identities.add(identity);
   }

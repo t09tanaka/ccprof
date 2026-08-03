@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
@@ -203,6 +204,33 @@ test("descriptor-list validation rejects malformed containers and duplicate sour
   );
   assertContentFreeError(
     () => validateSourceDescriptors([descriptor, structuredClone(descriptor)]),
+    "duplicate_source",
+  );
+});
+
+test("descriptor-list validation rejects a duplicate source instance across adapters", () => {
+  const claude = deriveSourceDescriptor(session());
+  const codex = deriveSourceDescriptor(session({ source: "codex" }));
+  codex.source_instance_id = claude.source_instance_id;
+  codex.canonical_fingerprint = `sha256:${createHash("sha256")
+    .update("ccprof:source-descriptor:v1")
+    .update("\0")
+    .update(JSON.stringify([
+      codex.adapter_id,
+      codex.adapter_version,
+      codex.source_instance_id,
+      codex.source_kind,
+      codex.provided_capabilities,
+      codex.required_capabilities,
+      codex.provenance,
+      codex.sensitivity,
+      codex.retention_class,
+    ]))
+    .digest("hex")}`;
+
+  assert.deepEqual(validateSourceDescriptor(codex), codex);
+  assertContentFreeError(
+    () => validateSourceDescriptors([claude, codex]),
     "duplicate_source",
   );
 });
