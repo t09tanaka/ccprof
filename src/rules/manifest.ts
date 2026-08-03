@@ -1,4 +1,9 @@
-import { ALL_SESSION_CAPABILITIES, type RuleId, type SessionCapability } from "../core/model.js";
+import {
+  ALL_SESSION_CAPABILITIES,
+  type Finding,
+  type RuleId,
+  type SessionCapability,
+} from "../core/model.js";
 import type { SourceAdapterId } from "../core/source-descriptor.js";
 export interface RuleManifest {
   id: RuleId;
@@ -205,4 +210,13 @@ export function ruleManifest(id: string): RuleManifest {
     throw new TypeError(`unknown rule id ${id}; expected ${RULE_IDS.join(", ")}`);
   }
   return clone(entry);
+}
+
+export function withRuleManifest(finding: Finding): Finding {
+  const manifest = ruleManifest(finding.rule_id);
+  return {
+    ...finding,
+    rule_version: manifest.version,
+    compatibility_epoch: manifest.compatibility_epoch,
+  };
 }
