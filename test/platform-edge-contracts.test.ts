@@ -58,12 +58,14 @@ test("an actual NFD-named directory canonicalizes and hashes as NFC", async () =
     const nfdPath = join(root, nfdName);
     await mkdir(nfdPath);
 
-    const physicalPath = await realpath(nfdPath);
-    const canonical = await canonicalRepoPath(nfdPath);
-    const expectedNfc = physicalPath.normalize("NFC");
-    assert.equal(canonical, expectedNfc);
-    assert.equal(canonical, canonical.normalize("NFC"));
-    assert.equal(repoHash(canonical), repoHash(physicalPath.normalize("NFD")));
+    const canonicalFromNfd = await canonicalRepoPath(nfdPath);
+    const canonicalFromNfc = await canonicalRepoPath(nfdPath.normalize("NFC"));
+    assert.equal(canonicalFromNfd, canonicalFromNfc);
+    assert.equal(canonicalFromNfd, canonicalFromNfd.normalize("NFC"));
+    assert.equal(
+      repoHash(canonicalFromNfd),
+      repoHash(canonicalFromNfd.normalize("NFD")),
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
