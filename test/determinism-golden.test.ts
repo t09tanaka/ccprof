@@ -20,7 +20,38 @@ const report: ReportV2 = {
     unexplained_min: 0,
     baseline: null,
   },
-  findings: [],
+  findings: [{
+    finding_key: "R002:stable",
+    rule_id: "R002",
+    title: "Repeated command",
+    classification: "behavior",
+    cause: null,
+    scope: "this_pr",
+    confidence: "high",
+    impact: {
+      lower_ms: 60_000,
+      expected_ms: 90_000,
+      upper_ms: 120_000,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "high",
+      source_completeness: 1,
+    },
+    severity: "high",
+    scoring_rationale: ["observed_lower_bound"],
+    evidence: {
+      session_refs: ["session-a#1"],
+      interval_ids: ["R002:stable"],
+    },
+    recoverable: { min: 2, bound: "upper" },
+    fix_recipe: {
+      suggestion: "Run focused tests while iterating.",
+      verify: "npm test",
+    },
+    caveats: [],
+  }],
   caveats: [],
 };
 
@@ -42,7 +73,49 @@ const golden = `{
     "unexplained_min": 0,
     "baseline": null
   },
-  "findings": [],
+  "findings": [
+    {
+      "finding_key": "R002:stable",
+      "rule_id": "R002",
+      "title": "Repeated command",
+      "classification": "behavior",
+      "cause": null,
+      "scope": "this_pr",
+      "confidence": "high",
+      "impact": {
+        "lower_ms": 60000,
+        "expected_ms": 90000,
+        "upper_ms": 120000,
+        "kind": "critical_path_latency"
+      },
+      "finding_confidence": {
+        "evidence": "high",
+        "causal": "high",
+        "source_completeness": 1
+      },
+      "severity": "high",
+      "scoring_rationale": [
+        "observed_lower_bound"
+      ],
+      "evidence": {
+        "session_refs": [
+          "session-a#1"
+        ],
+        "interval_ids": [
+          "R002:stable"
+        ]
+      },
+      "recoverable": {
+        "min": 2,
+        "bound": "upper"
+      },
+      "fix_recipe": {
+        "suggestion": "Run focused tests while iterating.",
+        "verify": "npm test"
+      },
+      "caveats": []
+    }
+  ],
   "caveats": []
 }
 `;

@@ -330,6 +330,18 @@ time, but every finding produced by the analysis is written to the store.
       "cause": null,
       "scope": "this_pr",
       "confidence": "high",
+      "impact": {
+        "lower_ms": 840000,
+        "upper_ms": 840000,
+        "kind": "critical_path_latency"
+      },
+      "finding_confidence": {
+        "evidence": "high",
+        "causal": "high",
+        "source_completeness": 1
+      },
+      "severity": "high",
+      "scoring_rationale": ["observed_lower_bound"],
       "evidence": {
         "session_refs": ["session-ref-1"],
         "interval_ids": ["interval-1"],
@@ -356,8 +368,35 @@ The time fields mean:
 ```text
 raw_observed = measured_min + idle_excluded_min
 measured_min = normal_min + point_recoverable_min + human_wait_min + unexplained_min
-estimated_floor_min = measured_min - point_recoverable_min
+confirmed_lower_bound_ms = duration(union(eligible critical-path intervals))
+estimated_floor_min = max(0, measured_min - confirmed_lower_bound_ms / 60000)
 ```
+
+The canonical `impact` object is a millisecond range. `lower_ms` and
+`upper_ms` are always present, `expected_ms` appears only when the evidence
+supports a point inside that range, and `kind` distinguishes critical-path
+latency from resource cost. `finding_confidence` records evidence strength,
+causal strength, and source completeness independently. `severity` and the
+ordered `scoring_rationale` codes are deterministic consequences of those
+fields.
+
+The scalar `confidence` and minute-based `recoverable` object remain in JSON
+v2 for compatibility. They are projections of the canonical fields:
+`recoverable.min` uses `upper_ms`, its bound is `point` only when lower and
+upper are equal, and scalar confidence is the minimum of evidence, causal,
+and the completeness band. A legacy finding without canonical fields remains
+readable, but is conservatively normalized to lower `0`, its original value as
+the upper bound, partial/non-high confidence, and a `legacy_projection`
+rationale. Legacy point estimates are therefore never upgraded to confirmed
+lower bounds.
+
+An interval reduces `estimated_floor_min` only when it is critical-path
+latency with a positive lower bound and its evidence and causal ratings are
+both `high` with source completeness exactly `1`. The floor subtracts the
+union of those eligible lower-bound intervals, so overlaps and duplicates are
+not counted twice. Resource-cost findings, upper-only estimates, partial
+coverage, and medium/low confidence remain visible but never reduce the
+floor.
 
 `human_wait_min` is sub-threshold human wait (waiting for a reply between turns
 and waiting for an AskUserQuestion answer). It is reported separately because it
@@ -365,8 +404,7 @@ is not agent inefficiency. Waits that can be proven to be approval-driven still
 count toward `recoverable_min` as before. `unexplained_min` is active time that
 could be classified neither as normal cost nor as a deterministic reduction
 candidate. It is kept so that unknown waste is never silently folded into normal
-cost. Findings with `bound: "upper"` are displayed but do not reduce the
-estimated floor.
+cost.
 
 ### How `scope` is used
 
