@@ -395,6 +395,108 @@ test("event admission uses deterministic identity ties for equal source indices"
   assert.deepEqual(admitted.map(({ session_id }) => session_id), ["a"]);
 });
 
+test("tool-use identity breaks equal source-index ties independent of input order", () => {
+  const tiedTool = (toolUseId: string): Session["events"][number] => ({
+    kind: "tool_use",
+    timestamp_ms: 1,
+    session_id: "shared",
+    entry_uuid: "same-entry",
+    session_ref: "shared#same-entry",
+    source_index: 0,
+    agent_id: "shared",
+    is_sidechain: false,
+    confidence: "high",
+    tool_use_id: toolUseId,
+    tool_name: "Read",
+    input: {},
+    paths: [],
+    edit_fragments: [],
+  });
+  const admittedTool = (toolUseIds: readonly string[]): string | undefined => {
+    const meter = new AnalysisBudgetMeter(
+      budgets({ max_input_events: 1 }),
+      clock,
+    );
+    const [session] = admitSessionEventPrefix([{
+      ...fakeSession("/repo/shared.jsonl"),
+      session_id: "shared",
+      events: toolUseIds.map(tiedTool),
+    }], meter);
+    const event = session?.events[0];
+    return event?.kind === "tool_use" ? event.tool_use_id : undefined;
+  };
+
+  assert.equal(admittedTool(["z-call", "a-call"]), "a-call");
+  assert.equal(admittedTool(["a-call", "z-call"]), "a-call");
+});
+
+test("truncated session confidence comes only from admitted events", () => {
+  const event = (
+    entryUuid: string,
+    sourceIndex: number,
+    confidence: "high" | "low",
+  ): Session["events"][number] => ({
+    kind: "assistant",
+    timestamp_ms: sourceIndex + 1,
+    session_id: "confidence",
+    entry_uuid: entryUuid,
+    session_ref: `confidence#${entryUuid}`,
+    source_index: sourceIndex,
+    agent_id: "confidence",
+    is_sidechain: false,
+    confidence,
+    text: entryUuid,
+  });
+  const meter = new AnalysisBudgetMeter(
+    budgets({ max_input_events: 1 }),
+    clock,
+  );
+
+  const admitted = admitSessionEventPrefix([{
+    ...fakeSession("/repo/confidence.jsonl"),
+    session_id: "confidence",
+    confidence: "low",
+    events: [event("prefix", 0, "high"), event("suffix", 1, "low")],
+  }], meter);
+
+  assert.equal(admitted[0]?.confidence, "high");
+});
+
+test("truncated warning must match both an admitted reference and line", () => {
+  const event = (entryUuid: string, sourceIndex: number): Session["events"][number] => ({
+    kind: "assistant",
+    timestamp_ms: sourceIndex + 1,
+    session_id: "warnings",
+    entry_uuid: entryUuid,
+    session_ref: `warnings#${entryUuid}`,
+    source_index: sourceIndex,
+    agent_id: "warnings",
+    is_sidechain: false,
+    confidence: "high",
+    text: entryUuid,
+  });
+  const prefix = event("prefix", 0);
+  const meter = new AnalysisBudgetMeter(
+    budgets({ max_input_events: 1 }),
+    clock,
+  );
+
+  const admitted = admitSessionEventPrefix([{
+    ...fakeSession("/repo/warnings.jsonl"),
+    session_id: "warnings",
+    events: [prefix, event("suffix", 1)],
+    warnings: [{
+      code: "suffix_line_with_prefix_ref",
+      message: "suffix",
+      source_path: "/repo/warnings.jsonl",
+      line: 2,
+      session_ref: prefix.session_ref,
+    }],
+  }], meter);
+
+  assert.deepEqual(admitted[0]?.warnings, []);
+});
+
 test("event admission computes large-prefix bounds without variadic min/max", () => {
   const eventCount = 200_000;
   const events: Session["events"] = Array.from(

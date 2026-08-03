@@ -585,6 +585,37 @@ test("budgeted Claude discovery claims a zero source-item budget before lstat", 
   assert.equal(meter.result().observed.source_items, 1);
 });
 
+test("budgeted Claude discovery claims an item before resolving a transcript symlink", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-budget-claude-symlink-first-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const projects = join(root, "projects");
+  const repo = join(root, "repo");
+  await Promise.all([
+    mkdir(projects, { recursive: true }),
+    mkdir(repo, { recursive: true }),
+  ]);
+  await symlink(
+    join(root, "missing.jsonl"),
+    join(projects, "broken.jsonl"),
+  );
+  const meter = new AnalysisBudgetMeter(
+    analysisBudgets({ max_source_items: 0 }),
+    steadyBudgetClock,
+  );
+
+  const sessions = await discoverClaudeSessions(projects, {
+    repoRoot: repo,
+    headBranch: "feature/parser",
+    startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+    analysisBudgetMeter: meter,
+  });
+
+  assert.deepEqual(sessions, []);
+  assert.equal(meter.result().truncation_reason, "max_source_items");
+  assert.equal(meter.result().observed.source_items, 1);
+});
+
 test("throws a typed discovery error when malformed-only sources yield no sessions", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-source-error-"));
   t.after(async () => rm(root, { recursive: true, force: true }));
