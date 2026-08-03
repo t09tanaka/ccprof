@@ -143,7 +143,8 @@ jobs:
           set -euo pipefail
           BUNDLE_DIR="$RUNNER_TEMP/release-bundle"
           cd "$BUNDLE_DIR"
-          # shellcheck disable=SC2016 -- JavaScript template literals are intentionally single-quoted.
+          # JavaScript template literals are intentionally single-quoted.
+          # shellcheck disable=SC2016
           mapfile -t METADATA < <(node -e 'const { readFileSync } = require("node:fs"); const metadata = JSON.parse(readFileSync("release-metadata.json", "utf8")); const stable = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/; const tag = process.argv[1]; if (metadata.schemaVersion !== 1 || metadata.repository !== "t09tanaka/ccprof" || metadata.workflow !== "release-assets.yml" || !stable.test(metadata.version) || metadata.tag !== tag || tag !== `v${metadata.version}` || metadata.tarball !== `ccprof-${metadata.version}.tgz` || metadata.sbom !== `ccprof-${metadata.version}.spdx.json` || !/^sha512-[A-Za-z0-9+/]+={0,2}$/.test(metadata.integrity) || !/^[0-9a-f]{64}$/.test(metadata.sha256)) throw new Error("invalid release metadata"); process.stdout.write([metadata.version, metadata.tarball, metadata.sbom, metadata.integrity, metadata.sha256].join("\n") + "\n");' "$TAG")
           [ "${#METADATA[@]}" -eq 5 ]
           node -e 'const { readFileSync } = require("node:fs"); const expected = process.argv.slice(1).sort(); const lines = readFileSync("SHA256SUMS", "utf8").trim().split("\n"); const names = lines.map((line) => { const match = /^[0-9a-f]{64}  ([^/\r\n]+)$/.exec(line); if (!match) throw new Error("invalid checksum entry"); return match[1]; }).sort(); if (lines.length !== 2 || JSON.stringify(names) !== JSON.stringify(expected)) throw new Error("invalid checksum manifest");' "${METADATA[1]}" "${METADATA[2]}"
