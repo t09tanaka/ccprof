@@ -8,6 +8,7 @@ import {
   open,
   type FileHandle,
 } from "node:fs/promises";
+import { types as utilTypes } from "node:util";
 
 import type { PrivacyProfile } from "../reporters/privacy.js";
 
@@ -114,16 +115,35 @@ function invalid(): never {
   throw new OrganizationPolicyError("invalid_policy");
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function assertClosedObject(
+function captureClosedObject(
   value: unknown,
   allowedKeys: ReadonlySet<string>,
-): asserts value is Record<string, unknown> {
-  if (!isRecord(value)) invalid();
-  if (Object.keys(value).some((key) => !allowedKeys.has(key))) invalid();
+): Record<string, unknown> {
+  try {
+    if (
+      typeof value !== "object" || value === null ||
+      utilTypes.isProxy(value) || Array.isArray(value) ||
+      Object.getPrototypeOf(value) !== Object.prototype
+    ) {
+      invalid();
+    }
+    const captured: Record<string, unknown> = {};
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== "string" || !allowedKeys.has(key)) invalid();
+      const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+      if (
+        descriptor === undefined || !descriptor.enumerable ||
+        !("value" in descriptor)
+      ) {
+        invalid();
+      }
+      captured[key] = descriptor.value;
+    }
+    return captured;
+  } catch (error) {
+    if (error instanceof OrganizationPolicyError) throw error;
+    invalid();
+  }
 }
 
 function privacyProfile(value: unknown): value is PrivacyProfile {
@@ -134,53 +154,62 @@ function snapshotKillSwitches(
   value: unknown,
 ): OrganizationPolicyKillSwitches | undefined {
   if (value === undefined) return undefined;
-  assertClosedObject(value, KILL_SWITCH_KEYS);
+  const captured = captureClosedObject(value, KILL_SWITCH_KEYS);
+  const raw = captured.raw;
+  const advisory = captured.advisory;
+  const exportAllowed = captured.export;
   if (
-    typeof value.raw !== "boolean" ||
-    typeof value.advisory !== "boolean" ||
-    typeof value.export !== "boolean"
+    typeof raw !== "boolean" ||
+    typeof advisory !== "boolean" ||
+    typeof exportAllowed !== "boolean"
   ) {
     invalid();
   }
   return {
-    raw: value.raw,
-    advisory: value.advisory,
-    export: value.export,
+    raw,
+    advisory,
+    export: exportAllowed,
   };
 }
 
 function snapshotPolicy(value: unknown): OrganizationPolicy {
-  assertClosedObject(value, POLICY_KEYS);
+  const captured = captureClosedObject(value, POLICY_KEYS);
+  const schema = captured.$schema;
+  const policySchemaVersion = captured.policy_schema_version;
+  const organization = captured.organization;
+  const minimumPrivacy = captured.minimum_privacy;
+  const allowRaw = captured.allow_raw;
+  const allowAdvisory = captured.allow_advisory;
+  const allowExport = captured.allow_export;
+  const rawRetentionDaysMax = captured.raw_retention_days_max;
+  const requiredSourceCoverage = captured.required_source_coverage;
   if (
-    value.policy_schema_version !== 1 ||
-    typeof value.organization !== "string" ||
-    !ORGANIZATION.test(value.organization) ||
-    !privacyProfile(value.minimum_privacy) ||
-    typeof value.allow_raw !== "boolean" ||
-    typeof value.allow_advisory !== "boolean" ||
-    typeof value.allow_export !== "boolean" ||
-    typeof value.raw_retention_days_max !== "number" ||
-    !Number.isSafeInteger(value.raw_retention_days_max) ||
-    value.raw_retention_days_max < 0 ||
-    typeof value.required_source_coverage !== "number" ||
-    !Number.isFinite(value.required_source_coverage) ||
-    value.required_source_coverage < 0 ||
-    value.required_source_coverage > 1 ||
-    (value.$schema !== undefined &&
-      (typeof value.$schema !== "string" || value.$schema.trim() === ""))
+    policySchemaVersion !== 1 ||
+    typeof organization !== "string" || !ORGANIZATION.test(organization) ||
+    !privacyProfile(minimumPrivacy) ||
+    typeof allowRaw !== "boolean" ||
+    typeof allowAdvisory !== "boolean" ||
+    typeof allowExport !== "boolean" ||
+    typeof rawRetentionDaysMax !== "number" ||
+    !Number.isSafeInteger(rawRetentionDaysMax) || rawRetentionDaysMax < 0 ||
+    typeof requiredSourceCoverage !== "number" ||
+    !Number.isFinite(requiredSourceCoverage) || requiredSourceCoverage < 0 ||
+    requiredSourceCoverage > 1 ||
+    (schema !== undefined &&
+      (typeof schema !== "string" || schema.trim() === ""))
   ) {
     invalid();
   }
-  const killSwitches = snapshotKillSwitches(value.kill_switches);
+  const killSwitches = snapshotKillSwitches(captured.kill_switches);
   return {
     policy_schema_version: 1,
-    organization: value.organization,
-    minimum_privacy: value.minimum_privacy,
-    allow_raw: value.allow_raw,
-    allow_advisory: value.allow_advisory,
-    allow_export: value.allow_export,
-    raw_retention_days_max: value.raw_retention_days_max,
-    required_source_coverage: value.required_source_coverage,
+    organization,
+    minimum_privacy: minimumPrivacy,
+    allow_raw: allowRaw,
+    allow_advisory: allowAdvisory,
+    allow_export: allowExport,
+    raw_retention_days_max: rawRetentionDaysMax,
+    required_source_coverage: requiredSourceCoverage,
     ...(killSwitches === undefined
       ? {}
       : { kill_switches: killSwitches }),
@@ -220,21 +249,19 @@ async function readBounded(
     "policy_unreadable" | "signature_unreadable" | "public_key_unreadable"
   >,
 ): Promise<Buffer> {
-  const chunks: Buffer[] = [];
+  const content = Buffer.allocUnsafe(maxBytes + 1);
   let total = 0;
   while (total <= maxBytes) {
     const remaining = maxBytes + 1 - total;
-    const chunk = Buffer.allocUnsafe(Math.min(16 * 1024, remaining));
     const { bytesRead } = await handle.read(
-      chunk,
-      0,
-      chunk.byteLength,
+      content,
+      total,
+      remaining,
       null,
     );
-    if (bytesRead === 0) return Buffer.concat(chunks, total);
+    if (bytesRead === 0) return content.subarray(0, total);
     total += bytesRead;
     if (total > maxBytes) throw new OrganizationPolicyError(code);
-    chunks.push(chunk.subarray(0, bytesRead));
   }
   throw new OrganizationPolicyError(code);
 }
@@ -419,7 +446,9 @@ export function resolveEffectivePolicy(input: {
   repository?: RepositoryPolicyPreferences;
   request: PolicyRequest;
 }): EffectivePolicy {
-  const organization = input.organization;
+  const organization = input.organization === undefined
+    ? undefined
+    : snapshotPolicy(input.organization);
   const repository = input.repository;
   const rawKilled = organization?.kill_switches?.raw === true;
   const advisoryKilled = organization?.kill_switches?.advisory === true;
