@@ -5,6 +5,7 @@ import {
 } from "node:crypto";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import {
+  mkdir,
   lstat,
   mkdtemp,
   open,
@@ -17,6 +18,11 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test, { type TestContext } from "node:test";
 
+import {
+  loadRepositoryConfig,
+  loadRepositoryPolicyPreferences,
+  RepositoryConfigError,
+} from "../src/analysis/repository-config.js";
 import {
   canonicalOrganizationPolicy,
   loadConfiguredOrganizationPolicy,
@@ -111,6 +117,21 @@ async function signedPolicyFixture(
   };
 }
 
+async function temporaryRepository(t: TestContext): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-policy-repository-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  return root;
+}
+
+async function writeRepositoryConfig(
+  repoRoot: string,
+  value: unknown,
+): Promise<void> {
+  const path = join(repoRoot, ".ccprof", "config.json");
+  await mkdir(join(repoRoot, ".ccprof"), { recursive: true });
+  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
 test("published organization policy schema is closed and exact", async () => {
   const schema = JSON.parse(await readFile(
     resolve(process.cwd(), "schemas/organization-policy.schema.json"),
@@ -149,6 +170,131 @@ test("published organization policy schema is closed and exact", async () => {
   };
   assert.equal(killSwitches.additionalProperties, false);
   assert.deepEqual(killSwitches.required, ["raw", "advisory", "export"]);
+});
+
+test("repository config schema publishes a closed optional policy section", async () => {
+  const schema = JSON.parse(await readFile(
+    resolve(process.cwd(), "schemas/config.schema.json"),
+    "utf8",
+  )) as {
+    properties?: {
+      policy?: {
+        additionalProperties?: unknown;
+        required?: unknown;
+        properties?: Record<string, unknown>;
+      };
+    };
+  };
+  const policySchema = schema.properties?.policy;
+  assert.equal(policySchema?.additionalProperties, false);
+  assert.deepEqual(policySchema?.required, []);
+  assert.deepEqual(Object.keys(policySchema?.properties ?? {}), [
+    "minimum_privacy",
+    "allow_raw",
+    "allow_advisory",
+    "allow_export",
+    "raw_retention_days_max",
+    "required_source_coverage",
+  ]);
+});
+
+test("repository policy preferences preserve the existing config result", async (t) => {
+  const repoRoot = await temporaryRepository(t);
+  assert.deepEqual(await loadRepositoryPolicyPreferences(repoRoot), {});
+  assert.deepEqual(await loadRepositoryConfig(repoRoot), {
+    mappings: [],
+    caveats: [],
+  });
+
+  await writeRepositoryConfig(repoRoot, {
+    schema_version: 1,
+    policy: {
+      minimum_privacy: "balanced",
+      allow_raw: false,
+      allow_advisory: true,
+      allow_export: false,
+      raw_retention_days_max: 0,
+      required_source_coverage: 1,
+    },
+  });
+
+  assert.deepEqual(await loadRepositoryConfig(repoRoot), {
+    mappings: [],
+    caveats: [],
+    config_schema_version: 1,
+  });
+  const preferences = await loadRepositoryPolicyPreferences(repoRoot);
+  assert.deepEqual(preferences, {
+    minimum_privacy: "balanced",
+    allow_raw: false,
+    allow_advisory: true,
+    allow_export: false,
+    raw_retention_days_max: 0,
+    required_source_coverage: 1,
+  });
+  preferences.minimum_privacy = "raw";
+  assert.equal(
+    (await loadRepositoryPolicyPreferences(repoRoot)).minimum_privacy,
+    "balanced",
+  );
+});
+
+test("repository policy preferences are independently optional", async (t) => {
+  const fields = {
+    minimum_privacy: "strict",
+    allow_raw: false,
+    allow_advisory: false,
+    allow_export: false,
+    raw_retention_days_max: Number.MAX_SAFE_INTEGER,
+    required_source_coverage: 0,
+  } as const;
+  for (const [key, value] of Object.entries(fields)) {
+    const repoRoot = await temporaryRepository(t);
+    await writeRepositoryConfig(repoRoot, {
+      schema_version: 1,
+      policy: { [key]: value },
+    });
+    assert.deepEqual(await loadRepositoryPolicyPreferences(repoRoot), {
+      [key]: value,
+    });
+  }
+});
+
+test("repository policy validation is closed, bounded, and content-free", async (t) => {
+  const sentinel = "CCPROF_PRIVATE_REPOSITORY_POLICY_817ca2";
+  const invalidPolicies: readonly unknown[] = [
+    null,
+    [],
+    sentinel,
+    { [sentinel]: true },
+    { minimum_privacy: "RAW" },
+    { allow_raw: sentinel },
+    { allow_advisory: 1 },
+    { allow_export: null },
+    { raw_retention_days_max: -1 },
+    { raw_retention_days_max: 1.5 },
+    { raw_retention_days_max: Number.MAX_SAFE_INTEGER + 1 },
+    { required_source_coverage: -Number.EPSILON },
+    { required_source_coverage: 1 + Number.EPSILON },
+  ];
+
+  for (const value of invalidPolicies) {
+    const repoRoot = await temporaryRepository(t);
+    await writeRepositoryConfig(repoRoot, {
+      schema_version: 1,
+      policy: value,
+    });
+    await assert.rejects(
+      loadRepositoryPolicyPreferences(repoRoot),
+      (error: unknown) => {
+        assert.ok(error instanceof RepositoryConfigError);
+        assert.match(error.message, /^\.ccprof\/config\.json:/u);
+        assert.doesNotMatch(error.message, new RegExp(sentinel, "u"));
+        assert.doesNotMatch(error.message, new RegExp(repoRoot, "u"));
+        return true;
+      },
+    );
+  }
 });
 
 test("organization policy parser returns the exact validated contract", () => {
