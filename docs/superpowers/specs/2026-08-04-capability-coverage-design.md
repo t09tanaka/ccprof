@@ -97,4 +97,3 @@ a Store schema change. Parser/session warning text is never added to output.
 - JSON/TTY/Markdown/privacy expose coverage without mutating input.
 - Legacy reports without coverage and old stored records remain readable;
   policy snapshots change when coverage changes.
-
