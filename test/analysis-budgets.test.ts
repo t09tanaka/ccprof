@@ -5,6 +5,7 @@ import {
   AnalysisBudgetMeter,
   AnalysisBudgetValidationError,
   normalizeAnalysisBudgets,
+  normalizeAnalysisBudgetResult,
   type AnalysisBudgetClock,
   type AnalysisBudgets,
 } from "../src/analysis/budgets.js";
@@ -62,6 +63,30 @@ function validationCode(run: () => unknown): string {
     return validationError.code;
   }
   assert.fail("expected analysis budget validation to fail");
+}
+
+function completeResult() {
+  return {
+    configured: limits(),
+    consumed: {
+      input_bytes: 10,
+      input_events: 3,
+      wall_ms: 20,
+      cpu_ms: 15,
+      output_bytes: 200,
+      source_items: 2,
+    },
+    observed: {
+      input_bytes: 10,
+      input_events: 3,
+      wall_ms: 20,
+      cpu_ms: 15,
+      output_bytes: 200,
+      source_items: 2,
+    },
+    completeness: "complete" as const,
+    coverage: 1,
+  };
 }
 
 test("normalizes exactly six detached finite nonnegative safe-integer limits", () => {
@@ -357,4 +382,80 @@ test("result snapshots are detached from the meter and from each other", () => {
   first.consumed.input_events = 999;
   assert.equal(meter.result().configured.max_input_events, 3);
   assert.equal(meter.result().consumed.input_events, 2);
+});
+
+test("normalizes a detached exact analysis budget result", () => {
+  const input = completeResult();
+  const normalized = normalizeAnalysisBudgetResult(input);
+
+  assert.deepEqual(normalized, input);
+  assert.notEqual(normalized, input);
+  assert.notEqual(normalized.configured, input.configured);
+  assert.notEqual(normalized.consumed, input.consumed);
+  assert.notEqual(normalized.observed, input.observed);
+
+  input.configured.max_input_bytes = 999;
+  input.consumed.input_bytes = 999;
+  assert.equal(normalized.configured.max_input_bytes, 10);
+  assert.equal(normalized.consumed.input_bytes, 10);
+});
+
+test("rejects malformed or hostile analysis budget results without reading accessors", () => {
+  const malformed: unknown[] = [
+    { ...completeResult(), extra: "token-canary" },
+    { ...completeResult(), coverage: Number.NaN },
+    { ...completeResult(), coverage: -0.1 },
+    { ...completeResult(), coverage: 1.1 },
+    { ...completeResult(), completeness: "partial" },
+    { ...completeResult(), truncation_reason: "max_input_bytes" },
+    {
+      ...completeResult(),
+      consumed: { ...completeResult().consumed, input_bytes: 10.5 },
+    },
+    {
+      ...completeResult(),
+      observed: { ...completeResult().observed, secret: "token-canary" },
+    },
+    {
+      ...completeResult(),
+      completeness: "partial",
+      truncation_reason: "token-canary",
+      coverage: 0,
+    },
+  ];
+  const missing = completeResult() as Record<string, unknown>;
+  delete missing.observed;
+  malformed.push(missing);
+
+  for (const value of malformed) {
+    assert.ok([
+      "invalid_shape",
+      "invalid_value",
+    ].includes(validationCode(() => normalizeAnalysisBudgetResult(value))));
+  }
+
+  let getterReads = 0;
+  const accessor = completeResult() as Record<string, unknown>;
+  Object.defineProperty(accessor, "coverage", {
+    enumerable: true,
+    get() {
+      getterReads += 1;
+      throw new Error("token-canary");
+    },
+  });
+  assert.ok([
+    "invalid_shape",
+    "invalid_value",
+  ].includes(validationCode(() => normalizeAnalysisBudgetResult(accessor))));
+  assert.equal(getterReads, 0);
+
+  const proxy = new Proxy(completeResult(), {
+    ownKeys() {
+      throw new Error("token-canary");
+    },
+  });
+  assert.equal(
+    validationCode(() => normalizeAnalysisBudgetResult(proxy)),
+    "invalid_shape",
+  );
 });
