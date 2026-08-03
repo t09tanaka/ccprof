@@ -10,6 +10,7 @@ import {
   type JsonObject,
   type JsonValue,
   type NormalizedEvent,
+  type ResultStatusEvidence,
   type Session,
   type SourceWarning,
   type ToolResultEvent,
@@ -57,7 +58,7 @@ type UnknownRecord = Record<string, unknown>;
 
 interface IngestedToolResult {
   toolUseId?: string;
-  status: ToolResultStatus;
+  statusEvidence: ResultStatusEvidence;
   output: string;
   outputBytes: number;
   estimatedTokens: number;
@@ -308,60 +309,65 @@ function observedExitCode(value: unknown): number | undefined {
   return undefined;
 }
 
-function classifyExplicitResultStatus(
-  value: unknown,
-  exitCode: number | undefined,
-): { status: ToolResultStatus; recognized: boolean } {
-  if (isRecord(value)) {
-    const observedStatus = value.status;
-    if (
-      value.timedOut === true ||
-      value.timed_out === true ||
-      observedStatus === "timeout" ||
-      observedStatus === "timed_out"
-    ) {
-      return { status: "timeout", recognized: true };
-    }
-    if (
-      value.cancelled === true ||
-      value.interrupted === true ||
-      observedStatus === "cancelled" ||
-      observedStatus === "canceled"
-    ) {
-      return { status: "cancelled", recognized: true };
-    }
-    if (
-      value.is_error === true ||
-      value.success === false ||
-      (exitCode !== undefined && exitCode !== 0) ||
-      observedStatus === "failed" ||
-      observedStatus === "failure" ||
-      observedStatus === "error"
-    ) {
-      return { status: "failure", recognized: true };
-    }
-    if (
-      value.is_error === false ||
-      value.success === true ||
-      value.interrupted === false ||
-      value.noOutputExpected === true ||
-      [
-        "async_launched",
-        "completed",
-        "forked",
-        "success",
-        "teammate_spawned",
-      ].includes(
-        typeof observedStatus === "string" ? observedStatus : "",
-      )
-    ) {
-      return { status: "success", recognized: true };
-    }
+function explicitStatusCandidates(value: unknown): ToolResultStatus[] {
+  if (!isRecord(value)) {
+    return [];
   }
-  if (exitCode === 0) {
-    return { status: "success", recognized: true };
+  const statuses: ToolResultStatus[] = [];
+  const observedStatus = value.status;
+  if (
+    value.timedOut === true ||
+    value.timed_out === true ||
+    observedStatus === "timeout" ||
+    observedStatus === "timed_out"
+  ) {
+    statuses.push("timeout");
   }
-  return { status: "unknown", recognized: false };
+  if (
+    value.cancelled === true ||
+    observedStatus === "cancelled" ||
+    observedStatus === "canceled"
+  ) {
+    statuses.push("cancelled");
+  }
+  if (
+    value.is_error === true ||
+    value.success === false ||
+    ["failed", "failure", "error"].includes(
+      typeof observedStatus === "string" ? observedStatus : "",
+    )
+  ) {
+    statuses.push("failure");
+  }
+  if (
+    value.is_error === false ||
+    value.success === true ||
+    observedStatus === "success"
+  ) {
+    statuses.push("success");
+  }
+  return statuses;
+}
+
+function adapterStatusCandidates(value: unknown): ToolResultStatus[] {
+  if (!isRecord(value)) {
+    return [];
+  }
+  const statuses: ToolResultStatus[] = [];
+  if (value.interrupted === true) {
+    statuses.push("cancelled");
+  }
+  if (value.interrupted === false || value.noOutputExpected === true) {
+    statuses.push("success");
+  }
+  if (
+    ["async_launched", "completed", "forked", "teammate_spawned"].includes(
+      typeof value.status === "string" ? value.status : "",
+    )
+  ) {
+    statuses.push("success");
+  }
+  return statuses;
 }
 
 function structuredResultId(value: unknown): string | undefined {
@@ -427,26 +433,59 @@ function structuredResultForTool(
 function classifyResultStatus(
   block: UnknownRecord,
   structuredResult: unknown,
-  visibleText: ResultText,
-  structuredText: ResultText,
   visibleExitCode: number | undefined,
   structuredExitCode: number | undefined,
-): { status: ToolResultStatus; recognized: boolean } {
-  const visible = classifyExplicitResultStatus(block, visibleExitCode);
-  if (visible.recognized) {
-    return visible;
+): [ResultStatusEvidence, boolean] {
+  const explicitStatuses = new Set([
+    ...explicitStatusCandidates(block),
+    ...explicitStatusCandidates(structuredResult),
+  ]);
+  if (explicitStatuses.size > 0) {
+    if (explicitStatuses.has("timeout")) {
+      return [{ status: "timeout", source: "explicit_status", confidence: "high" }, true];
+    }
+    if (explicitStatuses.has("cancelled")) {
+      return [{ status: "cancelled", source: "explicit_status", confidence: "high" }, true];
+    }
+    if (explicitStatuses.has("failure") && explicitStatuses.has("success")) {
+      return [{ status: "unknown", source: "none", confidence: "low" }, true];
+    }
+    const status = explicitStatuses.has("failure") ? "failure" : "success";
+    return [{ status, source: "explicit_status", confidence: "high" }, true];
   }
-  const structured = classifyExplicitResultStatus(
-    structuredResult,
-    structuredExitCode,
-  );
-  if (structured.recognized) {
-    return structured;
+  const groups = [
+    {
+      statuses: [visibleExitCode, structuredExitCode]
+        .filter((code): code is number => code !== undefined)
+        .map(
+          (code): ToolResultStatus => code === 0 ? "success" : "failure",
+        ),
+      source: "exit_code" as const,
+      confidence: "high" as const,
+    },
+    {
+      statuses: [
+        ...adapterStatusCandidates(block),
+        ...adapterStatusCandidates(structuredResult),
+      ],
+      source: "tool_adapter" as const,
+      confidence: "medium" as const,
+    },
+  ];
+  for (const group of groups) {
+    const statuses = new Set(group.statuses);
+    if (statuses.size === 1) {
+      return [{
+        status: [...statuses][0]!,
+        source: group.source,
+        confidence: group.confidence,
+      }, true];
+    }
+    if (statuses.size > 1) {
+      return [{ status: "unknown", source: "none", confidence: "low" }, true];
+    }
   }
-  if (visibleText.recognized || structuredText.recognized) {
-    return { status: "success", recognized: true };
-  }
-  return { status: "unknown", recognized: false };
+  return [{ status: "unknown", source: "none", confidence: "low" }, false];
 }
 
 function boundedOutput(
@@ -485,11 +524,9 @@ function ingestToolResults(parsed: UnknownRecord): IngestedToolResult[] {
     const structuredText = resultText(supplementalResult);
     const visibleExitCode = observedExitCode(item);
     const structuredExitCode = observedExitCode(supplementalResult);
-    const status = classifyResultStatus(
+    const [statusEvidence, hasStatusSchema] = classifyResultStatus(
       item,
       supplementalResult,
-      visibleText,
-      structuredText,
       visibleExitCode,
       structuredExitCode,
     );
@@ -499,11 +536,12 @@ function ingestToolResults(parsed: UnknownRecord): IngestedToolResult[] {
     const bounded = boundedOutput(selectedText);
     const exitCode = visibleExitCode ?? structuredExitCode;
     results.push({
-      status: status.status,
+      statusEvidence,
       output: bounded.output,
       outputBytes: bounded.outputBytes,
       estimatedTokens: bounded.estimatedTokens,
-      hasUnknownSchema: !status.recognized,
+      hasUnknownSchema:
+        !hasStatusSchema && !visibleText.recognized && !structuredText.recognized,
       ...(toolUseId !== undefined ? { toolUseId } : {}),
       ...(exitCode !== undefined ? { exitCode } : {}),
     });
@@ -1241,7 +1279,8 @@ function toolResultEvent(
     ...eventBase(row, agentId, result.hasUnknownSchema),
     kind: "tool_result",
     tool_use_id: toolUseId,
-    status: result.status,
+    status: result.statusEvidence.status,
+    status_evidence: result.statusEvidence,
     output: result.output,
     output_bytes: result.outputBytes,
     estimated_tokens: result.estimatedTokens,

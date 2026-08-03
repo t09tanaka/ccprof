@@ -9,6 +9,7 @@ import {
   type GenuineUserEvent,
   type JsonObject,
   type NormalizedEvent,
+  type ResultStatusEvidence,
   type Session,
   type SourceWarning,
   type ToolResultEvent,
@@ -38,7 +39,7 @@ const INJECTED_USER_TEXT_PREFIXES = [
   "<turn_context>",
 ];
 
-const EXIT_CODE_PATTERN = /^Process exited with code (\d+)/u;
+const EXIT_CODE_PATTERN = /^Process exited with code (\d+)(?:\r?\n|$)/u;
 
 /**
  * File headers in an apply_patch body. Content lines inside a patch are
@@ -220,7 +221,10 @@ function resolveOutput(raw: string): ResolvedOutput {
     if (isRecord(parsed)) {
       const metadata = parsed.metadata;
       const metadataExitCode =
-        isRecord(metadata) && typeof metadata.exit_code === "number"
+        isRecord(metadata) &&
+        typeof metadata.exit_code === "number" &&
+        Number.isFinite(metadata.exit_code) &&
+        Number.isInteger(metadata.exit_code)
           ? metadata.exit_code
           : undefined;
       const text = typeof parsed.output === "string" ? parsed.output : raw;
@@ -428,16 +432,36 @@ function buildFunctionCallOutputEvent(
 
   const { text, metadataExitCode } = resolveOutput(rawOutput);
   const match = EXIT_CODE_PATTERN.exec(text);
-  const textExitCode = match?.[1] !== undefined ? Number(match[1]) : undefined;
+  const parsedTextExitCode =
+    match?.[1] !== undefined ? Number(match[1]) : undefined;
+  const textExitCode =
+    parsedTextExitCode !== undefined && Number.isFinite(parsedTextExitCode)
+      ? parsedTextExitCode
+      : undefined;
   const exitCode = metadataExitCode ?? textExitCode;
-  const status: ToolResultStatus =
-    exitCode === undefined ? "unknown" : exitCode === 0 ? "success" : "failure";
+  const statusForExitCode = (code: number): ToolResultStatus =>
+    code === 0 ? "success" : "failure";
+  const statusEvidence: ResultStatusEvidence =
+    metadataExitCode !== undefined
+      ? {
+          status: statusForExitCode(metadataExitCode),
+          source: "exit_code",
+          confidence: "high",
+        }
+      : textExitCode !== undefined
+        ? {
+            status: statusForExitCode(textExitCode),
+            source: "tool_adapter",
+            confidence: "medium",
+          }
+        : { status: "unknown", source: "none", confidence: "low" };
 
   return {
     ...eventBase(row, sessionId, baseConfidence, false),
     kind: "tool_result",
     tool_use_id: callId,
-    status,
+    status: statusEvidence.status,
+    status_evidence: statusEvidence,
     output: text,
     output_bytes: Buffer.byteLength(text),
     estimated_tokens: Math.ceil(text.length / 4),
