@@ -18,10 +18,11 @@ Store module. Do not connect discovery or parsing in this PR.
 
 - Production: `src/store/sqlite.ts` and new `src/store/source-catalog.ts`, at most
   300 added/changed production lines.
-- Tests: migration coverage in `test/store.test.ts` and catalog coverage in new
-  `test/source-catalog.test.ts`.
+- Tests: migration coverage in `test/store.test.ts`, catalog coverage in new
+  `test/source-catalog.test.ts`, and the directly affected migration-marker
+  assertion in `test/data-command.test.ts`.
 - Documentation: this plan and the matching design document.
-- Target: six changed files, never more than eight.
+- Target: seven changed files, never more than eight.
 
 ## Task 1 — RED schema and migration tests
 
@@ -32,7 +33,7 @@ Store module. Do not connect discovery or parsing in this PR.
 - [x] Cover v0, v2, double open, explicit rerun/no-op, version 1/future rejection,
   and failure injection that rolls back table/marker/version without touching
   existing rows.
-- [ ] Re-run legacy JSON migration/read/write tests unchanged.
+- [x] Re-run legacy JSON migration/read/write tests unchanged.
 - [x] Delegate the focused test and record the expected implementation-only RED.
 
 ## Task 2 — Transactional Store v3 migration
@@ -61,16 +62,16 @@ Store module. Do not connect discovery or parsing in this PR.
 - [x] Add strict content-free validation that returns detached rows.
 - [x] Add atomic upsert, deterministic get/list, and fail-closed content-change
   comparison without storing source bodies.
-- [ ] Use the TypeScript LanguageService for semantic reference/diagnostic checks;
+- [x] Use the TypeScript LanguageService for semantic reference/diagnostic checks;
   record that `ts-rename-helper` is unavailable in this environment.
 - [x] Delegate focused tests GREEN and commit without amend.
 
 ## Task 5 — Review, verification, and delivery
 
-- [ ] Run independent specification review against the audit/design/plan.
-- [ ] Run a separate quality/security/scope review and fix only introduced defects
+- [x] Run independent specification review against the audit/design/plan.
+- [x] Run a separate quality/security/scope review and fix only introduced defects
   in new commits.
-- [ ] Delegate focused tests, full check, build, `git diff --check`, and the
+- [x] Delegate focused tests, full check, build, `git diff --check`, and the
   applicable `/run-github-actions-locally` workflow.
 - [ ] Push and open `[Store] feat: add a transactional source catalog` against
   `main`; wait for remote CI/review, merge under standing authorization, sync
