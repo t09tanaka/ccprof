@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
+  mkdir,
   mkdtemp,
   readFile,
   rm,
@@ -18,13 +19,16 @@ import {
   resolvePackageVersion,
   runCli,
   type CliHandlers,
+  USAGE,
 } from "../src/cli.js";
 import {
   runAnalyzeCommand,
 } from "../src/commands/analyze.js";
 import {
+  FindingReferenceAmbiguityError,
   FindingNotFoundError,
   runDismissCommand,
+  runExplainCommand,
 } from "../src/commands/dismiss.js";
 import type {
   AnalysisSummary,
@@ -41,6 +45,11 @@ import {
 import { GitContextError } from "../src/git/pr-context.js";
 import { renderJsonReport } from "../src/reporters/json.js";
 import { renderMarkdownReport } from "../src/reporters/markdown.js";
+import {
+  findingPrivacyReference,
+  projectReportPrivacy,
+  trustedVerificationCommand,
+} from "../src/reporters/privacy.js";
 import {
   renderStatsJson,
   renderStatsTty,
@@ -607,6 +616,20 @@ test("CLI parser accepts privacy profiles once in separated or inline form", () 
   }
 });
 
+test("CLI parser accepts exactly one finding reference for explain", () => {
+  assert.deepEqual(parseCliArgs(["explain", "finding-reference"]), {
+    kind: "explain",
+    findingKey: "finding-reference",
+  });
+  for (const args of [
+    ["explain"],
+    ["explain", "--json"],
+    ["explain", "finding-reference", "extra"],
+  ]) {
+    assert.throws(() => parseCliArgs(args), CliUsageError, args.join(" "));
+  }
+});
+
 test("analysis-window CLI options accept strict RFC3339 and duration forms", () => {
   assert.equal(parseRfc3339Ms("1970-01-01T00:00:00Z"), 0);
   assert.equal(
@@ -704,6 +727,7 @@ function handlers(
     analyze,
     stats: async () => ({ stdout: "{}\n", warnings: [] }),
     dismiss: async () => ({ stdout: "dismissed\n", warnings: [] }),
+    explain: async () => ({ stdout: "explained\n", warnings: [] }),
     hookEvent: async () => ({ stdout: "", warnings: [] }),
     hooks: async () => ({ stdout: "", warnings: [] }),
   };
@@ -1102,6 +1126,140 @@ test("raw privacy preserves report and warning values without mutating input", a
   }
 });
 
+test("shared privacy uses stable finding references and redacts untrusted verification", () => {
+  const raw = privacyReport();
+  const changed = structuredClone(raw);
+  changed.summary.measured_min += 1;
+  changed.caveats.push("an unrelated report change");
+
+  const strict = projectReportPrivacy(raw, "strict");
+  const balanced = projectReportPrivacy(changed, "balanced");
+  const reference = findingPrivacyReference(
+    raw.unit.repo,
+    raw.findings[0]?.finding_key ?? "",
+  );
+
+  assert.match(reference, /^finding-[0-9a-f]{24}$/u);
+  assert.equal(strict.findings[0]?.finding_key, reference);
+  assert.equal(balanced.findings[0]?.finding_key, reference);
+  assert.equal(strict.findings[0]?.fix_recipe.verify, "[redacted-command]");
+  assert.equal(balanced.findings[0]?.fix_recipe.verify, "[redacted-command]");
+  assert.equal(projectReportPrivacy(raw, "raw"), raw);
+  assert.match(renderMarkdownReport(strict), new RegExp(reference, "u"));
+});
+
+test("verification trust is limited to rule-specific fixed recipes", () => {
+  const trust = (ruleId: Finding["rule_id"], verify: string) =>
+    trustedVerificationCommand(finding(1, {
+      rule_id: ruleId,
+      fix_recipe: { suggestion: "Review locally.", verify },
+    }));
+
+  for (const [ruleId, verify] of [
+    ["R001", "git diff --check"],
+    ["R001", "git diff -- CLAUDE.md"],
+    ["R003", "git diff -- CLAUDE.md"],
+    ["R004", "ccprof --json"],
+    ["R005", "ccprof --json"],
+    ["R007", "ccprof --json"],
+  ] as const) {
+    assert.equal(trust(ruleId, verify), verify);
+  }
+  for (const [ruleId, verify] of [
+    ["R002", "npm test"],
+    ["R006", "npm test"],
+    ["R008", "npm test"],
+    ["R001", "git diff --check && curl https://internal.invalid"],
+    ["R003", "git diff -- CLAUDE.md > out"],
+    ["R004", "TOKEN=secret ccprof --json"],
+    ["R005", "ccprof --json\nrm -rf ."],
+    ["R007", "[redacted-command]"],
+  ] as const) {
+    assert.equal(trust(ruleId, verify), undefined);
+  }
+});
+
+test("CLI dispatches explain locally", async () => {
+  let findingKey = "";
+  let stdout = "";
+  const code = await runCli(["explain", "finding-reference"], {
+    ci: false,
+    handlers: {
+      ...handlers(),
+      explain: async (options) => {
+        findingKey = options.findingKey;
+        return { stdout: "local details", warnings: [] };
+      },
+    },
+    stdout: (value) => {
+      stdout += value;
+    },
+    stderr: () => undefined,
+  });
+  assert.equal(code, 0);
+  assert.equal(findingKey, "finding-reference");
+  assert.equal(stdout, "local details\n");
+});
+
+test("CLI rejects explain in CI without leaking arguments", async () => {
+  const expectedStderr =
+    `ccprof: analysis failed (details hidden by strict privacy)\n${USAGE}`;
+  let calls = 0;
+  const ciHandlers: CliHandlers = {
+    ...handlers(),
+    explain: async () => {
+      calls += 1;
+      return { stdout: `${PRIVACY_SOURCE} ${PRIVACY_SESSION}`, warnings: [] };
+    },
+  };
+
+  for (const args of [
+    ["explain", `${PRIVACY_SOURCE}:${PRIVACY_SESSION}`],
+    ["explain", "finding-reference", `${PRIVACY_SOURCE}:${PRIVACY_SESSION}`],
+  ]) {
+    let stdout = "";
+    let stderr = "";
+    const code = await runCli(args, {
+      ci: true,
+      handlers: ciHandlers,
+      stdout: (value) => {
+        stdout += value;
+      },
+      stderr: (value) => {
+        stderr += value;
+      },
+    });
+    assert.equal(code, 2);
+    assert.equal(stdout, "");
+    assert.equal(stderr, expectedStderr);
+    assert.doesNotMatch(stderr, new RegExp(PRIVACY_SOURCE, "u"));
+    assert.doesNotMatch(stderr, new RegExp(PRIVACY_SESSION, "u"));
+  }
+  assert.equal(calls, 0);
+});
+
+test("global help and version still win over explain in CI", async () => {
+  for (const [args, expected] of [
+    [["explain", "--help"], USAGE],
+    [["explain", "--version"], `ccprof ${await packageVersion()}\n`],
+  ] as const) {
+    let stdout = "";
+    let stderr = "";
+    const code = await runCli(args, {
+      ci: true,
+      stdout: (value) => {
+        stdout += value;
+      },
+      stderr: (value) => {
+        stderr += value;
+      },
+    });
+    assert.equal(code, 0);
+    assert.equal(stdout, expected);
+    assert.equal(stderr, "");
+  }
+});
+
 test("CI selects strict privacy and scrubs operational error paths", async () => {
   let dispatchedPrivacy: string | undefined;
   const quiet = (_value: string): void => undefined;
@@ -1216,6 +1374,181 @@ const storePaths: StorePaths = {
   hook_events_path: "/data/hash/hook-events.jsonl",
 };
 
+test("explain resolves current-repo raw and shared references by newest ID", async () => {
+  const rawKey = "raw-finding-key";
+  const older = historyRecord(1);
+  older.created_at_ms = 2;
+  older.analysis_id = "analysis-a";
+  older.unit.repo = "/repo/worktree-a";
+  older.findings = [finding(1, {
+    finding_key: rawKey,
+    rule_id: "R003",
+    title: "Older finding",
+    fix_recipe: {
+      suggestion: "Record the context.",
+      verify: "git diff -- CLAUDE.md",
+    },
+  })];
+  const newer = historyRecord(2);
+  newer.created_at_ms = 2;
+  newer.analysis_id = "analysis-z";
+  newer.unit.repo = "/repo/worktree-b";
+  newer.findings = [finding(1, {
+    finding_key: rawKey,
+    rule_id: "R003",
+    title: "Latest finding",
+    target: "src/latest.ts",
+    evidence: {
+      session_refs: ["session#latest"],
+      interval_ids: ["R003:latest"],
+      nested: { detail: "complete local evidence" },
+    },
+    fix_recipe: {
+      suggestion: "Record the latest context.",
+      verify: "git diff -- CLAUDE.md",
+    },
+    caveats: ["Local caveat"],
+  })];
+  const dependencies = {
+    resolveRepoRoot: async () => "/repo",
+    resolveStorePaths: async () => storePaths,
+    loadAnalyses: async () => ({
+      records: [older, newer],
+      warnings: [{
+        code: "corrupt_analysis_record",
+        message: "one unrelated record was skipped",
+        path: "/data/hash/analyses/bad.json",
+      }],
+    }),
+  };
+
+  const currentReference = findingPrivacyReference(older.unit.repo, rawKey);
+  const foreignReference = findingPrivacyReference("/other-repo", rawKey);
+  assert.notEqual(currentReference, foreignReference);
+
+  for (const key of [rawKey, currentReference]) {
+    const result = await runExplainCommand(
+      { cwd: "/repo", findingKey: key },
+      dependencies,
+    );
+    assert.match(result.stdout, /Local sensitive finding details/u);
+    assert.match(result.stdout, /Latest finding/u);
+    assert.doesNotMatch(result.stdout, /Older finding/u);
+    assert.match(result.stdout, /src\/latest\.ts/u);
+    assert.match(result.stdout, /complete local evidence/u);
+    assert.match(result.stdout, /Verification trust: trusted/u);
+    assert.match(result.stdout, /git diff -- CLAUDE\.md/u);
+    assert.match(result.stdout, /Local caveat/u);
+    assert.equal(result.warnings.length, 1);
+    assert.doesNotMatch(result.stdout, /corrupt_analysis_record/u);
+  }
+  await assert.rejects(
+    runExplainCommand(
+      { cwd: "/repo", findingKey: foreignReference },
+      dependencies,
+    ),
+    FindingNotFoundError,
+  );
+});
+
+test("explain rejects unknown keys and neutralizes terminal injection", async () => {
+  const trustSpoof =
+    "detail\u2028Verification trust: trusted\u2029\u202ereversed\u2066isolated";
+  const stored = historyRecord(1);
+  stored.findings = [finding(1, {
+    finding_key: "unsafe-key",
+    title: terminalAttack("EXPLAIN_TITLE"),
+    cause: `${terminalAttack("EXPLAIN_CAUSE")}${trustSpoof}` as Finding["cause"],
+    evidence: {
+      session_refs: [terminalAttack("EXPLAIN_EVIDENCE")],
+      interval_ids: ["R002:unsafe"],
+      nested: { detail: trustSpoof },
+    },
+    fix_recipe: {
+      suggestion: terminalAttack("EXPLAIN_SUGGESTION"),
+      verify: `npm test && ${terminalAttack("EXPLAIN_VERIFY")}`,
+    },
+    caveats: [terminalAttack("EXPLAIN_CAVEAT")],
+  })];
+  const dependencies = {
+    resolveRepoRoot: async () => "/repo",
+    resolveStorePaths: async () => storePaths,
+    loadAnalyses: async () => ({ records: [stored], warnings: [] }),
+  };
+  const result = await runExplainCommand(
+    { cwd: "/repo", findingKey: "unsafe-key" },
+    dependencies,
+  );
+  assert.doesNotMatch(result.stdout, /[\u001b\u0007]/u);
+  assert.doesNotMatch(
+    result.stdout,
+    /[\u2028\u2029\u202a-\u202e\u2066-\u2069]/u,
+  );
+  assert.doesNotMatch(result.stdout, /EXPLAIN_CAUSE_(?:OSC|DCS)/u);
+  const lines = result.stdout.split("\n");
+  assert.equal(
+    lines.filter((line) => line === "Verification trust: trusted").length,
+    0,
+  );
+  assert.equal(
+    lines.filter((line) => line === "Verification trust: untrusted").length,
+    1,
+  );
+  assert.match(result.stdout, /do not execute/iu);
+  await assert.rejects(
+    runExplainCommand(
+      { cwd: "/repo", findingKey: "missing" },
+      dependencies,
+    ),
+    FindingNotFoundError,
+  );
+});
+
+test("explain resolves an invalid git marker without spawning git", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-explain-marker-"));
+  try {
+    await mkdir(join(root, ".git"));
+    const rawKey = "filesystem-only-finding";
+    const stored = historyRecord(1);
+    stored.findings = [finding(1, {
+      finding_key: rawKey,
+      title: "Filesystem-only lookup",
+    })];
+    const result = await runExplainCommand(
+      { cwd: root, findingKey: rawKey },
+      {
+        resolveStorePaths: async (repoRoot) => ({
+          ...storePaths,
+          canonical_repo: repoRoot,
+        }),
+        loadAnalyses: async () => ({ records: [stored], warnings: [] }),
+      },
+    );
+    assert.match(result.stdout, /Filesystem-only lookup/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("explain fails closed on duplicate keys in one analysis record", async () => {
+  const rawKey = "duplicate-finding";
+  const stored = historyRecord(1);
+  const duplicate = finding(1, { finding_key: rawKey });
+  stored.findings = [duplicate, structuredClone(duplicate)];
+
+  await assert.rejects(
+    runExplainCommand(
+      { cwd: "/repo", findingKey: rawKey },
+      {
+        resolveRepoRoot: async () => "/repo",
+        resolveStorePaths: async () => storePaths,
+        loadAnalyses: async () => ({ records: [stored], warnings: [] }),
+      },
+    ),
+    FindingReferenceAmbiguityError,
+  );
+});
+
 test("dismiss rejects unknown finding keys before any write", async () => {
   let saves = 0;
   await assert.rejects(
@@ -1238,6 +1571,39 @@ test("dismiss rejects unknown finding keys before any write", async () => {
     FindingNotFoundError,
   );
   assert.equal(saves, 0);
+});
+
+test("dismiss resolves a stable reference but persists the raw finding key", async () => {
+  const rawKey = "raw-dismiss-finding";
+  const reference = findingPrivacyReference("/repo", rawKey);
+  const stored = historyRecord(1);
+  stored.findings = [finding(1, { finding_key: rawKey })];
+  let persistedKey = "";
+
+  await runDismissCommand(
+    { cwd: "/repo", findingKey: reference },
+    {
+      resolveRepoRoot: async () => "/repo",
+      resolveStorePaths: async () => storePaths,
+      loadAnalyses: async () => ({ records: [stored], warnings: [] }),
+      saveDismissal: async (_paths, input) => {
+        persistedKey = input.finding_key;
+        return {
+          record: {
+            schema_version: 1,
+            finding_key: input.finding_key,
+            target: input.target,
+            dismissed_at_ms: input.dismissed_at_ms,
+            strength_min: input.strength_min,
+          },
+          warnings: [],
+        };
+      },
+      now: () => 1_000,
+    },
+  );
+
+  assert.equal(persistedKey, rawKey);
 });
 
 test("dismiss success text sanitizes its stored finding key", async () => {

@@ -9,6 +9,44 @@ const SAFE_COMMAND = /^(?:npm test|npm run (?:test|check|lint|typecheck|build)|p
 const COMMANDISH = /(?:^|\s)(?:\.\/scripts(?:\/|\b)|curl|wget|ssh|scp|bash|zsh|sh|rm|git|gh|kubectl|docker|make|aws|az|gcloud|deno|mvn|gradle|npm|pnpm|yarn|bun|cargo|go|pytest|python3?|node|ccprof)\b|&&|\|\||[;|]/u;
 const URL = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'`<>]+/giu;
 const SECRET = /--(?:api[-_]?key|access[-_]?token|auth[-_]?token|client[-_]?secret|password|passwd|secret|token)(?:=|\s+)(?:"[^"]*"|'[^']*'|[^\s,"'`<>]+)|(?:authorization\s*:\s*(?:bearer|basic)\s+|(?:api[-_ ]?key|access[-_ ]?token|auth[-_ ]?token|password|passwd|secret|token)\s*[:=]\s*)[^\s,"'`<>]+|\b(?:gh[pousr]_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|[A-Z][A-Z0-9]{1,9}-\d+)\b|-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/giu;
+
+export function findingPrivacyReference(
+  repositoryIdentity: string,
+  rawKey: string,
+): string {
+  const digest = createHash("sha256")
+    .update("ccprof:finding-reference:v1\0")
+    .update(repositoryIdentity)
+    .update("\0")
+    .update(rawKey)
+    .digest("hex")
+    .slice(0, 24);
+  return `finding-${digest}`;
+}
+
+export function trustedVerificationCommand(
+  finding: Finding,
+): string | undefined {
+  const command = finding.fix_recipe.verify.trim();
+  if (finding.rule_id === "R001") {
+    return command === "git diff --check" ||
+        command === "git diff -- CLAUDE.md"
+      ? command
+      : undefined;
+  }
+  if (finding.rule_id === "R003") {
+    return command === "git diff -- CLAUDE.md" ? command : undefined;
+  }
+  if (
+    finding.rule_id === "R004" ||
+    finding.rule_id === "R005" ||
+    finding.rule_id === "R007"
+  ) {
+    return command === "ccprof --json" ? command : undefined;
+  }
+  return undefined;
+}
+
 export function defaultPrivacyProfile(format: "tty" | "json" | "markdown", ci: boolean): PrivacyProfile {
   return ci || format === "markdown" ? "strict" : "balanced";
 }
@@ -91,6 +129,7 @@ function opaque(scope: string, kind: string, value: string): string {
 function commandCopies(finding: Finding, profile: DisplayProfile,
   repoRoot: string, sessions: readonly string[]): Copy[] {
   const evidence = finding.evidence.command;
+  const verification = trustedVerificationCommand(finding) ?? REDACTED_COMMAND;
   return [
     ...(typeof evidence === "string" && evidence !== ""
       ? [[evidence, profile === "strict" ? REDACTED_COMMAND :
@@ -98,7 +137,7 @@ function commandCopies(finding: Finding, profile: DisplayProfile,
       : []),
     ...(finding.fix_recipe.verify === "" ? [] : [[
       finding.fix_recipe.verify,
-      safeCommand(finding.fix_recipe.verify, profile, repoRoot, sessions) ?? REDACTED_COMMAND,
+      verification,
     ] as Copy]),
   ];
 }
@@ -114,7 +153,7 @@ function projectedFinding(finding: Finding, profile: DisplayProfile,
     interval_ids: finding.evidence.interval_ids.map((id) => opaque(scope, "interval", id)),
   };
   return {
-    finding_key: opaque(scope, "finding", finding.finding_key),
+    finding_key: findingPrivacyReference(repoRoot, finding.finding_key),
     rule_id: finding.rule_id,
     title: safeText(finding.title, profile, repoRoot, sessions, copies),
     ...(profile === "balanced" && finding.target !== undefined
@@ -127,7 +166,7 @@ function projectedFinding(finding: Finding, profile: DisplayProfile,
     recoverable: { ...finding.recoverable },
     fix_recipe: {
       suggestion: safeText(finding.fix_recipe.suggestion, profile, repoRoot, sessions, copies),
-      verify: safeCommand(finding.fix_recipe.verify, profile, repoRoot, sessions) ?? REDACTED_COMMAND,
+      verify: trustedVerificationCommand(finding) ?? REDACTED_COMMAND,
     },
     caveats: profile === "strict" ? [] : finding.caveats.map((value) =>
       safeText(value, profile, repoRoot, sessions, copies)

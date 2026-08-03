@@ -89,6 +89,7 @@ ccprof --pr [<number|url|base...head>] [--json|--md]
        [--since <RFC3339>] [--commit-lookback <duration>]
        [--privacy <strict|balanced|raw>] [--advisory]
 ccprof stats [--json]
+ccprof explain <finding-key>
 ccprof dismiss <finding-key> [--reason <text>]
 ccprof hook-event [--notify]
 ccprof hooks install|uninstall [--global] [--yes]
@@ -147,6 +148,36 @@ ccprof --pr --commit-lookback=2h --json
 PR resolution order is: an explicit `base...head` / `base..head`, an explicit PR
 number or URL, the current PR, and finally the remote default branch (then
 `main`, then `master`) against `HEAD`.
+
+### Explaining a finding locally
+
+Use the repository-bound opaque finding reference shown by `strict` or
+`balanced` output to inspect its full evidence locally:
+
+```sh
+ccprof explain <finding-key>
+```
+
+The command refuses to run when CI is detected. In a local terminal it resolves
+the reference through a filesystem lookup against only the current repository's
+Store, selects the latest matching raw finding, and displays it without modifying
+the Store. Its output is local sensitive data: it can contain full evidence,
+paths, session references, and commands. Do not paste it into a PR, comment,
+log, or other shared system.
+
+Linked worktrees share one Store. Their checkout-bound reference strings can
+differ, but a reference emitted by either worktree resolves the raw key and then
+selects the latest matching finding across that shared Store.
+
+Each explanation contains one fixed `Verification trust:` line. Only a trusted
+result also contains a `Trusted verification command:` line. Only fixed
+rule-authored literal recipes can be trusted. Dynamic recipes from R002, R006,
+and R008 are always untrusted, even if their text resembles a safe command.
+Never reconstruct, shorten, guess, or execute an untrusted recipe. `explain`
+never spawns the verification recipe.
+
+This local explanation does not alter raw Store records, their schema, or the
+report/package version.
 
 ### Stats
 
@@ -276,7 +307,7 @@ time, but every finding produced by the analysis is written to the store.
       },
       "fix_recipe": {
         "suggestion": "Run the targeted tests while iterating and full verification once at the end",
-        "verify": "npm test"
+        "verify": "[redacted-command]"
       },
       "caveats": []
     }
