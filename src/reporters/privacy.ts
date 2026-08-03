@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { AnalyzeWarning } from "../core/analyze.js";
-import { hasValidFindingCompatibilityMetadata } from "../core/model.js";
+import { findingCompatibilityMetadata } from "../core/model.js";
 import type {
   CommandIdentity,
   Finding,
@@ -154,6 +154,7 @@ function commandCopies(finding: Finding, profile: DisplayProfile,
 }
 function projectedFinding(finding: Finding, profile: DisplayProfile,
   scope: string, repoRoot: string, sessions: readonly string[]): Finding {
+  const compatibility = findingCompatibilityMetadata(finding);
   const copies = commandCopies(finding, profile, repoRoot, sessions);
   const evidence: FindingEvidence = profile === "strict" ? {
     session_refs: finding.evidence.session_refs.map((ref) => opaque(scope, "session-ref", ref)),
@@ -166,13 +167,8 @@ function projectedFinding(finding: Finding, profile: DisplayProfile,
   return {
     finding_key: findingPrivacyReference(repoRoot, finding.finding_key),
     rule_id: finding.rule_id,
-    ...(hasValidFindingCompatibilityMetadata(finding) &&
-        finding.rule_version !== undefined &&
-        finding.compatibility_epoch !== undefined
-      ? {
-          rule_version: finding.rule_version,
-          compatibility_epoch: finding.compatibility_epoch,
-        }
+    ...(compatibility.valid && compatibility.metadata !== undefined
+      ? compatibility.metadata
       : {}),
     title: safeText(finding.title, profile, repoRoot, sessions, copies),
     ...(profile === "balanced" && finding.target !== undefined

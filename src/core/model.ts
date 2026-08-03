@@ -314,13 +314,27 @@ export interface Finding extends FindingMetadata {
   compatibility_epoch?: number;
 }
 
-export function hasValidFindingCompatibilityMetadata(value: unknown): boolean {
-  if (value === null || typeof value !== "object") return false;
-  const versionDescriptor = Object.getOwnPropertyDescriptor(value, "rule_version");
-  const epochDescriptor = Object.getOwnPropertyDescriptor(value, "compatibility_epoch");
-  if ((versionDescriptor === undefined) !== (epochDescriptor === undefined)) return false;
-  if (versionDescriptor === undefined || epochDescriptor === undefined) return true;
-  if (!("value" in versionDescriptor) || !("value" in epochDescriptor)) return false;
+export function findingCompatibilityMetadata(value: unknown):
+  | { valid: true; metadata?: { rule_version: string; compatibility_epoch: number } }
+  | { valid: false } {
+  if (value === null || typeof value !== "object") return { valid: false };
+  let versionDescriptor: PropertyDescriptor | undefined;
+  let epochDescriptor: PropertyDescriptor | undefined;
+  try {
+    versionDescriptor = Object.getOwnPropertyDescriptor(value, "rule_version");
+    epochDescriptor = Object.getOwnPropertyDescriptor(value, "compatibility_epoch");
+  } catch {
+    return { valid: false };
+  }
+  if ((versionDescriptor === undefined) !== (epochDescriptor === undefined)) {
+    return { valid: false };
+  }
+  if (versionDescriptor === undefined || epochDescriptor === undefined) {
+    return { valid: true };
+  }
+  if (!("value" in versionDescriptor) || !("value" in epochDescriptor)) {
+    return { valid: false };
+  }
   const ruleVersion = versionDescriptor.value;
   const compatibilityEpoch = epochDescriptor.value;
   if (
@@ -328,11 +342,21 @@ export function hasValidFindingCompatibilityMetadata(value: unknown): boolean {
     typeof compatibilityEpoch !== "number" ||
     !Number.isSafeInteger(compatibilityEpoch) ||
     compatibilityEpoch <= 0
-  ) return false;
+  ) return { valid: false };
   const match = /^([1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u
     .exec(ruleVersion);
-  return match !== null && match[0] === ruleVersion &&
-    match[1] === String(compatibilityEpoch);
+  if (
+    match === null || match[0] !== ruleVersion ||
+    match[1] !== String(compatibilityEpoch)
+  ) return { valid: false };
+  return {
+    valid: true,
+    metadata: { rule_version: ruleVersion, compatibility_epoch: compatibilityEpoch },
+  };
+}
+
+export function hasValidFindingCompatibilityMetadata(value: unknown): boolean {
+  return findingCompatibilityMetadata(value).valid;
 }
 
 export interface BaselineNotable {

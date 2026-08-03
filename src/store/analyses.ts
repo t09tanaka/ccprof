@@ -11,7 +11,7 @@ import { dirname, join } from "node:path";
 import { normalizeCommand } from "../analysis/command.js";
 import { commandIdentityKey } from "../analysis/command-identity.js";
 import { normalizeRepoPath } from "../analysis/test-map.js";
-import { hasValidFindingCompatibilityMetadata } from "../core/model.js";
+import { findingCompatibilityMetadata } from "../core/model.js";
 import type {
   AnalysisSummary,
   AnalysisUnit,
@@ -198,7 +198,7 @@ function isStoredFinding(value: unknown): value is Finding {
     typeof fixRecipe.verify === "string" &&
     fixRecipe.verify !== "" &&
     isStringArray(value.caveats) &&
-    hasValidFindingCompatibilityMetadata(value)
+    findingCompatibilityMetadata(value).valid
   );
 }
 
