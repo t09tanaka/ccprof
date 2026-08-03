@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
   readdir,
   realpath,
   rm,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -47,6 +49,12 @@ import {
   resolveStorePaths,
   type StorePaths,
 } from "../src/store/paths.js";
+import {
+  openStoreDatabase,
+  storeDatabasePath,
+  STORE_SCHEMA_VERSION,
+  UnsupportedStoreSchemaError,
+} from "../src/store/sqlite.js";
 
 const summary: AnalysisSummary = {
   measured_min: 100,
@@ -170,6 +178,47 @@ function git(args: string[], cwd: string): void {
   );
 }
 
+type StoreDatabase = ReturnType<typeof openStoreDatabase>;
+
+interface SqliteColumn {
+  name: string;
+  type: string;
+  notnull: 0 | 1;
+  pk: number;
+}
+
+function tableColumns(database: StoreDatabase, table: string): SqliteColumn[] {
+  return database
+    .prepare(`PRAGMA table_info(${JSON.stringify(table)})`)
+    .all() as SqliteColumn[];
+}
+
+function userIndexColumns(database: StoreDatabase, table: string): string[][] {
+  const indexes = database
+    .prepare(`PRAGMA index_list(${JSON.stringify(table)})`)
+    .all() as { name: string; origin: string }[];
+  return indexes
+    .filter(({ origin }) => origin === "c")
+    .map(({ name }) => (database
+      .prepare(`PRAGMA index_info(${JSON.stringify(name)})`)
+      .all() as { name: string; seqno: number }[])
+      .sort((left, right) => left.seqno - right.seqno)
+      .map(({ name: column }) => column))
+    .sort((left, right) => {
+      const leftKey = left.join("\0");
+      const rightKey = right.join("\0");
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
+}
+
+function assertConnectionPragmas(database: StoreDatabase): void {
+  assert.equal(database.pragma("journal_mode", { simple: true }), "wal");
+  assert.equal(Number(database.pragma("foreign_keys", { simple: true })), 1);
+  const busyTimeout = Number(database.pragma("busy_timeout", { simple: true }));
+  assert.ok(Number.isSafeInteger(busyTimeout));
+  assert.ok(busyTimeout > 0 && busyTimeout <= 60_000);
+}
+
 test("canonicalRepoPath resolves a linked git worktree to the main worktree's repository root", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-worktree-canon-"));
   try {
@@ -265,6 +314,292 @@ test("store paths hash the canonical repository and honor data-root precedence",
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("SQLite paths are deterministic and shared by linked worktrees", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-sqlite-path-"));
+  try {
+    const mainRepo = join(root, "main");
+    await mkdir(mainRepo);
+    git(["init", "-q"], mainRepo);
+    git(["-c", "user.email=test@example.com", "-c", "user.name=Test",
+      "commit", "--allow-empty", "-q", "-m", "init"], mainRepo);
+    const worktree = join(root, "worktree");
+    git(["worktree", "add", "-q", "-b", "sqlite-path", worktree], mainRepo);
+
+    const options = { env: { CCPROF_DATA_DIR: join(root, "data") } };
+    const mainPaths = await resolveStorePaths(mainRepo, options);
+    const worktreePaths = await resolveStorePaths(worktree, options);
+    assert.equal(mainPaths.repo_dir, worktreePaths.repo_dir);
+    assert.equal(storeDatabasePath(mainPaths), join(mainPaths.repo_dir, "store.sqlite3"));
+    assert.equal(storeDatabasePath(worktreePaths), storeDatabasePath(mainPaths));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("SQLite bootstrap is private, idempotent, and creates the Store v2 schema", async () => {
+  await temporaryStore(async (paths) => {
+    assert.equal(STORE_SCHEMA_VERSION, 2);
+    const databasePath = storeDatabasePath(paths);
+    const first = openStoreDatabase(paths);
+    const second = openStoreDatabase(paths);
+    try {
+      assertConnectionPragmas(first);
+      assertConnectionPragmas(second);
+      assert.equal(Number(first.pragma("user_version", { simple: true })), 2);
+      assert.equal(Number(second.pragma("user_version", { simple: true })), 2);
+
+      if (process.platform !== "win32") {
+        assert.equal((await stat(paths.repo_dir)).mode & 0o777, 0o700);
+        assert.equal((await stat(databasePath)).mode & 0o777, 0o600);
+      }
+
+      const tables = first.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+      ).all() as { name: string }[];
+      assert.deepEqual(tables.map(({ name }) => name), [
+        "adoptions",
+        "analysis_executions",
+        "analysis_snapshots",
+        "dismissals",
+        "store_migrations",
+      ]);
+
+      assert.deepEqual(userIndexColumns(first, "analysis_snapshots"), [["created_at_ms"]]);
+      assert.deepEqual(userIndexColumns(first, "analysis_executions"), [
+        ["executed_at_ms"],
+        ["snapshot_id", "executed_at_ms"],
+      ]);
+      assert.deepEqual(userIndexColumns(first, "dismissals"), [["dismissed_at_ms"]]);
+      assert.deepEqual(userIndexColumns(first, "adoptions"), [["detected_at_ms"]]);
+
+      const expectedColumns: Record<string, [string, string, number][]> = {
+        store_migrations: [
+          ["name", "TEXT", 1],
+          ["completed_at_ms", "INTEGER", 0],
+        ],
+        analysis_snapshots: [
+          ["snapshot_id", "TEXT", 1],
+          ["created_at_ms", "INTEGER", 0],
+          ["record_json", "TEXT", 0],
+        ],
+        analysis_executions: [
+          ["execution_id", "TEXT", 1],
+          ["snapshot_id", "TEXT", 0],
+          ["executed_at_ms", "INTEGER", 0],
+        ],
+        dismissals: [
+          ["finding_key", "TEXT", 1],
+          ["dismissed_at_ms", "INTEGER", 0],
+          ["record_json", "TEXT", 0],
+        ],
+        adoptions: [
+          ["finding_key", "TEXT", 1],
+          ["detected_at_ms", "INTEGER", 0],
+          ["record_json", "TEXT", 0],
+        ],
+      };
+      for (const [table, expected] of Object.entries(expectedColumns)) {
+        const columns = tableColumns(first, table);
+        assert.deepEqual(
+          columns.map(({ name, type, pk }) => [name, type.toUpperCase(), pk]),
+          expected,
+        );
+        assert.ok(columns.every(({ notnull }) => notnull === 1));
+      }
+
+      const foreignKeys = first
+        .prepare("PRAGMA foreign_key_list(analysis_executions)")
+        .all() as { table: string; from: string; to: string; on_delete: string }[];
+      assert.deepEqual(foreignKeys.map(({ table, from, to, on_delete }) => ({
+        table, from, to, on_delete,
+      })), [{
+        table: "analysis_snapshots",
+        from: "snapshot_id",
+        to: "snapshot_id",
+        on_delete: "CASCADE",
+      }]);
+    } finally {
+      second.close();
+      first.close();
+    }
+  });
+});
+
+test("SQLite connections share commits and immediate transactions roll back completely", async () => {
+  await temporaryStore(async (paths) => {
+    const first = openStoreDatabase(paths);
+    const second = openStoreDatabase(paths);
+    try {
+      first.prepare(
+        "INSERT INTO analysis_snapshots(snapshot_id, created_at_ms, record_json) VALUES (?, ?, ?)",
+      ).run("snapshot-a", 1, "{\"snapshot\":true}");
+      assert.deepEqual(second.prepare(
+        "SELECT snapshot_id, record_json FROM analysis_snapshots WHERE snapshot_id = ?",
+      ).get("snapshot-a"), {
+        snapshot_id: "snapshot-a",
+        record_json: "{\"snapshot\":true}",
+      });
+
+      const failMigration = first.transaction(() => {
+        first.prepare(
+          "INSERT INTO store_migrations(name, completed_at_ms) VALUES (?, ?)",
+        ).run("test-rollback-marker", 2);
+        throw new Error("rollback requested");
+      });
+      assert.throws(() => failMigration.immediate(), /rollback requested/u);
+      assert.equal(first.prepare(
+        "SELECT 1 FROM store_migrations WHERE name = ?",
+      ).get("test-rollback-marker"), undefined);
+      assert.equal(second.prepare(
+        "SELECT 1 FROM store_migrations WHERE name = ?",
+      ).get("test-rollback-marker"), undefined);
+    } finally {
+      second.close();
+      first.close();
+    }
+  });
+});
+
+test("opening an existing v2 schema does not contend with an active writer", async () => {
+  await temporaryStore(async (paths) => {
+    const writer = openStoreDatabase(paths);
+    let reader: StoreDatabase | undefined;
+    try {
+      writer.exec("BEGIN IMMEDIATE");
+      reader = openStoreDatabase(paths);
+      reader.close();
+      reader = undefined;
+    } finally {
+      reader?.close();
+      if (writer.inTransaction) writer.exec("ROLLBACK");
+      writer.close();
+    }
+  });
+});
+
+test("SQLite bootstrap rejects a symlinked repository directory without touching its target", async (context) => {
+  await temporaryStore(async (paths, root) => {
+    const target = join(root, "repo-dir-target");
+    const sentinel = join(target, "sentinel.txt");
+    await mkdir(paths.root_dir, { recursive: true });
+    await mkdir(target, { mode: 0o755 });
+    await writeFile(sentinel, "preserve-directory-target", "utf8");
+    const targetMode = (await stat(target)).mode & 0o777;
+    try {
+      await symlink(target, paths.repo_dir, process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      if (["EACCES", "ENOSYS", "EPERM"].includes(
+        (error as NodeJS.ErrnoException).code ?? "",
+      )) {
+        context.skip("symbolic links are unavailable on this platform");
+        return;
+      }
+      throw error;
+    }
+
+    let opened: StoreDatabase | undefined;
+    let rejected: unknown;
+    try {
+      opened = openStoreDatabase(paths);
+    } catch (error) {
+      rejected = error;
+    } finally {
+      opened?.close();
+    }
+
+    assert.equal(await readFile(sentinel, "utf8"), "preserve-directory-target");
+    assert.deepEqual(await readdir(target), ["sentinel.txt"]);
+    if (process.platform !== "win32") {
+      assert.equal((await stat(target)).mode & 0o777, targetMode);
+    }
+    assert.match(String(rejected), /unsafe store path|symbolic link.*not allowed/iu);
+  });
+});
+
+test("SQLite bootstrap rejects a symlinked database without touching its target", async (context) => {
+  await temporaryStore(async (paths, root) => {
+    await mkdir(paths.repo_dir, { recursive: true, mode: 0o700 });
+    const targetPaths: StorePaths = {
+      ...paths,
+      repo_dir: join(root, "database-target"),
+    };
+    const targetPath = storeDatabasePath(targetPaths);
+    const target = openStoreDatabase(targetPaths);
+    try {
+      target.exec(
+        "CREATE TABLE symlink_sentinel(value TEXT NOT NULL); INSERT INTO symlink_sentinel VALUES ('preserve-database-target')",
+      );
+      target.pragma("wal_checkpoint(TRUNCATE)");
+      if (process.platform !== "win32") await chmod(targetPath, 0o644);
+      const targetMode = (await stat(targetPath)).mode & 0o777;
+      const targetBytes = await readFile(targetPath);
+      try {
+        await symlink(targetPath, storeDatabasePath(paths), "file");
+      } catch (error) {
+        if (["EACCES", "ENOSYS", "EPERM"].includes(
+          (error as NodeJS.ErrnoException).code ?? "",
+        )) {
+          context.skip("symbolic links are unavailable on this platform");
+          return;
+        }
+        throw error;
+      }
+
+      let opened: StoreDatabase | undefined;
+      let rejected: unknown;
+      try {
+        opened = openStoreDatabase(paths);
+      } catch (error) {
+        rejected = error;
+      } finally {
+        opened?.close();
+      }
+
+      assert.equal(
+        target.prepare("SELECT value FROM symlink_sentinel").pluck().get(),
+        "preserve-database-target",
+      );
+      assert.deepEqual(await readFile(targetPath), targetBytes);
+      if (process.platform !== "win32") {
+        assert.equal((await stat(targetPath)).mode & 0o777, targetMode);
+      }
+      assert.deepEqual(await readdir(paths.repo_dir), ["store.sqlite3"]);
+      assert.match(String(rejected), /unsafe store path|symbolic link.*not allowed/iu);
+    } finally {
+      target.close();
+    }
+  });
+});
+
+test("SQLite bootstrap rejects unknown future schemas without mutation", async () => {
+  await temporaryStore(async (paths) => {
+    const futureVersion = STORE_SCHEMA_VERSION + 1;
+    const future = openStoreDatabase(paths);
+    try {
+      future.exec(
+        "CREATE TABLE future_sentinel(value TEXT NOT NULL); INSERT INTO future_sentinel VALUES ('preserve-me')",
+      );
+      future.pragma(`user_version = ${futureVersion}`);
+
+      assert.throws(() => openStoreDatabase(paths), (error: unknown) => {
+        assert.ok(error instanceof UnsupportedStoreSchemaError);
+        assert.match(String(error), new RegExp(String(futureVersion), "u"));
+        return true;
+      });
+      assert.equal(
+        Number(future.pragma("user_version", { simple: true })),
+        futureVersion,
+      );
+      assert.equal(
+        future.prepare("SELECT value FROM future_sentinel").pluck().get(),
+        "preserve-me",
+      );
+    } finally {
+      future.close();
+    }
+  });
 });
 
 test("analysis records are immutable, complete, atomically indexed, and stably ordered", async () => {

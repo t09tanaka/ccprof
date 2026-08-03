@@ -29,7 +29,7 @@
     "CHANGELOG.md"
   ],
   "engines": {
-    "node": ">=20"
+    "node": "20.x || 22.x || 23.x || 24.x || 25.x"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -40,7 +40,11 @@
     "prepack": "npm run build"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "7.6.13",
     "@types/node": "^20.0.0",
     "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "better-sqlite3": "12.9.0"
   }
 }
