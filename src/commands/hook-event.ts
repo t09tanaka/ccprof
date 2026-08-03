@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { constants } from "node:fs";
 import {
   appendFile,
+  lstat,
   mkdir,
   open,
   readFile,
@@ -130,60 +132,89 @@ async function maybeCompactHookEvents(
   try {
     const info = await stat(path);
     if (info.size <= MAX_HOOK_EVENTS_BYTES) return;
-
-    const text = await readFile(path, "utf8");
-    const cutoffMs = nowMs - RETENTION_MS;
-    const kept: string[] = [];
-    for (const line of text.split("\n")) {
-      if (line.trim() === "") continue;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(line);
-      } catch {
-        continue; // Malformed line: dropped by compaction.
-      }
-      if (!isHookEventLogRow(parsed)) continue;
-      if (parsed.received_at_ms < cutoffMs) continue;
-      kept.push(line);
-    }
-
-    // Absolute cap: walk from the newest side and keep the longest suffix
-    // that fits, so recent rows win over old ones while relative order is
-    // preserved.
-    let suffixStart = kept.length;
-    let suffixBytes = 0;
-    while (suffixStart > 0) {
-      const line = kept[suffixStart - 1];
-      if (line === undefined) break;
-      const lineBytes = Buffer.byteLength(line, "utf8") + 1;
-      if (suffixBytes + lineBytes > MAX_HOOK_EVENTS_BYTES) break;
-      suffixBytes += lineBytes;
-      suffixStart -= 1;
-    }
-    const output = kept
-      .slice(suffixStart)
-      .map((line) => `${line}\n`)
-      .join("");
-
-    const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
-    let handle: Awaited<ReturnType<typeof open>> | undefined;
-    try {
-      handle = await open(temporaryPath, "wx", 0o600);
-      await handle.writeFile(output, "utf8");
-      await handle.sync();
-      await handle.close();
-      handle = undefined;
-      await rename(temporaryPath, path);
-    } catch (error) {
-      if (handle !== undefined) {
-        await handle.close().catch(() => undefined);
-      }
-      await unlink(temporaryPath).catch(() => undefined);
-      throw error;
-    }
+    await compactHookEventFile(path, nowMs);
   } catch {
     // Best-effort: an unbounded log is preferable to a failing hook.
   }
+}
+
+async function compactHookEventFile(
+  path: string,
+  nowMs: number,
+  source?: string,
+): Promise<number> {
+  const text = source ?? await readFile(path, "utf8");
+  const input = text.split("\n").filter((line) => line.trim() !== "");
+  const cutoffMs = nowMs - RETENTION_MS;
+  const kept = input.filter((line) => {
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      return isHookEventLogRow(parsed) && parsed.received_at_ms >= cutoffMs;
+    } catch {
+      return false;
+    }
+  });
+
+  let suffixStart = kept.length;
+  let suffixBytes = 0;
+  while (suffixStart > 0) {
+    const line = kept[suffixStart - 1];
+    if (line === undefined) break;
+    const lineBytes = Buffer.byteLength(line, "utf8") + 1;
+    if (suffixBytes + lineBytes > MAX_HOOK_EVENTS_BYTES) break;
+    suffixBytes += lineBytes;
+    suffixStart -= 1;
+  }
+  const retained = kept.slice(suffixStart);
+  const output = retained.map((line) => `${line}\n`).join("");
+  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(temporaryPath, "wx", 0o600);
+    await handle.writeFile(output, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporaryPath, path);
+  } catch (error) {
+    if (handle !== undefined) await handle.close().catch(() => undefined);
+    await unlink(temporaryPath).catch(() => undefined);
+    throw error;
+  }
+  return input.length - retained.length;
+}
+
+/** Force compaction for explicit maintenance, propagating unsafe-path and I/O
+ * failures instead of weakening the always-successful hook command. */
+export async function compactHookEventsStrict(
+  path: string,
+  nowMs: number,
+): Promise<number> {
+  let before;
+  try {
+    before = await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+  if (!before.isFile()) throw new Error("hook event log is not a regular file");
+  const handle = await open(path,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  let text: string;
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) {
+      throw new Error("hook event log changed while opening");
+    }
+    text = await handle.readFile("utf8");
+    const after = await handle.stat();
+    if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino) {
+      throw new Error("hook event log changed while reading");
+    }
+  } finally {
+    await handle.close();
+  }
+  return compactHookEventFile(path, nowMs, text);
 }
 
 /** Reads the throttle decision input. Any read/parse failure (including a

@@ -11,6 +11,10 @@ import {
   type CommandExecutionResult,
 } from "./commands/analyze.js";
 import {
+  runDataCommand,
+  type DataCommandOptions,
+} from "./commands/data.js";
+import {
   FindingNotFoundError,
   runDismissCommand,
   runExplainCommand,
@@ -52,6 +56,7 @@ export const USAGE = `Usage: ccprof [--pr [<number|url|base...head>]] [--json|--
        ccprof explain <finding-key>
        ccprof hook-event [--notify]
        ccprof hooks install|uninstall [--global] [--yes]
+       ccprof data gc|delete
        ccprof --version
 `;
 
@@ -134,6 +139,11 @@ export interface ParsedHooksCommand {
   yes: boolean;
 }
 
+export interface ParsedDataCommand {
+  kind: "data";
+  action: "gc" | "delete";
+}
+
 export interface ParsedHelpCommand {
   kind: "help";
 }
@@ -149,6 +159,7 @@ export type ParsedCliCommand =
   | ParsedExplainCommand
   | ParsedHookEventCommand
   | ParsedHooksCommand
+  | ParsedDataCommand
   | ParsedHelpCommand
   | ParsedVersionCommand;
 
@@ -170,6 +181,9 @@ export interface CliHandlers {
   ) => Promise<CommandExecutionResult>;
   hooks: (
     options: HooksCommandOptions,
+  ) => Promise<CommandExecutionResult>;
+  data?: (
+    options: DataCommandOptions,
   ) => Promise<CommandExecutionResult>;
 }
 
@@ -625,6 +639,14 @@ function parseHooksArgs(args: readonly string[]): ParsedHooksCommand {
   return { kind: "hooks", action, global, yes };
 }
 
+function parseDataArgs(args: readonly string[]): ParsedDataCommand {
+  const action = args[0];
+  if ((action !== "gc" && action !== "delete") || args.length !== 1) {
+    throw new CliUsageError("data requires exactly one gc or delete action");
+  }
+  return { kind: "data", action };
+}
+
 export function parseCliArgs(
   args: readonly string[],
 ): ParsedCliCommand {
@@ -639,6 +661,7 @@ export function parseCliArgs(
   if (args[0] === "explain") return parseExplainArgs(args.slice(1));
   if (args[0] === "hook-event") return parseHookEventArgs(args.slice(1));
   if (args[0] === "hooks") return parseHooksArgs(args.slice(1));
+  if (args[0] === "data") return parseDataArgs(args.slice(1));
   return parseAnalyzeArgs(args);
 }
 
@@ -743,7 +766,7 @@ export async function runCli(
   let activePrivacy: PrivacyProfile | undefined =
     args[0] === "explain" && ci
       ? "strict"
-      : ["stats", "dismiss", "explain", "hooks"].includes(args[0] ?? "")
+      : ["stats", "dismiss", "explain", "hooks", "data"].includes(args[0] ?? "")
         ? undefined
         : explicitPrivacy ??
           (ci || args.includes("--md") ? "strict" : "balanced");
@@ -808,11 +831,16 @@ export async function runCli(
         global: command.global,
         yes: command.yes,
       });
+    } else if (command.kind === "data") {
+      result = await (handlers.data ?? runDataCommand)({
+        cwd,
+        action: command.action,
+      });
     } else {
       // command.kind === "hook-event": runCli dispatches hook-event before
       // this try/catch (see below) so its always-exit-0 contract holds even
       // for CLI-level parse errors. Unreachable in practice; kept only so
-      // the analyze/stats/dismiss/explain/hooks narrowing above stays exhaustive.
+      // the analyze/stats/dismiss/explain/hooks/data narrowing above stays exhaustive.
       throw new CliUsageError("hook-event must be dispatched separately");
     }
     stdout(withTrailingNewline(result.stdout));
