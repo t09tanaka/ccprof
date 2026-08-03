@@ -48,12 +48,14 @@ import { renderMarkdownReport } from "../src/reporters/markdown.js";
 import {
   findingPrivacyReference,
   projectReportPrivacy,
+  projectStatsPrivacy,
   trustedVerificationCommand,
 } from "../src/reporters/privacy.js";
 import {
   renderStatsJson,
   renderStatsTty,
   summarizeStats,
+  type StatsReport,
 } from "../src/reporters/stats.js";
 import {
   renderTtyReport,
@@ -224,6 +226,138 @@ function assertPrivacyCanariesAbsent(value: string): void {
   ]) {
     assert.ok(!value.includes(canary), `privacy leak: ${canary}`);
   }
+}
+
+const STATS_PRIVACY_WINDOWS_PATH =
+  String.raw`C:\Users\alice\SecretCo\ccprof\private.txt`;
+const STATS_PRIVACY_UNC_PATH =
+  String.raw`\\corp-files\ccprof\private.txt`;
+const STATS_PRIVACY_SESSION =
+  "session-550e8400-e29b-41d4-a716-446655440000";
+const STATS_PRIVACY_ARGV_SECRET = "ARGV_SECRET_123456789";
+const STATS_PRIVACY_KEY =
+  `${PRIVACY_REPO}:${STATS_PRIVACY_SESSION}:${PRIVACY_TOKEN}`;
+const STATS_PRIVACY_CANARIES = [
+  PRIVACY_REPO,
+  PRIVACY_SOURCE,
+  STATS_PRIVACY_WINDOWS_PATH,
+  STATS_PRIVACY_UNC_PATH,
+  PRIVACY_URL,
+  PRIVACY_TOKEN,
+  STATS_PRIVACY_SESSION,
+  STATS_PRIVACY_ARGV_SECRET,
+] as const;
+
+function statsPrivacyReport(): StatsReport {
+  const privateText = [
+    PRIVACY_REPO,
+    PRIVACY_SOURCE,
+    STATS_PRIVACY_WINDOWS_PATH,
+    STATS_PRIVACY_UNC_PATH,
+    PRIVACY_URL,
+    PRIVACY_TOKEN,
+    STATS_PRIVACY_SESSION,
+  ].join(" ");
+  return {
+    history_count: 7,
+    baseline_metrics: [{ metric: `metric ${privateText}`, value: 0.42, baseline: 0.17 }],
+    chronic_commands: [{
+      command: "npm test",
+      command_identity: {
+        repo_relative_cwd: ".",
+        normalized_argv: ["npm", "test"],
+        executor: "shell",
+      },
+      presence_count: 4,
+      cost_ratio: 0.57,
+      estimated_min: 12.25,
+    }, {
+      command: "[redacted-command]",
+      presence_count: 3,
+      cost_ratio: 0.43,
+      estimated_min: 8.5,
+    }, {
+      command: `${PRIVACY_COMMAND} ${STATS_PRIVACY_WINDOWS_PATH}`,
+      presence_count: 2,
+      cost_ratio: 0.29,
+      estimated_min: 6.75,
+    }, {
+      command: "npm test",
+      command_identity: {
+        repo_relative_cwd: PRIVACY_REPO,
+        normalized_argv: [
+          "npm",
+          "test",
+          `--password=${STATS_PRIVACY_ARGV_SECRET}`,
+          STATS_PRIVACY_UNC_PATH,
+        ],
+        executor: "native-tool",
+      },
+      presence_count: 2,
+      cost_ratio: 0.29,
+      estimated_min: 5.25,
+    }],
+    rule_minutes: [
+      { rule_id: "R001", minutes: 4.25 },
+      { rule_id: "R007", minutes: 9.5 },
+    ],
+    recurring_findings: [{
+      finding_key: STATS_PRIVACY_KEY,
+      rule_id: "R002",
+      title: `Recurring ${privateText}`,
+      occurrence_count: 3,
+      first_min: 12.5,
+      first_bound: "point",
+      last_min: 2.75,
+      last_bound: "upper",
+      trend: "indeterminate",
+    }],
+    adoptions: [{
+      finding_key: STATS_PRIVACY_KEY,
+      rule_id: "R002",
+      title: `Adopted ${privateText}`,
+      method: "target_file_edit",
+      detected_at_ms: 1_785_628_800_123,
+      analyses_after: 5,
+      recurrences_after: 1,
+      minutes_before: 12.5,
+      minutes_after: 2.75,
+      status: "recurred",
+    }],
+    adoption_coverage: { detectable: 8, undetectable: 2 },
+  };
+}
+
+function statsPrivacyPreservedFields(stats: StatsReport): unknown {
+  return {
+    history_count: stats.history_count,
+    baseline_metrics: stats.baseline_metrics.map(({ value, baseline }) => ({ value, baseline })),
+    chronic_commands: stats.chronic_commands.map(
+      ({ presence_count, cost_ratio, estimated_min }) =>
+        ({ presence_count, cost_ratio, estimated_min }),
+    ),
+    rule_minutes: stats.rule_minutes,
+    recurring_findings: stats.recurring_findings.map((entry) => ({
+      rule_id: entry.rule_id,
+      occurrence_count: entry.occurrence_count,
+      first_min: entry.first_min,
+      first_bound: entry.first_bound,
+      last_min: entry.last_min,
+      last_bound: entry.last_bound,
+      trend: entry.trend,
+    })),
+    adoptions: stats.adoptions.map((entry) => ({
+      rule_id: entry.rule_id,
+      method: entry.method,
+      detected_at_ms: entry.detected_at_ms,
+      analyses_after: entry.analyses_after,
+      recurrences_after: entry.recurrences_after,
+      minutes_before: entry.minutes_before,
+      minutes_after: entry.minutes_after,
+      status: entry.status,
+    })),
+    adoption_coverage: stats.adoption_coverage,
+  };
 }
 
 function terminalAttack(marker: string): string {
@@ -1175,6 +1309,100 @@ test("shared privacy uses stable finding references and redacts untrusted verifi
   assert.equal(balanced.findings[0]?.fix_recipe.verify, "[redacted-command]");
   assert.equal(projectReportPrivacy(raw, "raw"), raw);
   assert.match(renderMarkdownReport(strict), new RegExp(reference, "u"));
+});
+
+test("stats raw privacy returns the report and keeps JSON and TTY bytes unchanged", () => {
+  const raw = statsPrivacyReport();
+  const projected = projectStatsPrivacy(raw, "raw", PRIVACY_REPO);
+
+  assert.equal(projected, raw);
+  assert.equal(renderStatsJson(projected), renderStatsJson(raw));
+  assert.equal(renderStatsTty(projected), renderStatsTty(raw));
+});
+
+test("stats display privacy aliases keys, removes canaries, and preserves facts", () => {
+  const raw = statsPrivacyReport();
+  const expectedReference = findingPrivacyReference(
+    PRIVACY_REPO,
+    STATS_PRIVACY_KEY,
+  );
+
+  for (const profile of ["strict", "balanced"] as const) {
+    const projected = projectStatsPrivacy(raw, profile, PRIVACY_REPO);
+    const rawOutput = renderStatsJson(raw);
+    const output = renderStatsJson(projected);
+
+    assert.equal(projected.recurring_findings[0]?.finding_key, expectedReference);
+    assert.equal(projected.adoptions[0]?.finding_key, expectedReference);
+    assert.equal(
+      projected.recurring_findings[0]?.finding_key,
+      projected.adoptions[0]?.finding_key,
+    );
+    assert.notEqual(
+      projected.baseline_metrics[0]?.metric,
+      raw.baseline_metrics[0]?.metric,
+    );
+    assert.notEqual(
+      projected.recurring_findings[0]?.title,
+      raw.recurring_findings[0]?.title,
+    );
+    assert.notEqual(projected.adoptions[0]?.title, raw.adoptions[0]?.title);
+    assert.deepEqual(
+      statsPrivacyPreservedFields(projected),
+      statsPrivacyPreservedFields(raw),
+    );
+    for (const canary of STATS_PRIVACY_CANARIES) {
+      const serialized = JSON.stringify(canary).slice(1, -1);
+      assert.ok(rawOutput.includes(serialized), `fixture lacks ${canary}`);
+      assert.ok(!output.includes(serialized), `${profile} leaked ${canary}`);
+    }
+  }
+});
+
+test("stats command privacy is allowlisted, deterministic, and non-mutating", () => {
+  const raw = statsPrivacyReport();
+  const before = structuredClone(raw);
+  const strict = projectStatsPrivacy(raw, "strict", PRIVACY_REPO);
+  const balanced = projectStatsPrivacy(raw, "balanced", PRIVACY_REPO);
+
+  assert.deepEqual(
+    strict.chronic_commands.map((entry) => entry.command),
+    ["npm test", "[redacted-command]", "[redacted-command]", "npm test"],
+  );
+  assert.ok(strict.chronic_commands.every(
+    (entry) => entry.command === "npm test" ||
+      entry.command === "[redacted-command]",
+  ));
+  assert.ok(strict.chronic_commands.every(
+    (entry) => !("command_identity" in entry),
+  ));
+
+  assert.equal(balanced.chronic_commands[0]?.command, "npm test");
+  assert.deepEqual(balanced.chronic_commands[0]?.command_identity, {
+    repo_relative_cwd: ".",
+    normalized_argv: ["npm", "test"],
+    executor: "shell",
+  });
+  assert.equal(balanced.chronic_commands[1]?.command, "[redacted-command]");
+  assert.equal(balanced.chronic_commands[2]?.command, "[redacted-command]");
+  assert.equal(balanced.chronic_commands[3]?.command, "npm test");
+  assert.equal("command_identity" in balanced.chronic_commands[3]!, false);
+
+  assert.deepEqual(raw, before);
+  assert.notEqual(strict, raw);
+  assert.notEqual(strict.chronic_commands, raw.chronic_commands);
+  assert.notEqual(
+    strict.chronic_commands[0]?.command_identity,
+    raw.chronic_commands[0]?.command_identity,
+  );
+  assert.deepEqual(
+    projectStatsPrivacy(raw, "strict", PRIVACY_REPO),
+    strict,
+  );
+  assert.deepEqual(
+    projectStatsPrivacy(raw, "balanced", PRIVACY_REPO),
+    balanced,
+  );
 });
 
 test("verification trust is limited to rule-specific fixed recipes", () => {

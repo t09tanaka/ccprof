@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
 import type { AnalyzeWarning } from "../core/analyze.js";
-import type { Finding, FindingEvidence, JsonValue, ReportV2 } from "../core/model.js";
+import type {
+  CommandIdentity,
+  Finding,
+  FindingEvidence,
+  JsonValue,
+  ReportV2,
+} from "../core/model.js";
+import type { StatsReport } from "./stats.js";
 export type PrivacyProfile = "strict" | "balanced" | "raw";
 type DisplayProfile = Exclude<PrivacyProfile, "raw">;
 type Copy = readonly [raw: string, replacement: string];
@@ -8,6 +15,8 @@ const REDACTED_COMMAND = "[redacted-command]";
 const SAFE_COMMAND = /^(?:npm test|npm run (?:test|check|lint|typecheck|build)|pnpm (?:test|check|lint|typecheck|build)|yarn (?:test|check|lint|typecheck|build)|bun test|cargo test|go test|pytest|python3? -m pytest|node --test|ccprof --json|git diff --check|git diff -- CLAUDE\.md)$/u;
 const COMMANDISH = /(?:^|\s)(?:\.\/scripts(?:\/|\b)|curl|wget|ssh|scp|bash|zsh|sh|rm|git|gh|kubectl|docker|make|aws|az|gcloud|deno|mvn|gradle|npm|pnpm|yarn|bun|cargo|go|pytest|python3?|node|ccprof)\b|&&|\|\||[;|]/u;
 const URL = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'`<>]+/giu;
+const SESSION_IDENTIFIER =
+  /\bsession(?:[-_:#][\p{L}\p{N}._-]+)+\b/giu;
 const SECRET = /--(?:api[-_]?key|access[-_]?token|auth[-_]?token|client[-_]?secret|password|passwd|secret|token)(?:=|\s+)(?:"[^"]*"|'[^']*'|[^\s,"'`<>]+)|(?:authorization\s*:\s*(?:bearer|basic)\s+|(?:api[-_ ]?key|access[-_ ]?token|auth[-_ ]?token|password|passwd|secret|token)\s*[:=]\s*)[^\s,"'`<>]+|\b(?:gh[pousr]_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|[A-Z][A-Z0-9]{1,9}-\d+)\b|-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/giu;
 
 export function findingPrivacyReference(
@@ -80,6 +89,7 @@ export function sanitizePrivacyText(text: string, profile: PrivacyProfile,
   const repo = repoRoot === undefined ? undefined : repoPattern(repoRoot);
   if (repo !== undefined) value = value.replace(repo, "$1[repository]");
   return value.replace(URL, "[url]")
+    .replace(SESSION_IDENTIFIER, "[session]")
     .replace(/\\\\[^\\/\r\n]+[\\/][^\r\n]*?(?=$|[,;"'`<>)\]}])/gu, "[path]")
     .replace(/\b[A-Za-z]:[\\/][^\r\n]*?(?=$|[,;"'`<>)\]}])/gu, "[path]")
     .replace(/(^|[\s("'`=:\[{},;])\/(?!\/)[^\r\n]*?(?=$|[,;"'`<>)\]}])/gu, "$1[path]")
@@ -219,6 +229,96 @@ export function projectReportPrivacy(report: ReportV2, profile: PrivacyProfile):
     }),
   };
 }
+
+function balancedStatsIdentity(
+  command: string,
+  identity: CommandIdentity,
+  repoRoot: string,
+): CommandIdentity | undefined {
+  if (identity.repo_relative_cwd !== ".") return undefined;
+  const safeDisplay = safeCommand(command, "strict", repoRoot, []);
+  const safeArgv = safeCommand(
+    identity.normalized_argv.join(" "),
+    "strict",
+    repoRoot,
+    [],
+  );
+  if (
+    safeDisplay === undefined ||
+    safeDisplay === REDACTED_COMMAND ||
+    safeArgv !== safeDisplay
+  ) {
+    return undefined;
+  }
+  return {
+    repo_relative_cwd: ".",
+    normalized_argv: [...identity.normalized_argv],
+    executor: identity.executor,
+  };
+}
+
+export function projectStatsPrivacy(
+  stats: StatsReport,
+  profile: PrivacyProfile,
+  repoRoot: string,
+): StatsReport {
+  if (profile === "raw") return stats;
+  const projectText = (value: string): string =>
+    safeText(value, profile, repoRoot, []);
+  return {
+    history_count: stats.history_count,
+    baseline_metrics: stats.baseline_metrics.map((entry) => ({
+      metric: projectText(entry.metric),
+      value: entry.value,
+      baseline: entry.baseline,
+    })),
+    chronic_commands: stats.chronic_commands.map((entry) => {
+      const command = safeCommand(entry.command, profile, repoRoot, []) ??
+        REDACTED_COMMAND;
+      const identity = profile === "balanced" &&
+          entry.command_identity !== undefined
+        ? balancedStatsIdentity(
+          entry.command,
+          entry.command_identity,
+          repoRoot,
+        )
+        : undefined;
+      return {
+        command,
+        ...(identity === undefined ? {} : { command_identity: identity }),
+        presence_count: entry.presence_count,
+        cost_ratio: entry.cost_ratio,
+        estimated_min: entry.estimated_min,
+      };
+    }),
+    rule_minutes: stats.rule_minutes.map((entry) => ({ ...entry })),
+    recurring_findings: stats.recurring_findings.map((entry) => ({
+      finding_key: findingPrivacyReference(repoRoot, entry.finding_key),
+      rule_id: entry.rule_id,
+      title: projectText(entry.title),
+      occurrence_count: entry.occurrence_count,
+      first_min: entry.first_min,
+      first_bound: entry.first_bound,
+      last_min: entry.last_min,
+      last_bound: entry.last_bound,
+      trend: entry.trend,
+    })),
+    adoptions: stats.adoptions.map((entry) => ({
+      finding_key: findingPrivacyReference(repoRoot, entry.finding_key),
+      rule_id: entry.rule_id,
+      title: projectText(entry.title),
+      method: entry.method,
+      detected_at_ms: entry.detected_at_ms,
+      analyses_after: entry.analyses_after,
+      recurrences_after: entry.recurrences_after,
+      minutes_before: entry.minutes_before,
+      minutes_after: entry.minutes_after,
+      status: entry.status,
+    })),
+    adoption_coverage: { ...stats.adoption_coverage },
+  };
+}
+
 export function privacyWarningTexts(warnings: readonly AnalyzeWarning[], profile: PrivacyProfile,
   repoRoot?: string, sessions: readonly string[] = []): string[] {
   if (profile === "strict") {
