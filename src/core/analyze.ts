@@ -29,6 +29,7 @@ import type {
   ToolResultEvent,
   ToolUseEvent,
 } from "./model.js";
+import { sourceDescriptorsForSessions } from "./source-descriptor.js";
 import {
   detectAdoptions,
   detectability,
@@ -1284,6 +1285,7 @@ export async function analyze(
   const report: ReportV2 = {
     version: 2,
     unit,
+    sources: sourceDescriptorsForSessions(sessions),
     summary: ledger.summary,
     findings: [...applied.findings]
       .filter((finding) => finding.recoverable.min > 0)

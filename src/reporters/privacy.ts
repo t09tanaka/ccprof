@@ -217,6 +217,9 @@ export function projectReportPrivacy(report: ReportV2, profile: PrivacyProfile):
       pr_ref: opaque(scope, "ref", report.unit.pr_ref),
       sessions: sessions.map((session) => opaque(scope, "session", session)),
     },
+    ...(report.sources === undefined
+      ? {}
+      : { sources: structuredClone(report.sources) }),
     summary: structuredClone(report.summary),
     findings: report.findings.map((finding) => projectedFinding(
       finding, profile, scope, repoRoot, sessions,

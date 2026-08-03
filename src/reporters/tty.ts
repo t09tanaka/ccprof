@@ -64,6 +64,20 @@ export function skippedRulesLine(report: ReportV2): string | null {
   return `Skipped rules (source lacks required data): ${detail}`;
 }
 
+export function sourcesLine(report: ReportV2): string | null {
+  if (report.sources === undefined || report.sources.length === 0) return null;
+  const counts = new Map<string, number>();
+  for (const source of report.sources) {
+    const key = `${source.adapter_id}@${source.adapter_version}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  const detail = [...counts]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, count]) => `${key} (${count})`)
+    .join(", ");
+  return `Sources: ${detail}.`;
+}
+
 function caveatLines(report: ReportV2): string[] {
   const caveats = [
     ...report.caveats,
@@ -90,6 +104,8 @@ export function renderTtyReport(
   const lines = [
     paint(conclusion, report.summary.recoverable_min > 0 ? 33 : 32, color),
   ];
+  const sourceSummary = sourcesLine(report);
+  if (sourceSummary !== null) lines.push(sourceSummary);
   const findings = report.findings.slice(0, 3);
   if (findings.length === 0) {
     lines.push("No actionable findings.");

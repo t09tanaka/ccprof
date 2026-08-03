@@ -291,6 +291,27 @@ time, but every finding produced by the analysis is written to the store.
     "pr_ref": "ref-1",
     "sessions": ["session-1"]
   },
+  "sources": [
+    {
+      "adapter_id": "claude",
+      "adapter_version": "1.0.0",
+      "source_instance_id": "source-0e596344ad7c80946741116ed2a54665d0a55027b6a78d6bfb4f1c9dd2872a6d",
+      "source_kind": "claude_transcript_jsonl",
+      "provided_capabilities": [
+        "approvals",
+        "branch_rows",
+        "edit_fragments",
+        "sidechains",
+        "token_usage",
+        "tool_timestamps"
+      ],
+      "required_capabilities": [],
+      "provenance": "local_filesystem",
+      "sensitivity": "sensitive",
+      "retention_class": "raw_evidence",
+      "canonical_fingerprint": "sha256:d2a320e97e2dd44189283e8d839c346dbcadac97eb0100200e27e23bafe24278"
+    }
+  ],
   "summary": {
     "measured_min": 52,
     "idle_excluded_min": 35,
@@ -480,6 +501,27 @@ with `CCPROF_CODEX_SESSIONS_DIR`). Sessions from both are filtered to the
 repository's canonical working directory and the query's head branch before
 being combined into a single analysis.
 
+Each new report includes one validated descriptor per distinct source instance.
+The built-in registry accepts only `claude@1.0.0` with source kind
+`claude_transcript_jsonl` and `codex@1.0.0` with source kind
+`codex_rollout_jsonl`. A descriptor has exactly `adapter_id`,
+`adapter_version`, `source_instance_id`, `source_kind`, sorted
+`provided_capabilities`, sorted `required_capabilities`, `provenance`,
+`sensitivity`, `retention_class`, and `canonical_fingerprint`. Both built-ins
+currently declare no prerequisite capabilities; provided capabilities retain
+the existing session-source compatibility rule where an omitted declaration
+means all known capabilities.
+
+`source_instance_id` is a domain-separated SHA-256 alias of the adapter and
+NFC-normalized logical session ID, so linked-worktree copies remain stable while
+the raw session ID and source path are never emitted. `canonical_fingerprint`
+is a separate domain-separated SHA-256 digest of the other nine canonical
+fields. Validation rejects unknown adapters, versions, fields, capability
+names, NULs, malformed aliases, non-canonical capability arrays, registry or
+fingerprint mismatches, and duplicate source instances with stable errors that
+do not echo rejected values. The descriptor field is additive: older v2 reports
+without `sources` remain readable and keep their previous rendered bytes.
+
 Claude Code's JSONL is an unpublished schema, so drift is absorbed at the parser
 boundary. For cumulative snapshots sharing a `message.id` the final form wins,
 and different content fragments split across the same ID are joined in order.
@@ -611,6 +653,10 @@ Store records remain raw so local baselines and history retain their existing
 identity and evidence. Privacy profiles govern rendered output and advisory
 input; they do not rewrite the Store. Protect the data directory as local
 sensitive data.
+
+Source descriptors contain only fixed registry metadata and opaque hashes.
+Strict, balanced, and raw output therefore preserve the same descriptor values;
+none of the profiles introduces a raw session ID, transcript path, or secret.
 
 For verification or unusual layouts, `CCPROF_DATA_DIR` overrides the storage
 root, `CCPROF_CLAUDE_PROJECTS_DIR` overrides the Claude projects directory, and

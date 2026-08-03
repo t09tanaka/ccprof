@@ -2060,6 +2060,25 @@ test("hook Stop rows respect both frozen boundaries and unique session attributi
       { ...claude, source: "codex", source_path: join(repo, "codex.jsonl") },
     ]);
     assert.equal(collision.ledger.totals_ms.measured, 60_000);
+    assert.deepEqual(
+      collision.report.sources?.map((source) => ({
+        adapter_id: source.adapter_id,
+        adapter_version: source.adapter_version,
+        source_kind: source.source_kind,
+      })),
+      [
+        {
+          adapter_id: "claude",
+          adapter_version: "1.0.0",
+          source_kind: "claude_transcript_jsonl",
+        },
+        {
+          adapter_id: "codex",
+          adapter_version: "1.0.0",
+          source_kind: "codex_rollout_jsonl",
+        },
+      ],
+    );
 
     const preStartCollision: Session = {
       ...claude,

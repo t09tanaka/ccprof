@@ -25,6 +25,22 @@ function reportForDisplay(
       pr_ref: report.unit.pr_ref,
       sessions: [...report.unit.sessions],
     },
+    ...(report.sources === undefined
+      ? {}
+      : {
+        sources: report.sources.map((source) => ({
+          adapter_id: source.adapter_id,
+          adapter_version: source.adapter_version,
+          source_instance_id: source.source_instance_id,
+          source_kind: source.source_kind,
+          provided_capabilities: [...source.provided_capabilities],
+          required_capabilities: [...source.required_capabilities],
+          provenance: source.provenance,
+          sensitivity: source.sensitivity,
+          retention_class: source.retention_class,
+          canonical_fingerprint: source.canonical_fingerprint,
+        })),
+      }),
     summary: {
       measured_min: report.summary.measured_min,
       idle_excluded_min: report.summary.idle_excluded_min,
