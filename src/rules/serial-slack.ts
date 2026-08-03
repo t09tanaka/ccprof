@@ -13,11 +13,16 @@ import {
 } from "../core/event-identity.js";
 import {
   createFindingCandidate,
+  impactFromClaim,
   minimumConfidence,
   orderedActions,
   recoverableClaim,
   sortedUnique,
 } from "./shared.js";
+
+export interface SerialSlackOptions {
+  sourceCompleteness?: number;
+}
 
 const READ_TOOL_NAMES = new Set([
   "glob",
@@ -216,6 +221,7 @@ function groupsForAgent(
 
 export function detectSerialSlack(
   actions: readonly MatchedAction[],
+  options: SerialSlackOptions = {},
 ) {
   const byAgent = new Map<string, MatchedAction[]>();
   for (const action of orderedActions(actions)) {
@@ -236,18 +242,24 @@ export function detectSerialSlack(
         serialDurationMs,
         longestActionMs,
       } = upperClaim(target, groupActions);
+      const evidenceConfidence = minimumConfidence(
+        groupActions.flatMap((action) => [
+          action.confidence,
+          action.match_confidence,
+        ]),
+      );
       return createFindingCandidate({
         rule_id: "R005",
         title: "Independent tool calls ran serially",
         classification: "behavior",
         cause: null,
         scope: "claude_md",
-        confidence: minimumConfidence(
-          groupActions.flatMap((action) => [
-            action.confidence,
-            action.match_confidence,
-          ]),
-        ),
+        impact: impactFromClaim(claim, "resource_cost"),
+        finding_confidence: {
+          evidence: evidenceConfidence,
+          causal: minimumConfidence([evidenceConfidence, "medium"]),
+          source_completeness: options.sourceCompleteness ?? 1,
+        },
         target,
         evidence: {
           session_refs: sortedUnique(
@@ -271,7 +283,7 @@ export function detectSerialSlack(
             ),
           ),
         },
-        recoverable: claim,
+        intervals: claim.intervals,
         fix_recipe: {
           suggestion:
             `Batch the independent read or validation calls for ${target} into one parallel tool invocation.`,

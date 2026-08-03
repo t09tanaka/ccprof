@@ -10,11 +10,16 @@ import type {
 import {
   createFindingCandidate,
   findingKey,
+  impactFromClaim,
   minimumConfidence,
   orderedActions,
   recoverableClaim,
   sortedUnique,
 } from "./shared.js";
+
+export interface RedundantRunsOptions {
+  sourceCompleteness?: number;
+}
 
 function normalizedCommand(action: MatchedAction): string | undefined {
   if (
@@ -52,6 +57,7 @@ function r002FindingKey(identity: CommandIdentity): string {
 
 export function detectRedundantRuns(
   actions: readonly MatchedAction[],
+  options: RedundantRunsOptions = {},
 ) {
   const tools = orderedActions(actions).filter(
     (action) =>
@@ -92,18 +98,24 @@ export function detectRedundantRuns(
       const recoverable = recoverableClaim("R002", target, redundant);
       if (recoverable.estimated_ms === 0) return [];
       const descriptor = classifyCommand(command);
+      const evidenceConfidence = minimumConfidence(
+        redundant.flatMap((action) => [
+          action.confidence,
+          action.match_confidence,
+        ]),
+      );
       const candidate = createFindingCandidate({
         rule_id: "R002",
         title: "Redundant test or build runs",
         classification: "behavior",
         cause: null,
         scope: "this_pr",
-        confidence: minimumConfidence(
-          redundant.flatMap((action) => [
-            action.confidence,
-            action.match_confidence,
-          ]),
-        ),
+        impact: impactFromClaim(recoverable, "critical_path_latency"),
+        finding_confidence: {
+          evidence: evidenceConfidence,
+          causal: evidenceConfidence,
+          source_completeness: options.sourceCompleteness ?? 1,
+        },
         target,
         evidence: {
           session_refs: sortedUnique(
@@ -127,7 +139,7 @@ export function detectRedundantRuns(
           prior_success_proven: descriptor.scope !== "targeted",
           prior_success_basis: "matcher-classification",
         },
-        recoverable,
+        intervals: recoverable.intervals,
         fix_recipe: recipeFor(command, identity),
         caveats: sortedUnique([
           ...redundant.flatMap((action) => action.caveats),

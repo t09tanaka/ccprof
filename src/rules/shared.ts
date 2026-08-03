@@ -2,23 +2,45 @@ import { createHash } from "node:crypto";
 
 import { durationMs, normalizeInterval } from "../core/intervals.js";
 import { encodeEventIdentity } from "../core/event-identity.js";
+import {
+  findingScoringRationale,
+  findingSeverity,
+  projectFindingConfidence,
+  projectFindingRecoverable,
+  snapshotFindingConfidence,
+  snapshotImpactEstimate,
+} from "../core/model.js";
 import type {
   Confidence,
   FindingCandidate,
   FindingEvidence,
+  ImpactEstimate,
   JsonObject,
   JsonValue,
   RecoverableClaim,
+  RecoverableInterval,
   RuleId,
   TimelineAction,
 } from "../core/model.js";
 import { ruleManifest } from "./manifest.js";
 
 export interface FindingCandidateInput
-  extends Omit<FindingCandidate, "finding_key" | "target" | "evidence" | "caveats"> {
+  extends Omit<
+    FindingCandidate,
+    | "finding_key"
+    | "target"
+    | "evidence"
+    | "caveats"
+    | "confidence"
+    | "recoverable"
+    | "severity"
+    | "scoring_rationale"
+  > {
   target: string;
   evidence: FindingEvidence;
   caveats: readonly string[];
+  intervals: readonly RecoverableInterval[];
+  policy_dependent?: boolean;
 }
 
 export function normalizeFindingTarget(target: string): string {
@@ -88,6 +110,11 @@ export function createFindingCandidate(
 ): FindingCandidate {
   const target = normalizeFindingTarget(input.target);
   const evidence = canonicalEvidence(input.evidence);
+  const impact = snapshotImpactEstimate(input.impact);
+  const findingConfidence = snapshotFindingConfidence(
+    input.finding_confidence,
+  );
+  const projectedRecoverable = projectFindingRecoverable(impact);
   const errors: string[] = [];
   if (evidence.session_refs.length === 0) {
     errors.push("evidence session refs must be non-empty");
@@ -102,19 +129,42 @@ export function createFindingCandidate(
     throw new TypeError(`invalid finding: ${errors.join("; ")}`);
   }
   return {
-    ...input,
     finding_key: findingKey(input.rule_id, target),
+    rule_id: input.rule_id,
+    title: input.title,
+    classification: input.classification,
+    cause: input.cause,
+    scope: input.scope,
+    confidence: projectFindingConfidence(findingConfidence),
     target,
     evidence,
+    impact,
+    finding_confidence: findingConfidence,
+    severity: findingSeverity(impact, findingConfidence),
+    scoring_rationale: findingScoringRationale(impact, findingConfidence, {
+      ...(input.policy_dependent === true ? { policy_dependent: true } : {}),
+    }),
     recoverable: {
-      ...input.recoverable,
-      intervals: [...input.recoverable.intervals],
+      bound: projectedRecoverable.bound,
+      estimated_ms: impact.upper_ms,
+      intervals: input.intervals.map((interval) => ({ ...interval })),
     },
     fix_recipe: {
       suggestion: input.fix_recipe.suggestion.trim(),
       verify: input.fix_recipe.verify.trim(),
     },
     caveats: sortedUnique(input.caveats),
+  };
+}
+
+export function impactFromClaim(
+  claim: RecoverableClaim,
+  kind: ImpactEstimate["kind"],
+): ImpactEstimate {
+  return {
+    lower_ms: claim.bound === "point" ? claim.estimated_ms : 0,
+    upper_ms: claim.estimated_ms,
+    kind,
   };
 }
 

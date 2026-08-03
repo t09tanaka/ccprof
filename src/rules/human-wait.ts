@@ -10,6 +10,7 @@ import type {
 import type { AttributedTimelineAction } from "../analysis/timeline.js";
 import {
   createFindingCandidate,
+  impactFromClaim,
   minimumConfidence,
   orderedActions,
   recoverableClaim,
@@ -28,6 +29,7 @@ export const APPROVAL_PROMPT_PHRASES = [
 
 export interface HumanWaitOptions {
   assistantEvents?: readonly AssistantEvent[];
+  sourceCompleteness?: number;
 }
 
 interface ApprovalSignal {
@@ -123,7 +125,13 @@ export function detectHumanWait(
     classification: "config",
     cause: null,
     scope: "separate_issue",
-    confidence,
+    impact: impactFromClaim(recoverable, "critical_path_latency"),
+    finding_confidence: {
+      evidence: confidence,
+      causal: confidence,
+      source_completeness: options.sourceCompleteness ?? 1,
+    },
+    policy_dependent: true,
     target: "approval-wait",
     evidence: {
       session_refs: sortedUnique(
@@ -144,7 +152,7 @@ export function detectHumanWait(
         ),
       ),
     },
-    recoverable,
+    intervals: recoverable.intervals,
     fix_recipe: {
       suggestion:
         "Add the repeated safe approval pattern to the agent permission allowlist in a separate configuration change.",

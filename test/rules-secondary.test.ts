@@ -5,6 +5,11 @@ import type {
   CommandIdentity,
   CompactionEvent,
   Finding,
+  FindingCandidate,
+  FindingConfidence,
+  FindingScoringRationale,
+  FindingSeverity,
+  ImpactEstimate,
   MatchedAction,
   TimelineAction,
   ToolResultEvent,
@@ -24,6 +29,24 @@ import {
 } from "../src/rules/flaky-test.js";
 import { findingKey } from "../src/rules/shared.js";
 import { detectSerialSlack } from "../src/rules/serial-slack.js";
+
+function assertCanonicalCandidate(
+  finding: FindingCandidate,
+  expected: {
+    impact: ImpactEstimate;
+    finding_confidence: FindingConfidence;
+    severity: FindingSeverity;
+    scoring_rationale: FindingScoringRationale[];
+    confidence: FindingCandidate["confidence"];
+  },
+): void {
+  assert.deepEqual(finding.impact, expected.impact);
+  assert.deepEqual(finding.finding_confidence, expected.finding_confidence);
+  assert.equal(finding.severity, expected.severity);
+  assert.deepEqual(finding.scoring_rationale, expected.scoring_rationale);
+  assert.equal(finding.confidence, expected.confidence);
+  assert.equal("expected_ms" in (finding.impact ?? {}), false);
+}
 
 function timelineAction(
   actionId: string,
@@ -236,9 +259,24 @@ test("R005 detects adjacent independent reads and estimates only sum minus max",
   assert.equal(finding.classification, "behavior");
   assert.equal(finding.scope, "claude_md");
   assert.equal(finding.cause, null);
-  assert.equal(finding.confidence, "high");
+  assert.equal(finding.confidence, "medium");
   assert.equal(finding.recoverable.bound, "upper");
   assert.equal(finding.recoverable.estimated_ms, 100);
+  assertCanonicalCandidate(finding, {
+    impact: {
+      lower_ms: 0,
+      upper_ms: 100,
+      kind: "resource_cost",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "medium",
+      source_completeness: 1,
+    },
+    severity: "medium",
+    scoring_rationale: ["estimated_upper_only", "resource_cost_only"],
+    confidence: "medium",
+  });
   assert.deepEqual(finding.evidence.interval_ids, [
     "R005:read-a",
     "R005:read-b",
@@ -509,6 +547,21 @@ test("R007 uses a strict token threshold, links compaction, and claims caused la
   assert.equal(finding.scope, "claude_md");
   assert.equal(finding.recoverable.bound, "upper");
   assert.equal(finding.recoverable.estimated_ms, 300);
+  assertCanonicalCandidate(finding, {
+    impact: {
+      lower_ms: 0,
+      upper_ms: 300,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "medium",
+      source_completeness: 1,
+    },
+    severity: "medium",
+    scoring_rationale: ["estimated_upper_only"],
+    confidence: "medium",
+  });
   assert.deepEqual(finding.evidence.interval_ids, [
     "R007:large-inference",
   ]);
@@ -536,7 +589,7 @@ test("R007 reports compaction without inventing latency when no large result pre
   })[0];
   assert.ok(finding !== undefined);
   assert.equal(finding.target, "compaction");
-  assert.equal(finding.recoverable.bound, "upper");
+  assert.equal(finding.recoverable.bound, "point");
   assert.equal(finding.recoverable.estimated_ms, 0);
   assert.deepEqual(finding.recoverable.intervals, []);
   assert.equal(finding.evidence.compaction_count, 1);
@@ -602,6 +655,21 @@ test("R008 claims a definite unchanged fail-to-pass investigation as point time"
   assert.equal(finding.finding_key, r008FindingKey(identity));
   assert.equal(finding.recoverable.bound, "point");
   assert.equal(finding.recoverable.estimated_ms, 140);
+  assertCanonicalCandidate(finding, {
+    impact: {
+      lower_ms: 140,
+      upper_ms: 140,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "high",
+      source_completeness: 1,
+    },
+    severity: "high",
+    scoring_rationale: ["observed_lower_bound"],
+    confidence: "high",
+  });
   assert.deepEqual(finding.evidence.interval_ids, [
     "R008:failed",
     "R008:investigation",

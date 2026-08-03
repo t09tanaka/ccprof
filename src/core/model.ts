@@ -325,14 +325,10 @@ interface FindingMetadata {
 export interface FindingCandidate extends FindingMetadata {
   target: string;
   recoverable: RecoverableClaim;
-  /** Required after the candidate-construction boundary migrates in Task 2. */
-  impact?: ImpactEstimate;
-  /** Required after the candidate-construction boundary migrates in Task 2. */
-  finding_confidence?: FindingConfidence;
-  /** Required after the candidate-construction boundary migrates in Task 2. */
-  severity?: FindingSeverity;
-  /** Required after the candidate-construction boundary migrates in Task 2. */
-  scoring_rationale?: FindingScoringRationale[];
+  impact: ImpactEstimate;
+  finding_confidence: FindingConfidence;
+  severity: FindingSeverity;
+  scoring_rationale: FindingScoringRationale[];
 }
 
 export interface FindingRecoverable {

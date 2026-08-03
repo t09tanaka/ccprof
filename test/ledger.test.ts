@@ -22,6 +22,10 @@ function candidate(
     0,
   ),
 ): FindingCandidate {
+  const kind = ruleId === "R005" || ruleId === "R006"
+    ? "resource_cost" as const
+    : "critical_path_latency" as const;
+  const lowerMs = bound === "point" ? estimatedMs : 0;
   return {
     finding_key: key,
     rule_id: ruleId,
@@ -30,6 +34,29 @@ function candidate(
     cause: ruleId === "R001" ? "unknown" : null,
     scope: "separate_issue",
     confidence: "high",
+    impact: {
+      lower_ms: lowerMs,
+      upper_ms: estimatedMs,
+      kind,
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "high",
+      source_completeness: 1,
+    },
+    severity: estimatedMs === 0
+      ? "info"
+      : kind === "critical_path_latency" && lowerMs > 0
+        ? "high"
+        : "medium",
+    scoring_rationale: [
+      ...(lowerMs > 0
+        ? ["observed_lower_bound" as const]
+        : estimatedMs > 0
+          ? ["estimated_upper_only" as const]
+          : []),
+      ...(kind === "resource_cost" ? ["resource_cost_only" as const] : []),
+    ],
     target: key,
     evidence: {
       session_refs: [`s1#${key}`],

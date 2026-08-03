@@ -2602,6 +2602,22 @@ test("R006 requires five histories, identity presence in three, and a 30 percent
   assert.equal(chronic.evidence.minimum_presence_count, 3);
   assert.equal(chronic.evidence.minimum_cost_ratio, 0.3);
   assert.equal(chronic.recoverable.bound, "upper");
+  assert.deepEqual(chronic.impact, {
+    lower_ms: 0,
+    upper_ms: chronic.recoverable.estimated_ms,
+    kind: "resource_cost",
+  });
+  assert.deepEqual(chronic.finding_confidence, {
+    evidence: "high",
+    causal: "medium",
+    source_completeness: 1,
+  });
+  assert.equal(chronic.severity, "medium");
+  assert.deepEqual(chronic.scoring_rationale, [
+    "estimated_upper_only",
+    "resource_cost_only",
+  ]);
+  assert.equal(chronic.confidence, "medium");
   assert.equal(chronic.fix_recipe.verify, "npm test");
   assert.match(chronic.fix_recipe.suggestion, /packages\/api/u);
 

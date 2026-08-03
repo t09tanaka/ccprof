@@ -22,6 +22,7 @@ export interface ChronicCostOptions {
   minimum_history_count?: number;
   minimum_presence_count?: number;
   minimum_cost_ratio?: number;
+  sourceCompleteness?: number;
 }
 
 interface CommandAggregate {
@@ -206,13 +207,23 @@ export function detectChronicCost(
         normalized_argv: [...aggregate.identity.normalized_argv] };
       const target = formatCommandIdentityTarget(identity, aggregate.command) +
         (identity.executor === "native-tool" ? " [native-tool]" : "");
+      const estimatedMs = (costMin / history.length) * 60_000;
       const candidate = createFindingCandidate({
         rule_id: "R006",
         title: "Chronic command cost",
         classification: "repo",
         cause: null,
         scope: "separate_issue",
-        confidence: "high",
+        impact: {
+          lower_ms: 0,
+          upper_ms: estimatedMs,
+          kind: "resource_cost",
+        },
+        finding_confidence: {
+          evidence: "high",
+          causal: "medium",
+          source_completeness: options.sourceCompleteness ?? 1,
+        },
         target,
         evidence: {
           session_refs: aggregate.session_refs,
@@ -228,11 +239,7 @@ export function detectChronicCost(
           minimum_presence_count: minimumPresenceCount,
           minimum_cost_ratio: minimumCostRatio,
         },
-        recoverable: {
-          bound: "upper",
-          estimated_ms: (costMin / history.length) * 60_000,
-          intervals: [],
-        },
+        intervals: [],
         fix_recipe: recipe(aggregate.command, identity),
         caveats: [
           "The estimate is a historical per-analysis upper bound; actual savings require a repository change and follow-up measurement.",

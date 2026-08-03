@@ -969,14 +969,27 @@ interface RuleEvidenceLane {
   events: readonly NormalizedEvent[];
 }
 
+function findingSourceCompleteness(entry: RuleCoverage): number {
+  return entry.truncated ? 0 : entry.completeness;
+}
+
 function ruleCandidates(
   lanes: Readonly<Record<RuleId, RuleEvidenceLane>>,
+  coverage: readonly RuleCoverage[],
   history: readonly AnalysisRecord[],
   currentObjectIdsByPath: ReadonlyMap<string, string>,
   crossPrEligibleReadKeys: ReadonlySet<string>,
   testMap: TestMap,
   externalToolNames: ReadonlySet<string> | undefined,
 ): FindingCandidate[] {
+  const completenessByRule = new Map(
+    coverage.map((entry) => [
+      entry.rule_id,
+      findingSourceCompleteness(entry),
+    ]),
+  );
+  const completeness = (ruleId: RuleId): number =>
+    completenessByRule.get(ruleId) ?? 0;
   const userEvents = lanes.R001.events.filter(
     (event): event is Extract<NormalizedEvent, { kind: "genuine_user" }> =>
       event.kind === "genuine_user",
@@ -988,26 +1001,41 @@ function ruleCandidates(
     (event): event is ToolResultEvent => event.kind === "tool_result",
   );
   return [
-    ...detectRework(lanes.R001.matched, { userEvents }),
-    ...detectRedundantRuns(lanes.R002.matched),
+    ...detectRework(lanes.R001.matched, {
+      userEvents,
+      sourceCompleteness: completeness("R001"),
+    }),
+    ...detectRedundantRuns(lanes.R002.matched, {
+      sourceCompleteness: completeness("R002"),
+    }),
     ...detectRediscovery(lanes.R003.matched, {
       estimatedTokensByEventIdentity: tokenEstimates(lanes.R003.events),
       history,
       currentObjectIdsByPath,
       crossPrEligibleReadKeys,
+      sourceCompleteness: completeness("R003"),
     }),
-    ...detectHumanWait(lanes.R004.timeline.actions, { assistantEvents }),
-    ...detectSerialSlack(lanes.R005.matched),
-    ...detectChronicCost(history),
+    ...detectHumanWait(lanes.R004.timeline.actions, {
+      assistantEvents,
+      sourceCompleteness: completeness("R004"),
+    }),
+    ...detectSerialSlack(lanes.R005.matched, {
+      sourceCompleteness: completeness("R005"),
+    }),
+    ...detectChronicCost(history, {
+      sourceCompleteness: completeness("R006"),
+    }),
     ...detectContextBloat(lanes.R007.matched, {
       events: lanes.R007.events,
       ...(externalToolNames === undefined ? {} : { externalToolNames }),
+      sourceCompleteness: completeness("R007"),
     }),
     ...detectFlakyTests(lanes.R008.matched, {
       toolResults,
       additionalTestCommands: mappedTestCommands(testMap),
       editRelevanceByActionId: buildFlakyEditRelevance(lanes.R008.matched, testMap),
       history,
+      sourceCompleteness: completeness("R008"),
     }),
   ];
 }
@@ -1612,6 +1640,7 @@ export async function analyze(
   }
   const candidates = ruleCandidates(
     ruleLanes,
+    coverage,
     history,
     reads.objects,
     reads.eligibleReadKeys,

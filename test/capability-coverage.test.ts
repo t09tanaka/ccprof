@@ -390,6 +390,11 @@ test("mixed Claude and Codex lanes retain eligible R001 and R007 evidence", asyn
       assert.ok(findings.every(({ evidence }) =>
         evidence.session_refs.every((ref) => !ref.startsWith("codex-limited#"))
       ));
+      assert.ok(findings.every((finding) =>
+        finding.finding_confidence?.source_completeness === 0.5 &&
+        finding.severity !== "high" &&
+        finding.scoring_rationale?.includes("partial_source") === true
+      ));
     }
 
     const zero = await analyzeSessions(root, repo, [limited]);
@@ -493,6 +498,10 @@ test("R005 receives only tool-timestamp-capable session actions", async () => {
     assert.ok(findings.length > 0, "eligible serial reads must remain detectable");
     assert.ok(findings.every(({ evidence }) =>
       evidence.session_refs.every((ref) => !ref.startsWith("ineligible#"))
+    ));
+    assert.ok(findings.every((finding) =>
+      finding.finding_confidence?.source_completeness === 0.5 &&
+      finding.scoring_rationale?.includes("partial_source") === true
     ));
   } finally {
     await rm(root, { recursive: true, force: true });

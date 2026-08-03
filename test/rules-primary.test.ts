@@ -20,7 +20,12 @@ import type {
   AssistantEvent,
   CommandIdentity,
   Finding,
+  FindingCandidate,
+  FindingConfidence,
+  FindingScoringRationale,
+  FindingSeverity,
   GenuineUserEvent,
+  ImpactEstimate,
   MatchedAction,
   Session,
   TimelineAction,
@@ -59,6 +64,24 @@ import {
 const READ_OID_A = "a".repeat(40);
 const READ_OID_B = "b".repeat(40);
 const ANALYZE_NOW_MS = Date.parse("2026-08-01T00:00:00.000Z");
+
+function assertCanonicalCandidate(
+  finding: FindingCandidate,
+  expected: {
+    impact: ImpactEstimate;
+    finding_confidence: FindingConfidence;
+    severity: FindingSeverity;
+    scoring_rationale: FindingScoringRationale[];
+    confidence: FindingCandidate["confidence"];
+  },
+): void {
+  assert.deepEqual(finding.impact, expected.impact);
+  assert.deepEqual(finding.finding_confidence, expected.finding_confidence);
+  assert.equal(finding.severity, expected.severity);
+  assert.deepEqual(finding.scoring_rationale, expected.scoring_rationale);
+  assert.equal(finding.confidence, expected.confidence);
+  assert.equal("expected_ms" in (finding.impact ?? {}), false);
+}
 
 function timelineAction(
   actionId: string,
@@ -513,14 +536,23 @@ test("shared finding construction hashes normalized targets and stabilizes evide
     classification: "behavior",
     cause: null,
     scope: "this_pr",
-    confidence: "high",
+    impact: {
+      lower_ms: 20,
+      upper_ms: 20,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "high",
+      source_completeness: 1,
+    },
     target: " npm   test ",
     evidence: {
       session_refs: ["s1#z", "s1#a", "s1#z"],
       interval_ids: ["R002:z", "R002:a", "R002:z"],
       paths: ["src/z.ts", "src/a.ts", "src/z.ts"],
     },
-    recoverable: claim,
+    intervals: claim.intervals,
     fix_recipe: { suggestion: "Use a targeted test.", verify: "npm test" },
     caveats: ["z caveat", "a caveat", "z caveat"],
   });
@@ -535,6 +567,23 @@ test("shared finding construction hashes normalized targets and stabilizes evide
   assert.deepEqual(finding.evidence.interval_ids, ["R002:a", "R002:z"]);
   assert.deepEqual(finding.evidence.paths, ["src/a.ts", "src/z.ts"]);
   assert.deepEqual(finding.caveats, ["a caveat", "z caveat"]);
+  assertCanonicalCandidate(finding, {
+    impact: {
+      lower_ms: 20,
+      upper_ms: 20,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "high",
+      source_completeness: 1,
+    },
+    severity: "high",
+    scoring_rationale: ["observed_lower_bound"],
+    confidence: "high",
+  });
+  assert.equal(finding.recoverable.bound, "point");
+  assert.equal(finding.recoverable.estimated_ms, 20);
   assert.deepEqual(finding.recoverable.intervals, [{
     interval_id: "R002:run",
     target: "npm test",
@@ -552,14 +601,19 @@ test("shared finding construction rejects missing evidence and recipes", () => {
         classification: "behavior",
         cause: "unknown",
         scope: "separate_issue",
-        confidence: "low",
+        impact: {
+          lower_ms: 0,
+          upper_ms: 0,
+          kind: "critical_path_latency",
+        },
+        finding_confidence: {
+          evidence: "low",
+          causal: "low",
+          source_completeness: 1,
+        },
         target: "src/a.ts",
         evidence: { session_refs: [], interval_ids: [] },
-        recoverable: {
-          bound: "point",
-          estimated_ms: 0,
-          intervals: [],
-        },
+        intervals: [],
         fix_recipe: { suggestion: "", verify: "" },
         caveats: [],
       }),
@@ -615,6 +669,21 @@ test("R001 requires proven rework and keeps only directly adjacent causal infere
   assert.equal(first.cause, "unknown");
   assert.equal(first.confidence, "high");
   assert.equal(first.recoverable.estimated_ms, 160);
+  assertCanonicalCandidate(first, {
+    impact: {
+      lower_ms: 160,
+      upper_ms: 160,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "high",
+      source_completeness: 1,
+    },
+    severity: "high",
+    scoring_rationale: ["observed_lower_bound"],
+    confidence: "high",
+  });
   assert.deepEqual(first.evidence.interval_ids, [
     "R001:edit-a",
     "R001:infer-a",
@@ -962,12 +1031,68 @@ test("R002 groups proven redundant tool runs and retains prior-success relevance
   ]);
   assert.equal(finding.recoverable.bound, "point");
   assert.equal(finding.recoverable.estimated_ms, 500);
+  assertCanonicalCandidate(finding, {
+    impact: {
+      lower_ms: 500,
+      upper_ms: 500,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "medium",
+      causal: "medium",
+      source_completeness: 1,
+    },
+    severity: "medium",
+    scoring_rationale: ["observed_lower_bound"],
+    confidence: "medium",
+  });
   assert.match(finding.fix_recipe.suggestion, /packages\/api/u);
   assert.equal(finding.fix_recipe.verify, "npm test");
   assert.deepEqual(finding.caveats, [
     "Relevance uses an explicit test map.",
     "Relevance uses manifest conventions.",
   ]);
+});
+
+test("R002 carries partial source completeness without confirming severity", () => {
+  const identity = commandIdentity(".");
+  const actions = [
+    matchedAction("run-1", 0, 100, "contributing_run", {
+      command: "npm test",
+      normalized_command: "npm test",
+      tool_use_id: "run-1",
+      tool_name: "Bash",
+      command_identity: identity,
+    }),
+    matchedAction("run-2", 100, 300, "redundant_run", {
+      command: "npm test",
+      normalized_command: "npm test",
+      tool_use_id: "run-2",
+      tool_name: "Bash",
+      command_identity: identity,
+    }),
+  ];
+  const detector = detectRedundantRuns as unknown as (
+    input: readonly MatchedAction[],
+    options: { sourceCompleteness: number },
+  ) => FindingCandidate[];
+  const finding = detector(actions, { sourceCompleteness: 0.5 })[0];
+  assert.ok(finding !== undefined);
+  assertCanonicalCandidate(finding, {
+    impact: {
+      lower_ms: 200,
+      upper_ms: 200,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "high",
+      source_completeness: 0.5,
+    },
+    severity: "medium",
+    scoring_rationale: ["observed_lower_bound", "partial_source"],
+    confidence: "medium",
+  });
 });
 
 test("R002 isolates exact identities, excludes missing and inference actions, and is permutation-stable", () => {
@@ -1104,6 +1229,21 @@ test("R003 claims duplicate reads and only their directly caused post-result inf
     "R003:duplicate-2",
   ]);
   assert.equal(finding.recoverable.estimated_ms, 250);
+  assertCanonicalCandidate(finding, {
+    impact: {
+      lower_ms: 250,
+      upper_ms: 250,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "medium",
+      causal: "medium",
+      source_completeness: 1,
+    },
+    severity: "medium",
+    scoring_rationale: ["observed_lower_bound"],
+    confidence: "medium",
+  });
   assert.notEqual(finding.fix_recipe.suggestion, "");
   assert.notEqual(finding.fix_recipe.verify, "");
 });
@@ -1630,7 +1770,7 @@ test("analyze stores frozen-head reads, caps session confidence, and omits unver
       ({ rule_id }) => rule_id === "R003",
     );
     assert.ok(rediscovery);
-    assert.equal(rediscovery.confidence, "medium");
+    assert.equal(rediscovery.confidence, "low");
     assert.equal(rediscovery.recoverable.min, 1);
     assert.deepEqual(rediscovery.evidence.interval_ids, [
       "R003:read-b#use:tool:read-b-read",
@@ -1804,6 +1944,21 @@ test("R004 reports all active wait but claims only explicit or tightly phrased a
   ]);
   assert.equal(finding.recoverable.estimated_ms, 320);
   assert.equal(finding.recoverable.bound, "point");
+  assertCanonicalCandidate(finding, {
+    impact: {
+      lower_ms: 320,
+      upper_ms: 320,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "medium",
+      causal: "medium",
+      source_completeness: 1,
+    },
+    severity: "medium",
+    scoring_rationale: ["observed_lower_bound", "policy_dependent"],
+    confidence: "medium",
+  });
   assert.notEqual(finding.fix_recipe.suggestion, "");
   assert.notEqual(finding.fix_recipe.verify, "");
   assert.ok(

@@ -174,6 +174,7 @@ git commit -m "feat: add finding impact and confidence contracts"
 ### Task 2: Canonical candidate construction and explicit detector confidence
 
 **Files:**
+- Modify: `src/core/model.ts:266-315`
 - Modify: `src/rules/shared.ts:17-22,86-128`
 - Modify: `src/rules/rework.ts:229-293`
 - Modify: `src/rules/redundant-runs.ts:53-140`
@@ -187,6 +188,8 @@ git commit -m "feat: add finding impact and confidence contracts"
 - Test: `test/rules-primary.test.ts`
 - Test: `test/rules-secondary.test.ts`
 - Test: `test/capability-coverage.test.ts`
+- Test: `test/ledger.test.ts`
+- Test: `test/store.test.ts`
 
 - [ ] **Step 1: Write RED tests for canonical candidates**
 

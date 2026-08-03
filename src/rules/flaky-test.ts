@@ -27,6 +27,7 @@ import type { AnalysisRecord } from "../store/analyses.js";
 import {
   createFindingCandidate,
   findingKey,
+  impactFromClaim,
   minimumConfidence,
   orderedActions,
   recoverableClaim,
@@ -58,6 +59,7 @@ export interface FlakyTestOptions {
   editRelevanceByActionId?: ReadonlyMap<string, EditRelevance>;
   additionalTestCommands?: ReadonlySet<string>;
   history?: readonly AnalysisRecord[];
+  sourceCompleteness?: number;
 }
 
 interface RunSignal {
@@ -598,16 +600,22 @@ export function detectFlakyTests(
         ...passingRuns.map(({ classification }) => classification.confidence),
       ]);
       const historical = historyByIdentity.get(identityKey);
+      const causalConfidence = downgradeForUnrelatedEdits(
+        baseConfidence,
+        unrelatedEdits.length > 0,
+      );
       const candidate = createFindingCandidate({
         rule_id: "R008",
         title: "Test failed then passed without a relevant edit",
         classification: "repo",
         cause: null,
         scope: "separate_issue",
-        confidence: downgradeForUnrelatedEdits(
-          baseConfidence,
-          unrelatedEdits.length > 0,
-        ),
+        impact: impactFromClaim(recoverable, "critical_path_latency"),
+        finding_confidence: {
+          evidence: baseConfidence,
+          causal: causalConfidence,
+          source_completeness: options.sourceCompleteness ?? 1,
+        },
         target,
         evidence: {
           session_refs: sortedUnique([
@@ -650,7 +658,7 @@ export function detectFlakyTests(
               historical_session_refs: historical.sessionRefs,
             }),
         },
-        recoverable,
+        intervals: recoverable.intervals,
         fix_recipe: {
           suggestion:
             `In \`${identity.repo_relative_cwd}\`, fix or quarantine the flaky behavior exercised by \`${command}\` in a separate repository issue.${
