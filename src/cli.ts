@@ -34,12 +34,17 @@ import {
   NoMatchingSessionsError,
 } from "./core/analyze.js";
 import { GitContextError } from "./git/pr-context.js";
+import {
+  defaultPrivacyProfile,
+  sanitizePrivacyText,
+  type PrivacyProfile,
+} from "./reporters/privacy.js";
 import { sanitizeHumanText } from "./reporters/sanitize.js";
 
 export const USAGE = `Usage: ccprof [--pr [<number|url|base...head>]] [--json|--md]
               [--idle-threshold <duration>] [--test-map <path>] [--color]
               [--since <RFC3339>] [--commit-lookback <duration>]
-              [--advisory]
+              [--privacy <strict|balanced|raw>] [--advisory]
        ccprof stats [--json]
        ccprof dismiss <finding-key> [--reason <text>]
        ccprof hook-event [--notify]
@@ -90,6 +95,7 @@ export interface ParsedAnalyzeCommand {
   format: AnalyzeOutputFormat;
   color: boolean;
   advisory: boolean;
+  privacy?: PrivacyProfile;
   pr?: string;
   sinceMs?: number;
   commitAnchorLookbackMs?: number;
@@ -157,6 +163,8 @@ export interface CliHandlers {
 
 export interface CliRuntime {
   cwd?: string;
+  /** Override CI detection; CI defaults analysis output to strict privacy. */
+  ci?: boolean;
   handlers?: CliHandlers;
   stdout?: (value: string) => void;
   stdoutIsTTY?: boolean;
@@ -298,6 +306,7 @@ function parseAnalyzeArgs(
   let format: AnalyzeOutputFormat = "tty";
   let color = false;
   let advisory = false;
+  let privacy: PrivacyProfile | undefined;
   let pr: string | undefined;
   let sinceMs: number | undefined;
   let commitAnchorLookbackMs: number | undefined;
@@ -307,6 +316,7 @@ function parseAnalyzeArgs(
   let sawFormat = false;
   let sawColor = false;
   let sawAdvisory = false;
+  let sawPrivacy = false;
   let sawSince = false;
   let sawCommitLookback = false;
   let sawIdle = false;
@@ -334,6 +344,27 @@ function parseAnalyzeArgs(
       }
       sawAdvisory = true;
       advisory = true;
+      continue;
+    }
+    if (token === "--privacy") {
+      if (sawPrivacy) {
+        throw new CliUsageError("--privacy was specified twice");
+      }
+      sawPrivacy = true;
+      const selected = requiredOptionValue(args, index, "--privacy");
+      privacy = parsePrivacyProfile(selected.value);
+      index = selected.nextIndex;
+      continue;
+    }
+    const inlinePrivacy = token.startsWith("--privacy=")
+      ? inlineOptionValue(token, "--privacy")
+      : null;
+    if (inlinePrivacy !== null) {
+      if (sawPrivacy) {
+        throw new CliUsageError("--privacy was specified twice");
+      }
+      sawPrivacy = true;
+      privacy = parsePrivacyProfile(inlinePrivacy);
       continue;
     }
     if (token === "--pr") {
@@ -453,6 +484,7 @@ function parseAnalyzeArgs(
     format,
     color,
     advisory,
+    ...(privacy === undefined ? {} : { privacy }),
     ...(pr === undefined ? {} : { pr }),
     ...(sinceMs === undefined ? {} : { sinceMs }),
     ...(commitAnchorLookbackMs === undefined
@@ -461,6 +493,15 @@ function parseAnalyzeArgs(
     ...(idleThresholdMs === undefined ? {} : { idleThresholdMs }),
     ...(testMapPath === undefined ? {} : { testMapPath }),
   };
+}
+
+function isPrivacyProfile(value: unknown): value is PrivacyProfile {
+  return value === "strict" || value === "balanced" || value === "raw";
+}
+
+function parsePrivacyProfile(value: string): PrivacyProfile {
+  if (isPrivacyProfile(value)) return value;
+  throw new CliUsageError("--privacy must be strict, balanced, or raw");
 }
 
 function parseStatsArgs(
@@ -652,6 +693,7 @@ export async function runCli(
   });
   const handlers = runtime.handlers ?? defaultHandlers;
   const cwd = runtime.cwd ?? process.cwd();
+  const ci = runtime.ci ?? detectedCi(process.env.CI);
   if (args[0] === "hook-event") {
     await runHookEventDispatch(
       args.slice(1),
@@ -663,6 +705,14 @@ export async function runCli(
     );
     return 0;
   }
+  const explicitPrivacy = args.map((token, index) =>
+    token.startsWith("--privacy=") ? token.slice(10) :
+      args[index - 1] === "--privacy" ? token : ""
+  ).find(isPrivacyProfile);
+  let activePrivacy: PrivacyProfile | undefined =
+    ["stats", "dismiss", "hooks"].includes(args[0] ?? "")
+      ? undefined
+      : explicitPrivacy ?? (ci || args.includes("--md") ? "strict" : "balanced");
   try {
     const command = parseCliArgs(args);
     if (command.kind === "help") {
@@ -675,12 +725,15 @@ export async function runCli(
     }
     let result: CommandExecutionResult;
     if (command.kind === "analyze") {
+      activePrivacy = command.privacy ??
+        defaultPrivacyProfile(command.format, ci);
       result = await handlers.analyze({
         cwd,
         format: command.format,
         color: command.color ||
           (command.format === "tty" && stdoutIsTTY),
         ...(command.advisory ? { advisory: true } : {}),
+        privacy: activePrivacy,
         ...(command.pr === undefined ? {} : { pr: command.pr }),
         ...(command.sinceMs === undefined
           ? {}
@@ -722,12 +775,22 @@ export async function runCli(
     }
     stdout(withTrailingNewline(result.stdout));
     for (const warning of result.warnings) {
-      stderr(withTrailingNewline(sanitizeHumanText(warning)));
+      stderr(withTrailingNewline(sanitizeHumanText(
+        activePrivacy === undefined
+          ? warning
+          : sanitizePrivacyText(warning, activePrivacy, cwd, []),
+      )));
     }
     return 0;
   } catch (error) {
     const code = exitCodeFor(error);
-    stderr(`ccprof: ${sanitizeHumanText(errorMessage(error))}\n`);
+    const detail = activePrivacy === "strict"
+      ? "analysis failed (details hidden by strict privacy)"
+      : errorMessage(error);
+    const message = activePrivacy === undefined ? detail : sanitizePrivacyText(
+      detail, activePrivacy, cwd, [],
+    );
+    stderr(`ccprof: ${sanitizeHumanText(message)}\n`);
     if (
       code === 2 &&
       (error instanceof CliUsageError ||
@@ -737,6 +800,12 @@ export async function runCli(
     }
     return code;
   }
+}
+
+function detectedCi(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase();
+  return normalized !== undefined && normalized !== "" &&
+    normalized !== "false" && normalized !== "0";
 }
 
 export function isDirectExecution(

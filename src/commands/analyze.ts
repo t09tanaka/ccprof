@@ -8,11 +8,18 @@ import {
   analyze as analyzeCore,
   type AnalyzeOptions,
   type AnalyzeResult,
-  type AnalyzeWarning,
 } from "../core/analyze.js";
 import { runCommand, type CommandRunner } from "../git/client.js";
 import { renderJsonReport } from "../reporters/json.js";
 import { renderMarkdownReport } from "../reporters/markdown.js";
+import {
+  defaultPrivacyProfile,
+  privacyWarningTexts,
+  projectReportPrivacy,
+  sanitizePrivacyText,
+  type PrivacyProfile,
+} from "../reporters/privacy.js";
+import { sanitizeHumanText } from "../reporters/sanitize.js";
 import { renderTtyReport } from "../reporters/tty.js";
 
 export type AnalyzeOutputFormat = "tty" | "json" | "markdown";
@@ -27,6 +34,7 @@ export interface AnalyzeCommandOptions {
   idleThresholdMs?: number;
   testMapPath?: string;
   advisory?: boolean;
+  privacy?: PrivacyProfile;
 }
 
 export interface CommandExecutionResult {
@@ -42,12 +50,6 @@ export interface AnalyzeCommandDependencies {
   ) => Promise<CommandAnalysis>;
   /** Runner for the external `claude` CLI behind `--advisory`. */
   runCommand?: CommandRunner;
-}
-
-function warningText(warning: AnalyzeWarning): string {
-  return `[${warning.code}] ${warning.message}${
-    warning.source === undefined ? "" : ` (${warning.source})`
-  }`;
 }
 
 export async function runAnalyzeCommand(
@@ -69,28 +71,41 @@ export async function runAnalyzeCommand(
       ? {}
       : { testMapPath: resolve(options.cwd, options.testMapPath) }),
   });
-  const warnings = result.warnings.map(warningText);
+  const privacy = options.privacy ?? defaultPrivacyProfile(options.format, false);
+  const repoRoot = result.report.unit.repo;
+  const report = projectReportPrivacy(result.report, privacy);
+  const sessions = result.report.unit.sessions;
+  const warnings = privacyWarningTexts(
+    result.warnings, privacy, repoRoot, sessions,
+  ).map((warning) => sanitizeHumanText(warning));
   // Requested only after analyze() returned, so the store write inside it
   // has already completed with the deterministic report alone: advisory
   // text can never reach AnalysisRecord or the baseline.
   let advisory: AdvisoryText | undefined;
   if (options.advisory === true) {
     const outcome = await requestAdvisory(
-      renderJsonReport(result.report),
+      renderJsonReport(report),
       dependencies.runCommand ?? runCommand,
     );
     if (outcome.kind === "available") {
-      advisory = outcome.advisory;
+      advisory = {
+        ...outcome.advisory,
+        text: privacy === "strict"
+          ? "[advisory hidden by strict privacy]"
+          : sanitizePrivacyText(outcome.advisory.text, privacy, repoRoot, sessions),
+      };
     } else {
-      warnings.push(`advisory unavailable: ${outcome.reason}`);
+      warnings.push(sanitizeHumanText(sanitizePrivacyText(
+        `advisory unavailable: ${outcome.reason}`, privacy, repoRoot, sessions,
+      )));
     }
   }
   const advisoryOption = advisory === undefined ? {} : { advisory };
   const stdout = options.format === "json"
-    ? renderJsonReport(result.report, advisoryOption)
+    ? renderJsonReport(report, advisoryOption)
     : options.format === "markdown"
-      ? renderMarkdownReport(result.report, advisoryOption)
-      : renderTtyReport(result.report, {
+      ? renderMarkdownReport(report, advisoryOption)
+      : renderTtyReport(report, {
         color: options.color,
         ...advisoryOption,
       });
