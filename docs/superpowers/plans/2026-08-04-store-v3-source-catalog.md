@@ -25,15 +25,15 @@ Store module. Do not connect discovery or parsing in this PR.
 
 ## Task 1 — RED schema and migration tests
 
-- [ ] Update bootstrap assertions for exact Store v3 columns, constraints,
+- [x] Update bootstrap assertions for exact Store v3 columns, constraints,
   indexes, marker, and `user_version`.
-- [ ] Build a populated v2 fixture and prove opening preserves every legacy table
+- [x] Build a populated v2 fixture and prove opening preserves every legacy table
   row while adding only the catalog and marker.
-- [ ] Cover v0, v2, double open, explicit rerun/no-op, version 1/future rejection,
+- [x] Cover v0, v2, double open, explicit rerun/no-op, version 1/future rejection,
   and failure injection that rolls back table/marker/version without touching
   existing rows.
 - [ ] Re-run legacy JSON migration/read/write tests unchanged.
-- [ ] Delegate the focused test and record the expected implementation-only RED.
+- [x] Delegate the focused test and record the expected implementation-only RED.
 
 ## Task 2 — Transactional Store v3 migration
 
@@ -47,13 +47,13 @@ Store module. Do not connect discovery or parsing in this PR.
 
 ## Task 3 — RED catalog contract/API tests
 
-- [ ] Cover exact validation, detached clones, unknown/raw-content fields,
+- [x] Cover exact validation, detached clones, unknown/raw-content fields,
   empty/NUL text, hashes, integer safety, file-identity pairing, offset bounds,
   and direct SQLite constraint bypass.
-- [ ] Cover insert/get/list ordering, stale/equal/newer observations, exact replay,
+- [x] Cover insert/get/list ordering, stale/equal/newer observations, exact replay,
   same-revision progress monotonicity, revision reset, partial completeness, and
   changed-content decisions.
-- [ ] Delegate the focused test and record the expected missing-module RED.
+- [x] Delegate the focused test and record the expected missing-module RED.
 
 ## Task 4 — Catalog implementation
 

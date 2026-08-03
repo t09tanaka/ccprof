@@ -59,7 +59,8 @@ interface SourceCatalogEntry {
 ```
 
 All numbers are non-negative JavaScript safe integers. Parsed offset cannot
-exceed size. Device and inode are both present or both null; the null pair is the
+exceed size, and a `complete` observation must have parsed through `size_bytes`.
+Device and inode are both present or both null; the null pair is the
 portable representation when Windows or another platform cannot provide stable
 file identity. Hash fields use exact `sha256:<64 lowercase hex>` syntax.
 Canonical paths and parser versions are non-empty and NUL-free. The table repeats
