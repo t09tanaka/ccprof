@@ -54,6 +54,49 @@ function fail(code: ValidationCode, index?: number, field?: string): never {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
+function snapshotArrayValues(
+  value: unknown,
+  invalidContainer: () => never,
+  invalidElement: (index: number) => never,
+): unknown[] {
+  let array: unknown[];
+  try {
+    if (!Array.isArray(value)) return invalidContainer();
+    array = value;
+  } catch {
+    return invalidContainer();
+  }
+  let lengthDescriptor: PropertyDescriptor | undefined;
+  try {
+    lengthDescriptor = Object.getOwnPropertyDescriptor(array, "length");
+  } catch {
+    return invalidContainer();
+  }
+  if (
+    lengthDescriptor === undefined ||
+    !("value" in lengthDescriptor) ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0
+  ) return invalidContainer();
+  const snapshot: unknown[] = [];
+  for (let index = 0; index < lengthDescriptor.value; index += 1) {
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(array, String(index));
+    } catch {
+      return invalidElement(index);
+    }
+    if (descriptor === undefined) return invalidElement(index);
+    try {
+      snapshot.push("value" in descriptor
+        ? descriptor.value
+        : descriptor.get?.call(array));
+    } catch {
+      return invalidElement(index);
+    }
+  }
+  return snapshot;
+}
 function canonicalId(value: string): string { return value.normalize("NFC").trim().toUpperCase(); }
 function isCanonicalList(
   value: unknown,
@@ -98,16 +141,14 @@ const RAW_CATALOG: RuleManifest[] = ROWS.map(([
   evidence_schema: `ccprof://rules/${id}/evidence/v1`, policy_risk: risk,
 }));
 export function validateRuleManifestCatalog(value: unknown): RuleManifest[] {
-  if (!Array.isArray(value)) return fail("invalid_catalog");
+  const catalog = snapshotArrayValues(
+    value,
+    () => fail("invalid_catalog"),
+    (index) => fail("invalid_entry", index),
+  );
   const entries: Array<Record<string, unknown>> = [];
-  for (let index = 0; index < value.length; index += 1) {
-    let entry: unknown;
-    try {
-      if (!Object.hasOwn(value, index)) return fail("invalid_entry", index);
-      entry = value[index];
-    } catch {
-      return fail("invalid_entry", index);
-    }
+  for (let index = 0; index < catalog.length; index += 1) {
+    const entry = catalog[index];
     if (!isRecord(entry)) return fail("invalid_entry", index);
     let ownKeys: (string | symbol)[];
     try {
@@ -172,12 +213,22 @@ export function validateRuleManifestCatalog(value: unknown): RuleManifest[] {
     if (epoch !== declared.compatibility_epoch) {
       return fail("invalid_epoch", index, "compatibility_epoch");
     }
-    if (!isCanonicalList(entry.required_capabilities, CAPABILITY_SET) ||
-      !sameList(entry.required_capabilities, declared.required_capabilities)) {
+    const requiredCapabilities = snapshotArrayValues(
+      entry.required_capabilities,
+      () => fail("invalid_capability", index, "required_capabilities"),
+      () => fail("invalid_capability", index, "required_capabilities"),
+    );
+    if (!isCanonicalList(requiredCapabilities, CAPABILITY_SET) ||
+      !sameList(requiredCapabilities, declared.required_capabilities)) {
       return fail("invalid_capability", index, "required_capabilities");
     }
-    if (!isCanonicalList(entry.supported_sources, SOURCE_SET) ||
-      !sameList(entry.supported_sources, declared.supported_sources)) {
+    const supportedSources = snapshotArrayValues(
+      entry.supported_sources,
+      () => fail("invalid_source", index, "supported_sources"),
+      () => fail("invalid_source", index, "supported_sources"),
+    );
+    if (!isCanonicalList(supportedSources, SOURCE_SET) ||
+      !sameList(supportedSources, declared.supported_sources)) {
       return fail("invalid_source", index, "supported_sources");
     }
     const impact = enumValue(entry.impact_kind,
@@ -207,8 +258,8 @@ export function validateRuleManifestCatalog(value: unknown): RuleManifest[] {
     }
     return {
       id, version: entry.version as string, compatibility_epoch: epoch,
-      required_capabilities: [...entry.required_capabilities] as SessionCapability[],
-      supported_sources: [...entry.supported_sources] as SourceAdapterId[],
+      required_capabilities: [...requiredCapabilities] as SessionCapability[],
+      supported_sources: [...supportedSources] as SourceAdapterId[],
       impact_kind: impact, default_mode: mode, aggregation_policy: aggregation,
       evidence_schema: entry.evidence_schema as string, policy_risk: risk,
     };

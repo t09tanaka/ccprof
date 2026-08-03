@@ -245,7 +245,24 @@ function snapshotStoredFinding(value: Finding): Finding {
 
 function snapshotStoredFindings(values: readonly Finding[]): Finding[] {
   try {
-    return Array.from(values, (value) => snapshotStoredFinding(value));
+    if (!Array.isArray(values)) throw new TypeError();
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(values, "length");
+    if (
+      lengthDescriptor === undefined ||
+      !("value" in lengthDescriptor) ||
+      !Number.isSafeInteger(lengthDescriptor.value) ||
+      lengthDescriptor.value < 0
+    ) throw new TypeError();
+    const snapshots: Finding[] = [];
+    for (let index = 0; index < lengthDescriptor.value; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(values, String(index));
+      if (descriptor === undefined) throw new TypeError();
+      const value = "value" in descriptor
+        ? descriptor.value
+        : descriptor.get?.call(values);
+      snapshots.push(snapshotStoredFinding(value as Finding));
+    }
+    return snapshots;
   } catch {
     throw new TypeError("invalid finding compatibility metadata");
   }
@@ -550,7 +567,13 @@ export async function writeJsonAtomically(
 function asRecord(
   input: AnalysisRecord | AnalysisRecordInput,
 ): AnalysisRecord {
-  return isRecord(input) ? cloneJson(input) : makeAnalysisRecord(input);
+  try {
+    const record = makeAnalysisRecord(input);
+    if (!isRecord(record)) throw new TypeError();
+    return record;
+  } catch {
+    throw new TypeError("invalid analysis record");
+  }
 }
 
 type StoreDatabase = ReturnType<typeof openStoreDatabase>;
