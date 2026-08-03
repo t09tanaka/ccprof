@@ -284,5 +284,10 @@ Expected: a normal verified commit; never use `--no-verify` or amend.
   RED-first tests, and the final code review was CLEAN.
 - Scope remains 8 changed files and 298 added production lines. Package version
   `0.2.0`, report schema v2, and store schema v2 are unchanged.
-- Feature and validation commits were created and rebased. Push, PR creation,
-  and remote checks are still pending.
+- At PR #46 head `c6d2cf3`, initial remote validation completed successfully:
+  7/7 visible and 6/6 required checks passed, with the additional CodeQL result
+  also successful and no billing-related job block.
+- Final review remained CLEAN. PR reviews, comments, review threads, and
+  actionable findings were all zero.
+- Feature and validation commits were created, rebased, and pushed. Initial
+  remote validation is complete; merge and worktree cleanup remain pending.
