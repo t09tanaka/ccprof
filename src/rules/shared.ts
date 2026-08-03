@@ -12,6 +12,7 @@ import type {
   RuleId,
   TimelineAction,
 } from "../core/model.js";
+import { ruleManifest } from "./manifest.js";
 
 export interface FindingCandidateInput
   extends Omit<FindingCandidate, "finding_key" | "target" | "evidence" | "caveats"> {
@@ -28,10 +29,26 @@ export function normalizeFindingTarget(target: string): string {
   return normalized;
 }
 
-export function findingKey(ruleId: RuleId, target: string): string {
+export function findingKeyForCompatibility(
+  ruleId: RuleId,
+  target: string,
+  epoch: number,
+): string {
+  if (!Number.isSafeInteger(epoch) || epoch <= 0) {
+    throw new TypeError("compatibility epoch must be a positive safe integer");
+  }
+  const prefix = epoch === 1 ? ruleId : `${ruleId}@${epoch}`;
   return createHash("sha256")
-    .update(`${ruleId}\0${normalizeFindingTarget(target)}`)
+    .update(`${prefix}\0${normalizeFindingTarget(target)}`)
     .digest("hex");
+}
+
+export function findingKey(ruleId: RuleId, target: string): string {
+  return findingKeyForCompatibility(
+    ruleId,
+    target,
+    ruleManifest(ruleId).compatibility_epoch,
+  );
 }
 
 export function sortedUnique(values: readonly string[]): string[] {
