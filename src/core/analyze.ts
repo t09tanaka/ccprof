@@ -9,6 +9,12 @@ import {
   reconcileLedger,
   type LedgerResult,
 } from "./ledger.js";
+import {
+  encodeEventIdentity,
+  encodeInvocationIdentity,
+  eventIdentity,
+  evidenceEventIdentity,
+} from "./event-identity.js";
 import type {
   AnalysisWindow,
   AssistantEvent,
@@ -72,7 +78,10 @@ import {
   type EditRelevance,
 } from "../rules/flaky-test.js";
 import { detectHumanWait } from "../rules/human-wait.js";
-import { detectRediscovery } from "../rules/rediscovery.js";
+import {
+  detectRediscovery,
+  rediscoveryReadIdentityKey,
+} from "../rules/rediscovery.js";
 import { detectRedundantRuns } from "../rules/redundant-runs.js";
 import { detectRework } from "../rules/rework.js";
 import { detectSerialSlack } from "../rules/serial-slack.js";
@@ -297,6 +306,7 @@ function orderedSessions(sessions: readonly Session[]): Session[] {
   return [...sessions].sort(
     (left, right) =>
       left.source_path.localeCompare(right.source_path) ||
+      left.source.localeCompare(right.source) ||
       left.session_id.localeCompare(right.session_id),
   ).map((session) => ({
     ...session,
@@ -307,11 +317,17 @@ function orderedSessions(sessions: readonly Session[]): Session[] {
 
 function orderedEvents(sessions: readonly Session[]): NormalizedEvent[] {
   return orderedSessions(sessions)
-    .flatMap((session) => session.events)
+    .flatMap((session) => session.events.map((event): NormalizedEvent => ({
+      ...event,
+      event_identity: eventIdentity(session, event),
+    })))
     .sort(
       (left, right) =>
         left.timestamp_ms - right.timestamp_ms ||
         left.source_index - right.source_index ||
+        encodeEventIdentity(evidenceEventIdentity(left)).localeCompare(
+          encodeEventIdentity(evidenceEventIdentity(right)),
+        ) ||
         left.session_id.localeCompare(right.session_id) ||
         left.agent_id.localeCompare(right.agent_id) ||
         left.session_ref.localeCompare(right.session_ref) ||
@@ -325,11 +341,7 @@ function toolKey(
     "agent_id" | "session_id" | "tool_use_id"
   >,
 ): string {
-  return [
-    value.session_id,
-    value.agent_id,
-    value.tool_use_id ?? "",
-  ].join("\0");
+  return encodeInvocationIdentity(evidenceEventIdentity(value));
 }
 
 interface ToolEventIndex {
@@ -406,9 +418,10 @@ function tokenEstimates(
   const values = new Map<string, number>();
   for (const event of events) {
     if (event.kind !== "tool_result") continue;
+    const key = encodeEventIdentity(evidenceEventIdentity(event));
     values.set(
-      event.tool_use_id,
-      Math.max(values.get(event.tool_use_id) ?? 0, event.estimated_tokens),
+      key,
+      Math.max(values.get(key) ?? 0, event.estimated_tokens),
     );
   }
   return values;
@@ -569,7 +582,7 @@ async function readObservations(
             commandMayMutateRepo(mutation.command)))
       )) continue;
       byPath.set(path, [...(byPath.get(path) ?? []), action]);
-      eligibleReadKeys.add([action.session_id, action.agent_id, action.action_id, path].join("\0"));
+      eligibleReadKeys.add(rediscoveryReadIdentityKey(action, path));
     }
   }
   const empty = { objects: new Map<string, string>(), observations: [] as StoredReadObservation[], eligibleReadKeys };
@@ -883,7 +896,7 @@ function ruleCandidates(
     ...detectRework(matched, { userEvents }),
     ...detectRedundantRuns(matched),
     ...detectRediscovery(matched, {
-      estimatedTokensByToolUseId: tokenEstimates(events),
+      estimatedTokensByEventIdentity: tokenEstimates(events),
       history,
       currentObjectIdsByPath,
       crossPrEligibleReadKeys,

@@ -4,6 +4,12 @@ import type {
   R001Cause,
 } from "../core/model.js";
 import {
+  encodeAgentIdentity,
+  encodeEventIdentity,
+  encodeInvocationIdentity,
+  evidenceEventIdentity,
+} from "../core/event-identity.js";
+import {
   createFindingCandidate,
   minimumConfidence,
   orderedActions,
@@ -59,7 +65,8 @@ function directlyCausedInference(
     action.kind === "inference" &&
     action.match === tool.match &&
     tool.tool_use_id !== undefined &&
-    action.tool_use_id === tool.tool_use_id &&
+    encodeInvocationIdentity(evidenceEventIdentity(action)) ===
+      encodeInvocationIdentity(evidenceEventIdentity(tool)) &&
     action.interval.start_ms === tool.interval.end_ms
   );
 }
@@ -94,7 +101,7 @@ function isContinuous(
 function reworkBlocks(actions: readonly MatchedAction[]): ReworkBlock[] {
   const byAgent = new Map<string, MatchedAction[]>();
   for (const action of orderedActions(actions)) {
-    const key = `${action.session_id}\0${action.agent_id}`;
+    const key = encodeAgentIdentity(evidenceEventIdentity(action));
     const group = byAgent.get(key);
     if (group === undefined) byAgent.set(key, [action]);
     else group.push(action);
@@ -166,13 +173,17 @@ function latestUserEvent(
   return [...events]
     .filter(
       (event) =>
-        event.session_id === first.session_id &&
+        encodeAgentIdentity(evidenceEventIdentity(event)) ===
+          encodeAgentIdentity(evidenceEventIdentity(first)) &&
         event.timestamp_ms <= first.interval.start_ms,
     )
     .sort(
       (left, right) =>
         right.timestamp_ms - left.timestamp_ms ||
         right.source_index - left.source_index ||
+        encodeEventIdentity(evidenceEventIdentity(right)).localeCompare(
+          encodeEventIdentity(evidenceEventIdentity(left)),
+        ) ||
         right.session_ref.localeCompare(left.session_ref),
     )[0];
 }
