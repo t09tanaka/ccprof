@@ -1,5 +1,16 @@
 import type { AdvisoryText } from "../advisory/advisory.js";
-import type { Finding, ReportV2 } from "../core/model.js";
+import {
+  findingScoringRationale,
+  findingSeverity,
+  projectFindingConfidence,
+  projectFindingRecoverable,
+} from "../core/model.js";
+import type {
+  Finding,
+  FindingConfidence,
+  ImpactEstimate,
+  ReportV2,
+} from "../core/model.js";
 import { sanitizeHumanText } from "./sanitize.js";
 
 export const TTY_MAX_LINES = 18;
@@ -41,14 +52,64 @@ export function formatMinutes(value: number): string {
   return remainder === 0 ? `${hours}h` : `${hours}h ${remainder}m`;
 }
 
+export function findingForDisplay(finding: Finding): Finding {
+  if (
+    finding.impact !== undefined &&
+    finding.finding_confidence !== undefined &&
+    finding.severity !== undefined &&
+    finding.scoring_rationale !== undefined
+  ) return finding;
+  const impact: ImpactEstimate = {
+    lower_ms: 0,
+    upper_ms: finding.recoverable.min * 60_000,
+    kind: finding.rule_id === "R005" || finding.rule_id === "R006"
+      ? "resource_cost"
+      : "critical_path_latency",
+  };
+  const confidence: FindingConfidence = finding.confidence === "low"
+    ? { evidence: "low", causal: "low", source_completeness: 0 }
+    : {
+      evidence: finding.confidence,
+      causal: "medium",
+      source_completeness: 0.5,
+    };
+  return {
+    ...finding,
+    confidence: projectFindingConfidence(confidence),
+    impact,
+    finding_confidence: confidence,
+    severity: findingSeverity(impact, confidence),
+    scoring_rationale: findingScoringRationale(impact, confidence, {
+      ...(finding.rule_id === "R004" ? { policy_dependent: true } : {}),
+      legacy_projection: true,
+    }),
+    recoverable: projectFindingRecoverable(impact),
+  };
+}
+
+export function formatFindingImpact(finding: Finding): string {
+  const impact = findingForDisplay(finding).impact as ImpactEstimate;
+  const expected = impact.expected_ms === undefined
+    ? ""
+    : `expected ${formatMinutes(impact.expected_ms / 60_000)}; `;
+  const kind = impact.kind === "critical_path_latency"
+    ? "critical path"
+    : "resource cost";
+  return `${formatMinutes(impact.lower_ms / 60_000)}–${
+    formatMinutes(impact.upper_ms / 60_000)
+  } (${expected}${kind})`;
+}
+
 function findingLine(
   finding: Finding,
   index: number,
   color: boolean,
 ): string {
-  const rule = paint(`[${finding.rule_id}]`, 36, color);
-  const bound = finding.recoverable.bound === "upper" ? " upper" : "";
-  return `${index + 1}. ${rule} ${formatMinutes(finding.recoverable.min)}${bound} — ${plainLine(finding.title)}`;
+  const displayed = findingForDisplay(finding);
+  const confidence = displayed.finding_confidence as FindingConfidence;
+  const rule = paint(`[${displayed.rule_id}]`, 36, color);
+  const rationale = displayed.scoring_rationale?.join(",") || "none";
+  return `${index + 1}. ${rule} Impact ${formatFindingImpact(displayed)}; severity ${displayed.severity}; confidence evidence=${confidence.evidence} causal=${confidence.causal} completeness=${confidence.source_completeness}; rationale ${rationale} — ${plainLine(displayed.title)}`;
 }
 
 function recipeLine(finding: Finding): string {

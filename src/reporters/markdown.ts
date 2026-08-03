@@ -3,6 +3,8 @@ import type { Finding, ReportV2 } from "../core/model.js";
 import { sanitizeHumanText } from "./sanitize.js";
 import {
   analysisBudgetLine,
+  findingForDisplay,
+  formatFindingImpact,
   formatMinutes,
   skippedRulesLine,
   sourcesLine,
@@ -37,12 +39,18 @@ function findingMarkdown(
   finding: Finding,
   index: number,
 ): string[] {
-  const command = finding.evidence.command;
+  const displayed = findingForDisplay(finding);
+  const command = displayed.evidence.command;
+  const confidence = displayed.finding_confidence;
   return [
-    `${index + 1}. **[${finding.rule_id}] ${markdownText(finding.title)}** — ${formatMinutes(finding.recoverable.min)} (${finding.recoverable.bound})`,
-    `   - Finding key: ${markdownText(finding.finding_key)}`,
-    `   - Suggestion: ${markdownText(finding.fix_recipe.suggestion)}`,
-    `   - Verify: ${markdownText(finding.fix_recipe.verify)}`,
+    `${index + 1}. **[${displayed.rule_id}] ${markdownText(displayed.title)}**`,
+    `   - Impact: ${formatFindingImpact(displayed)}`,
+    `   - Severity: ${displayed.severity}`,
+    `   - Confidence: evidence=${confidence?.evidence}; causal=${confidence?.causal}; completeness=${confidence?.source_completeness}`,
+    `   - Rationale: ${displayed.scoring_rationale?.join(", ") || "none"}`,
+    `   - Finding key: ${markdownText(displayed.finding_key)}`,
+    `   - Suggestion: ${markdownText(displayed.fix_recipe.suggestion)}`,
+    `   - Verify: ${markdownText(displayed.fix_recipe.verify)}`,
     ...(typeof command === "string" && command.trim() !== ""
       ? [`   - Evidence command: ${markdownText(command)}`]
       : []),
