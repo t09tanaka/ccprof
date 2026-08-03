@@ -4,6 +4,12 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
+import type {
+  Confidence,
+  ResultStatusSource,
+  ToolResultEvent,
+  ToolResultStatus,
+} from "../src/core/model.js";
 import {
   MAX_TOOL_INPUT_FRAGMENT_BYTES,
   MAX_TOOL_OUTPUT_BYTES,
@@ -14,6 +20,18 @@ import {
 
 const fixture = (name: string): string =>
   resolve(process.cwd(), "test", "fixtures", "claude", name);
+
+function assertStatusEvidence(
+  result: ToolResultEvent,
+  status: ToolResultStatus,
+  source: ResultStatusSource,
+  confidence: Confidence,
+): void {
+  assert.equal(result.status, status);
+  assert.equal(result.status_evidence?.status, status);
+  assert.equal(result.status_evidence?.source, source);
+  assert.equal(result.status_evidence?.confidence, confidence);
+}
 
 test("parses malformed JSONL tolerantly and reconstructs cumulative assistant snapshots", async () => {
   const session = await parseClaudeSession(
@@ -61,6 +79,12 @@ test("reconstructs distinct one-block fragments sharing an assistant message id"
     fixture("duplicate-and-malformed.jsonl"),
   );
   assert.ok(session);
+
+  assert.ok(
+    session.events
+      .filter((event) => event.kind === "tool_result")
+      .every((result) => result.status_evidence?.status === result.status),
+  );
 
   const fragmented = session.events.filter(
     (event) =>
@@ -181,6 +205,7 @@ test("normalizes tool inputs, polymorphic results, and only observed exit codes"
   );
   assert.ok(bashResult?.kind === "tool_result");
   assert.equal(bashResult.status, "success");
+  assertStatusEvidence(bashResult, "success", "tool_adapter", "medium");
   assert.equal(bashResult.output, "shell visible output");
   assert.equal("exit_code" in bashResult, false);
   assert.ok(bashResult.output_bytes > 0);
@@ -192,6 +217,7 @@ test("normalizes tool inputs, polymorphic results, and only observed exit codes"
   );
   assert.ok(writeResult?.kind === "tool_result");
   assert.equal(writeResult.status, "failure");
+  assertStatusEvidence(writeResult, "failure", "explicit_status", "high");
   assert.equal(writeResult.exit_code, 2);
   assert.equal(writeResult.output, "write failed");
 
@@ -220,10 +246,11 @@ test("normalizes tool inputs, polymorphic results, and only observed exit codes"
   );
   assert.ok(absentResult?.kind === "tool_result");
   assert.equal(absentResult.output, "absent structured result");
-  assert.equal(absentResult.status, "success");
+  assert.equal(absentResult.status, "unknown");
+  assertStatusEvidence(absentResult, "unknown", "none", "low");
 });
 
-test("marks wholly unknown tool result schemas unknown without penalizing recognized empty success", async () => {
+test("marks wholly unknown schemas low-confidence without penalizing recognized empty results", async () => {
   const session = await parseClaudeSession(fixture("unknown-result.jsonl"));
   assert.ok(session);
 
@@ -234,6 +261,7 @@ test("marks wholly unknown tool result schemas unknown without penalizing recogn
   );
   assert.ok(unknown?.kind === "tool_result");
   assert.equal(unknown.status, "unknown");
+  assertStatusEvidence(unknown, "unknown", "none", "low");
   assert.equal(unknown.output, "");
   assert.equal(unknown.confidence, "low");
   assert.ok(
@@ -248,9 +276,46 @@ test("marks wholly unknown tool result schemas unknown without penalizing recogn
       event.tool_use_id === "tool-empty-success",
   );
   assert.ok(knownEmpty?.kind === "tool_result");
-  assert.equal(knownEmpty.status, "success");
+  assert.equal(knownEmpty.status, "unknown");
+  assertStatusEvidence(knownEmpty, "unknown", "none", "low");
   assert.equal(knownEmpty.output, "");
   assert.equal(knownEmpty.confidence, "high");
+  assert.equal(
+    session.warnings.some((warning) => warning.session_ref === knownEmpty.session_ref),
+    false,
+  );
+});
+
+test("selects Claude result evidence conservatively and by precedence", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "ccprof-result-evidence-"));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "result-evidence.jsonl");
+  const raw = [
+    '{"type":"user","sessionId":"result-evidence","uuid":"explicit","timestamp":"2026-08-03T00:00:00.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"explicit","content":"done","is_error":false}]},"toolUseResult":{"exitCode":9}}',
+    '{"type":"user","sessionId":"result-evidence","uuid":"exit","timestamp":"2026-08-03T00:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"exit","content":"failed"}]},"toolUseResult":{"exitCode":3}}',
+    '{"type":"user","sessionId":"result-evidence","uuid":"timeout","timestamp":"2026-08-03T00:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"timeout","timedOut":true,"is_error":true}]}}',
+    '{"type":"user","sessionId":"result-evidence","uuid":"conflict","timestamp":"2026-08-03T00:00:03.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"conflict","is_error":true}]},"toolUseResult":{"success":true}}',
+    '{"type":"user","sessionId":"result-evidence","uuid":"malformed-exit","timestamp":"2026-08-03T00:00:04.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"malformed-exit","content":"Error: build failed"}]},"toolUseResult":{"exitCode":"2"}}',
+  ].join("\n");
+  await writeFile(path, raw);
+
+  const session = await parseClaudeSession(path);
+  assert.ok(session);
+  const results = session.events.filter(
+    (event): event is ToolResultEvent => event.kind === "tool_result",
+  );
+  assert.equal(results.length, 5);
+  assert.equal(results[0]?.status, "success");
+  assertStatusEvidence(results[0]!, "success", "explicit_status", "high");
+  assert.equal(results[0]?.exit_code, 9);
+  assert.equal(results[1]?.status, "failure");
+  assertStatusEvidence(results[1]!, "failure", "exit_code", "high");
+  assert.equal(results[1]?.exit_code, 3);
+  assertStatusEvidence(results[2]!, "timeout", "explicit_status", "high");
+  assertStatusEvidence(results[3]!, "unknown", "none", "low");
+  assertStatusEvidence(results[4]!, "unknown", "none", "low");
+  assert.equal("exit_code" in results[4]!, false);
+  assert.ok(results.slice(2, 4).every((result) => result.confidence === "high"));
 });
 
 test("keeps assistant rows without ids and treats compact summaries as compaction", async () => {

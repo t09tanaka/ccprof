@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test, { type TestContext } from "node:test";
 
-import { makeSessionRef } from "../src/core/model.js";
+import {
+  type Confidence,
+  makeSessionRef,
+  type ResultStatusSource,
+  type ToolResultEvent,
+  type ToolResultStatus,
+} from "../src/core/model.js";
 import { parseCodexSession } from "../src/sources/codex/parser.js";
 
 const fixturePath = (name: string): string =>
@@ -25,6 +31,18 @@ async function tempRollout(
   const path = join(dir, name);
   await writeFile(path, raw);
   return path;
+}
+
+function assertStatusEvidence(
+  result: ToolResultEvent,
+  status: ToolResultStatus,
+  source: ResultStatusSource,
+  confidence: Confidence,
+): void {
+  assert.equal(result.status, status);
+  assert.equal(result.status_evidence?.status, status);
+  assert.equal(result.status_evidence?.source, source);
+  assert.equal(result.status_evidence?.confidence, confidence);
 }
 
 test("returns null when there is no parseable content", async (t) => {
@@ -164,12 +182,16 @@ test("maps function_call_output rows into tool_result events with exit-code stat
 
   const results = session.events.filter((event) => event.kind === "tool_result");
   assert.equal(results.length, 2);
+  assert.ok(
+    results.every((result) => result.status_evidence?.status === result.status),
+  );
 
   const success = results.find(
     (event) => event.kind === "tool_result" && event.tool_use_id === "call-1",
   );
   assert.ok(success && success.kind === "tool_result");
   assert.equal(success.status, "success");
+  assertStatusEvidence(success, "success", "exit_code", "high");
   assert.equal(success.exit_code, 0);
   assert.equal(success.output, "Process exited with code 0\nok  \tpkg/health\t0.004s");
   assert.equal(success.output_bytes, Buffer.byteLength(success.output));
@@ -180,6 +202,7 @@ test("maps function_call_output rows into tool_result events with exit-code stat
   );
   assert.ok(failure && failure.kind === "tool_result");
   assert.equal(failure.status, "failure");
+  assertStatusEvidence(failure, "failure", "tool_adapter", "medium");
   assert.equal(failure.exit_code, 1);
   assert.equal(
     failure.output,
@@ -230,10 +253,10 @@ test("falls back to the file name stem and low confidence when session_meta is a
   );
 });
 
-test("classifies a function_call_output with no exit-code marker as unknown", async (t) => {
+test("does not infer success or failure from result text alone", async (t) => {
   const raw = [
     '{"timestamp":"2026-07-30T11:00:00.000Z","type":"session_meta","payload":{"id":"unknown-exit-session","cwd":"/workspace/repo"}}',
-    '{"timestamp":"2026-07-30T11:00:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-x","output":"no exit code information here"}}',
+    '{"timestamp":"2026-07-30T11:00:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-x","output":"Tests failed: connection refused"}}',
   ].join("\n");
 
   const session = await parseCodexSession({
@@ -243,9 +266,9 @@ test("classifies a function_call_output with no exit-code marker as unknown", as
 
   const result = session.events.find((event) => event.kind === "tool_result");
   assert.ok(result && result.kind === "tool_result");
-  assert.equal(result.status, "unknown");
+  assertStatusEvidence(result, "unknown", "none", "low");
   assert.equal(result.exit_code, undefined);
-  assert.equal(result.output, "no exit code information here");
+  assert.equal(result.output, "Tests failed: connection refused");
 });
 
 test("skips function_call rows missing call_id/name and function_call_output rows missing output, warning instead of throwing", async (t) => {
@@ -286,7 +309,7 @@ test("does not fabricate an exit code from a quoted phrase mid-output", async (t
 
   const result = session.events.find((event) => event.kind === "tool_result");
   assert.ok(result && result.kind === "tool_result");
-  assert.equal(result.status, "unknown");
+  assertStatusEvidence(result, "unknown", "none", "low");
   assert.equal(result.exit_code, undefined);
 });
 
@@ -303,9 +326,31 @@ test("prefers metadata.exit_code over text scanning, even when the text does not
 
   const result = session.events.find((event) => event.kind === "tool_result");
   assert.ok(result && result.kind === "tool_result");
-  assert.equal(result.status, "failure");
+  assertStatusEvidence(result, "failure", "exit_code", "high");
   assert.equal(result.exit_code, 2);
   assert.equal(result.output, "no matching phrase here");
+});
+
+test("validates metadata exit codes and gives them precedence over runner banners", async (t) => {
+  const raw = [
+    '{"timestamp":"2026-07-30T15:30:00.000Z","type":"session_meta","payload":{"id":"metadata-validation","cwd":"/workspace/repo"}}',
+    '{"timestamp":"2026-07-30T15:30:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"malformed","output":"{\\"output\\":\\"failed\\",\\"metadata\\":{\\"exit_code\\":\\"2\\"}}"}}',
+    '{"timestamp":"2026-07-30T15:30:02.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"conflict","output":"{\\"output\\":\\"Process exited with code 9\\\\nfailed\\",\\"metadata\\":{\\"exit_code\\":0}}"}}',
+  ].join("\n");
+  const session = await parseCodexSession({
+    sourcePath: await tempRollout(t, "metadata-validation.jsonl", raw),
+  });
+  assert.ok(session);
+
+  const results = session.events.filter(
+    (event): event is ToolResultEvent => event.kind === "tool_result",
+  );
+  assert.equal(results[0]?.status, "unknown");
+  assertStatusEvidence(results[0]!, "unknown", "none", "low");
+  assert.equal(results[0]?.exit_code, undefined);
+  assert.equal(results[1]?.status, "success");
+  assertStatusEvidence(results[1]!, "success", "exit_code", "high");
+  assert.equal(results[1]?.exit_code, 0);
 });
 
 test("extracts edit paths and fragments from apply_patch file headers", async () => {

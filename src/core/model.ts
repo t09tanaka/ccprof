@@ -129,10 +129,24 @@ export type ToolResultStatus =
   | "cancelled"
   | "unknown";
 
+export type ResultStatusSource =
+  | "explicit_status"
+  | "exit_code"
+  | "tool_adapter"
+  | "output_pattern"
+  | "none";
+
+export interface ResultStatusEvidence {
+  status: ToolResultStatus;
+  source: ResultStatusSource;
+  confidence: Confidence;
+}
+
 export interface ToolResultEvent extends NormalizedEventBase {
   kind: "tool_result";
   tool_use_id: string;
   status: ToolResultStatus;
+  status_evidence?: ResultStatusEvidence;
   output: string;
   output_bytes: number;
   estimated_tokens: number;
