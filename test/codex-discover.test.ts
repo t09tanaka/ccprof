@@ -258,6 +258,52 @@ test("budgeted Codex traversal preserves an earlier session and records a later 
   assert.equal(meter.result().coverage, 0);
 });
 
+test("oversized Codex input still records a non-budget parser failure", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows chmod does not make a file unreadable.");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "ccprof-budget-codex-read-error-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const sessionsDir = join(root, "sessions", "2026", "07", "31");
+  const repo = join(root, "repo");
+  await Promise.all([
+    mkdir(sessionsDir, { recursive: true }),
+    mkdir(repo, { recursive: true }),
+  ]);
+  const sourcePath = join(sessionsDir, "rollout-unreadable.jsonl");
+  await writeFile(
+    sourcePath,
+    rollout({
+      id: "unreadable",
+      cwd: repo,
+      branch: "feature/codex",
+    }),
+  );
+  const meter = new AnalysisBudgetMeter(
+    analysisBudgets({ max_input_bytes: 1 }),
+    steadyBudgetClock,
+  );
+
+  await chmod(sourcePath, 0o000);
+  let sessions: Awaited<ReturnType<typeof discoverCodexSessions>>;
+  try {
+    sessions = await discoverCodexSessions(join(root, "sessions"), {
+      repoRoot: repo,
+      headBranch: "feature/codex",
+      startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+      endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+      analysisBudgetMeter: meter,
+    });
+  } finally {
+    await chmod(sourcePath, 0o600);
+  }
+
+  assert.deepEqual(sessions, []);
+  assert.equal(meter.result().truncation_reason, "max_input_bytes");
+  assert.equal(meter.result().coverage, 0);
+});
+
 test("budgeted Codex discovery re-checks wall time after adapter startup", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-budget-codex-clock-"));
   t.after(async () => rm(root, { recursive: true, force: true }));

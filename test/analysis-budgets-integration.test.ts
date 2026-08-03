@@ -339,6 +339,39 @@ test("custom sources cannot opt out of deterministic source and event admission"
   }
 });
 
+test("custom source evidence is not admitted after its discovery clock expires", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-budget-custom-clock-"));
+  try {
+    const repo = await makeRepository(root);
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const clock = new ScriptedClock([0, 0, 1], [0, 0, 0]);
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      sinceMs: NOW_MS - 20 * 60_000,
+      nowMs: NOW_MS,
+      sessionSource: { discover: async () => [session(repo)] },
+      storePaths,
+      persist: false,
+      budgets: budgets({ max_wall_ms: 0 }),
+      budgetClock: clock,
+    });
+
+    assert.equal(
+      result.report.analysis_budget?.truncation_reason,
+      "max_wall_ms",
+    );
+    assert.equal(result.report.analysis_budget?.consumed.source_items, 0);
+    assert.equal(result.report.analysis_budget?.consumed.input_events, 0);
+    assert.deepEqual(result.report.unit.sessions, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a complete budgeted persist:false run never creates or migrates the Store", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-budget-no-store-"));
   try {
@@ -369,6 +402,45 @@ test("a complete budgeted persist:false run never creates or migrates the Store"
         "code" in error &&
         error.code === "ENOENT",
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("legacy unbudgeted persist:false analysis retains Store-backed reads", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-unbudgeted-store-reads-"));
+  try {
+    const repo = await makeRepository(root);
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const databasePath = storeDatabasePath(storePaths);
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      sinceMs: NOW_MS - 20 * 60_000,
+      nowMs: NOW_MS,
+      sessionSource: { discover: async () => [session(repo)] },
+      storePaths,
+      persist: false,
+    });
+
+    assert.equal(result.report.analysis_budget, undefined);
+    await access(databasePath);
+    const database = openStoreDatabase(storePaths);
+    try {
+      const migrations = database.prepare(
+        "SELECT name FROM store_migrations WHERE name LIKE 'legacy-%' ORDER BY name",
+      ).pluck().all();
+      assert.deepEqual(migrations, [
+        "legacy-adoptions-json-v1",
+        "legacy-analyses-json-v1",
+        "legacy-dismissals-json-v1",
+      ]);
+    } finally {
+      database.close();
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
