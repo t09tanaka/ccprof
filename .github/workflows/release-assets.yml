@@ -6,18 +6,18 @@ on:
       - "v*"
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
-  artifact-metadata: write
+  contents: read
+
+concurrency:
+  group: release-assets-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  release:
-    concurrency:
-      group: release-assets-${{ github.ref_name }}
-      cancel-in-progress: false
+  build-verify:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Check out release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -28,13 +28,16 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: "20"
-          cache: npm
+          node-version: "24"
 
-      - name: Validate release inputs
+      - name: Install supported npm CLI
+        run: npm install --global npm@11.5.1
+
+      - name: Validate release identity
         env:
           TAG: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
           VERSION=$(node -p 'require("./package.json").version')
           LOCKFILE_VERSION=$(node -p 'require("./package-lock.json").version')
@@ -44,21 +47,42 @@ jobs:
           [ "$LOCKFILE_ROOT_VERSION" = "$VERSION" ]
           git fetch origin main:refs/remotes/origin/main
           git merge-base --is-ancestor HEAD origin/main
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Install dependencies and check package
         run: |
+          set -euo pipefail
           npm ci
           npm run check
 
-      - name: Build and smoke-test release assets
-        id: package
+      - name: Reproduce and smoke-test release bundle
         run: |
-          PACK_OUTPUT="$RUNNER_TEMP/ccprof-pack-output.txt"
-          npm pack --json > "$PACK_OUTPUT"
-          PACK_JSON=$(node -e 'const { readFileSync } = require("node:fs"); const source = readFileSync(process.argv[1], "utf8"); const match = source.match(/^\[\s*$/m); if (!match || match.index === undefined) throw new Error("npm pack JSON array not found"); const pack = JSON.parse(source.slice(match.index)); if (!Array.isArray(pack) || pack.length !== 1) throw new Error("npm pack must produce exactly one record"); const record = pack[0]; const valid = record && typeof record.filename === "string" && record.filename && typeof record.integrity === "string" && record.integrity; if (!valid) throw new Error("npm pack record is missing filename or integrity"); process.stdout.write(JSON.stringify(record));' "$PACK_OUTPUT")
-          TARBALL=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).filename)' "$PACK_JSON")
-          INTEGRITY=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).integrity)' "$PACK_JSON")
+          set -euo pipefail
+          PACK_DIR_A=$(mktemp -d)
+          PACK_DIR_B=$(mktemp -d)
+          PACK_OUTPUT_A="$RUNNER_TEMP/pack-a.json"
+          PACK_OUTPUT_B="$RUNNER_TEMP/pack-b.json"
+          npm pack --json --pack-destination "$PACK_DIR_A" > "$PACK_OUTPUT_A"
+          npm pack --json --pack-destination "$PACK_DIR_B" > "$PACK_OUTPUT_B"
+
+          PACK_RECORD_A=$(node -e 'const { readFileSync } = require("node:fs"); const source = readFileSync(process.argv[1], "utf8"); const match = source.match(/^\[\s*$/m); if (!match || match.index === undefined) throw new Error("npm pack JSON array not found"); const records = JSON.parse(source.slice(match.index)); if (!Array.isArray(records) || records.length !== 1 || typeof records[0]?.filename !== "string" || typeof records[0]?.integrity !== "string") throw new Error("invalid npm pack result"); process.stdout.write(JSON.stringify(records[0]));' "$PACK_OUTPUT_A")
+          PACK_RECORD_B=$(node -e 'const { readFileSync } = require("node:fs"); const source = readFileSync(process.argv[1], "utf8"); const match = source.match(/^\[\s*$/m); if (!match || match.index === undefined) throw new Error("npm pack JSON array not found"); const records = JSON.parse(source.slice(match.index)); if (!Array.isArray(records) || records.length !== 1 || typeof records[0]?.filename !== "string" || typeof records[0]?.integrity !== "string") throw new Error("invalid npm pack result"); process.stdout.write(JSON.stringify(records[0]));' "$PACK_OUTPUT_B")
+          TARBALL_NAME_A=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).filename)' "$PACK_RECORD_A")
+          TARBALL_NAME_B=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).filename)' "$PACK_RECORD_B")
+          INTEGRITY_A=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).integrity)' "$PACK_RECORD_A")
+          INTEGRITY_B=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).integrity)' "$PACK_RECORD_B")
+          [ "$TARBALL_NAME_A" = "$TARBALL_NAME_B" ]
+          [ "$INTEGRITY_A" = "$INTEGRITY_B" ]
+
+          TARBALL="$PACK_DIR_A/$TARBALL_NAME_A"
+          TARBALL_B="$PACK_DIR_B/$TARBALL_NAME_B"
+          [ -f "$TARBALL" ]
+          [ -f "$TARBALL_B" ]
+          SHA256_A=$(sha256sum "$TARBALL" | cut -d ' ' -f 1)
+          SHA256_B=$(sha256sum "$TARBALL_B" | cut -d ' ' -f 1)
+          [ "$SHA256_A" = "$SHA256_B" ]
+
           PREFIX=$(mktemp -d)
           npm install --global --prefix "$PREFIX" "$TARBALL"
           export PATH="$PREFIX/bin:$PATH"
@@ -68,47 +92,159 @@ jobs:
           SMOKE_DATA=$(mktemp -d)
           git -C "$SMOKE_REPO" init
           (cd "$SMOKE_REPO" && CCPROF_DATA_DIR="$SMOKE_DATA" ccprof stats --privacy strict --json)
-          npm sbom --omit=dev --sbom-format=spdx > "ccprof-$VERSION.spdx.json"
-          RELEASE_DIR="$RUNNER_TEMP/release-assets"
+
+          RELEASE_DIR="$RUNNER_TEMP/release-bundle"
           mkdir -p "$RELEASE_DIR"
-          mv "$TARBALL" "ccprof-$VERSION.spdx.json" "$RELEASE_DIR/"
+          cp "$TARBALL" "$RELEASE_DIR/$TARBALL_NAME_A"
+          SBOM_NAME="ccprof-$VERSION.spdx.json"
+          npm sbom --omit=dev --sbom-format=spdx > "$RELEASE_DIR/$SBOM_NAME"
+          node -e 'const { writeFileSync } = require("node:fs"); const [path, version, tag, tarball, integrity, sha256, sbom] = process.argv.slice(1); writeFileSync(path, JSON.stringify({ schemaVersion: 1, repository: "t09tanaka/ccprof", workflow: "release-assets.yml", version, tag, tarball, integrity, sha256, sbom }, null, 2) + "\n");' "$RELEASE_DIR/release-metadata.json" "$VERSION" "$TAG" "$TARBALL_NAME_A" "$INTEGRITY_A" "$SHA256_A" "$SBOM_NAME"
           cd "$RELEASE_DIR"
-          TARBALL=$(basename "$TARBALL")
-          sha256sum "$TARBALL" "ccprof-$VERSION.spdx.json" > SHA256SUMS
-          echo "tarball=$RELEASE_DIR/$TARBALL" >> "$GITHUB_OUTPUT"
-          echo "integrity=$INTEGRITY" >> "$GITHUB_OUTPUT"
-          echo "sbom=$RELEASE_DIR/ccprof-$VERSION.spdx.json" >> "$GITHUB_OUTPUT"
-          echo "checksums=$RELEASE_DIR/SHA256SUMS" >> "$GITHUB_OUTPUT"
+          sha256sum "$TARBALL_NAME_A" "$SBOM_NAME" > SHA256SUMS
+          sha256sum --check SHA256SUMS
 
-      - name: Read npm registry integrity
-        id: registry
-        run: |
-          REGISTRY_INTEGRITY=$(npm view "ccprof@$VERSION" dist.integrity)
-          echo "integrity=$REGISTRY_INTEGRITY" >> "$GITHUB_OUTPUT"
+      - name: Transfer verified release bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: release-bundle
+          path: ${{ runner.temp }}/release-bundle
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Verify npm registry integrity
+  publish-release:
+    needs: build-verify
+    environment: npm
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download verified release bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: release-bundle
+          path: ${{ runner.temp }}/release-bundle
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "24"
+
+      - name: Install supported npm CLI
+        run: npm install --global npm@11.5.1
+
+      - name: Verify downloaded release bundle
         env:
-          PACK_INTEGRITY: ${{ steps.package.outputs.integrity }}
-          REGISTRY_INTEGRITY: ${{ steps.registry.outputs.integrity }}
-        run: '[ "$REGISTRY_INTEGRITY" = "$PACK_INTEGRITY" ]'
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="$RUNNER_TEMP/release-bundle"
+          cd "$BUNDLE_DIR"
+          # JavaScript template literals are intentionally single-quoted.
+          # shellcheck disable=SC2016
+          mapfile -t METADATA < <(node -e 'const { readFileSync } = require("node:fs"); const metadata = JSON.parse(readFileSync("release-metadata.json", "utf8")); const stable = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/; const tag = process.argv[1]; if (metadata.schemaVersion !== 1 || metadata.repository !== "t09tanaka/ccprof" || metadata.workflow !== "release-assets.yml" || !stable.test(metadata.version) || metadata.tag !== tag || tag !== `v${metadata.version}` || metadata.tarball !== `ccprof-${metadata.version}.tgz` || metadata.sbom !== `ccprof-${metadata.version}.spdx.json` || !/^sha512-[A-Za-z0-9+/]+={0,2}$/.test(metadata.integrity) || !/^[0-9a-f]{64}$/.test(metadata.sha256)) throw new Error("invalid release metadata"); process.stdout.write([metadata.version, metadata.tarball, metadata.sbom, metadata.integrity, metadata.sha256].join("\n") + "\n");' "$TAG")
+          [ "${#METADATA[@]}" -eq 5 ]
+          node -e 'const { readFileSync } = require("node:fs"); const expected = process.argv.slice(1).sort(); const lines = readFileSync("SHA256SUMS", "utf8").trim().split("\n"); const names = lines.map((line) => { const match = /^[0-9a-f]{64}  ([^/\r\n]+)$/.exec(line); if (!match) throw new Error("invalid checksum entry"); return match[1]; }).sort(); if (lines.length !== 2 || JSON.stringify(names) !== JSON.stringify(expected)) throw new Error("invalid checksum manifest");' "${METADATA[1]}" "${METADATA[2]}"
+          sha256sum --check SHA256SUMS
+          VERSION="${METADATA[0]}"
+          TARBALL="$BUNDLE_DIR/${METADATA[1]}"
+          SBOM="$BUNDLE_DIR/${METADATA[2]}"
+          PACK_INTEGRITY="${METADATA[3]}"
+          PACK_SHA256="${METADATA[4]}"
+          CHECKSUMS="$BUNDLE_DIR/SHA256SUMS"
+          [ -f "$TARBALL" ]
+          [ -f "$SBOM" ]
+          [ "$(sha256sum "$TARBALL" | cut -d ' ' -f 1)" = "$PACK_SHA256" ]
+          {
+            echo "VERSION=$VERSION"
+            echo "TARBALL=$TARBALL"
+            echo "SBOM=$SBOM"
+            echo "CHECKSUMS=$CHECKSUMS"
+            echo "PACK_INTEGRITY=$PACK_INTEGRITY"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify npm environment protection
+        run: |
+          set -euo pipefail
+          ENVIRONMENT_JSON="$RUNNER_TEMP/npm-environment.json"
+          curl --proto '=https' --tlsv1.2 --fail-with-body --silent --show-error --location \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/environments/npm" \
+            --output "$ENVIRONMENT_JSON"
+          REVIEWER_COUNT=$(node -e 'const { readFileSync } = require("node:fs"); const response = JSON.parse(readFileSync(process.argv[1], "utf8")); if (!Array.isArray(response.protection_rules)) throw new Error("environment protection rules missing"); const rule = response.protection_rules.find(({ type }) => type === "required_reviewers"); if (!rule || !Array.isArray(rule.reviewers)) throw new Error("required_reviewers rule missing"); process.stdout.write(String(rule.reviewers.length));' "$ENVIRONMENT_JSON")
+          case "$REVIEWER_COUNT" in
+            ""|*[!0-9]*) exit 1 ;;
+          esac
+          [ "$REVIEWER_COUNT" -gt 0 ]
+
+      - name: Publish or safely resume
+        run: |
+          set -euo pipefail
+          REGISTRY_OUTPUT="$RUNNER_TEMP/registry-preflight.out"
+          REGISTRY_ERROR="$RUNNER_TEMP/registry-preflight.err"
+          if npm view "ccprof@$VERSION" dist.integrity > "$REGISTRY_OUTPUT" 2> "$REGISTRY_ERROR"; then
+            REGISTRY_INTEGRITY=$(tr -d '\r\n' < "$REGISTRY_OUTPUT")
+            if [ "$REGISTRY_INTEGRITY" = "$PACK_INTEGRITY" ]; then
+              echo "existing registry integrity matches; skipping publish"
+            else
+              echo "existing registry integrity mismatch" >&2
+              exit 1
+            fi
+          elif grep -Eq '^npm (error|ERR!) code E404$' "$REGISTRY_ERROR"; then
+            npm publish "$TARBALL" --access public --provenance
+          else
+            echo "network or non-404 registry failure" >&2
+            cat "$REGISTRY_ERROR" >&2
+            exit 1
+          fi
+
+      - name: Confirm registry propagation
+        run: |
+          set -euo pipefail
+          REGISTRY_MATCHED=false
+          for ATTEMPT in $(seq 1 12); do
+            if REGISTRY_INTEGRITY=$(npm view "ccprof@$VERSION" dist.integrity 2>/dev/null); then
+              REGISTRY_INTEGRITY=$(printf '%s' "$REGISTRY_INTEGRITY" | tr -d '\r\n')
+              if [ "$REGISTRY_INTEGRITY" = "$PACK_INTEGRITY" ]; then
+                REGISTRY_MATCHED=true
+                break
+              fi
+              if [ -n "$REGISTRY_INTEGRITY" ]; then
+                echo "existing registry integrity mismatch" >&2
+                exit 1
+              fi
+            fi
+            if [ "$ATTEMPT" -lt 12 ]; then
+              sleep 10
+            fi
+          done
+          if [ "$REGISTRY_MATCHED" != true ]; then
+            echo "registry propagation timed out" >&2
+            exit 1
+          fi
 
       - name: Attest build provenance
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d
         with:
-          subject-path: ${{ steps.package.outputs.tarball }}
+          subject-path: ${{ env.TARBALL }}
 
       - name: Attest SBOM
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d
         with:
-          subject-path: ${{ steps.package.outputs.tarball }}
-          sbom-path: ${{ steps.package.outputs.sbom }}
+          subject-path: ${{ env.TARBALL }}
+          sbom-path: ${{ env.SBOM }}
 
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
           fi
-          gh release upload "$TAG" "${{ steps.package.outputs.tarball }}" "${{ steps.package.outputs.sbom }}" "${{ steps.package.outputs.checksums }}" --clobber
+          gh release upload "$TAG" "$TARBALL" "$SBOM" "$CHECKSUMS" --clobber
