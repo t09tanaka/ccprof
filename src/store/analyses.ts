@@ -202,6 +202,55 @@ function isStoredFinding(value: unknown): value is Finding {
   );
 }
 
+function snapshotStoredFinding(value: Finding): Finding {
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const compatibilitySource: Record<string, unknown> = {};
+    for (const field of ["rule_version", "compatibility_epoch"] as const) {
+      const descriptor = descriptors[field];
+      if (descriptor !== undefined) {
+        Object.defineProperty(compatibilitySource, field, descriptor);
+      }
+    }
+    const compatibility = findingCompatibilityMetadata(compatibilitySource);
+    if (!compatibility.valid) throw new TypeError();
+    const read = (field: keyof Finding): unknown => {
+      const descriptor = descriptors[field];
+      if (descriptor === undefined) return undefined;
+      return "value" in descriptor
+        ? descriptor.value
+        : descriptor.get?.call(value);
+    };
+    const snapshot = cloneJson({
+      finding_key: read("finding_key"),
+      rule_id: read("rule_id"),
+      title: read("title"),
+      target: read("target"),
+      classification: read("classification"),
+      cause: read("cause"),
+      scope: read("scope"),
+      confidence: read("confidence"),
+      evidence: read("evidence"),
+      recoverable: read("recoverable"),
+      fix_recipe: read("fix_recipe"),
+      caveats: read("caveats"),
+      ...(compatibility.metadata ?? {}),
+    });
+    if (!isStoredFinding(snapshot)) throw new TypeError();
+    return snapshot;
+  } catch {
+    throw new TypeError("invalid finding compatibility metadata");
+  }
+}
+
+function snapshotStoredFindings(values: readonly Finding[]): Finding[] {
+  try {
+    return Array.from(values, (value) => snapshotStoredFinding(value));
+  } catch {
+    throw new TypeError("invalid finding compatibility metadata");
+  }
+}
+
 function summaryMetrics(summary: AnalysisSummary): Record<string, number> {
   const rawObserved = summary.measured_min + summary.idle_excluded_min;
   return {
@@ -349,19 +398,13 @@ function validateInput(input: AnalysisRecordInput): void {
   if (input.unit.repo.trim() === "" || input.unit.pr_ref.trim() === "") {
     throw new TypeError("analysis unit repo and pr_ref must be non-empty");
   }
-  if (
-    !input.findings.every(
-      (finding) => findingCompatibilityMetadata(finding).valid,
-    )
-  ) {
-    throw new TypeError("invalid finding compatibility metadata");
-  }
 }
 
 export function makeAnalysisRecord(
   input: AnalysisRecordInput,
 ): AnalysisRecord {
   validateInput(input);
+  const findings = snapshotStoredFindings(input.findings);
   const metrics = {
     ...summaryMetrics(input.summary),
     ...Object.fromEntries(
@@ -371,7 +414,7 @@ export function makeAnalysisRecord(
     ),
   };
   const costs = normalizedCommandCosts(
-    input.command_costs ?? findingCommandCosts(input.findings),
+    input.command_costs ?? findingCommandCosts(findings),
   );
   const content = {
     schema_version: 1 as const,
@@ -382,7 +425,7 @@ export function makeAnalysisRecord(
       sessions: sortedUnique(input.unit.sessions),
     },
     summary: cloneJson(input.summary),
-    findings: cloneJson([...input.findings]),
+    findings,
     metrics,
     command_costs: costs,
     ...(input.read_observations === undefined ? {} :

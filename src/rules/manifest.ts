@@ -99,15 +99,46 @@ const RAW_CATALOG: RuleManifest[] = ROWS.map(([
 }));
 export function validateRuleManifestCatalog(value: unknown): RuleManifest[] {
   if (!Array.isArray(value)) return fail("invalid_catalog");
-  const entries = value.map((entry, index) => {
-    if (!isRecord(entry)) return fail("invalid_entry", index);
-    for (const field of FIELDS) {
-      if (!Object.hasOwn(entry, field)) return fail("missing_field", index, field);
+  const entries: Array<Record<string, unknown>> = [];
+  for (let index = 0; index < value.length; index += 1) {
+    let entry: unknown;
+    try {
+      if (!Object.hasOwn(value, index)) return fail("invalid_entry", index);
+      entry = value[index];
+    } catch {
+      return fail("invalid_entry", index);
     }
-    const unknown = Object.keys(entry).filter((key) => !FIELD_SET.has(key)).sort()[0];
+    if (!isRecord(entry)) return fail("invalid_entry", index);
+    let ownKeys: (string | symbol)[];
+    try {
+      ownKeys = Reflect.ownKeys(entry);
+    } catch {
+      return fail("invalid_entry", index);
+    }
+    const unknown = ownKeys
+      .filter((key) => typeof key !== "string" || !FIELD_SET.has(key))
+      .map((key) => typeof key === "string" ? key : "<symbol>")
+      .sort()[0];
     if (unknown !== undefined) return fail("unknown_field", index, unknown);
-    return Object.fromEntries(FIELDS.map((field) => [field, entry[field]]));
-  });
+    const snapshot: Record<string, unknown> = {};
+    for (const field of FIELDS) {
+      let descriptor: PropertyDescriptor | undefined;
+      try {
+        descriptor = Object.getOwnPropertyDescriptor(entry, field);
+      } catch {
+        return fail("invalid_entry", index, field);
+      }
+      if (descriptor === undefined) return fail("missing_field", index, field);
+      try {
+        snapshot[field] = "value" in descriptor
+          ? descriptor.value
+          : descriptor.get?.call(entry);
+      } catch {
+        return fail("invalid_entry", index, field);
+      }
+    }
+    entries.push(snapshot);
+  }
   const seen = new Set<string>();
   for (const [index, entry] of entries.entries()) {
     if (typeof entry.id !== "string") continue;

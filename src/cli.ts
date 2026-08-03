@@ -810,6 +810,24 @@ export async function runCli(
   const stderr = runtime.stderr ?? ((value: string) => {
     process.stderr.write(value);
   });
+  if (args[0] === "rules") {
+    try {
+      const command = parseCliArgs(args);
+      if (command.kind !== "rules") {
+        throw new CliUsageError("rules requires list or explain <rule-id>");
+      }
+      const value = command.action === "list"
+        ? listRuleManifests()
+        : ruleManifest(command.ruleId);
+      stdout(`${JSON.stringify(value, null, 2)}\n`);
+      return 0;
+    } catch (error) {
+      const code = exitCodeFor(error);
+      stderr(`ccprof: ${sanitizeHumanText(errorMessage(error))}\n`);
+      if (code === 2 && error instanceof CliUsageError) stderr(USAGE);
+      return code;
+    }
+  }
   const handlers = runtime.handlers ?? defaultHandlers;
   const cwd = runtime.cwd ?? process.cwd();
   const ci = runtime.ci ?? detectedCi(process.env.CI);
