@@ -99,7 +99,7 @@ export async function runStatsCommand(
   const stats = projectStatsPrivacy(
     summarizeStats(history.records, adoptions.records),
     privacy,
-    policyRepoRoot,
+    repoRoot,
   );
   const warnings = [...history.warnings, ...adoptions.warnings].map(
     (warning) => ({
@@ -112,6 +112,6 @@ export async function runStatsCommand(
     stdout: options.json
       ? renderStatsJson(stats)
       : renderStatsTty(stats),
-    warnings: privacyWarningTexts(warnings, privacy, policyRepoRoot),
+    warnings: privacyWarningTexts(warnings, privacy, repoRoot),
   };
 }
