@@ -84,9 +84,16 @@ function invalidValue(): never {
 }
 
 export function normalizeAnalysisBudgets(value: unknown): AnalysisBudgets {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+  if (value === null || typeof value !== "object") {
     return invalidShape();
   }
+  let array: boolean;
+  try {
+    array = Array.isArray(value);
+  } catch {
+    return invalidShape();
+  }
+  if (array) return invalidShape();
 
   let keys: readonly PropertyKey[];
   let descriptors: PropertyDescriptorMap;
@@ -165,6 +172,8 @@ export class AnalysisBudgetMeter {
   readonly #reasonCoverage = new Map<AnalysisTruncationReason, number>();
   #startedWallMs = 0;
   #startedCpuMs = 0;
+  #lastWallMs = 0;
+  #lastCpuMs = 0;
 
   constructor(budgets: unknown, clock: AnalysisBudgetClock) {
     this.#configured = normalizeAnalysisBudgets(budgets);
@@ -177,6 +186,8 @@ export class AnalysisBudgetMeter {
       } else {
         this.#startedWallMs = wall;
         this.#startedCpuMs = cpu;
+        this.#lastWallMs = wall;
+        this.#lastCpuMs = cpu;
       }
     } catch {
       this.#recordReason("meter_error", 0);
@@ -201,8 +212,8 @@ export class AnalysisBudgetMeter {
     if (
       !validClockReading(wall) ||
       !validClockReading(cpu) ||
-      wall < this.#startedWallMs ||
-      cpu < this.#startedCpuMs
+      wall < this.#lastWallMs ||
+      cpu < this.#lastCpuMs
     ) {
       this.#recordReason("meter_error", 0);
       return false;
@@ -213,6 +224,8 @@ export class AnalysisBudgetMeter {
       this.#recordReason("meter_error", 0);
       return false;
     }
+    this.#lastWallMs = wall;
+    this.#lastCpuMs = cpu;
     this.#consumed.wall_ms = wallElapsed;
     this.#observed.wall_ms = wallElapsed;
     this.#consumed.cpu_ms = cpuElapsed;

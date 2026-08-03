@@ -132,6 +132,13 @@ test("rejects unknown, symbol, hidden, accessor, array, and hostile Proxy shapes
     });
     assert.equal(validationCode(() => normalizeAnalysisBudgets(proxy)), "invalid_shape");
   }
+
+  const revoked = Proxy.revocable({}, {});
+  revoked.revoke();
+  assert.equal(
+    validationCode(() => normalizeAnalysisBudgets(revoked.proxy)),
+    "invalid_shape",
+  );
 });
 
 test("accepts zero and exact boundaries without truncation", () => {
@@ -278,6 +285,21 @@ test("contains backwards, NaN, and unsafe clock readings as meter_error", () => 
     assert.equal(Number.isFinite(meter.result().consumed.wall_ms), true);
     assert.equal(Number.isFinite(meter.result().consumed.cpu_ms), true);
   }
+});
+
+test("rejects regression from the last checkpoint and retains accepted elapsed time", () => {
+  const meter = new AnalysisBudgetMeter(
+    limits(),
+    new ScriptedClock([10, 20, 15], [0, 1, 2]),
+  );
+
+  assert.equal(meter.checkpoint(), true);
+  assert.equal(meter.result().consumed.wall_ms, 10);
+  assert.equal(meter.checkpoint(), false);
+  assert.equal(meter.result().truncation_reason, "meter_error");
+  assert.equal(meter.result().consumed.wall_ms, 10);
+  assert.equal(meter.result().observed.wall_ms, 10);
+  assert.equal(meter.result().consumed.cpu_ms, 1);
 });
 
 test("source failure and zero-budget attempts are partial without NaN", () => {
