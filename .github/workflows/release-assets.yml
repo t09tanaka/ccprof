@@ -1,0 +1,112 @@
+name: Release assets
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  release:
+    concurrency:
+      group: release-assets-${{ github.ref_name }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Validate release inputs
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          VERSION=$(node -p 'require("./package.json").version')
+          LOCKFILE_VERSION=$(node -p 'require("./package-lock.json").version')
+          LOCKFILE_ROOT_VERSION=$(node -p 'require("./package-lock.json").packages[""]?.version')
+          [ "$TAG" = "v$VERSION" ]
+          [ "$LOCKFILE_VERSION" = "$VERSION" ]
+          [ "$LOCKFILE_ROOT_VERSION" = "$VERSION" ]
+          git fetch origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD origin/main
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Install dependencies and check package
+        run: |
+          npm ci
+          npm run check
+
+      - name: Build and smoke-test release assets
+        id: package
+        run: |
+          PACK_RESULT=$(npm pack --json)
+          TARBALL=$(node -e 'process.stdout.write(JSON.parse(process.argv[1])[0].filename)' "$PACK_RESULT")
+          INTEGRITY=$(node -e 'process.stdout.write(JSON.parse(process.argv[1])[0].integrity)' "$PACK_RESULT")
+          PREFIX=$(mktemp -d)
+          npm install --global --prefix "$PREFIX" "$TARBALL"
+          export PATH="$PREFIX/bin:$PATH"
+          [ "$(ccprof --version)" = "ccprof $VERSION" ]
+          ccprof --help
+          SMOKE_REPO=$(mktemp -d)
+          SMOKE_DATA=$(mktemp -d)
+          git -C "$SMOKE_REPO" init
+          (cd "$SMOKE_REPO" && CCPROF_DATA_DIR="$SMOKE_DATA" ccprof stats --json)
+          npm sbom --omit=dev --sbom-format=spdx > "ccprof-$VERSION.spdx.json"
+          RELEASE_DIR="$RUNNER_TEMP/release-assets"
+          mkdir -p "$RELEASE_DIR"
+          mv "$TARBALL" "ccprof-$VERSION.spdx.json" "$RELEASE_DIR/"
+          cd "$RELEASE_DIR"
+          TARBALL=$(basename "$TARBALL")
+          sha256sum "$TARBALL" "ccprof-$VERSION.spdx.json" > SHA256SUMS
+          echo "tarball=$RELEASE_DIR/$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "integrity=$INTEGRITY" >> "$GITHUB_OUTPUT"
+          echo "sbom=$RELEASE_DIR/ccprof-$VERSION.spdx.json" >> "$GITHUB_OUTPUT"
+          echo "checksums=$RELEASE_DIR/SHA256SUMS" >> "$GITHUB_OUTPUT"
+
+      - name: Read npm registry integrity
+        id: registry
+        run: |
+          REGISTRY_INTEGRITY=$(npm view "ccprof@$VERSION" dist.integrity)
+          echo "integrity=$REGISTRY_INTEGRITY" >> "$GITHUB_OUTPUT"
+
+      - name: Verify npm registry integrity
+        env:
+          PACK_INTEGRITY: ${{ steps.package.outputs.integrity }}
+          REGISTRY_INTEGRITY: ${{ steps.registry.outputs.integrity }}
+        run: '[ "$REGISTRY_INTEGRITY" = "$PACK_INTEGRITY" ]'
+
+      - name: Attest build provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d
+        with:
+          subject-path: ${{ steps.package.outputs.tarball }}
+
+      - name: Attest SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d
+        with:
+          subject-path: ${{ steps.package.outputs.tarball }}
+          sbom-path: ${{ steps.package.outputs.sbom }}
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          fi
+          gh release upload "$TAG" "${{ steps.package.outputs.tarball }}" "${{ steps.package.outputs.sbom }}" "${{ steps.package.outputs.checksums }}" --clobber

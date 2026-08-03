@@ -620,6 +620,14 @@ under the Node built-in test runner. `better-sqlite3` provides the embedded
 SQLite runtime; only `git`, and `gh` when needed, are invoked as external
 processes.
 
+### Maintainer release
+
+Use [`ccprof-release`](.claude/skills/ccprof-release/SKILL.md) to prepare the
+version, lockfile, and changelog PR. The human maintainer alone runs
+`npm publish --access public <absolute-tarball-path>`; afterward the skill
+verifies the registry artifact and completes the GitHub Release assets and
+attestations.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
