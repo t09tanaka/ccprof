@@ -136,8 +136,8 @@ export async function* boundedJsonlLines(
     }
     if (partBytes > 0) {
       const raw = Buffer.concat(parts, partBytes);
-      const content = raw.at(-1) === 0x0d ? raw.subarray(0, -1) : raw;
-      yield { text: content.toString("utf8"), bytes: content.byteLength, line };
+      tracker.assertLineBytes(raw.byteLength, line);
+      yield { text: raw.toString("utf8"), bytes: raw.byteLength, line };
     }
   } catch (error) {
     if (tracker.signal?.aborted === true) tracker.throwIfAborted();
@@ -155,10 +155,10 @@ schema adapters run. Track valid-row bytes before retaining the row. Provide a
 warning array whose overridden `push` never grows beyond `maxWarnings` and
 reserves the last slot for `parser_warning_budget_exceeded`.
 
-- [ ] **Step 4: Delegate focused GREEN verification**
+- [x] **Step 4: Delegate focused GREEN verification**
 
-Run the focused compiled parser tests. Expected: the shared boundary tests pass;
-adapter integration cases may remain RED until Tasks 3 and 4.
+Run the focused compiled parser budget and abort tests. Result: all 14/14
+focused cases passed after GREEN.
 
 ### Task 3: Integrate budgets into the Claude parser
 
@@ -189,7 +189,7 @@ recursive helpers, rethrow the original reason for mid-read cancellation, and
 compute session timestamp bounds iteratively rather than spreading a large
 array into `Math.min`/`Math.max`.
 
-- [ ] **Step 4: Delegate Claude GREEN verification**
+- [x] **Step 4: Delegate Claude GREEN verification**
 
 Run:
 
@@ -221,7 +221,7 @@ Claude. Keep Codex's metadata precedence and status evidence unchanged. If
 exhaustion occurs before any event exists, rethrow the typed budget error rather
 than returning an unexplained `null`.
 
-- [ ] **Step 3: Delegate Codex GREEN verification**
+- [x] **Step 3: Delegate Codex GREEN verification**
 
 Run:
 
@@ -244,18 +244,18 @@ finite physical file/line, JSON-node/depth, retained-byte, and warning limits;
 exhaustion preserves a warned prefix, and programmatic callers can supply an
 AbortSignal.
 
-- [ ] **Step 2: Delegate full validation**
+- [x] **Step 2: Delegate full validation**
 
-Run the repository's Node 20 local CI workflow, including typecheck, the full
-test suite, deterministic golden test, package smoke, and audit. Expected: all
-checks pass and existing default parser fixture behavior remains unchanged.
+Run the repository's Node 20 local workflow equivalents: typecheck, the full
+unit suite, deterministic golden test, package smoke, and the CodeQL npm build
+step. Keep CodeQL initialization/analysis and dependency review remote-only.
 
 - [x] **Step 3: Reassert scope and protected versions**
 
 Confirm at most 10 changed files, no more than 300 added production lines, and
 no diff in `package.json`, `package-lock.json`, report schema, or store schema.
 
-- [ ] **Step 4: Commit only after the orchestrator lifts the current hold**
+- [x] **Step 4: Commit only after the orchestrator lifts the current hold**
 
 ```bash
 git add README.md src/sources/jsonl-budget.ts \
@@ -270,15 +270,19 @@ Expected: a normal verified commit; never use `--no-verify` or amend.
 
 ## Current validation record
 
-- TDD RED: delegated typecheck failed on the intentionally missing
-  `budgets`/`signal` API and shared module.
-- Initial TDD GREEN passed build/typecheck and 8/8 focused tests. Independent
-  review then moved normalized-event budgeting to a follow-up and required
-  CRLF, nesting-depth, mid-read abort-reason, and iterative timestamp fixes.
-- Review-remediation tests are written first; their RED/GREEN rerun is pending
-  because the orchestrator explicitly held all test execution.
-- Scope: 8 changed files and 279 added production lines.
-- Protected contracts: package `0.2.0`, report schema v2, and store schema v2
-  are unchanged.
-- Full Node 20 CI, commit, push, and PR remain intentionally pending for the
-  orchestrator's PR completion phase.
+- TDD RED reproduced the missing `budgets`/`signal` API and shared module, then
+  the review-remediation RED cases reproduced both remaining P2 defects.
+- Delegated GREEN verification passed all 14/14 focused parser budget and abort
+  cases.
+- Before rebasing, Node.js 20.20.2 passed the full 541/541 suite, build, and
+  package smoke verification.
+- After rebasing, the local workflow passed typecheck, all 563/563 unit tests,
+  package smoke, and determinism checks. The CodeQL npm build step also passed;
+  CodeQL initialization/analysis and dependency review remain remote-only.
+- Independent review found two P2 defects: lone-CR EOF accounting and Codex
+  nested-argument exhaustion without a surviving event. Both were fixed with
+  RED-first tests, and the final code review was CLEAN.
+- Scope remains 8 changed files and 298 added production lines. Package version
+  `0.2.0`, report schema v2, and store schema v2 are unchanged.
+- Feature and validation commits were created and rebased. Push, PR creation,
+  and remote checks are still pending.

@@ -45,8 +45,9 @@ nonnegative safe integer. Invalid controls fail before opening the transcript.
   `readline` to assemble an unbounded line.
 - `maxNodesPerLine` counts the parsed JSON root plus all descendant JSON values
   using an iterative walk. `maxNestingDepth` is checked by that same walk before
-  recursive schema adapters run. An over-budget row is skipped; later rows may
-  still be parsed.
+  recursive schema adapters run. Codex also applies both checks to the decoded
+  JSON inside string-valued `payload.arguments`. An over-budget row is skipped;
+  later rows may still be parsed.
 - `maxRetainedBytes` counts the physical bytes of valid rows retained for
   normalization. When the next row would cross the limit, parsing stops at
   the previous complete row.
@@ -56,8 +57,9 @@ nonnegative safe integer. Invalid controls fail before opening the transcript.
   with a `parser_*_budget_exceeded` warning whenever a session can be returned.
   Claude's detailed result can carry the warning even with no session. Codex
   rejects with `ParserBudgetExceededError` only when no event exists to carry
-  the warning; discovery already converts parser rejection into a source
-  warning.
+  the warning, including when its sole event is rejected because decoded tool
+  arguments exceed a node or depth budget; discovery already converts parser
+  rejection into a source warning.
 - Abort is not a parser warning. A pre-aborted or mid-read `AbortSignal`
   rejects with the original `signal.reason`, closes the stream, and returns no
   misleading partial success.
@@ -65,6 +67,8 @@ nonnegative safe integer. Invalid controls fail before opening the transcript.
 ## Edge cases
 
 - An unterminated final line is still a line and is subject to its byte limit.
+  A lone trailing CR at EOF is line content and counts toward both line and
+  retained-byte limits; CR is stripped only as part of a CRLF delimiter.
 - CRLF delimiters are not part of the line-content limit; both bytes still
   count toward the physical file budget.
 - Split UTF-8 sequences are reassembled from raw buffers before decoding.
