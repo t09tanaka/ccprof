@@ -215,7 +215,7 @@ function snapshotStoredFinding(value: Finding): Finding {
     const compatibility = findingCompatibilityMetadata(compatibilitySource);
     if (!compatibility.valid) throw new TypeError();
     const read = (field: keyof Finding): unknown => {
-      const descriptor = descriptors[field];
+      const descriptor = descriptors[field] as PropertyDescriptor | undefined;
       if (descriptor === undefined) return undefined;
       return "value" in descriptor
         ? descriptor.value
