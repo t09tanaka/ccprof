@@ -154,9 +154,24 @@ time and stable ID.
 5. [x] Document SQLite history/migration behavior and extend the installed-package
    smoke test to run `ccprof stats --json` inside a temporary Git repository with
    an isolated data directory.
-6. [ ] Run focused tests, the repository's local GitHub Actions workflow checks, full
-   tests, build, determinism, package smoke, scope/security review, and then the
-   PR lifecycle through merge and worktree cleanup.
+6. [x] Run focused tests, the repository's local GitHub Actions workflow checks,
+   full tests, build, determinism, package smoke, scope/security review, and the
+   pre-merge PR CI/review gate.
+
+## Validation
+
+- Fresh non-root Node 20.20.2: `npm ci`, 523/523 tests, build, and audit with
+  zero reported vulnerabilities.
+- Determinism golden: 1/1.
+- Packed install: version/help and `stats --json` succeeded while loading native
+  SQLite and creating exactly one `store.sqlite3`.
+- GitHub PR #42: all seven checks succeeded, no review comments remained, and
+  the merge state was clean for the implementation commit.
+- Independent specification, worktree-regression, and SQLite/concurrency reviews
+  were clean. Package 0.2.0 and Report v2 remained unchanged.
+
+Merge and worktree cleanup follow after this validation-only commit passes the
+same required checks.
 
 ## Change budget
 
