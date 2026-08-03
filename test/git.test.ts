@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { access, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import {
   runCommand,
@@ -106,6 +110,121 @@ test("runCommand passes metacharacters literally, bounds output, and times out",
   );
   assert.equal(timedOut.code, 124);
   assert.equal(timedOut.timedOut, true);
+});
+
+test("runCommand roundtrips UTF-8 stdin and rejects an oversized payload before spawn", async () => {
+  const roundtrip = await runCommand(
+    process.execPath,
+    ["-e", "process.stdin.pipe(process.stdout)"],
+    { stdin: "日本語", maxStdinBytes: 9 },
+  );
+  assert.equal(roundtrip.code, 0);
+  assert.equal(roundtrip.stdout, "日本語");
+
+  const root = await mkdtemp(join(tmpdir(), "ccprof-stdin-cap-"));
+  const marker = join(root, "spawned");
+  try {
+    await assert.rejects(
+      runCommand(
+        process.execPath,
+        [
+          "-e",
+          "require('node:fs').writeFileSync(process.argv[1], 'spawned')",
+          marker,
+        ],
+        { stdin: "日本語", maxStdinBytes: 8 },
+      ),
+      /stdin exceeds maxStdinBytes/u,
+    );
+    await assert.rejects(access(marker), /ENOENT/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("runCommand replaces the environment only when explicitly requested", async () => {
+  const key = "CCPROF_RUNNER_PARENT_CANARY";
+  const previous = process.env[key];
+  process.env[key] = "parent";
+  const script = [
+    `process.stdout.write(process.env.${key} ?? "missing")`,
+    'process.stdout.write(":" + (process.env.CCPROF_RUNNER_EXPLICIT ?? "missing"))',
+  ].join(";");
+  try {
+    const inherited = await runCommand(process.execPath, ["-e", script], {
+      env: { CCPROF_RUNNER_EXPLICIT: "child" },
+    });
+    assert.equal(inherited.stdout, "parent:child");
+
+    const replaced = await runCommand(process.execPath, ["-e", script], {
+      env: { CCPROF_RUNNER_EXPLICIT: "child" },
+      envMode: "replace",
+    });
+    assert.equal(replaced.stdout, "missing:child");
+  } finally {
+    if (previous === undefined) delete process.env[key];
+    else process.env[key] = previous;
+  }
+});
+
+test("runCommand turns a rejected stdin write into a content-free failure", async () => {
+  const canary = "CCPROF_STDIN_CANARY_MUST_NOT_LEAK";
+  const input = `${canary}${"x".repeat(2 * 1024 * 1024)}`;
+  const result = await runCommand(
+    process.execPath,
+    ["-e", "process.stdin.destroy(); setTimeout(() => process.exit(0), 25)"],
+    { stdin: input, timeoutMs: 2_000 },
+  );
+
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /stdin write failed/u);
+  assert.doesNotMatch(result.stderr, new RegExp(canary, "u"));
+});
+
+test("runCommand caps stdout and stderr independently", async () => {
+  const result = await runCommand(
+    process.execPath,
+    [
+      "-e",
+      "process.stdout.write('abcdefgh'); process.stderr.write('ABCDEFGH')",
+    ],
+    { maxOutputBytes: 4 },
+  );
+
+  assert.equal(result.stdout, "abcd");
+  assert.equal(result.stderr, "ABCD");
+  assert.equal(result.stdoutTruncated, true);
+  assert.equal(result.stderrTruncated, true);
+});
+
+test("runCommand kills timed-out descendants when process-group termination is requested", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-process-group-"));
+  const marker = join(root, "descendant-survived");
+  const descendantScript = [
+    'const { writeFileSync } = require("node:fs");',
+    `setTimeout(() => writeFileSync(${JSON.stringify(marker)}, "alive"), 500);`,
+    "setInterval(() => {}, 1_000);",
+  ].join("\n");
+  const parentScript = [
+    'const { spawn } = require("node:child_process");',
+    `spawn(process.execPath, ["-e", ${JSON.stringify(descendantScript)}], {`,
+    '  stdio: ["ignore", "ignore", "ignore"],',
+    "});",
+    "setInterval(() => {}, 1_000);",
+  ].join("\n");
+
+  try {
+    const result = await runCommand(process.execPath, ["-e", parentScript], {
+      timeoutMs: 100,
+      killProcessGroup: true,
+    });
+    assert.equal(result.code, 124);
+    assert.equal(result.timedOut, true);
+    await delay(700);
+    await assert.rejects(access(marker), /ENOENT/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("runCommand rejects a zero timeout instead of disabling its bound", async () => {
