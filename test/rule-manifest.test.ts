@@ -421,6 +421,39 @@ test("stored and private compatibility metadata accepts only a canonical complet
   assert.equal(Object.hasOwn(strict.findings[0] ?? {}, "rule_version"), false);
   assert.equal(Object.hasOwn(strict.findings[0] ?? {}, "compatibility_epoch"), false);
   assert.doesNotMatch(JSON.stringify(strict), /token-secret|\/private\/repository/u);
+
+  let changingReads = 0;
+  const changing: Record<string, unknown> = { compatibility_epoch: 1 };
+  Object.defineProperty(changing, "rule_version", {
+    enumerable: true,
+    get: () => changingReads++ === 0 ? "1.0.0" : "token-secret",
+  });
+  assert.equal(hasValidFindingCompatibilityMetadata(changing), false);
+  assert.equal(changingReads, 0);
+
+  let throwingReads = 0;
+  const throwing: Record<string, unknown> = { compatibility_epoch: 1 };
+  Object.defineProperty(throwing, "rule_version", {
+    enumerable: true,
+    get() {
+      throwingReads += 1;
+      throw new Error("metadata getter must not run");
+    },
+  });
+  assert.equal(hasValidFindingCompatibilityMetadata(throwing), false);
+  assert.equal(throwingReads, 0);
+
+  const accessorFinding = finding("R001");
+  Object.defineProperties(accessorFinding, {
+    rule_version: {
+      enumerable: false,
+      get() { throw new Error("private metadata getter must not run"); },
+    },
+    compatibility_epoch: { enumerable: false, value: 1 },
+  });
+  const accessorStrict = projectReportPrivacy(reportWith(accessorFinding), "strict");
+  assert.equal(Object.hasOwn(accessorStrict.findings[0] ?? {}, "rule_version"), false);
+  assert.equal(Object.hasOwn(accessorStrict.findings[0] ?? {}, "compatibility_epoch"), false);
 });
 
 test("a compatibility epoch change isolates dismissal and adoption identities", () => {
