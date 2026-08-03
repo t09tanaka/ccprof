@@ -17,11 +17,11 @@
 - Modify: `test/command-and-matcher.test.ts`
 - Modify: `test/data-command.test.ts`
 
-- [ ] **Step 1: Record the RED evidence**
+- [x] **Step 1: Record the RED evidence**
 
 Use Windows run `30831758305`, jobs `91747163720` and `91747163587`, where exact newline and dynamically constructed path regular expressions fail. Do not reproduce these host-specific failures by changing production code.
 
-- [ ] **Step 2: Normalize documentation reads**
+- [x] **Step 2: Normalize documentation reads**
 
 Change `readDocument` to normalize CRLF only:
 
@@ -32,7 +32,7 @@ return (await readFile(resolve(process.cwd(), path), "utf8")).replace(
 );
 ```
 
-- [ ] **Step 3: Make absolute-path non-leak checks literal**
+- [x] **Step 3: Make absolute-path non-leak checks literal**
 
 Replace each `new RegExp(repoRoot|root|paths.root_dir)` assertion with the equivalent complete-string check:
 
@@ -48,7 +48,7 @@ Keep the fixed alphanumeric sentinel regular expression unchanged.
 - Modify: `test/git.test.ts`
 - Modify: `test/hook-event.test.ts`
 
-- [ ] **Step 1: Intercept only taskkill**
+- [x] **Step 1: Intercept only taskkill**
 
 Use `createRequire` and `syncBuiltinESMExports` to replace the CommonJS
 `node:child_process.spawn` export inside `withFakeWindowsTaskkill`. Delegate
@@ -57,13 +57,13 @@ every command other than exact `taskkill` to the original function. For
 that waits `delayMs`, kills the target on success, and exits with `exitCode`.
 Restore `spawn` and `process.platform` in `finally`.
 
-- [ ] **Step 2: Preserve taskkill behavioral assertions**
+- [x] **Step 2: Preserve taskkill behavioral assertions**
 
 Keep both tests host-independent: successful termination must settle no sooner
 than the fake's delay, and exit code 7 must append `process termination failed:
 TASKKILL_7`.
 
-- [ ] **Step 3: Inject exact-path EACCES**
+- [x] **Step 3: Inject exact-path EACCES**
 
 Replace `chmod` with a CommonJS `node:fs/promises.readFile` interception. Reject
 only when its first argument equals `paths.hook_events_path`, using an error
@@ -76,13 +76,13 @@ new Stop row.
 **Files:**
 - Modify: `test/rules-primary.test.ts`
 
-- [ ] **Step 1: Replace only real filesystem trailing-space names**
+- [x] **Step 1: Replace only real filesystem trailing-space names**
 
 Change real fixture paths from `src/ value.ts ` and `pkg/src/ value.ts ` to
 `src/value name.ts` and `pkg/src/value name.ts` throughout repository setup,
 session inputs, Git object lookups, and expected observations.
 
-- [ ] **Step 2: Retain synthetic parser coverage**
+- [x] **Step 2: Retain synthetic parser coverage**
 
 Leave `const paths = ["src/a b.ts", "src/a  b.ts", "src/trailing.ts "]`
 unchanged so trailing whitespace remains covered without creating an illegal
@@ -93,13 +93,13 @@ Windows filename.
 **Files:**
 - Review all eight changed files
 
-- [ ] **Step 1: Delegate focused and full verification**
+- [x] **Step 1: Delegate focused and full verification**
 
 Another subagent runs `npm run typecheck`, builds the tests, executes the six
 changed test files from `.test-dist`, then runs `npm test`. Expected: every
 command passes with zero skips.
 
-- [ ] **Step 2: Run independent reviews in order**
+- [x] **Step 2: Run independent reviews in order**
 
 Request specification compliance first, then code quality. Fix only findings
 introduced by this PR and repeat delegated verification after any fix.
@@ -110,3 +110,18 @@ Run the delegated local GitHub-Actions-equivalent checks, push
 `feature/windows-test-portability`, create `[Tests] test: make fixtures portable
 on Windows`, wait for all existing remote checks, merge with a merge commit,
 sync `main`, and invoke `worktree-pr-flow:cleanup`.
+
+## Verification Evidence
+
+- RED: Windows run `30831758305`, jobs `91747163720` and `91747163587`.
+- Focused changed-file suite: 166 tests, 166 passed, 0 failed, 0 skipped.
+- Full suite: 609 tests, 609 passed, 0 failed, 0 skipped.
+- Typecheck and test build: passed.
+- Determinism golden: 1 test, 1 passed.
+- Package smoke: packed `ccprof-0.3.0.tgz`, installed it into an isolated
+  prefix, verified version/help, strict empty stats, and exactly one Store.
+- CodeQL local build steps: `npm ci` and `npm run build` passed; hosted CodeQL
+  init/analyze and dependency-review actions remain remote-only.
+- Specification and quality reviews: approved with no P0-P2 findings.
+- Final Windows Node.js 22/24 acceptance remains the responsibility of the
+  resumed platform matrix PR; this prerequisite does not change CI itself.
