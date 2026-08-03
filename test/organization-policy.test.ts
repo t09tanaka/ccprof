@@ -191,7 +191,7 @@ test("organization policy validation is closed, bounded, and content-free", () =
     [],
     { ...policy(), [sentinel]: true },
     { ...policy(), policy_schema_version: 2 },
-    { ...policy(), organization: sentinel },
+    { ...policy(), organization: `${sentinel}/invalid` },
     { ...policy(), organization: "-invalid" },
     { ...policy(), minimum_privacy: "RAW" },
     { ...policy(), allow_raw: sentinel },
