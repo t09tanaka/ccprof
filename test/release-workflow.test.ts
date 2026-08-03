@@ -78,7 +78,7 @@ test("release assets workflow verifies and attests artifacts in the required ord
   assert.match(workflow, /npm run check/u);
   assert.match(workflow, /npm sbom --omit=dev --sbom-format=spdx/u);
   assert.match(workflow, /npm view "ccprof@\$VERSION" dist\.integrity/u);
-  assert.match(workflow, /git merge-base --is-ancestor origin\/main HEAD/u);
+  assert.match(workflow, /git merge-base --is-ancestor HEAD origin\/main/u);
   assert.match(workflow, /sha256sum/u);
   assert.match(workflow, /npm sbom --omit=dev --sbom-format=spdx[^\n]*>\s*"?ccprof-\$VERSION\.spdx\.json"?/u);
   assert.match(workflow, /sha256sum[^\n]*"?\$TARBALL"?[^\n]*"?ccprof-\$VERSION\.spdx\.json"?[^\n]*>\s*SHA256SUMS/u);
