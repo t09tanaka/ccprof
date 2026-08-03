@@ -12,6 +12,7 @@ import {
   type ToolResultStatus,
 } from "../src/core/model.js";
 import { parseCodexSession } from "../src/sources/codex/parser.js";
+import { ParserBudgetExceededError } from "../src/sources/jsonl-budget.js";
 
 const fixturePath = (name: string): string =>
   resolve(process.cwd(), "test", "fixtures", "codex", name);
@@ -43,6 +44,30 @@ function assertStatusEvidence(
   assert.equal(result.status_evidence?.status, status);
   assert.equal(result.status_evidence?.source, source);
   assert.equal(result.status_evidence?.confidence, confidence);
+}
+
+function budgetCodexMeta(): string {
+  return JSON.stringify({
+    timestamp: "2026-07-31T19:00:00.000Z",
+    type: "session_meta",
+    payload: {
+      id: "budget-codex",
+      cwd: "/workspace/repo",
+      git: { branch: "feature/budget" },
+    },
+  });
+}
+
+function budgetCodexMessage(index: number): string {
+  return JSON.stringify({
+    timestamp: new Date(Date.UTC(2026, 6, 31, 19, 1, index)).toISOString(),
+    type: "response_item",
+    payload: {
+      type: "message",
+      role: "user",
+      content: `message-${index}`,
+    },
+  });
 }
 
 test("returns null when there is no parseable content", async (t) => {
@@ -564,4 +589,180 @@ test("does not invent a cwd when event and session metadata omit it", async (t) 
   assert.ok(tool?.kind === "tool_use");
   assert.equal(tool.cwd, undefined);
   assert.deepEqual(session.observed_cwds, []);
+});
+
+test("Codex parser accepts the exact file-byte limit and rejects an empty over-budget prefix", async (t) => {
+  const metadata = budgetCodexMeta();
+  const message = budgetCodexMessage(0);
+  const raw = `${metadata}\n${message}`;
+  const exactBytes = Buffer.byteLength(raw);
+  const path = await tempRollout(t, "file-budget.jsonl", raw);
+
+  const exact = await parseCodexSession({
+    sourcePath: path,
+    budgets: { maxFileBytes: exactBytes },
+  });
+  assert.equal(exact?.events.length, 1);
+
+  await assert.rejects(
+    parseCodexSession({
+      sourcePath: path,
+      budgets: { maxFileBytes: exactBytes - 1 },
+    }),
+    (error) =>
+      error instanceof ParserBudgetExceededError && error.budget === "file",
+  );
+});
+
+test("Codex parser applies budgets to nested function-call arguments", async (t) => {
+  let nested: unknown = "deep";
+  for (let depth = 0; depth < 16; depth += 1) nested = { child: nested };
+  const functionCall = (callId: string, input: unknown): string => JSON.stringify({
+    timestamp: "2026-07-31T18:02:00.000Z",
+    type: "response_item",
+    payload: {
+      type: "function_call",
+      name: "exec_command",
+      call_id: callId,
+      arguments: JSON.stringify(input),
+    },
+  });
+  const path = await tempRollout(
+    t,
+    "nested-argument-budget.jsonl",
+    `${[
+      budgetCodexMeta(),
+      functionCall("deep-call", { cmd: "true", nested }),
+      functionCall("wide-call", {
+        cmd: "true",
+        items: Array.from({ length: 64 }, () => 1),
+      }),
+      budgetCodexMessage(0),
+    ].join("\n")}\n`,
+  );
+
+  const session = await parseCodexSession({
+    sourcePath: path,
+    budgets: { maxNestingDepth: 4, maxNodesPerLine: 32 },
+  });
+
+  assert.ok(session);
+  assert.equal(session.events.some(
+    (event) => event.kind === "tool_use" && event.tool_use_id === "deep-call",
+  ), false);
+  assert.equal(session.events.some(
+    (event) => event.kind === "tool_use" && event.tool_use_id === "wide-call",
+  ), false);
+  assert.ok(session.events.some((event) => event.kind === "genuine_user"));
+  assert.ok(session.warnings.some(
+    (warning) => warning.code === "parser_depth_budget_exceeded" && warning.line === 2,
+  ));
+  assert.ok(session.warnings.some(
+    (warning) => warning.code === "parser_node_budget_exceeded" && warning.line === 3,
+  ));
+});
+
+test("Codex parser bounds a generated large rollout by retained bytes", async (t) => {
+  const metadata = budgetCodexMeta();
+  const messages = Array.from({ length: 20_000 }, (_, index) =>
+    budgetCodexMessage(index)
+  );
+  const retainedMessages = messages.slice(0, 64);
+  const retainedBytes = [metadata, ...retainedMessages]
+    .reduce((total, row) => total + Buffer.byteLength(row), 0);
+  const path = await tempRollout(
+    t,
+    "large-budget.jsonl",
+    `${metadata}\n${messages.join("\n")}\n`,
+  );
+
+  const session = await parseCodexSession({
+    sourcePath: path,
+    budgets: {
+      maxRetainedBytes: retainedBytes,
+      maxWarnings: 4,
+    },
+  });
+
+  assert.ok(session);
+  assert.equal(session.events.length, 64);
+  assert.deepEqual(
+    session.events.map((event) => event.entry_uuid),
+    Array.from({ length: 64 }, (_, index) => `line-${index + 2}`),
+  );
+  assert.ok(session.warnings.length <= 4);
+  assert.ok(session.warnings.some(
+    (warning) => warning.code === "parser_byte_budget_exceeded",
+  ));
+});
+
+test("Codex parser caps malformed-row warning floods", async (t) => {
+  const malformed = Array.from({ length: 10_000 }, () => "{");
+  const path = await tempRollout(
+    t,
+    "warning-budget.jsonl",
+    `${malformed.join("\n")}\n${budgetCodexMeta()}\n${budgetCodexMessage(0)}\n`,
+  );
+  const session = await parseCodexSession({
+    sourcePath: path,
+    budgets: { maxWarnings: 4 },
+  });
+
+  assert.ok(session);
+  assert.equal(session.warnings.length, 4);
+  assert.equal(session.warnings.at(-1)?.code, "parser_warning_budget_exceeded");
+});
+
+test("Codex parser validates budgets and propagates AbortSignal cancellation", async (t) => {
+  const path = await tempRollout(
+    t,
+    "abort-budget.jsonl",
+    `${budgetCodexMeta()}\n${budgetCodexMessage(0)}\n`,
+  );
+  await assert.rejects(
+    parseCodexSession({ sourcePath: path, budgets: { maxNestingDepth: -1 } }),
+    /maxNestingDepth/u,
+  );
+
+  const controller = new AbortController();
+  controller.abort(new Error("stop Codex parsing"));
+  await assert.rejects(
+    parseCodexSession({ sourcePath: path, signal: controller.signal }),
+    /stop Codex parsing/u,
+  );
+});
+
+test("Codex parser preserves a budget-shaped mid-read abort reason", async (t) => {
+  const raw = `${budgetCodexMeta()}\n${Array.from({ length: 2_000 }, (_, index) =>
+    budgetCodexMessage(index)).join("\n")}\n`;
+  const path = await tempRollout(t, "mid-read-abort.jsonl", raw);
+  const controller = new AbortController();
+  const reason = new ParserBudgetExceededError("node", 999);
+  let budgetReads = 0;
+  Object.defineProperty(reason, "budget", {
+    configurable: true,
+    get: () => {
+      budgetReads += 1;
+      return "node";
+    },
+  });
+  const originalThrowIfAborted = controller.signal.throwIfAborted.bind(
+    controller.signal,
+  );
+  let checks = 0;
+  Object.defineProperty(controller.signal, "throwIfAborted", {
+    configurable: true,
+    value: () => {
+      checks += 1;
+      if (checks === 6) controller.abort(reason);
+      originalThrowIfAborted();
+    },
+  });
+
+  const parsing = parseCodexSession({
+    sourcePath: path,
+    signal: controller.signal,
+  });
+  await assert.rejects(parsing, (error) => error === reason);
+  assert.equal(budgetReads, 0);
 });
