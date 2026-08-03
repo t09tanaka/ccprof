@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   ALL_SESSION_CAPABILITIES,
+  hasValidFindingCompatibilityMetadata,
   type Finding,
   type ReportV2,
   type RuleId,
@@ -392,6 +393,34 @@ test("Report v2 privacy keeps static metadata and never invents it for legacy fi
     assert.doesNotMatch(JSON.stringify(projected), /session-private|\/private\/repository/u);
   }
   assert.equal(projectReportPrivacy(currentReport, "raw"), currentReport);
+});
+
+test("stored and private compatibility metadata accepts only a canonical complete pair", () => {
+  assert.equal(hasValidFindingCompatibilityMetadata({}), true);
+  assert.equal(hasValidFindingCompatibilityMetadata({
+    rule_version: "1.0.0",
+    compatibility_epoch: 1,
+  }), true);
+  for (const invalid of [
+    { rule_version: "1.0.0" },
+    { compatibility_epoch: 1 },
+    { rule_version: "01.0.0", compatibility_epoch: 1 },
+    { rule_version: "2.0.0", compatibility_epoch: 1 },
+    { rule_version: "/private/repository/token-secret", compatibility_epoch: 1 },
+    { rule_version: "1.0.0", compatibility_epoch: 0 },
+  ]) {
+    assert.equal(hasValidFindingCompatibilityMetadata(invalid), false);
+  }
+
+  const unsafe = reportWith({
+    ...finding("R001"),
+    rule_version: "/private/repository/token-secret",
+    compatibility_epoch: 1,
+  });
+  const strict = projectReportPrivacy(unsafe, "strict");
+  assert.equal(Object.hasOwn(strict.findings[0] ?? {}, "rule_version"), false);
+  assert.equal(Object.hasOwn(strict.findings[0] ?? {}, "compatibility_epoch"), false);
+  assert.doesNotMatch(JSON.stringify(strict), /token-secret|\/private\/repository/u);
 });
 
 test("a compatibility epoch change isolates dismissal and adoption identities", () => {
