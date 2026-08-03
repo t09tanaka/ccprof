@@ -175,31 +175,18 @@ test("ruleCoverage is order-independent and undefined capabilities remain full",
   assert.equal(coverage(ruleCoverage([sessions[0]!]), "R007").status, "full");
 });
 
-test("ruleCoverage computes non-binary ratios and canonical missing unions", () => {
-  const mutableRequirements = RULE_REQUIRED_CAPABILITIES as Record<
-    RuleId,
-    readonly SessionCapability[]
-  >;
-  const original = mutableRequirements.R001;
-  mutableRequirements.R001 = ["tool_timestamps", "edit_fragments"];
-  try {
-    const result = coverage(ruleCoverage([
-      session({ id: "eligible" }),
-      session({ id: "missing-edit", capabilities: ["tool_timestamps"] }),
-      session({ id: "missing-time", capabilities: ["edit_fragments"] }),
-    ]), "R001");
-    assert.equal(result.eligible_sessions, 1);
-    assert.equal(result.total_sessions, 3);
-    assert.equal(result.status, "partial");
-    assert.deepEqual(result.missing_capabilities, [
-      "edit_fragments",
-      "tool_timestamps",
-    ]);
-    assert.equal(result.completeness, 1 / 3);
-    assert.ok(Number.isFinite(result.completeness));
-  } finally {
-    mutableRequirements.R001 = original;
-  }
+test("ruleCoverage computes the R001 ratio and canonical missing capabilities", () => {
+  const result = coverage(ruleCoverage([
+    session({ id: "eligible-one" }),
+    session({ id: "eligible-two" }),
+    session({ id: "missing-edit", capabilities: ["tool_timestamps"] }),
+  ]), "R001");
+  assert.equal(result.eligible_sessions, 2);
+  assert.equal(result.total_sessions, 3);
+  assert.equal(result.status, "partial");
+  assert.deepEqual(result.missing_capabilities, ["edit_fragments"]);
+  assert.equal(result.completeness, 2 / 3);
+  assert.ok(Number.isFinite(result.completeness));
 });
 
 test("ruleCoverage truncation uses only admitted parser codes and partial windows", () => {

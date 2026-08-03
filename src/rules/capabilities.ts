@@ -48,10 +48,10 @@ import { listRuleManifests } from "./manifest.js";
 
 export const RULE_REQUIRED_CAPABILITIES: Readonly<
   Record<RuleId, readonly SessionCapability[]>
-> = Object.fromEntries(listRuleManifests().map((manifest) => [
+> = Object.freeze(Object.fromEntries(listRuleManifests().map((manifest) => [
   manifest.id,
-  manifest.required_capabilities,
-])) as unknown as Readonly<Record<RuleId, readonly SessionCapability[]>>;
+  Object.freeze([...manifest.required_capabilities]),
+]))) as Readonly<Record<RuleId, readonly SessionCapability[]>>;
 
 export interface RuleApplicability {
   rule_id: RuleId;

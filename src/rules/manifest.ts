@@ -101,7 +101,7 @@ export function validateRuleManifestCatalog(value: unknown): RuleManifest[] {
     }
     const unknown = Object.keys(entry).filter((key) => !FIELD_SET.has(key)).sort()[0];
     if (unknown !== undefined) return fail("unknown_field", index, unknown);
-    return entry;
+    return Object.fromEntries(FIELDS.map((field) => [field, entry[field]]));
   });
   const seen = new Set<string>();
   for (const [index, entry] of entries.entries()) {
@@ -118,6 +118,7 @@ export function validateRuleManifestCatalog(value: unknown): RuleManifest[] {
     }
     if (!RULE_ID_SET.has(entry.id)) return fail("unknown_rule_id", index, "id");
     const id = entry.id as RuleId;
+    const declared = RAW_CATALOG.find((candidate) => candidate.id === id)!;
     const version = typeof entry.version === "string"
       ? VERSION_PATTERN.exec(entry.version)
       : null;
@@ -129,27 +130,45 @@ export function validateRuleManifestCatalog(value: unknown): RuleManifest[] {
     if (version[1] !== String(epoch)) {
       return fail("version_epoch_mismatch", index, "compatibility_epoch");
     }
-    const declared = RAW_CATALOG.find((candidate) => candidate.id === id)!;
+    if (entry.version !== declared.version) {
+      return fail("invalid_version", index, "version");
+    }
+    if (epoch !== declared.compatibility_epoch) {
+      return fail("invalid_epoch", index, "compatibility_epoch");
+    }
     if (!isCanonicalList(entry.required_capabilities, CAPABILITY_SET) ||
       !sameList(entry.required_capabilities, declared.required_capabilities)) {
       return fail("invalid_capability", index, "required_capabilities");
     }
-    if (!isCanonicalList(entry.supported_sources, SOURCE_SET)) {
+    if (!isCanonicalList(entry.supported_sources, SOURCE_SET) ||
+      !sameList(entry.supported_sources, declared.supported_sources)) {
       return fail("invalid_source", index, "supported_sources");
     }
     const impact = enumValue(entry.impact_kind,
       ["critical_path_latency", "resource_cost", "policy_latency", "evidence_only"],
       "invalid_impact_kind", index, "impact_kind");
+    if (impact !== declared.impact_kind) {
+      return fail("invalid_impact_kind", index, "impact_kind");
+    }
     const mode = enumValue(entry.default_mode, ["enabled", "observe_only", "disabled"],
       "invalid_mode", index, "default_mode");
+    if (mode !== declared.default_mode) {
+      return fail("invalid_mode", index, "default_mode");
+    }
     const aggregation = enumValue(entry.aggregation_policy,
       ["sum", "union", "max", "never_aggregate"],
       "invalid_aggregation_policy", index, "aggregation_policy");
-    if (entry.evidence_schema !== `ccprof://rules/${id}/evidence/v${epoch}`) {
+    if (aggregation !== declared.aggregation_policy) {
+      return fail("invalid_aggregation_policy", index, "aggregation_policy");
+    }
+    if (entry.evidence_schema !== declared.evidence_schema) {
       return fail("invalid_evidence_schema", index, "evidence_schema");
     }
     const risk = enumValue(entry.policy_risk, ["low", "medium", "high"],
       "invalid_policy_risk", index, "policy_risk");
+    if (risk !== declared.policy_risk) {
+      return fail("invalid_policy_risk", index, "policy_risk");
+    }
     return {
       id, version: entry.version as string, compatibility_epoch: epoch,
       required_capabilities: [...entry.required_capabilities] as SessionCapability[],

@@ -220,6 +220,38 @@ test("manifest validation fails closed with actionable deterministic codes", () 
   manifestError(invalid((value) => { value[0]!.policy_risk = "critical"; }), "invalid_policy_risk", 0, "policy_risk");
 });
 
+test("manifest validation rejects valid-looking deviations from every rule contract", () => {
+  for (const [index, expected] of EXPECTED.entries()) {
+    manifestError(invalid((value) => {
+      value[index]!.supported_sources = [];
+    }), "invalid_source", index, "supported_sources");
+    manifestError(invalid((value) => {
+      value[index]!.impact_kind = "evidence_only";
+    }), "invalid_impact_kind", index, "impact_kind");
+    manifestError(invalid((value) => {
+      value[index]!.default_mode = "disabled";
+    }), "invalid_mode", index, "default_mode");
+    manifestError(invalid((value) => {
+      value[index]!.aggregation_policy = "sum";
+    }), "invalid_aggregation_policy", index, "aggregation_policy");
+    manifestError(invalid((value) => {
+      value[index]!.policy_risk = expected.policy_risk === "high" ? "low" : "high";
+    }), "invalid_policy_risk", index, "policy_risk");
+  }
+});
+
+test("manifest validation snapshots accessor-backed inputs before returning them", () => {
+  const value = catalog();
+  let reads = 0;
+  Object.defineProperty(value[0]!, "supported_sources", {
+    configurable: true,
+    enumerable: true,
+    get: () => reads++ === 0 ? ["claude", "codex"] : [],
+  });
+
+  assert.deepEqual(validateRuleManifestCatalog(value), EXPECTED);
+});
+
 test("the capability compatibility map is derived exactly from manifests", () => {
   assert.deepEqual(
     RULE_REQUIRED_CAPABILITIES,
@@ -228,6 +260,10 @@ test("the capability compatibility map is derived exactly from manifests", () =>
       entry.required_capabilities,
     ])),
   );
+  assert.ok(Object.isFrozen(RULE_REQUIRED_CAPABILITIES));
+  for (const capabilities of Object.values(RULE_REQUIRED_CAPABILITIES)) {
+    assert.ok(Object.isFrozen(capabilities));
+  }
   assert.deepEqual(
     [...new Set(Object.values(RULE_REQUIRED_CAPABILITIES).flat())].sort(),
     ["edit_fragments", "token_usage", "tool_timestamps"],
