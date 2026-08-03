@@ -724,9 +724,31 @@ function analysisMetrics(
   };
 }
 
+const FINDING_SEVERITY_RANK = {
+  info: 0,
+  low: 1,
+  medium: 2,
+  high: 3,
+} as const;
+
+const FINDING_CONFIDENCE_RANK = {
+  low: 0,
+  medium: 1,
+  high: 2,
+} as const;
+
 function findingOrder(left: Finding, right: Finding): number {
+  const leftUpperMs = left.impact?.upper_ms ?? left.recoverable.min * 60_000;
+  const rightUpperMs = right.impact?.upper_ms ?? right.recoverable.min * 60_000;
+  const leftLowerMs = left.impact?.lower_ms ?? 0;
+  const rightLowerMs = right.impact?.lower_ms ?? 0;
   return (
-    right.recoverable.min - left.recoverable.min ||
+    rightUpperMs - leftUpperMs ||
+    rightLowerMs - leftLowerMs ||
+    FINDING_SEVERITY_RANK[right.severity ?? "info"] -
+      FINDING_SEVERITY_RANK[left.severity ?? "info"] ||
+    FINDING_CONFIDENCE_RANK[right.confidence] -
+      FINDING_CONFIDENCE_RANK[left.confidence] ||
     left.rule_id.localeCompare(right.rule_id) ||
     left.finding_key.localeCompare(right.finding_key)
   );

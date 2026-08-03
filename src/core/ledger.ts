@@ -5,6 +5,7 @@ import {
   subtractIntervals,
   unionIntervals,
 } from "./intervals.js";
+import { isStrictHighConfidence } from "./model.js";
 import type {
   AnalysisSummary,
   BaselineComparison,
@@ -63,6 +64,7 @@ export interface LedgerResult {
   raw_observed_min: number;
   normal_min: number;
   totals_ms: LedgerTotalsMs;
+  highConfidenceLowerBoundIntervals: Interval[];
   pointRecoverableIntervals: Interval[];
   humanWaitIntervals: Interval[];
   normalIntervals: Interval[];
@@ -74,6 +76,48 @@ export interface LedgerResult {
 interface IndexedCandidate {
   candidate: FindingCandidate;
   index: number;
+}
+
+function takeIntervalDuration(
+  intervals: readonly Interval[],
+  maximumMs: number,
+): Interval[] {
+  let remainingMs = Number.isFinite(maximumMs) && maximumMs > 0
+    ? Math.floor(maximumMs)
+    : 0;
+  const result: Interval[] = [];
+  for (const interval of unionIntervals(intervals)) {
+    if (!(remainingMs > 0)) break;
+    const duration = interval.end_ms - interval.start_ms;
+    const claimed = Math.min(duration, remainingMs);
+    if (claimed > 0) {
+      result.push({
+        start_ms: interval.start_ms,
+        end_ms: interval.start_ms + claimed,
+      });
+      remainingMs -= claimed;
+    }
+  }
+  return result;
+}
+
+function confirmedLowerBoundIntervals(
+  candidates: readonly FindingCandidate[],
+  activeIntervals: readonly Interval[],
+): Interval[] {
+  return unionIntervals(candidates.flatMap((candidate) => {
+    if (
+      candidate.impact.kind !== "critical_path_latency" ||
+      !(candidate.impact.lower_ms > 0) ||
+      !isStrictHighConfidence(candidate.finding_confidence)
+    ) {
+      return [];
+    }
+    return takeIntervalDuration(
+      intersectIntervals(candidate.recoverable.intervals, activeIntervals),
+      candidate.impact.lower_ms,
+    );
+  }));
 }
 
 type PartitionName = "recoverable" | "human_wait" | "normal" | "unexplained";
@@ -188,6 +232,10 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
     input.activeIntervals,
     rawIntervals,
   );
+  const highConfidenceLowerBoundIntervals = confirmedLowerBoundIntervals(
+    input.candidates,
+    activeIntervals,
+  );
   const indexed = input.candidates.map((candidate, index) => ({
     candidate,
     index,
@@ -276,6 +324,10 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
     rawObservedHundredths - measuredHundredths,
   );
   const recoverableHundredths = partitionHundredths.recoverable;
+  const confirmedHundredths = Math.min(
+    measuredHundredths,
+    roundedHundredths(durationMs(highConfidenceLowerBoundIntervals)),
+  );
 
   const attributions = indexed.map(({ candidate, index }) =>
     attributionsByIndex.get(index) ?? {
@@ -293,7 +345,7 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
       measured_min: minutesFromHundredths(measuredHundredths),
       idle_excluded_min: minutesFromHundredths(idleHundredths),
       estimated_floor_min: minutesFromHundredths(
-        measuredHundredths - recoverableHundredths,
+        measuredHundredths - confirmedHundredths,
       ),
       recoverable_min: minutesFromHundredths(recoverableHundredths),
       human_wait_min: minutesFromHundredths(
@@ -313,6 +365,7 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
     raw_observed_min: minutesFromHundredths(rawObservedHundredths),
     normal_min: minutesFromHundredths(partitionHundredths.normal),
     totals_ms: totalsMs,
+    highConfidenceLowerBoundIntervals,
     pointRecoverableIntervals,
     humanWaitIntervals,
     normalIntervals,
