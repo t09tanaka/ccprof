@@ -13,6 +13,12 @@ import type {
   ToolResultEvent,
   ToolUseEvent,
 } from "../core/model.js";
+import {
+  encodeAgentIdentity,
+  encodeIdentityScope,
+  encodeInvocationIdentity,
+  evidenceEventIdentity,
+} from "../core/event-identity.js";
 import type {
   DiffEvidence,
   FileDiffEvidence,
@@ -937,7 +943,11 @@ function successfulReadKey(
   action: TimelineAction,
   path: string,
 ): string {
-  return [action.session_id, action.agent_id, path].join("\0");
+  return encodeIdentityScope(
+    "successful-read",
+    encodeAgentIdentity(evidenceEventIdentity(action)),
+    path,
+  );
 }
 
 function normalizeText(value: string): string {
@@ -1028,11 +1038,10 @@ function toolIdentity(observation: ActionObservation): string | null {
   const toolUseId =
     observation.action.tool_use_id ?? observation.toolUse?.tool_use_id;
   if (toolUseId === undefined || toolUseId === "") return null;
-  return [
-    observation.action.session_id,
-    observation.action.agent_id,
-    toolUseId,
-  ].join("\0");
+  return encodeInvocationIdentity({
+    ...evidenceEventIdentity(observation.action),
+    tool_use_id: toolUseId,
+  });
 }
 
 function rememberToolClassification(

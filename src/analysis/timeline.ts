@@ -2,6 +2,16 @@ import {
   subtractIntervals,
   unionIntervals,
 } from "../core/intervals.js";
+import {
+  encodeAgentIdentity,
+  encodeEventIdentity,
+  encodeIdentityScope,
+  encodeInvocationIdentity,
+  encodeSessionIdentity,
+  evidenceEventIdentity,
+  eventIdentity,
+  type EventIdentity,
+} from "../core/event-identity.js";
 import type {
   ApprovalRequest,
   Confidence,
@@ -36,6 +46,7 @@ export interface TimelineResult {
 
 interface OrderedEvent {
   event: NormalizedEvent;
+  identity: EventIdentity;
   inputIndex: number;
   agentKey: string;
   /**
@@ -54,24 +65,6 @@ interface InternalAction {
 interface PendingAssistant {
   event: Extract<NormalizedEvent, { kind: "assistant" }>;
   approval?: ApprovalRequest;
-}
-
-function eventIdentity(event: NormalizedEvent, sourcePath: string): string {
-  const discriminator =
-    event.kind === "tool_use" || event.kind === "tool_result"
-      ? event.tool_use_id
-      : event.kind === "assistant"
-        ? (event.message_id ?? "")
-        : "";
-  return [
-    sourcePath,
-    event.agent_id,
-    event.kind,
-    event.session_ref,
-    event.timestamp_ms,
-    event.source_index,
-    discriminator,
-  ].join("\0");
 }
 
 function actionConfidence(
@@ -102,6 +95,7 @@ function orderedSessions(sessions: readonly Session[]): Session[] {
   return [...sessions].sort(
     (left, right) =>
       left.source_path.localeCompare(right.source_path) ||
+      left.source.localeCompare(right.source) ||
       left.session_id.localeCompare(right.session_id),
   );
 }
@@ -124,21 +118,19 @@ function collectEvents(
         );
         continue;
       }
-      const identity = eventIdentity(event, session.source_path);
-      if (identities.has(identity)) {
+      const identity = eventIdentity(session, event);
+      const identityKey = encodeEventIdentity(identity);
+      if (identities.has(identityKey)) {
         caveats.push(`ignored duplicate event ${event.session_ref}`);
         continue;
       }
-      identities.add(identity);
+      identities.add(identityKey);
       events.push({
         event,
+        identity,
         inputIndex: currentIndex,
-        agentKey: [
-          session.source_path,
-          event.session_id,
-          event.agent_id,
-        ].join("\0"),
-        laneKey: [session.source_path, event.session_id].join("\0"),
+        agentKey: encodeAgentIdentity(identity),
+        laneKey: encodeSessionIdentity(identity),
       });
     }
   }
@@ -147,6 +139,9 @@ function collectEvents(
     (left, right) =>
       left.event.timestamp_ms - right.event.timestamp_ms ||
       left.event.source_index - right.event.source_index ||
+      encodeEventIdentity(left.identity).localeCompare(
+        encodeEventIdentity(right.identity),
+      ) ||
       left.inputIndex - right.inputIndex,
   );
   return events;
@@ -239,7 +234,13 @@ function verifiedTailActions(
     ) {
       continue;
     }
-    const laneKey = [session.source_path, session.session_id].join("\0");
+    const laneKey = encodeSessionIdentity({
+      source_adapter_id: session.source,
+      source_instance_id: session.source_path,
+      session_id: session.session_id,
+      agent_id: "",
+      source_index: 0,
+    });
     if (mainAgentsByLaneKey.get(laneKey)?.size !== 1) continue;
     const last = lastMainEventByLaneKey.get(laneKey);
     if (last === undefined || verifiedEndedAtMs <= last.event.timestamp_ms) {
@@ -260,6 +261,7 @@ function verifiedTailActions(
         confidence: "low",
         concurrent: false,
         paths: [],
+        event_identity: last.identity,
       },
       agentKey: last.agentKey,
     });
@@ -275,7 +277,9 @@ function isUserQuestionTool(use: ToolUseEvent): boolean {
 
 function toolAction(
   use: ToolUseEvent,
+  useIdentity: EventIdentity,
   result: ToolResultEvent | undefined,
+  resultIdentity: EventIdentity | undefined,
   agentKey: string,
   validPair: boolean,
   idleThresholdMs: number,
@@ -306,6 +310,10 @@ function toolAction(
     confidence,
     concurrent: false,
     paths: unique(use.paths),
+    event_identity: useIdentity,
+    ...(validPair && resultIdentity !== undefined
+      ? { result_identity: resultIdentity }
+      : {}),
     tool_use_id: use.tool_use_id,
     tool_name: use.tool_name,
     ...(use.command === undefined ? {} : { command: use.command }),
@@ -335,8 +343,10 @@ function pairTools(
   for (const ordered of events) {
     const event = ordered.event;
     if (event.kind === "tool_use") {
-      laneToolUses.add(`${ordered.laneKey}\0${event.tool_use_id}`);
-      const key = `${ordered.agentKey}\0${event.tool_use_id}`;
+      laneToolUses.add(
+        encodeIdentityScope("lane-tool-use", ordered.laneKey, event.tool_use_id),
+      );
+      const key = encodeInvocationIdentity(ordered.identity);
       if (uses.has(key)) {
         caveats.push(
           `ignored duplicate tool use ${event.tool_use_id} in ${event.session_id}`,
@@ -345,7 +355,7 @@ function pairTools(
         uses.set(key, ordered);
       }
     } else if (event.kind === "tool_result") {
-      const key = `${ordered.agentKey}\0${event.tool_use_id}`;
+      const key = encodeInvocationIdentity(ordered.identity);
       const group = results.get(key);
       if (group === undefined) {
         results.set(key, [ordered]);
@@ -420,7 +430,15 @@ function pairTools(
       }
     }
     actions.push(
-      toolAction(use, result, orderedUse.agentKey, validPair, idleThresholdMs),
+      toolAction(
+        use,
+        orderedUse.identity,
+        result,
+        resultEntry?.identity,
+        orderedUse.agentKey,
+        validPair,
+        idleThresholdMs,
+      ),
     );
   }
 
@@ -431,7 +449,15 @@ function pairTools(
     const orderedResult = candidates[0];
     const result = orderedResult?.event;
     if (orderedResult !== undefined && result?.kind === "tool_result") {
-      if (laneToolUses.has(`${orderedResult.laneKey}\0${result.tool_use_id}`)) {
+      if (
+        laneToolUses.has(
+          encodeIdentityScope(
+            "lane-tool-use",
+            orderedResult.laneKey,
+            result.tool_use_id,
+          ),
+        )
+      ) {
         caveats.push(
           `tool result ${result.tool_use_id} in ${result.session_id} was attributed to a different agent and has no matching use`,
         );
@@ -455,6 +481,7 @@ function causalAction(
   kind: "inference" | "human_wait" | "away",
   start: NormalizedEvent,
   end: NormalizedEvent,
+  startIdentity: EventIdentity,
   agentKey: string,
   details?: {
     use?: ToolUseEvent;
@@ -475,6 +502,7 @@ function causalAction(
     confidence: actionConfidence(start, end),
     concurrent: false,
     paths: use === undefined ? [] : unique(use.paths),
+    event_identity: startIdentity,
     ...(use === undefined
       ? {}
       : {
@@ -499,6 +527,9 @@ function causalActions(
   idleThresholdMs: number,
   caveats: string[],
 ): InternalAction[] {
+  const identities = new Map(
+    events.map(({ event, identity }) => [event, identity] as const),
+  );
   const usesWithResults = new Set(useForResult.values());
   const grouped = new Map<string, OrderedEvent[]>();
   for (const ordered of events) {
@@ -544,6 +575,7 @@ function causalActions(
                   elapsed > idleThresholdMs ? "away" : "human_wait",
                   pendingAssistant.event,
                   event,
+                  identities.get(pendingAssistant.event)!,
                   agentKey,
                   pendingAssistant.approval === undefined
                     ? undefined
@@ -572,6 +604,7 @@ function causalActions(
                   "inference",
                   pendingInference,
                   event,
+                  identities.get(pendingInference)!,
                   agentKey,
                   use === undefined ? undefined : { use },
                 ),
@@ -677,7 +710,10 @@ function sortedActions(
         left.agent_id.localeCompare(right.agent_id) ||
         (kindOrder.get(left.kind) ?? 99) -
           (kindOrder.get(right.kind) ?? 99) ||
-        left.action_id.localeCompare(right.action_id),
+        left.action_id.localeCompare(right.action_id) ||
+        encodeEventIdentity(evidenceEventIdentity(left)).localeCompare(
+          encodeEventIdentity(evidenceEventIdentity(right)),
+        ),
     );
 }
 

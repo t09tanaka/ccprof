@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { durationMs, normalizeInterval } from "../core/intervals.js";
+import { encodeEventIdentity } from "../core/event-identity.js";
 import type {
   Confidence,
   FindingCandidate,
@@ -105,10 +106,29 @@ export function recoverableClaim(
   target: string,
   actions: readonly Pick<
     TimelineAction,
-    "action_id" | "concurrent" | "interval"
+    "action_id" | "concurrent" | "event_identity" | "interval"
   >[],
 ): RecoverableClaim {
   const normalizedTarget = normalizeFindingTarget(target);
+  const normalizedActions = actions.flatMap((action) => {
+    const interval = normalizeInterval(action.interval);
+    if (interval === null) return [];
+    return [{
+      action,
+      interval,
+      baseIntervalId: `${ruleId}:${action.action_id}`,
+      identityKey: action.event_identity === undefined
+        ? undefined
+        : encodeEventIdentity(action.event_identity),
+    }];
+  });
+  const identitiesByBaseId = new Map<string, Set<string | undefined>>();
+  for (const { baseIntervalId, identityKey } of normalizedActions) {
+    const identities = identitiesByBaseId.get(baseIntervalId) ??
+      new Set<string | undefined>();
+    identities.add(identityKey);
+    identitiesByBaseId.set(baseIntervalId, identities);
+  }
   const byId = new Map<
     string,
     {
@@ -119,10 +139,21 @@ export function recoverableClaim(
       concurrent: boolean;
     }
   >();
-  for (const action of actions) {
-    const interval = normalizeInterval(action.interval);
-    if (interval === null) continue;
-    const intervalId = `${ruleId}:${action.action_id}`;
+  for (const {
+    action,
+    interval,
+    baseIntervalId,
+    identityKey,
+  } of normalizedActions) {
+    const identityCollision =
+      (identitiesByBaseId.get(baseIntervalId)?.size ?? 0) > 1;
+    const intervalId = identityCollision && identityKey !== undefined
+      ? `${baseIntervalId}:${createHash("sha256")
+        .update("ccprof:recoverable-interval-identity:v1\0", "utf8")
+        .update(identityKey, "utf8")
+        .digest("hex")
+        .slice(0, 32)}`
+      : baseIntervalId;
     const existing = byId.get(intervalId);
     if (
       existing !== undefined &&

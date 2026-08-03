@@ -6,6 +6,8 @@
  * the producing source cannot determine the repository root.
  */
 
+import type { EventIdentity } from "./event-identity.js";
+
 export type JsonPrimitive = boolean | number | string | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | JsonObject;
 export interface JsonObject {
@@ -81,6 +83,8 @@ interface NormalizedEventBase {
   agent_id: string;
   is_sidechain: boolean;
   confidence: Confidence;
+  /** Analysis-only identity added after a Session establishes source context. */
+  event_identity?: EventIdentity;
   parent_uuid?: string;
   /** Git branch recorded on the source row, when the log provided one. */
   branch?: string;
@@ -228,6 +232,10 @@ export interface TimelineAction {
   confidence: Confidence;
   concurrent: boolean;
   paths: string[];
+  /** Analysis-only identity of the event that starts this action. */
+  event_identity?: EventIdentity;
+  /** Analysis-only identity of the selected valid tool result, when present. */
+  result_identity?: EventIdentity;
   tool_use_id?: string;
   tool_name?: string;
   command?: string;

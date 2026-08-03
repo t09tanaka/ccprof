@@ -17,6 +17,12 @@ import type {
   MatchedAction,
   ToolResultEvent,
 } from "../core/model.js";
+import {
+  encodeEventIdentity,
+  encodeIdentityScope,
+  encodeInvocationIdentity,
+  evidenceEventIdentity,
+} from "../core/event-identity.js";
 import type { AnalysisRecord } from "../store/analyses.js";
 import {
   createFindingCandidate,
@@ -104,12 +110,17 @@ function readCommandIdentity(value: unknown): CommandIdentity | undefined {
 }
 
 function runKey(
-  value: Pick<
-    MatchedAction | ToolResultEvent,
-    "agent_id" | "session_id" | "tool_use_id"
-  >,
+  value: MatchedAction | ToolResultEvent,
 ): string {
-  return `${value.session_id}\0${value.agent_id}\0${value.tool_use_id ?? ""}`;
+  return encodeInvocationIdentity(evidenceEventIdentity(value));
+}
+
+function actionEvidenceKey(action: MatchedAction): string {
+  return encodeIdentityScope(
+    "flaky-action",
+    encodeEventIdentity(evidenceEventIdentity(action)),
+    action.action_id,
+  );
 }
 
 function isTestCommand(
@@ -344,7 +355,7 @@ function episodeFor(
     ),
   ];
   const uniqueInvestigation = new Map(
-    investigation.map((action) => [action.action_id, action] as const),
+    investigation.map((action) => [actionEvidenceKey(action), action] as const),
   );
   return {
     command: failure.command,
@@ -519,7 +530,7 @@ export function detectFlakyTests(
           commandEpisodes
             .flatMap((episode) => episode.investigation)
             .map((action) => [
-              `${action.session_id}\0${action.agent_id}\0${action.action_id}`,
+              actionEvidenceKey(action),
               action,
             ] as const),
         ).values()],
@@ -532,7 +543,7 @@ export function detectFlakyTests(
           commandEpisodes
             .flatMap((episode) => episode.failedRuns)
             .map((signal) => [
-              `${signal.action.session_id}\0${signal.action.agent_id}\0${signal.action.action_id}`,
+              actionEvidenceKey(signal.action),
               signal,
             ] as const),
         ).values(),
@@ -542,7 +553,7 @@ export function detectFlakyTests(
           commandEpisodes
             .flatMap((episode) => episode.unrelatedEdits)
             .map((action) => [
-              `${action.session_id}\0${action.agent_id}\0${action.action_id}`,
+              actionEvidenceKey(action),
               action,
             ] as const),
         ).values(),
