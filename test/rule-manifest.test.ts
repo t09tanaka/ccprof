@@ -383,6 +383,16 @@ test("Store records preserve new metadata and legacy findings remain readable", 
   assert.deepEqual(old.findings[0], legacy);
   assert.equal(Object.hasOwn(old.findings[0] ?? {}, "rule_version"), false);
   assert.equal(Object.hasOwn(old.findings[0] ?? {}, "compatibility_epoch"), false);
+
+  for (const invalid of [
+    { ...legacy, rule_version: "1.0.0" },
+    { ...legacy, rule_version: "2.0.0", compatibility_epoch: 1 },
+  ]) {
+    assert.throws(
+      () => makeAnalysisRecord({ ...common, findings: [invalid] }),
+      /invalid finding compatibility metadata/u,
+    );
+  }
 });
 
 test("Report v2 privacy keeps static metadata and never invents it for legacy findings", () => {
