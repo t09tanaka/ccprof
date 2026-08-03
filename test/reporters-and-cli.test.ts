@@ -68,6 +68,10 @@ import {
 } from "../src/store/analyses.js";
 import type { AdoptionRecord } from "../src/store/adoptions.js";
 import { runStatsCommand } from "../src/commands/stats.js";
+import {
+  resolveEffectivePolicy,
+  type PolicyRequest,
+} from "../src/policy/organization-policy.js";
 import type { StorePaths } from "../src/store/paths.js";
 
 function finding(
@@ -2659,7 +2663,7 @@ test("runStatsCommand loads adoptions and threads them into the summary", async 
   ]);
 });
 
-test("runStatsCommand projects reports and Store warnings without mutation", async () => {
+test("runStatsCommand preserves ungoverned linked-worktree output scope without mutation", async () => {
   const records = adoptionFixtureRecords();
   const adoptions = adoptionFixtureAdoptions();
   const privateWarning = [
@@ -2689,6 +2693,8 @@ test("runStatsCommand projects reports and Store warnings without mutation", asy
   const dependencies = {
     resolveRepoRoot: async () => PRIVACY_REPO,
     resolveStorePaths: async () => storePaths,
+    resolvePolicy: async (_repoRoot: string, request: PolicyRequest) =>
+      resolveEffectivePolicy({ request }),
     loadAnalyses: async () => ({ records, warnings: historyWarnings }),
     loadAdoptions: async () => ({ records: adoptions, warnings: adoptionWarnings }),
   };
@@ -2708,11 +2714,16 @@ test("runStatsCommand projects reports and Store warnings without mutation", asy
       { cwd: PRIVACY_REPO, json: true, privacy: profile },
       dependencies,
     );
-    const projected = JSON.parse(result.stdout) as StatsReport;
-    const reference = findingPrivacyReference(
-      storePaths.canonical_repo,
-      "recurred-key",
+    assert.equal(
+      result.stdout,
+      renderStatsJson(projectStatsPrivacy(
+        summarizeStats(records, adoptions),
+        profile,
+        PRIVACY_REPO,
+      )),
     );
+    const projected = JSON.parse(result.stdout) as StatsReport;
+    const reference = findingPrivacyReference(PRIVACY_REPO, "recurred-key");
     assert.equal(
       projected.recurring_findings.find((entry) =>
         entry.rule_id === "R002"
