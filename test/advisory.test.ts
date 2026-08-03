@@ -2,8 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  ADVISORY_ENV_KEYS,
+  ADVISORY_MAX_OUTPUT_BYTES,
+  ADVISORY_MAX_STDIN_BYTES,
   ADVISORY_MAX_TEXT_CHARS,
   ADVISORY_TIMEOUT_MS,
+  buildAdvisoryEnvironment,
   buildAdvisoryPrompt,
   requestAdvisory,
 } from "../src/advisory/advisory.js";
@@ -29,6 +33,33 @@ import type {
   CommandRunner,
 } from "../src/git/client.js";
 import { renderJsonReport } from "../src/reporters/json.js";
+
+const EXPECTED_ADVISORY_ENV_KEYS = [
+  "PATH",
+  "PATHEXT",
+  "HOME",
+  "USERPROFILE",
+  "SystemRoot",
+  "ComSpec",
+  "CLAUDE_CONFIG_DIR",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_STATE_HOME",
+  "XDG_CACHE_HOME",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "LANG",
+  "LANGUAGE",
+  "LC_ALL",
+  "LC_CTYPE",
+] as const;
 
 const summary: AnalysisSummary = {
   measured_min: 42,
@@ -133,21 +164,119 @@ test("markdown neutralizes leading structural markers in advisory lines", async 
   assert.doesNotMatch(markdown.stdout, /^### Injected heading$/mu);
 });
 
-test("advisory sends only the display report JSON to claude -p with a 60s timeout", async () => {
+test("advisory sends the complete display prompt only through bounded stdin", async () => {
   const calls: RunnerCall[] = [];
   await renderWith("json", fakeRunner({ stdout: "- fine" }, calls));
 
   assert.equal(calls.length, 1);
   const call = calls[0] as RunnerCall;
   assert.equal(call.command, "claude");
-  assert.equal(call.args.length, 2);
-  assert.equal(call.args[0], "-p");
+  assert.deepEqual(call.args, ["-p"]);
   assert.equal(
-    call.args[1],
+    call.options?.stdin,
     buildAdvisoryPrompt(renderJsonReport(report())),
   );
+  assert.equal(
+    call.options?.maxStdinBytes,
+    ADVISORY_MAX_STDIN_BYTES,
+  );
+  assert.equal(
+    call.options?.maxOutputBytes,
+    ADVISORY_MAX_OUTPUT_BYTES,
+  );
+  assert.equal(call.options?.envMode, "replace");
+  assert.equal(call.options?.killProcessGroup, true);
   assert.equal(call.options?.timeoutMs, ADVISORY_TIMEOUT_MS);
   assert.equal(ADVISORY_TIMEOUT_MS, 60_000);
+});
+
+test("advisory environment is an exact minimal allowlist", () => {
+  assert.deepEqual(ADVISORY_ENV_KEYS, EXPECTED_ADVISORY_ENV_KEYS);
+  assert.equal(ADVISORY_MAX_STDIN_BYTES, 1024 * 1024);
+  assert.equal(ADVISORY_MAX_OUTPUT_BYTES, 64 * 1024);
+
+  const forbidden = [
+    "NODE_OPTIONS",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "NPM_TOKEN",
+    "NODE_AUTH_TOKEN",
+    "npm_config_registry",
+    "HTTPS_PROXY",
+  ] as const;
+  const source: NodeJS.ProcessEnv = Object.fromEntries([
+    ...EXPECTED_ADVISORY_ENV_KEYS.map((key) => [key, `kept:${key}`]),
+    ...forbidden.map((key) => [key, `excluded:${key}`]),
+  ]);
+  const projected = buildAdvisoryEnvironment(source);
+
+  assert.deepEqual(Object.keys(projected), [...EXPECTED_ADVISORY_ENV_KEYS]);
+  for (const key of EXPECTED_ADVISORY_ENV_KEYS) {
+    assert.equal(projected[key], `kept:${key}`);
+  }
+  for (const key of forbidden) assert.equal(projected[key], undefined);
+});
+
+test("advisory report canary never enters argv, environment, or failure text", async () => {
+  const canary = "CCPROF_ADVISORY_REPORT_CANARY";
+  const calls: RunnerCall[] = [];
+  const runner: CommandRunner = async (command, args, options) => {
+    calls.push({
+      command,
+      args,
+      ...(options === undefined ? {} : { options }),
+    });
+    throw new Error(`lower layer echoed ${String(options?.stdin)}`);
+  };
+  const canaryReport = { ...report(), caveats: [canary] };
+  const result = await runAnalyzeCommand(
+    {
+      cwd: "/repo",
+      format: "json",
+      color: false,
+      privacy: "raw",
+      advisory: true,
+    },
+    {
+      analyze: async () => ({ report: canaryReport, warnings: [] }),
+      runCommand: runner,
+    },
+  );
+
+  assert.equal(calls.length, 1);
+  const call = calls[0] as RunnerCall;
+  assert.match(String(call.options?.stdin), new RegExp(canary, "u"));
+  assert.doesNotMatch(call.args.join("\u0000"), new RegExp(canary, "u"));
+  assert.doesNotMatch(
+    Object.values(call.options?.env ?? {}).join("\u0000"),
+    new RegExp(canary, "u"),
+  );
+  assert.equal(result.warnings.length, 1);
+  assert.doesNotMatch(result.warnings[0] ?? "", new RegExp(canary, "u"));
+});
+
+test("advisory rejects a prompt one UTF-8 byte over the cap without calling the runner", async () => {
+  const prefixBytes = Buffer.byteLength(buildAdvisoryPrompt(""), "utf8");
+  const remaining = ADVISORY_MAX_STDIN_BYTES - prefixBytes;
+  const reportJson = `${"界".repeat(Math.floor(remaining / 3))}${"x".repeat((remaining % 3) + 1)}`;
+  assert.equal(
+    Buffer.byteLength(buildAdvisoryPrompt(reportJson), "utf8"),
+    ADVISORY_MAX_STDIN_BYTES + 1,
+  );
+  const calls: RunnerCall[] = [];
+
+  const outcome = await requestAdvisory(
+    reportJson,
+    fakeRunner({ stdout: "must not run" }, calls),
+  );
+
+  assert.equal(calls.length, 0);
+  assert.deepEqual(outcome, {
+    kind: "unavailable",
+    reason: "advisory input exceeds 1048576-byte limit",
+  });
 });
 
 test("advisory success renders a separated, sanitized section in every format", async () => {
@@ -216,14 +345,18 @@ test("advisory failures degrade to one warning without touching the report", asy
       /^advisory unavailable: claude CLI timed out$/u,
     ],
     [
+      fakeRunner({ stdout: "partial", stdoutTruncated: true }),
+      /^advisory unavailable: claude CLI output exceeded 65536-byte limit$/u,
+    ],
+    [
       fakeRunner({ code: 0, stdout: " \n " }),
       /^advisory unavailable: claude CLI produced no output$/u,
     ],
     [
       async () => {
-        throw new Error("spawn claude ENOENT");
+        throw new Error("spawn failure with PRIVATE_DETAIL");
       },
-      /^advisory unavailable: spawn claude ENOENT$/u,
+      /^advisory unavailable: claude CLI could not be started$/u,
     ],
   ];
 
