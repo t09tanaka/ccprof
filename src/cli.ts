@@ -714,6 +714,7 @@ function parseRulesArgs(args: readonly string[]): ParsedRulesCommand {
 export function parseCliArgs(
   args: readonly string[],
 ): ParsedCliCommand {
+  if (args[0] === "rules") return parseRulesArgs(args.slice(1));
   if (args.includes("--help") || args.includes("-h")) {
     return { kind: "help" };
   }
@@ -726,7 +727,6 @@ export function parseCliArgs(
   if (args[0] === "hook-event") return parseHookEventArgs(args.slice(1));
   if (args[0] === "hooks") return parseHooksArgs(args.slice(1));
   if (args[0] === "data") return parseDataArgs(args.slice(1));
-  if (args[0] === "rules") return parseRulesArgs(args.slice(1));
   return parseAnalyzeArgs(args);
 }
 

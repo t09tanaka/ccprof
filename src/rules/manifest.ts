@@ -207,7 +207,9 @@ export function listRuleManifests(): RuleManifest[] { return BUILTIN_CATALOG.map
 export function ruleManifest(id: string): RuleManifest {
   const entry = BUILTIN_CATALOG.find((candidate) => candidate.id === id);
   if (entry === undefined) {
-    throw new TypeError(`unknown rule id ${id}; expected ${RULE_IDS.join(", ")}`);
+    const safeId = typeof id === "string" && /^R\d{3}$/u.test(id)
+      ? ` ${id}` : "";
+    throw new TypeError(`unknown rule id${safeId}; expected ${RULE_IDS.join(", ")}`);
   }
   return clone(entry);
 }
