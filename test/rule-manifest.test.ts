@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -32,8 +35,14 @@ import {
   findingKey,
   findingKeyForCompatibility,
 } from "../src/rules/shared.js";
-import { analysisDigest, makeAnalysisRecord } from "../src/store/analyses.js";
+import {
+  analysisDigest,
+  loadAnalyses,
+  makeAnalysisRecord,
+  saveAnalysis,
+} from "../src/store/analyses.js";
 import { applyDismissals } from "../src/store/dismissals.js";
+import { resolveStorePaths } from "../src/store/paths.js";
 
 const SOURCES = ["claude", "codex"] as const;
 
@@ -186,6 +195,27 @@ function manifestError(
   );
 }
 
+function contentFreeManifestError(
+  value: unknown,
+  code: string,
+  index?: number,
+  field?: string,
+): void {
+  assert.throws(
+    () => validateRuleManifestCatalog(value),
+    (error: unknown) => {
+      if (!(error instanceof Error)) return false;
+      const failure = error as RuleManifestValidationError;
+      assert.equal(error.constructor, RuleManifestValidationError);
+      assert.equal(failure.code, code);
+      assert.equal(failure.index, index);
+      assert.equal(failure.field, field);
+      assert.doesNotMatch(failure.message, /token-secret/u);
+      return true;
+    },
+  );
+}
+
 function finding(ruleId: RuleId = "R001", target = "npm test"): Finding {
   return {
     finding_key: findingKey(ruleId, target),
@@ -328,6 +358,63 @@ test("manifest validation fails closed for sparse, hidden, and trapped inputs", 
         return true;
       },
     );
+  }
+});
+
+test("manifest validation snapshots catalog and nested arrays without Proxy reads", () => {
+  let catalogGets = 0;
+  const proxiedCatalog = new Proxy(catalog(), {
+    get(target, property, receiver) {
+      if (property === "length" || property === "0" || property === Symbol.iterator) {
+        catalogGets += 1;
+        throw new Error("token-secret catalog get trap");
+      }
+      return Reflect.get(target, property, receiver) as unknown;
+    },
+  });
+  assert.deepEqual(validateRuleManifestCatalog(proxiedCatalog), EXPECTED);
+  assert.equal(catalogGets, 0);
+
+  const trappedCatalog = new Proxy(catalog(), {
+    getOwnPropertyDescriptor(target, property) {
+      if (property === "length") {
+        throw new Error("token-secret catalog descriptor trap");
+      }
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+  });
+  contentFreeManifestError(trappedCatalog, "invalid_catalog");
+
+  for (const [field, code] of [
+    ["required_capabilities", "invalid_capability"],
+    ["supported_sources", "invalid_source"],
+  ] as const) {
+    const value = catalog();
+    const source = value[0]![field] as string[];
+    let nestedGets = 0;
+    value[0]![field] = new Proxy(source, {
+      get(target, property, receiver) {
+        if (property === "length" || property === "0" || property === Symbol.iterator) {
+          nestedGets += 1;
+          throw new Error("token-secret nested get trap");
+        }
+        return Reflect.get(target, property, receiver) as unknown;
+      },
+    });
+    assert.deepEqual(validateRuleManifestCatalog(value), EXPECTED);
+    assert.equal(nestedGets, 0);
+
+    const trapped = catalog();
+    const trappedSource = trapped[0]![field] as string[];
+    trapped[0]![field] = new Proxy(trappedSource, {
+      getOwnPropertyDescriptor(target, property) {
+        if (property === "length" || property === "0") {
+          throw new Error("token-secret nested descriptor trap");
+        }
+        return Reflect.getOwnPropertyDescriptor(target, property);
+      },
+    });
+    contentFreeManifestError(trapped, code, 0, field);
   }
 });
 
@@ -493,6 +580,69 @@ test("Store snapshots compatibility metadata without reading Proxy values", () =
         return true;
       },
     );
+  }
+});
+
+test("saveAnalysis snapshots compatibility metadata on every input path", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-rule-manifest-store-"));
+  try {
+    const repo = join(root, "repo");
+    await mkdir(repo);
+    const paths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+      home_dir: join(root, "home"),
+    });
+    const decorated = withRuleManifest(finding("R001"));
+    const base = makeAnalysisRecord({
+      analysis_id: "proxy-record",
+      created_at_ms: 1,
+      unit: { repo: "repo-id", pr_ref: "pr-ref", sessions: ["session-id"] },
+      summary: reportWith(decorated).summary,
+      findings: [decorated],
+    });
+    let metadataGets = 0;
+    const lying = new Proxy(base.findings[0]!, {
+      get(target, property, receiver) {
+        if (property === "rule_version" || property === "compatibility_epoch") {
+          metadataGets += 1;
+          return property === "rule_version" ? "token-secret" : 99;
+        }
+        return Reflect.get(target, property, receiver) as unknown;
+      },
+      getOwnPropertyDescriptor(target, property) {
+        return Reflect.getOwnPropertyDescriptor(target, property);
+      },
+    });
+    const saved = await saveAnalysis(paths, { ...base, findings: [lying] });
+    assert.deepEqual(saved.warnings, []);
+    assert.equal(saved.record.findings[0]?.rule_version, "1.0.0");
+    assert.equal(saved.record.findings[0]?.compatibility_epoch, 1);
+    assert.equal(metadataGets, 0);
+
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded.warnings, []);
+    assert.equal(loaded.records.length, 1);
+    assert.equal(loaded.records[0]?.findings[0]?.rule_version, "1.0.0");
+    assert.equal(loaded.records[0]?.findings[0]?.compatibility_epoch, 1);
+
+    const trapped = new Proxy(base.findings[0]!, {
+      ownKeys() { throw new Error("token-secret save trap"); },
+    });
+    await assert.rejects(
+      saveAnalysis(paths, {
+        ...base,
+        analysis_id: "trapped-record",
+        findings: [trapped],
+      }),
+      (error: unknown) => {
+        if (!(error instanceof Error)) return false;
+        assert.equal(error.constructor, TypeError);
+        assert.doesNotMatch(error.message, /token-secret/u);
+        return true;
+      },
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
