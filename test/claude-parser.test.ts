@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 
 import type {
   Confidence,
@@ -17,9 +17,35 @@ import {
   parseClaudeTranscript,
   parseClaudeTranscriptDetailed,
 } from "../src/sources/claude/parser.js";
+import { ParserBudgetExceededError } from "../src/sources/jsonl-budget.js";
 
 const fixture = (name: string): string =>
   resolve(process.cwd(), "test", "fixtures", "claude", name);
+
+async function tempClaudeTranscript(
+  t: TestContext,
+  name: string,
+  raw: string,
+): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "ccprof-claude-budget-"));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, name);
+  await writeFile(path, raw);
+  return path;
+}
+
+function budgetClaudeRow(index: number, content = `message-${index}`): string {
+  return JSON.stringify({
+    sessionId: "budget-claude",
+    cwd: "/workspace/repo",
+    gitBranch: "feature/budget",
+    isSidechain: false,
+    type: "user",
+    uuid: `budget-${index}`,
+    timestamp: new Date(Date.UTC(2026, 6, 31, 18, 0, index)).toISOString(),
+    message: { role: "user", content },
+  });
+}
 
 function assertStatusEvidence(
   result: ToolResultEvent,
@@ -1426,4 +1452,165 @@ test("freezes Claude rows at an inclusive end snapshot without renumbering", asy
     ["invalid_timestamp", 8], ["invalid_timestamp", 9],
     ["missing_session_id", 10], ["invalid_json", 12], ["invalid_row", 13],
   ]);
+});
+
+test("Claude parser accepts the exact CRLF line-byte limit and stops before an overlong line", async (t) => {
+  const accepted = budgetClaudeRow(0, "界".repeat(64));
+  const overlong = budgetClaudeRow(1, `${"界".repeat(64)}x`);
+  assert.equal(Buffer.byteLength(overlong), Buffer.byteLength(accepted) + 1);
+  const parsed = await parseClaudeTranscriptDetailed(
+    await tempClaudeTranscript(t, "line-budget.jsonl", `${accepted}\r\n${overlong}\r\n`),
+    { budgets: { maxLineBytes: Buffer.byteLength(accepted) } },
+  );
+
+  assert.deepEqual(
+    parsed.sessions.flatMap((session) =>
+      session.events.map((event) => event.entry_uuid)
+    ),
+    ["budget-0"],
+  );
+  assert.ok(parsed.warnings.some(
+    (warning) => warning.code === "parser_line_budget_exceeded" && warning.line === 2,
+  ));
+});
+
+test("Claude parser counts a lone trailing CR at EOF as line content", async (t) => {
+  const row = budgetClaudeRow(0);
+  const exactJsonBytes = Buffer.byteLength(row);
+  const raw = `${row}\r`;
+  assert.equal(Buffer.byteLength(raw), exactJsonBytes + 1);
+  const path = await tempClaudeTranscript(t, "lone-cr-budget.jsonl", raw);
+
+  const exhausted = await parseClaudeTranscriptDetailed(path, {
+    budgets: { maxLineBytes: exactJsonBytes },
+  });
+  assert.deepEqual(exhausted.sessions, []);
+  assert.ok(exhausted.warnings.some(
+    (warning) =>
+      warning.code === "parser_line_budget_exceeded" && warning.line === 1,
+  ));
+
+  const accepted = await parseClaudeTranscriptDetailed(path, {
+    budgets: { maxLineBytes: exactJsonBytes + 1 },
+  });
+  assert.deepEqual(accepted.sessions[0]?.events.map(
+    (event) => event.entry_uuid,
+  ), ["budget-0"]);
+  assert.equal(accepted.warnings.some(
+    (warning) => warning.code === "parser_line_budget_exceeded",
+  ), false);
+});
+
+test("Claude parser skips node-heavy rows while bounding warning growth", async (t) => {
+  const wideRows = Array.from({ length: 64 }, (_, index) => JSON.stringify({
+    sessionId: "budget-claude",
+    type: "user",
+    uuid: `wide-${index}`,
+    timestamp: new Date(Date.UTC(2026, 6, 31, 18, 1, index)).toISOString(),
+    message: { role: "user", content: Array.from({ length: 64 }, () => 1) },
+  }));
+  const parsed = await parseClaudeTranscriptDetailed(
+    await tempClaudeTranscript(
+      t,
+      "node-warning-budget.jsonl",
+      `${[...wideRows, budgetClaudeRow(65)].join("\n")}\n`,
+    ),
+    { budgets: { maxNodesPerLine: 32, maxWarnings: 3 } },
+  );
+
+  assert.deepEqual(parsed.sessions[0]?.events.map((event) => event.entry_uuid), [
+    "budget-65",
+  ]);
+  assert.equal(parsed.warnings.length, 3);
+  assert.equal(parsed.warnings.at(-1)?.code, "parser_warning_budget_exceeded");
+  assert.ok(parsed.warnings.some(
+    (warning) => warning.code === "parser_node_budget_exceeded",
+  ));
+});
+
+test("Claude parser skips over-depth rows before recursive normalization", async (t) => {
+  let nested: unknown = "deep";
+  for (let depth = 0; depth < 16; depth += 1) nested = [nested];
+  const deepRow = JSON.stringify({
+    sessionId: "budget-claude",
+    type: "user",
+    uuid: "too-deep",
+    timestamp: "2026-07-31T18:02:00.000Z",
+    message: { role: "user", content: nested },
+  });
+  const parsed = await parseClaudeTranscriptDetailed(
+    await tempClaudeTranscript(
+      t,
+      "depth-budget.jsonl",
+      `${deepRow}\n${budgetClaudeRow(66)}\n`,
+    ),
+    { budgets: { maxNestingDepth: 2 } },
+  );
+
+  assert.deepEqual(parsed.sessions[0]?.events.map((event) => event.entry_uuid), [
+    "budget-66",
+  ]);
+  assert.ok(parsed.warnings.some(
+    (warning) => warning.code === "parser_depth_budget_exceeded" && warning.line === 1,
+  ));
+});
+
+test("Claude parser caps retained bytes in source order", async (t) => {
+  const rows = [0, 1, 2].map((index) => budgetClaudeRow(index));
+  const parsed = await parseClaudeTranscriptDetailed(
+    await tempClaudeTranscript(t, "retained-event-budget.jsonl", `${rows.join("\n")}\n`),
+    {
+      budgets: {
+        maxRetainedBytes: Buffer.byteLength(rows[0]!) + Buffer.byteLength(rows[1]!),
+      },
+    },
+  );
+
+  const session = parsed.sessions[0];
+  assert.ok(session);
+  assert.deepEqual(session.events.map((event) => event.entry_uuid), [
+    "budget-0",
+    "budget-1",
+  ]);
+  assert.equal(session.started_at_ms, session.events[0]?.timestamp_ms);
+  assert.equal(session.ended_at_ms, session.events[1]?.timestamp_ms);
+  assert.ok(parsed.warnings.some(
+    (warning) => warning.code === "parser_byte_budget_exceeded" && warning.line === 3,
+  ));
+});
+
+test("Claude parser rejects an aborted parse without returning a partial session", async (t) => {
+  const controller = new AbortController();
+  controller.abort(new Error("stop Claude parsing"));
+  const path = await tempClaudeTranscript(t, "aborted.jsonl", budgetClaudeRow(0));
+
+  await assert.rejects(
+    parseClaudeTranscriptDetailed(path, { signal: controller.signal }),
+    /stop Claude parsing/u,
+  );
+});
+
+test("Claude parser preserves a budget-shaped mid-read abort reason", async (t) => {
+  const raw = `${Array.from({ length: 2_000 }, (_, index) =>
+    budgetClaudeRow(index)).join("\n")}\n`;
+  const path = await tempClaudeTranscript(t, "mid-read-abort.jsonl", raw);
+  const controller = new AbortController();
+  const reason = new ParserBudgetExceededError("line", 999);
+  const originalThrowIfAborted = controller.signal.throwIfAborted.bind(
+    controller.signal,
+  );
+  let checks = 0;
+  Object.defineProperty(controller.signal, "throwIfAborted", {
+    configurable: true,
+    value: () => {
+      checks += 1;
+      if (checks === 4) controller.abort(reason);
+      originalThrowIfAborted();
+    },
+  });
+  const parsing = parseClaudeTranscriptDetailed(path, {
+    signal: controller.signal,
+  });
+
+  await assert.rejects(parsing, (error) => error === reason);
 });

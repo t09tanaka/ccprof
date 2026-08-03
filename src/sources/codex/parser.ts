@@ -1,6 +1,4 @@
-import { createReadStream } from "node:fs";
 import { basename } from "node:path";
-import { createInterface } from "node:readline";
 
 import {
   makeSessionRef,
@@ -16,6 +14,14 @@ import {
   type ToolResultStatus,
   type ToolUseEvent,
 } from "../../core/model.js";
+import {
+  boundedJsonlLines,
+  boundedWarnings,
+  budgetWarningCode,
+  JsonlBudgetTracker,
+  ParserBudgetExceededError,
+  type JsonlParserControls,
+} from "../jsonl-budget.js";
 
 /**
  * Codex rollout logs are one JSON object per line:
@@ -26,7 +32,7 @@ import {
  * most one `Session` per call (a rollout file represents a single Codex
  * session). The returned promise rejects when the file cannot be read.
  */
-export interface ParseCodexSessionOptions {
+export interface ParseCodexSessionOptions extends JsonlParserControls {
   sourcePath: string;
   endedAtMs?: number;
 }
@@ -99,17 +105,27 @@ function fileNameStem(sourcePath: string): string {
 }
 
 async function parseRows(
-  sourcePath: string,
-  endedAtMs?: number,
-): Promise<{ rows: ParsedRow[]; warnings: SourceWarning[] }> {
-  const warnings: SourceWarning[] = [];
+  options: ParseCodexSessionOptions,
+): Promise<{ rows: ParsedRow[]; warnings: SourceWarning[];
+  tracker: JsonlBudgetTracker;
+  firstBudgetError: ParserBudgetExceededError | undefined }> {
+  const { sourcePath, endedAtMs } = options;
+  const tracker = new JsonlBudgetTracker(options);
+  const warnings = boundedWarnings<SourceWarning>(
+    tracker.budgets.maxWarnings,
+    () => warn(
+      sourcePath,
+      undefined,
+      "parser_warning_budget_exceeded",
+      "Suppressed further parser warnings after reaching maxWarnings.",
+    ),
+  );
   const rows: ParsedRow[] = [];
-  const input = createReadStream(sourcePath, { encoding: "utf8" });
-  const lines = createInterface({ input, crlfDelay: Infinity });
-  let line = 0;
+  let firstBudgetError: ParserBudgetExceededError | undefined;
 
-  for await (const rawLine of lines) {
-    line += 1;
+  try {
+    for await (const inputLine of boundedJsonlLines(sourcePath, tracker)) {
+      const { text: rawLine, bytes: rawBytes, line } = inputLine;
     if (rawLine.trim().length === 0) {
       continue;
     }
@@ -126,6 +142,17 @@ async function parseRows(
     if (!isRecord(parsed)) {
       warnings.push(
         warn(sourcePath, line, "codex_row_invalid", "JSONL row is not an object."),
+      );
+      continue;
+    }
+    try {
+      tracker.assertNodes(parsed, line);
+    } catch (error) {
+      tracker.throwIfAborted();
+      if (!(error instanceof ParserBudgetExceededError)) throw error;
+      firstBudgetError ??= error;
+      warnings.push(
+        warn(sourcePath, error.line, budgetWarningCode(error), error.message),
       );
       continue;
     }
@@ -161,10 +188,29 @@ async function parseRows(
       continue;
     }
 
+    try {
+      tracker.retain(rawBytes, line);
+    } catch (error) {
+      tracker.throwIfAborted();
+      if (!(error instanceof ParserBudgetExceededError)) throw error;
+      firstBudgetError ??= error;
+      warnings.push(
+        warn(sourcePath, error.line, budgetWarningCode(error), error.message),
+      );
+      break;
+    }
     rows.push({ type, payload: parsed.payload, timestampMs, line });
+    }
+  } catch (error) {
+    tracker.throwIfAborted();
+    if (!(error instanceof ParserBudgetExceededError)) throw error;
+    firstBudgetError ??= error;
+    warnings.push(
+      warn(sourcePath, error.line, budgetWarningCode(error), error.message),
+    );
   }
 
-  return { rows, warnings };
+  return { rows, warnings, tracker, firstBudgetError };
 }
 
 /** Joins string `text` parts out of a Codex message `content` field. */
@@ -303,6 +349,8 @@ function buildFunctionCallEvent(
   warnings: SourceWarning[],
   sourcePath: string,
   sessionCwd: string | undefined,
+  tracker: JsonlBudgetTracker,
+  onBudgetError: (error: ParserBudgetExceededError) => void,
 ): ToolUseEvent | undefined {
   const callId = nonEmptyString(row.payload.call_id);
   const name = nonEmptyString(row.payload.name);
@@ -324,12 +372,20 @@ function buildFunctionCallEvent(
   if (typeof argumentsRaw === "string") {
     try {
       const parsedArguments: unknown = JSON.parse(argumentsRaw);
+      tracker.assertNodes(parsedArguments, row.line);
       if (isRecord(parsedArguments)) {
         input = parsedArguments as JsonObject;
       } else {
         hasSchemaLoss = true;
       }
-    } catch {
+    } catch (error) {
+      tracker.throwIfAborted();
+      if (error instanceof ParserBudgetExceededError) {
+        onBudgetError(error);
+        warnings.push(warn(sourcePath, error.line,
+          budgetWarningCode(error), error.message));
+        return undefined;
+      }
       hasSchemaLoss = true;
     }
     if (hasSchemaLoss) {
@@ -472,8 +528,8 @@ function buildFunctionCallOutputEvent(
 export async function parseCodexSession(
   options: ParseCodexSessionOptions,
 ): Promise<Session | null> {
-  const { sourcePath, endedAtMs } = options;
-  const { rows, warnings } = await parseRows(sourcePath, endedAtMs);
+  const { sourcePath } = options;
+  let { rows, warnings, tracker, firstBudgetError } = await parseRows(options);
 
   const sessionMetaRow = rows.find((row) => row.type === "session_meta");
   let sessionMetaId: string | undefined;
@@ -507,6 +563,7 @@ export async function parseCodexSession(
   const events: NormalizedEvent[] = [];
   const warnedUnknownSubtypes = new Set<string>();
   for (const row of rows) {
+    tracker.throwIfAborted();
     if (row.type !== "response_item") {
       continue;
     }
@@ -526,6 +583,8 @@ export async function parseCodexSession(
         warnings,
         sourcePath,
         sessionMetaCwd,
+        tracker,
+        (error) => { firstBudgetError ??= error; },
       );
       if (event !== undefined) {
         events.push(event);
@@ -566,10 +625,16 @@ export async function parseCodexSession(
   }
 
   if (events.length === 0) {
+    if (firstBudgetError !== undefined) throw firstBudgetError;
     return null;
   }
 
-  const timestamps = events.map((event) => event.timestamp_ms);
+  let startedAtMs = events[0]!.timestamp_ms;
+  let endedAtMs = startedAtMs;
+  for (const event of events) {
+    startedAtMs = Math.min(startedAtMs, event.timestamp_ms);
+    endedAtMs = Math.max(endedAtMs, event.timestamp_ms);
+  }
   const observedCwds = [...new Set([
     ...(sessionMetaCwd === undefined ? [] : [sessionMetaCwd]),
     ...events.flatMap((event) =>
@@ -588,8 +653,8 @@ export async function parseCodexSession(
     observed_cwds: observedCwds,
     observed_branches:
       sessionMetaBranch !== undefined ? [sessionMetaBranch] : [],
-    started_at_ms: Math.min(...timestamps),
-    ended_at_ms: Math.max(...timestamps),
+    started_at_ms: startedAtMs,
+    ended_at_ms: endedAtMs,
     confidence,
     events,
     warnings,

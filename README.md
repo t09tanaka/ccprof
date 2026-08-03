@@ -474,6 +474,16 @@ Malformed rows, unknown content blocks, and missing results degrade into warning
 and lower confidence instead of taking analyzable sessions down with them.
 Sidechains and compaction are normalized as well.
 
+Both JSONL adapters enforce finite per-transcript parser budgets by default:
+512 MiB per file, 8 MiB per physical line, 200,000 JSON nodes per line, nesting
+depth 128, 128 MiB of retained valid-row bytes, and 1,000 warnings. Exhaustion
+preserves a deterministic warned prefix (a node-heavy or over-depth row alone
+is skipped), while a warning flood is capped. Programmatic parser callers can
+override individual limits and supply an `AbortSignal`; limits are inclusive,
+CRLF delimiters do not consume the line-content budget, and cancellation
+rejects with its original reason instead of returning a misleading partial
+success.
+
 Markdown, baselines, and store-driven R006 were originally Phase 2 items, but
 they are included in this release. Framework-specific flaky test name
 extraction remains a future extension. The opt-in LLM advisory layer that was

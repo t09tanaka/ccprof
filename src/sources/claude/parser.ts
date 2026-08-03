@@ -1,6 +1,4 @@
-import { createReadStream } from "node:fs";
 import { basename } from "node:path";
-import { createInterface } from "node:readline";
 
 import {
   makeSessionRef,
@@ -17,6 +15,14 @@ import {
   type ToolResultStatus,
   type ToolUseEvent,
 } from "../../core/model.js";
+import {
+  boundedJsonlLines,
+  boundedWarnings,
+  budgetWarningCode,
+  JsonlBudgetTracker,
+  ParserBudgetExceededError,
+  type JsonlParserControls,
+} from "../jsonl-budget.js";
 
 export const MAX_TOOL_OUTPUT_BYTES = 16_384;
 /** Maximum UTF-8 bytes retained for any non-path/command tool-input string. */
@@ -127,7 +133,8 @@ export interface ClaudeParserInstrumentation {
   onAssistantPrefixProbe?(): void;
 }
 
-export interface ClaudeTranscriptParseOptions extends ClaudeParserInstrumentation {
+export interface ClaudeTranscriptParseOptions
+  extends ClaudeParserInstrumentation, JsonlParserControls {
   endedAtMs?: number;
 }
 
@@ -833,18 +840,31 @@ function warning(
   };
 }
 
+function parserBudgetWarning(
+  sourcePath: string, error: ParserBudgetExceededError,
+): PendingWarning {
+  return warning(sourcePath, budgetWarningCode(error), error.message,
+    error.line === undefined ? {} : { line: error.line });
+}
 async function readRows(
   sourcePath: string,
-  endedAtMs?: number,
-): Promise<{ rows: ParsedRow[]; warnings: PendingWarning[] }> {
+  options: ClaudeTranscriptParseOptions,
+): Promise<{ rows: ParsedRow[]; warnings: PendingWarning[];
+  tracker: JsonlBudgetTracker }> {
+  const tracker = new JsonlBudgetTracker(options);
   const rows: ParsedRow[] = [];
-  const warnings: PendingWarning[] = [];
-  const input = createReadStream(sourcePath, { encoding: "utf8" });
-  const lines = createInterface({ input, crlfDelay: Infinity });
-  let line = 0;
+  const warnings = boundedWarnings<PendingWarning>(
+    tracker.budgets.maxWarnings,
+    () => warning(
+      sourcePath,
+      "parser_warning_budget_exceeded",
+      "Suppressed further parser warnings after reaching maxWarnings.",
+    ),
+  );
 
-  for await (const rawLine of lines) {
-    line += 1;
+  try {
+    for await (const inputLine of boundedJsonlLines(sourcePath, tracker)) {
+      const { text: rawLine, bytes: rawBytes, line } = inputLine;
     if (rawLine.trim().length === 0) {
       warnings.push(
         warning(sourcePath, "empty_line", "Ignored an empty JSONL row.", {
@@ -873,6 +893,14 @@ async function readRows(
       );
       continue;
     }
+    try {
+      tracker.assertNodes(parsed, line);
+    } catch (error) {
+      tracker.throwIfAborted();
+      if (!(error instanceof ParserBudgetExceededError)) throw error;
+      warnings.push(parserBudgetWarning(sourcePath, error));
+      continue;
+    }
 
     const timestampMs = parseTimestamp(parsed.timestamp);
     if (timestampMs === undefined) {
@@ -895,7 +923,9 @@ async function readRows(
       }
       continue;
     }
-    if (endedAtMs !== undefined && timestampMs > endedAtMs) continue;
+    if (options.endedAtMs !== undefined && timestampMs > options.endedAtMs) {
+      continue;
+    }
 
     const sessionId = nonEmptyString(parsed.sessionId);
     if (sessionId === undefined) {
@@ -907,6 +937,14 @@ async function readRows(
     const isKnownAuxiliaryRow =
       rowType !== undefined && KNOWN_AUXILIARY_ROW_TYPES.has(rowType);
 
+    try {
+      tracker.retain(rawBytes, line);
+    } catch (error) {
+      tracker.throwIfAborted();
+      if (!(error instanceof ParserBudgetExceededError)) throw error;
+      warnings.push(parserBudgetWarning(sourcePath, error));
+      break;
+    }
     const sourceIndex = line - 1;
     const observedUuid = nonEmptyString(parsed.uuid);
     const entryUuid =
@@ -953,9 +991,14 @@ async function readRows(
         ),
       );
     }
+    }
+  } catch (error) {
+    tracker.throwIfAborted();
+    if (!(error instanceof ParserBudgetExceededError)) throw error;
+    warnings.push(parserBudgetWarning(sourcePath, error));
   }
 
-  return { rows, warnings };
+  return { rows, warnings, tracker };
 }
 
 function uniqueStrings(values: Array<string | undefined>): string[] {
@@ -1113,8 +1156,11 @@ function parseAssistantBlocks(
 }
 
 function maxDefined(values: Array<number | undefined>): number | undefined {
-  const present = values.filter((value): value is number => value !== undefined);
-  return present.length === 0 ? undefined : Math.max(...present);
+  let maximum: number | undefined;
+  for (const value of values) {
+    if (value !== undefined) maximum = Math.max(maximum ?? value, value);
+  }
+  return maximum;
 }
 
 interface AssistantTextLane {
@@ -1402,8 +1448,9 @@ function normalizeSession(
   sourcePath: string,
   sessionRows: ParsedRow[],
   allWarnings: PendingWarning[],
-  instrumentation: ClaudeParserInstrumentation,
+  instrumentation: ClaudeTranscriptParseOptions,
 ): Session | undefined {
+  instrumentation.signal?.throwIfAborted();
   const first = sessionRows[0];
   if (first === undefined) {
     return undefined;
@@ -1411,6 +1458,7 @@ function normalizeSession(
   const sessionId = first.sessionId;
   const rowsByUuid = new Map<string, ParsedRow[]>();
   for (const row of sessionRows) {
+    instrumentation.signal?.throwIfAborted();
     const matches = rowsByUuid.get(row.entryUuid);
     if (matches === undefined) {
       rowsByUuid.set(row.entryUuid, [row]);
@@ -1499,6 +1547,7 @@ function normalizeSession(
   const resultPositions = new Map<string, number>();
 
   for (const row of sessionRows) {
+    instrumentation.signal?.throwIfAborted();
     const compact = compactionEvent(row, agentFor(row));
     if (compact !== undefined) {
       ordered.push({ event: compact, suborder: 0 });
@@ -1585,6 +1634,7 @@ function normalizeSession(
   }
 
   for (const group of assistantGroups.values()) {
+    instrumentation.signal?.throwIfAborted();
     const blocks = dedupeAssistantBlocks(group, instrumentation);
     const hasSchemaLoss = group.some((item) => item.hasSchemaLoss);
     const textBlocks = blocks.filter(
@@ -1636,7 +1686,12 @@ function normalizeSession(
         item.targetSessionId === undefined || item.targetSessionId === sessionId,
     )
     .map(({ targetSessionId: _targetSessionId, ...item }) => item);
-  const timestamps = events.map((event) => event.timestamp_ms);
+  let startedAtMs = events[0]!.timestamp_ms;
+  let endedAtMs = startedAtMs;
+  for (const event of events) {
+    startedAtMs = Math.min(startedAtMs, event.timestamp_ms);
+    endedAtMs = Math.max(endedAtMs, event.timestamp_ms);
+  }
   const confidence: Confidence = events.some(
     (event) => event.confidence === "low",
   )
@@ -1649,8 +1704,8 @@ function normalizeSession(
     source_path: sourcePath,
     observed_cwds: uniqueStrings(sessionRows.map((row) => row.cwd)),
     observed_branches: uniqueStrings(sessionRows.map((row) => row.branch)),
-    started_at_ms: Math.min(...timestamps),
-    ended_at_ms: Math.max(...timestamps),
+    started_at_ms: startedAtMs,
+    ended_at_ms: endedAtMs,
     confidence,
     events,
     warnings: sessionWarnings,
@@ -1661,9 +1716,10 @@ export async function parseClaudeTranscriptDetailed(
   sourcePath: string,
   instrumentation: ClaudeTranscriptParseOptions = {},
 ): Promise<ClaudeTranscriptParseResult> {
-  const { rows, warnings } = await readRows(sourcePath, instrumentation.endedAtMs);
+  const { rows, warnings, tracker } = await readRows(sourcePath, instrumentation);
   const grouped = new Map<string, ParsedRow[]>();
   for (const row of rows) {
+    tracker.throwIfAborted();
     const group = grouped.get(row.sessionId);
     if (group === undefined) {
       grouped.set(row.sessionId, [row]);
@@ -1674,15 +1730,14 @@ export async function parseClaudeTranscriptDetailed(
 
   const sessions: Session[] = [];
   for (const sessionRows of grouped.values()) {
+    tracker.throwIfAborted();
     const session = normalizeSession(
       sourcePath,
       sessionRows,
       warnings,
       instrumentation,
     );
-    if (session !== undefined) {
-      sessions.push(session);
-    }
+    if (session !== undefined) sessions.push(session);
   }
   return {
     sessions,
