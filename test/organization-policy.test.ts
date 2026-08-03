@@ -23,14 +23,21 @@ import {
   loadRepositoryPolicyPreferences,
   RepositoryConfigError,
 } from "../src/analysis/repository-config.js";
+import { runAnalyzeCommand } from "../src/commands/analyze.js";
+import { runStatsCommand } from "../src/commands/stats.js";
+import type { ReportV2 } from "../src/core/model.js";
 import {
   canonicalOrganizationPolicy,
   loadConfiguredOrganizationPolicy,
   OrganizationPolicyError,
   parseOrganizationPolicy,
   resolveEffectivePolicy,
+  resolveRepositoryPolicy,
+  type EffectivePolicy,
   type OrganizationPolicy,
+  type PolicyRequest,
 } from "../src/policy/organization-policy.js";
+import { renderJsonReport } from "../src/reporters/json.js";
 
 const ENVIRONMENT_KEYS = {
   organization: "CCPROF_ORGANIZATION",
@@ -51,6 +58,43 @@ function policy(
     allow_export: true,
     raw_retention_days_max: 14,
     required_source_coverage: 0.9,
+    ...overrides,
+  };
+}
+
+function report(repoRoot: string): ReportV2 {
+  return {
+    version: 2,
+    unit: {
+      repo: repoRoot,
+      pr_ref: "private-feature",
+      sessions: ["private-session"],
+    },
+    summary: {
+      measured_min: 1,
+      idle_excluded_min: 0,
+      estimated_floor_min: 1,
+      recoverable_min: 0,
+      human_wait_min: 0,
+      unexplained_min: 1,
+      baseline: null,
+    },
+    findings: [],
+    caveats: [],
+  };
+}
+
+function effectivePolicy(
+  overrides: Partial<EffectivePolicy> = {},
+): EffectivePolicy {
+  return {
+    governed: false,
+    privacy: "raw",
+    allow_raw: true,
+    allow_advisory: true,
+    advisory_enabled: true,
+    allow_export: true,
+    required_source_coverage: 0,
     ...overrides,
   };
 }
@@ -918,4 +962,146 @@ test("ungoverned policy resolution preserves current CLI defaults", () => {
     raw_retention_days_max: 0,
     required_source_coverage: 1,
   });
+});
+
+test("repository policy resolver composes signed and repository layers", async (t) => {
+  const repoRoot = await temporaryRepository(t);
+  const organization = await signedPolicyFixture(t);
+  await writeRepositoryConfig(repoRoot, {
+    schema_version: 1,
+    policy: {
+      minimum_privacy: "raw",
+      allow_raw: true,
+      allow_advisory: true,
+      allow_export: true,
+      raw_retention_days_max: 30,
+      required_source_coverage: 0.1,
+    },
+  });
+
+  assert.deepEqual(await resolveRepositoryPolicy(
+    repoRoot,
+    { privacy: "raw", advisory: true },
+    organization.environment,
+  ), {
+    governed: true,
+    organization: "example-corp",
+    privacy: "strict",
+    allow_raw: false,
+    allow_advisory: false,
+    advisory_enabled: false,
+    allow_export: true,
+    raw_retention_days_max: 14,
+    required_source_coverage: 0.9,
+  });
+});
+
+test("analyze applies effective privacy and denies advisory before spawning", async (t) => {
+  const repoRoot = await temporaryRepository(t);
+  const rawReport = report(repoRoot);
+  const privateWarning = "/private/policy/warning";
+  let runnerCalls = 0;
+  let resolvedRepo = "";
+  let resolvedRequest: PolicyRequest | undefined;
+  const output = await runAnalyzeCommand({
+    cwd: repoRoot,
+    format: "json",
+    color: false,
+    privacy: "raw",
+    advisory: true,
+  }, {
+    analyze: async () => ({
+      report: rawReport,
+      warnings: [{
+        code: "private_policy_warning",
+        message: privateWarning,
+        source: privateWarning,
+      }],
+    }),
+    resolvePolicy: async (resolved: string, request: PolicyRequest) => {
+      resolvedRepo = resolved;
+      resolvedRequest = request;
+      return effectivePolicy({
+        governed: true,
+        organization: "example-corp",
+        privacy: "strict",
+        allow_raw: false,
+        allow_advisory: false,
+        advisory_enabled: false,
+      });
+    },
+    runCommand: async () => {
+      runnerCalls += 1;
+      return { code: 0, stdout: "must not run", stderr: "" };
+    },
+  });
+
+  assert.equal(resolvedRepo, repoRoot);
+  assert.deepEqual(resolvedRequest, { privacy: "raw", advisory: true });
+  assert.equal(runnerCalls, 0);
+  assert.doesNotMatch(output.stdout, new RegExp(repoRoot, "u"));
+  assert.deepEqual(output.warnings, [
+    "[private_policy_warning] 1 warning",
+    "[policy_advisory_disabled] Advisory execution is disabled by active policy.",
+  ]);
+  assert.doesNotMatch(output.warnings.join("\n"), /private\/policy/u);
+});
+
+test("stats applies the same effective privacy floor before warning projection", async (t) => {
+  const repoRoot = await temporaryRepository(t);
+  const privatePath = "/private/stats/policy-warning";
+  let resolvedRequest: PolicyRequest | undefined;
+  const output = await runStatsCommand({
+    cwd: repoRoot,
+    json: true,
+    privacy: "raw",
+  }, {
+    resolveRepoRoot: async () => repoRoot,
+    resolvePolicy: async (_resolved: string, request: PolicyRequest) => {
+      resolvedRequest = request;
+      return effectivePolicy({ privacy: "strict" });
+    },
+    resolveStorePaths: async () => ({
+      canonical_repo: repoRoot,
+      repo_hash: "hash",
+      root_dir: repoRoot,
+      repo_dir: repoRoot,
+      analyses_dir: repoRoot,
+      history_index_path: join(repoRoot, "history"),
+      dismissals_path: join(repoRoot, "dismissals"),
+      adoptions_path: join(repoRoot, "adoptions"),
+      hook_events_path: join(repoRoot, "hooks"),
+    }),
+    loadAnalyses: async () => ({
+      records: [],
+      warnings: [{
+        code: "private_stats_warning",
+        message: privatePath,
+        path: privatePath,
+      }],
+    }),
+    loadAdoptions: async () => ({ records: [], warnings: [] }),
+  });
+
+  assert.deepEqual(resolvedRequest, { privacy: "raw", advisory: false });
+  assert.deepEqual(output.warnings, ["[private_stats_warning] 1 warning"]);
+  assert.doesNotMatch(output.warnings.join("\n"), /private\/stats/u);
+});
+
+test("ungoverned analyze output remains byte-identical", async (t) => {
+  const repoRoot = await temporaryRepository(t);
+  const rawReport = report(repoRoot);
+  const output = await runAnalyzeCommand({
+    cwd: repoRoot,
+    format: "json",
+    color: false,
+    privacy: "raw",
+  }, {
+    analyze: async () => ({ report: rawReport, warnings: [] }),
+    resolvePolicy: async (_resolved: string, request: PolicyRequest) =>
+      resolveEffectivePolicy({ request }),
+  });
+
+  assert.equal(output.stdout, renderJsonReport(rawReport));
+  assert.deepEqual(output.warnings, []);
 });
