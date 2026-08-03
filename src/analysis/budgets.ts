@@ -154,8 +154,9 @@ function safeAmount(value: number): void {
   }
 }
 
-function safeAdd(left: number, right: number): number {
-  return Math.min(Number.MAX_SAFE_INTEGER, left + right);
+function checkedAdd(left: number, right: number): number | undefined {
+  if (left > Number.MAX_SAFE_INTEGER - right) return undefined;
+  return left + right;
 }
 
 function finiteRatio(numerator: number, denominator: number): number {
@@ -290,11 +291,18 @@ export class AnalysisBudgetMeter {
     requested: number,
   ): number {
     safeAmount(requested);
-    this.#observed[usage] = safeAdd(this.#observed[usage], requested);
     const limit = this.#configured[reason];
     const remaining = Math.max(0, limit - this.#consumed[usage]);
     const admitted = Math.min(requested, remaining);
-    this.#consumed[usage] = safeAdd(this.#consumed[usage], admitted);
+    const observed = checkedAdd(this.#observed[usage], requested);
+    const consumed = checkedAdd(this.#consumed[usage], admitted);
+    if (observed === undefined || consumed === undefined) {
+      this.#recordReason(reason, 0);
+      this.#recordReason("meter_error", 0);
+      return 0;
+    }
+    this.#observed[usage] = observed;
+    this.#consumed[usage] = consumed;
     if (admitted < requested) {
       this.#recordReason(
         reason,

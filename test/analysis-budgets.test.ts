@@ -222,6 +222,26 @@ test("admits only an exact prefix on one-over input and reports finite coverage"
   });
 });
 
+test("fails closed when one-over usage cannot be represented safely", () => {
+  const meter = new AnalysisBudgetMeter(
+    limits({ max_input_bytes: Number.MAX_SAFE_INTEGER }),
+    new ScriptedClock([0], [0]),
+  );
+
+  assert.equal(
+    meter.admitInputBytes(Number.MAX_SAFE_INTEGER),
+    Number.MAX_SAFE_INTEGER,
+  );
+  assert.equal(meter.admitInputBytes(1), 0);
+
+  const result = meter.result();
+  assert.equal(result.completeness, "partial");
+  assert.equal(result.truncation_reason, "max_input_bytes");
+  assert.equal(result.coverage, 0);
+  assert.equal(result.consumed.input_bytes, Number.MAX_SAFE_INTEGER);
+  assert.equal(result.observed.input_bytes, Number.MAX_SAFE_INTEGER);
+});
+
 test("applies one-over semantics to events, output, and source items", () => {
   const cases = [
     {
