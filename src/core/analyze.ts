@@ -56,6 +56,7 @@ import {
   mergeTestMaps,
   type TestMap,
 } from "../analysis/test-map.js";
+import { loadRepositoryConfig } from "../analysis/repository-config.js";
 import { runCommand, type CommandRunner } from "../git/client.js";
 import { collectDiffEvidence } from "../git/diff.js";
 import {
@@ -634,17 +635,21 @@ async function resolveTestMap(
   if (options.testMap !== undefined && options.testMapPath !== undefined) {
     throw new TypeError("testMap and testMapPath are mutually exclusive");
   }
-  const manifest = await discoverManifestTestMap(repoRoot);
+  const [repositoryConfig, manifest] = await Promise.all([
+    loadRepositoryConfig(repoRoot),
+    discoverManifestTestMap(repoRoot),
+  ]);
   if (options.testMap !== undefined) {
-    return mergeTestMaps(options.testMap, manifest);
+    return mergeTestMaps(options.testMap, repositoryConfig, manifest);
   }
   if (options.testMapPath !== undefined) {
     return mergeTestMaps(
       await loadExplicitTestMap(options.testMapPath),
+      repositoryConfig,
       manifest,
     );
   }
-  return manifest;
+  return mergeTestMaps(repositoryConfig, manifest);
 }
 
 function defaultSessionSource(
@@ -963,7 +968,10 @@ function snapshotIdentity(paths: StorePaths, context: PrContext, window: Analysi
       hook_warnings: hookWarnings.map(({ path: _path, ...warning }) => warning) }),
     config_digest: analysisDigest("analysis-config-v1", {
       idle_threshold_ms: options.idleThresholdMs ?? DEFAULT_IDLE_THRESHOLD_MS, mappings,
-      caveats: uniqueSorted(testMap.caveats), external_tool_names: uniqueSorted([...(options.externalToolNames ?? [])]) }),
+      caveats: uniqueSorted(testMap.caveats), external_tool_names: uniqueSorted([...(options.externalToolNames ?? [])]),
+      ...(testMap.config_schema_version === undefined ? {} : {
+        repository_config_schema_version: testMap.config_schema_version,
+      }) }),
     policy_digest: analysisDigest("analysis-policy-v1", {
       fingerprint: "ccprof-rule-policy-2026-08-03-v1",
       applicability: ruleApplicability(sessions), skipped_rules: inapplicable }),

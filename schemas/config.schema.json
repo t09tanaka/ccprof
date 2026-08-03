@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/config.schema.json",
+  "title": "ccprof repository configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version"],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "pattern": "\\S"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "test_map": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mappings"],
+      "properties": {
+        "mappings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["source", "tests", "commands"],
+            "properties": {
+              "source": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "tests": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "commands": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

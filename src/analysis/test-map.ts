@@ -8,7 +8,7 @@ import {
   type CommandDescriptor,
 } from "./command.js";
 
-export type TestMapOrigin = "explicit" | "manifest";
+export type TestMapOrigin = "explicit" | "config" | "manifest";
 
 export interface TestMapping {
   source: string[];
@@ -22,6 +22,7 @@ export interface TestMapping {
 export interface TestMap {
   mappings: TestMapping[];
   caveats: string[];
+  config_schema_version?: 1;
 }
 
 export interface TestRelevance {
@@ -314,9 +315,15 @@ export async function discoverManifestTestMap(
 }
 
 export function mergeTestMaps(...maps: readonly TestMap[]): TestMap {
+  const configSchemaVersion = maps.find(
+    (map) => map.config_schema_version !== undefined,
+  )?.config_schema_version;
   return {
     mappings: maps.flatMap((map) => map.mappings),
     caveats: unique(maps.flatMap((map) => map.caveats)),
+    ...(configSchemaVersion === undefined
+      ? {}
+      : { config_schema_version: configSchemaVersion }),
   };
 }
 
@@ -402,10 +409,11 @@ export function evaluateTestRelevance(
   const applicable = map.mappings.filter((mapping) =>
     mapping.commands.some((command) => commandMatches(descriptor, command))
   );
-  const explicit = applicable.filter((mapping) => mapping.origin === "explicit");
-  const selected = explicit.length > 0
-    ? explicit
-    : applicable.filter((mapping) => mapping.origin === "manifest");
+  const selected = (["explicit", "config", "manifest"] as const)
+    .map((origin) =>
+      applicable.filter((mapping) => mapping.origin === origin)
+    )
+    .find((mappings) => mappings.length > 0) ?? [];
   if (selected.length > 0) {
     const decisions = selected.map((mapping) => ({
       mapping,
