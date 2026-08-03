@@ -349,6 +349,13 @@ function validateInput(input: AnalysisRecordInput): void {
   if (input.unit.repo.trim() === "" || input.unit.pr_ref.trim() === "") {
     throw new TypeError("analysis unit repo and pr_ref must be non-empty");
   }
+  if (
+    !input.findings.every(
+      (finding) => findingCompatibilityMetadata(finding).valid,
+    )
+  ) {
+    throw new TypeError("invalid finding compatibility metadata");
+  }
 }
 
 export function makeAnalysisRecord(
