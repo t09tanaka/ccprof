@@ -10,7 +10,10 @@ const DOCUMENT_PATHS = [
 ] as const;
 
 async function readDocument(path: string): Promise<string> {
-  return readFile(resolve(process.cwd(), path), "utf8");
+  return (await readFile(resolve(process.cwd(), path), "utf8")).replace(
+    /\r\n/gu,
+    "\n",
+  );
 }
 
 test("documentation uses only the installed ccprof command", async () => {

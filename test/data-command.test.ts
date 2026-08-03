@@ -227,7 +227,7 @@ test("data gc applies retention boundaries, reachability, and legacy cleanup", a
     );
     assert.equal(result.warnings.length, 0);
     assert.match(result.stdout, /garbage collection/iu);
-    assert.doesNotMatch(result.stdout, new RegExp(paths.root_dir, "u"));
+    assert.ok(!result.stdout.includes(paths.root_dir));
 
     const after = openStoreDatabase(paths);
     try {
@@ -328,7 +328,7 @@ test("data gc aborts on an incomplete unsafe migration without following it", as
         return /garbage collection failed/iu.test(message);
       },
     );
-    assert.doesNotMatch(message, new RegExp(root, "u"));
+    assert.ok(!message.includes(root));
     assert.equal(await readFile(canary, "utf8"), "keep");
     assert.equal((await lstat(paths.analyses_dir)).isSymbolicLink(), true);
     const database = openStoreDatabase(paths);
@@ -359,7 +359,7 @@ test("forced hook compaction refuses a symlink and does not expose its path", as
         return /garbage collection failed/iu.test(message);
       },
     );
-    assert.doesNotMatch(message, new RegExp(root, "u"));
+    assert.ok(!message.includes(root));
     assert.equal(await readFile(outside, "utf8"), "private hook data\n");
     assert.equal((await lstat(paths.hook_events_path)).isSymbolicLink(), true);
   });
@@ -422,7 +422,7 @@ test("data delete is scoped, future-schema agnostic, idempotent, and symlink-saf
       dependencies(paths),
     );
     assert.equal(result.warnings.length, 0);
-    assert.doesNotMatch(result.stdout, new RegExp(root, "u"));
+    assert.ok(!result.stdout.includes(root));
 
     await mkdir(join(paths.repo_dir, "unknown"), { recursive: true });
     await writeFile(storeDatabasePath(paths), "future schema bytes", "utf8");

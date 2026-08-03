@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm } from "node:fs/promises";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -89,38 +90,59 @@ async function withFakeWindowsTaskkill(
   options: { delayMs: number; exitCode: number },
   run: () => Promise<void>,
 ): Promise<void> {
-  const root = await mkdtemp(join(tmpdir(), "ccprof-taskkill-"));
-  const taskkillPath = join(root, "taskkill");
+  type Spawn = typeof import("node:child_process").spawn;
+  const childProcess = createRequire(import.meta.url)("node:child_process") as {
+    spawn: Spawn;
+  };
+  const originalSpawn = childProcess.spawn;
   const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
-  const previousPath = process.env.PATH;
   assert.ok(platformDescriptor?.configurable);
-  await writeFile(
-    taskkillPath,
-    [
-      "#!/usr/bin/env node",
-      'const pidIndex = process.argv.indexOf("/PID");',
-      "const pid = Number(process.argv[pidIndex + 1]);",
-      `setTimeout(() => {`,
+  const interceptedSpawn = (function (
+    command: string,
+    ...spawnArguments: unknown[]
+  ) {
+    if (command !== "taskkill") {
+      return Reflect.apply(originalSpawn, childProcess, [
+        command,
+        ...spawnArguments,
+      ]);
+    }
+    const taskkillArgs = spawnArguments[0];
+    assert.ok(Array.isArray(taskkillArgs));
+    const pid = Number(taskkillArgs[1]);
+    assert.ok(Number.isSafeInteger(pid) && pid > 0);
+    assert.deepEqual(taskkillArgs, ["/PID", String(pid), "/T", "/F"]);
+    const script = [
+      "const pid = Number(process.argv[1]);",
+      "setTimeout(() => {",
       `  if (${options.exitCode} === 0) {`,
       '    try { process.kill(pid, "SIGKILL"); } catch {}',
       "  }",
       `  process.exit(${options.exitCode});`,
       `}, ${options.delayMs});`,
-    ].join("\n"),
-    { mode: 0o755 },
-  );
+    ].join("\n");
+    return originalSpawn(
+      process.execPath,
+      ["-e", script, String(pid)],
+      { shell: false, stdio: "ignore", windowsHide: true },
+    );
+  }) as unknown as Spawn;
+
   Object.defineProperty(process, "platform", {
     ...platformDescriptor,
     value: "win32",
   });
-  process.env.PATH = `${root}:${previousPath ?? ""}`;
   try {
+    childProcess.spawn = interceptedSpawn;
+    syncBuiltinESMExports();
     await run();
   } finally {
-    Object.defineProperty(process, "platform", platformDescriptor);
-    if (previousPath === undefined) delete process.env.PATH;
-    else process.env.PATH = previousPath;
-    await rm(root, { recursive: true, force: true });
+    try {
+      childProcess.spawn = originalSpawn;
+      syncBuiltinESMExports();
+    } finally {
+      Object.defineProperty(process, "platform", platformDescriptor);
+    }
   }
 }
 

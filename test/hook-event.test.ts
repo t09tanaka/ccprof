@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import {
-  chmod,
   mkdir,
   mkdtemp,
   readFile,
@@ -8,6 +7,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -603,18 +603,33 @@ test("a failing compaction is swallowed and leaves the log intact", async () => 
     const existing = lines.map((line) => `${line}\n`).join("");
     await mkdir(join(paths.hook_events_path, ".."), { recursive: true });
     await writeFile(paths.hook_events_path, existing, "utf8");
-    // Write-only log: the append (O_WRONLY|O_APPEND) still succeeds, but
-    // compaction's readFile fails with EACCES and must be swallowed.
-    await chmod(paths.hook_events_path, 0o200);
+    type ReadFile = typeof readFile;
+    const promises = createRequire(import.meta.url)("node:fs/promises") as {
+      readFile: ReadFile;
+    };
+    const originalReadFile = promises.readFile;
+    let rejectedReads = 0;
+    const failingReadFile = (async (...args: Parameters<ReadFile>) => {
+      if (args[0] === paths.hook_events_path) {
+        rejectedReads += 1;
+        throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+      }
+      return await originalReadFile(...args);
+    }) as ReadFile;
+
     try {
+      promises.readFile = failingReadFile;
+      syncBuiltinESMExports();
       const result = await runHookEventCommand(
         { cwd: "/repo", stdinText: stopPayload(), nowMs: COMPACTION_NOW_MS },
         dependencies,
       );
       assert.deepEqual(result, { stdout: "", warnings: [] });
     } finally {
-      await chmod(paths.hook_events_path, 0o600);
+      promises.readFile = originalReadFile;
+      syncBuiltinESMExports();
     }
+    assert.equal(rejectedReads, 1);
     const text = await readFile(paths.hook_events_path, "utf8");
     assert.equal(
       text,
@@ -753,4 +768,3 @@ test("runCli returns 0 for hook-event even with an unknown flag", async () => {
   });
   assert.equal(code, 0);
 });
-

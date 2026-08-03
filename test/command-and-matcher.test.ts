@@ -333,7 +333,7 @@ test("repository config rejects malformed and non-closed contracts", async (t) =
       (error: unknown) => {
         assert.ok(error instanceof RepositoryConfigError, label);
         assert.match(error.message, /^\.ccprof\/config\.json:/u, label);
-        assert.doesNotMatch(error.message, new RegExp(repoRoot, "u"), label);
+        assert.ok(!error.message.includes(repoRoot), label);
         return true;
       },
     );
