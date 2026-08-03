@@ -339,6 +339,38 @@ test("custom sources cannot opt out of deterministic source and event admission"
   }
 });
 
+test("custom source budget order uses locale-independent code units", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-budget-custom-order-"));
+  try {
+    const repo = await makeRepository(root);
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const upper = identifiedSession(repo, "upper", join(repo, "Z.jsonl"));
+    const lower = identifiedSession(repo, "lower", join(repo, "a.jsonl"));
+
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      sinceMs: NOW_MS - 20 * 60_000,
+      nowMs: NOW_MS,
+      sessionSource: { discover: async () => [lower, upper] },
+      storePaths,
+      persist: false,
+      budgets: budgets({ max_source_items: 1 }),
+      budgetClock: steadyClock,
+    });
+
+    assert.equal(
+      result.report.analysis_budget?.truncation_reason,
+      "max_source_items",
+    );
+    assert.deepEqual(result.report.unit.sessions, ["upper"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("custom source evidence is not admitted after its discovery clock expires", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-budget-custom-clock-"));
   try {

@@ -293,3 +293,137 @@ test("event admission follows one physical source-index prefix across interleave
   assert.equal(meter.result().observed.input_events, 4);
   assert.equal(meter.result().truncation_reason, "max_input_events");
 });
+
+test("event admission removes suffix-derived session metadata and warnings", () => {
+  const sourcePath = "/repo/shared.jsonl";
+  const tool = (
+    entry: string,
+    sourceIndex: number,
+    cwd: string,
+    branch: string,
+  ): Session["events"][number] => ({
+    kind: "tool_use",
+    timestamp_ms: sourceIndex + 1,
+    session_id: "shared",
+    entry_uuid: entry,
+    session_ref: `shared#${entry}`,
+    source_index: sourceIndex,
+    agent_id: "shared",
+    is_sidechain: false,
+    confidence: "high",
+    branch,
+    tool_use_id: entry,
+    tool_name: "Read",
+    input: {},
+    paths: [],
+    edit_fragments: [],
+    cwd,
+  });
+  const prefix = tool("prefix", 0, "/repo/prefix", "feature/prefix");
+  const suffix = tool("suffix", 1, "/repo/suffix", "feature/suffix");
+  const meter = new AnalysisBudgetMeter(
+    budgets({ max_input_events: 1 }),
+    clock,
+  );
+  const admitted = admitSessionEventPrefix([{
+    ...fakeSession(sourcePath),
+    session_id: "shared",
+    observed_cwds: ["/repo/prefix", "/repo/suffix"],
+    observed_branches: ["feature/prefix", "feature/suffix"],
+    events: [prefix, suffix],
+    warnings: [
+      {
+        code: "prefix_warning",
+        message: "prefix",
+        source_path: sourcePath,
+        line: 1,
+        session_ref: prefix.session_ref,
+      },
+      {
+        code: "suffix_warning",
+        message: "suffix",
+        source_path: sourcePath,
+        line: 2,
+        session_ref: suffix.session_ref,
+      },
+      {
+        code: "unscoped_warning",
+        message: "unscoped",
+        source_path: sourcePath,
+      },
+    ],
+  }], meter);
+
+  assert.deepEqual(admitted[0]?.observed_cwds, ["/repo/prefix"]);
+  assert.deepEqual(admitted[0]?.observed_branches, ["feature/prefix"]);
+  assert.deepEqual(
+    admitted[0]?.warnings.map(({ code }) => code),
+    ["prefix_warning"],
+  );
+});
+
+test("event admission uses deterministic identity ties for equal source indices", () => {
+  const tied = (sessionRef: string): Session => {
+    const [sessionId, entryUuid] = sessionRef.split("#") as [string, string];
+    return {
+      ...fakeSession("/repo/shared.jsonl"),
+      session_id: sessionId,
+      events: [{
+        kind: "assistant",
+        timestamp_ms: 1,
+        session_id: sessionId,
+        entry_uuid: entryUuid,
+        session_ref: sessionRef,
+        source_index: 0,
+        agent_id: sessionId,
+        is_sidechain: false,
+        confidence: "high",
+        text: sessionRef,
+      }],
+    };
+  };
+  const meter = new AnalysisBudgetMeter(
+    budgets({ max_input_events: 1 }),
+    clock,
+  );
+
+  const admitted = admitSessionEventPrefix(
+    [tied("z#entry"), tied("a#entry")],
+    meter,
+  );
+
+  assert.deepEqual(admitted.map(({ session_id }) => session_id), ["a"]);
+});
+
+test("event admission computes large-prefix bounds without variadic min/max", () => {
+  const eventCount = 200_000;
+  const events: Session["events"] = Array.from(
+    { length: eventCount },
+    (_, sourceIndex) => ({
+      kind: "assistant",
+      timestamp_ms: eventCount - sourceIndex,
+      session_id: "large",
+      entry_uuid: `entry-${sourceIndex.toString(10)}`,
+      session_ref: `large#${sourceIndex.toString(10)}`,
+      source_index: sourceIndex,
+      agent_id: "large",
+      is_sidechain: false,
+      confidence: "high",
+      text: "",
+    }),
+  );
+  const meter = new AnalysisBudgetMeter(
+    budgets({ max_input_events: eventCount }),
+    clock,
+  );
+
+  const admitted = admitSessionEventPrefix([{
+    ...fakeSession("large.jsonl"),
+    session_id: "large",
+    events,
+  }], meter);
+
+  assert.equal(admitted[0]?.events.length, eventCount);
+  assert.equal(admitted[0]?.started_at_ms, 1);
+  assert.equal(admitted[0]?.ended_at_ms, eventCount);
+});

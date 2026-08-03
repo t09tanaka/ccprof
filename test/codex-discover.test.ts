@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { unlinkSync } from "node:fs";
 import {
   chmod,
   mkdir,
@@ -343,6 +344,145 @@ test("budgeted Codex discovery re-checks wall time after adapter startup", async
   assert.deepEqual(sessions, []);
   assert.equal(meter.result().truncation_reason, "max_wall_ms");
   assert.equal(meter.result().observed.source_items, 0);
+});
+
+test("budgeted Codex discovery claims a zero source-item budget before stat", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-budget-codex-item-first-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const sessionsRoot = join(root, "sessions");
+  const dayDirectory = join(sessionsRoot, "2026", "07", "31");
+  const repo = join(root, "repo");
+  await Promise.all([
+    mkdir(dayDirectory, { recursive: true }),
+    mkdir(repo, { recursive: true }),
+  ]);
+  const sourcePath = join(dayDirectory, "rollout-vanishing.jsonl");
+  await writeFile(
+    sourcePath,
+    rollout({
+      id: "vanishing",
+      cwd: repo,
+      branch: "feature/codex",
+    }),
+  );
+  let wallReads = 0;
+  const meter = new AnalysisBudgetMeter(
+    analysisBudgets({ max_source_items: 0 }),
+    {
+      wall_ms: () => {
+        wallReads += 1;
+        if (wallReads === 13) unlinkSync(sourcePath);
+        return 0;
+      },
+      cpu_ms: () => 0,
+    },
+  );
+
+  const sessions = await discoverCodexSessions(sessionsRoot, {
+    repoRoot: repo,
+    headBranch: "feature/codex",
+    startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+    analysisBudgetMeter: meter,
+  });
+
+  assert.deepEqual(sessions, []);
+  assert.equal(meter.result().truncation_reason, "max_source_items");
+  assert.equal(meter.result().observed.source_items, 1);
+});
+
+test("budgeted Codex traversal uses locale-independent code-unit order", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-budget-codex-order-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const sessionsRoot = join(root, "sessions");
+  const upperDirectory = join(sessionsRoot, "Z");
+  const lowerDirectory = join(sessionsRoot, "a");
+  const repo = join(root, "repo");
+  await Promise.all([
+    mkdir(upperDirectory, { recursive: true }),
+    mkdir(lowerDirectory, { recursive: true }),
+    mkdir(repo, { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(
+      join(upperDirectory, "rollout-upper.jsonl"),
+      rollout({ id: "upper", cwd: repo, branch: "feature/codex" }),
+    ),
+    writeFile(
+      join(lowerDirectory, "rollout-lower.jsonl"),
+      rollout({ id: "lower", cwd: repo, branch: "feature/codex" }),
+    ),
+  ]);
+  const meter = new AnalysisBudgetMeter(
+    analysisBudgets({ max_source_items: 1 }),
+    steadyBudgetClock,
+  );
+
+  const sessions = await discoverCodexSessions(sessionsRoot, {
+    repoRoot: repo,
+    headBranch: "feature/codex",
+    startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+    analysisBudgetMeter: meter,
+  });
+
+  assert.deepEqual(sessions.map(({ session_id }) => session_id), ["upper"]);
+  assert.equal(meter.result().truncation_reason, "max_source_items");
+});
+
+test("unbudgeted Codex discovery preserves legacy locale ordering and read errors", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows chmod does not make a file unreadable.");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "ccprof-codex-legacy-order-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const sessionsRoot = join(root, "sessions");
+  const repo = join(root, "repo");
+  const paths = [
+    join(sessionsRoot, "Z", "rollout-upper.jsonl"),
+    join(sessionsRoot, "a", "rollout-lower.jsonl"),
+  ];
+  const unreadable = join(sessionsRoot, "z", "rollout-unreadable.jsonl");
+  await Promise.all([
+    ...paths.map((path) => mkdir(join(path, ".."), { recursive: true })),
+    mkdir(join(unreadable, ".."), { recursive: true }),
+    mkdir(repo, { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(
+      paths[0]!,
+      rollout({ id: "upper", cwd: repo, branch: "feature/codex" }),
+    ),
+    writeFile(
+      paths[1]!,
+      rollout({ id: "lower", cwd: repo, branch: "feature/codex" }),
+    ),
+    writeFile(
+      unreadable,
+      rollout({ id: "unreadable", cwd: repo, branch: "feature/codex" }),
+    ),
+  ]);
+  await chmod(unreadable, 0o000);
+  let sessions: Awaited<ReturnType<typeof discoverCodexSessions>>;
+  try {
+    sessions = await discoverCodexSessions(sessionsRoot, {
+      repoRoot: repo,
+      headBranch: "feature/codex",
+      startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+      endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+    });
+  } finally {
+    await chmod(unreadable, 0o600);
+  }
+  const expected = [...paths]
+    .sort((left, right) => left.localeCompare(right))
+    .map((path) => path.includes("rollout-upper") ? "upper" : "lower");
+
+  assert.deepEqual(sessions.map(({ session_id }) => session_id), expected);
+  assert.ok(sessions.every((session) =>
+    session.warnings.some(({ code }) => code === "codex_source_read_error")
+  ));
 });
 
 test("a rollout file with no events (parseCodexSession returns null) is skipped silently", async (t) => {
