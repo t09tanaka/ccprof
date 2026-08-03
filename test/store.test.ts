@@ -1406,6 +1406,64 @@ test("analysis budget results save and load through normalized Store v4 rows", a
   });
 });
 
+test("analysis record budget descriptors fail closed without evaluating hostile input", async () => {
+  await temporaryStore(async (paths) => {
+    let getterReads = 0;
+    const accessor = record("budget-accessor", 100) as AnalysisRecord & {
+      analysis_budget?: AnalysisBudgetResult;
+    };
+    Object.defineProperty(accessor, "analysis_budget", {
+      enumerable: true,
+      get() {
+        getterReads += 1;
+        throw new Error("token-canary");
+      },
+    });
+    await assert.rejects(() => saveAnalysis(paths, accessor), (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.ok(!String(error).includes("token-canary"));
+      return true;
+    });
+    assert.equal(getterReads, 0);
+
+    const hidden = record("budget-hidden", 200) as AnalysisRecord & {
+      analysis_budget?: AnalysisBudgetResult;
+    };
+    Object.defineProperty(hidden, "analysis_budget", {
+      enumerable: false,
+      value: budgetResult(),
+    });
+    await assert.rejects(() => saveAnalysis(paths, hidden), (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.ok(!String(error).includes("budget-hidden"));
+      return true;
+    });
+
+    const proxy = new Proxy(budgetRecord("budget-proxy", 300), {
+      ownKeys() {
+        throw new Error("token-canary");
+      },
+    });
+    await assert.rejects(() => saveAnalysis(paths, proxy), (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.ok(!String(error).includes("token-canary"));
+      return true;
+    });
+
+    const database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_executions",
+      ).pluck().get(), 0);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_budget_runs",
+      ).pluck().get(), 0);
+    } finally {
+      database.close();
+    }
+  });
+});
+
 test("legacy analysis snapshots remain readable with no synthetic budget result", async () => {
   await temporaryStore(async (paths) => {
     const legacy = record("legacy-without-budget", 100);

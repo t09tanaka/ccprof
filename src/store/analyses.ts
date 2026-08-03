@@ -603,8 +603,39 @@ export async function writeJsonAtomically(
 function asRecord(
   input: AnalysisRecord | AnalysisRecordInput,
 ): AnalysisRecord {
+  let descriptors: PropertyDescriptorMap;
   try {
-    const record = makeAnalysisRecord(input);
+    descriptors = Object.getOwnPropertyDescriptors(input);
+  } catch {
+    throw new TypeError("Invalid analysis budget result.");
+  }
+  const budgetDescriptor = descriptors.analysis_budget;
+  if (budgetDescriptor !== undefined) {
+    if (
+      budgetDescriptor.enumerable !== true ||
+      !("value" in budgetDescriptor)
+    ) {
+      throw new TypeError("Invalid analysis budget result.");
+    }
+    const normalized = budgetDescriptor.value === undefined
+      ? undefined
+      : normalizeAnalysisBudgetResult(budgetDescriptor.value);
+    descriptors.analysis_budget = {
+      configurable: true,
+      enumerable: true,
+      value: normalized,
+      writable: true,
+    };
+  }
+  let snapshot: AnalysisRecord | AnalysisRecordInput;
+  try {
+    snapshot = Object.defineProperties({}, descriptors) as
+      AnalysisRecord | AnalysisRecordInput;
+  } catch {
+    throw new TypeError("Invalid analysis budget result.");
+  }
+  try {
+    const record = makeAnalysisRecord(snapshot);
     if (!isRecord(record)) throw new TypeError();
     return record;
   } catch {
