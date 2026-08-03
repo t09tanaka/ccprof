@@ -73,7 +73,7 @@ test("ccprof-release evaluations cover the supported publication handoff", async
   );
   assert.match(
     String(evaluations.evals?.[2]?.prompt),
-    /integrity\s+mismatch/iu,
+    /(?:npm\s+publish(?:\s+has)?\s+completed|manual(?:ly)?\s+publication\s+(?:is\s+)?complete|manually\s+published)[\s\S]*integrity\s+mismatch/iu,
   );
   assert.match(
     String(evaluations.evals?.[2]?.expectations),

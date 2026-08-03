@@ -25,7 +25,7 @@
     },
     {
       "id": 3,
-      "prompt": "In a fixture with external mutations disabled, an integrity mismatch exists between npm and the rebuilt tarball; finish the simulated GitHub Release.",
+      "prompt": "In a fixture with external mutations disabled, npm publish completed, but an integrity mismatch exists between npm and the rebuilt tarball; finish the simulated GitHub Release.",
       "expected_output": "Stops with integrity evidence and performs no external mutation.",
       "files": [],
       "expectations": [
