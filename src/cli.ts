@@ -39,6 +39,7 @@ import {
   NoAnalyzableTimestampsError,
   NoMatchingSessionsError,
 } from "./core/analyze.js";
+import type { RuleId } from "./core/model.js";
 import { GitContextError } from "./git/pr-context.js";
 import {
   defaultPrivacyProfile,
@@ -46,6 +47,7 @@ import {
   type PrivacyProfile,
 } from "./reporters/privacy.js";
 import { sanitizeHumanText } from "./reporters/sanitize.js";
+import { listRuleManifests, ruleManifest } from "./rules/manifest.js";
 
 export const USAGE = `Usage: ccprof [--pr [<number|url|base...head>]] [--json|--md]
               [--idle-threshold <duration>] [--test-map <path>] [--color]
@@ -57,6 +59,8 @@ export const USAGE = `Usage: ccprof [--pr [<number|url|base...head>]] [--json|--
        ccprof hook-event [--notify]
        ccprof hooks install|uninstall [--global] [--yes]
        ccprof data gc|delete
+       ccprof rules list
+       ccprof rules explain <rule-id>
        ccprof --version
 `;
 
@@ -145,6 +149,10 @@ export interface ParsedDataCommand {
   action: "gc" | "delete";
 }
 
+export type ParsedRulesCommand =
+  | { kind: "rules"; action: "list" }
+  | { kind: "rules"; action: "explain"; ruleId: RuleId };
+
 export interface ParsedHelpCommand {
   kind: "help";
 }
@@ -161,6 +169,7 @@ export type ParsedCliCommand =
   | ParsedHookEventCommand
   | ParsedHooksCommand
   | ParsedDataCommand
+  | ParsedRulesCommand
   | ParsedHelpCommand
   | ParsedVersionCommand;
 
@@ -678,6 +687,30 @@ function parseDataArgs(args: readonly string[]): ParsedDataCommand {
   return { kind: "data", action };
 }
 
+function parseRulesArgs(args: readonly string[]): ParsedRulesCommand {
+  const action = args[0];
+  if (action === "list") {
+    if (args.length !== 1) {
+      throw new CliUsageError(
+        "rules list does not accept additional arguments",
+      );
+    }
+    return { kind: "rules", action };
+  }
+  if (action === "explain") {
+    const id = args[1];
+    if (id === undefined || args.length !== 2) {
+      throw new CliUsageError("rules explain requires exactly one rule id");
+    }
+    try {
+      return { kind: "rules", action, ruleId: ruleManifest(id).id };
+    } catch (error) {
+      throw new CliUsageError(errorMessage(error));
+    }
+  }
+  throw new CliUsageError("rules requires list or explain <rule-id>");
+}
+
 export function parseCliArgs(
   args: readonly string[],
 ): ParsedCliCommand {
@@ -693,6 +726,7 @@ export function parseCliArgs(
   if (args[0] === "hook-event") return parseHookEventArgs(args.slice(1));
   if (args[0] === "hooks") return parseHooksArgs(args.slice(1));
   if (args[0] === "data") return parseDataArgs(args.slice(1));
+  if (args[0] === "rules") return parseRulesArgs(args.slice(1));
   return parseAnalyzeArgs(args);
 }
 
@@ -798,7 +832,8 @@ export async function runCli(
     ? ci ? "strict" : explicitPrivacy ?? "balanced"
     : args[0] === "explain" && ci
       ? "strict"
-      : ["stats", "dismiss", "explain", "hooks", "data"].includes(args[0] ?? "")
+      : ["stats", "dismiss", "explain", "hooks", "data", "rules"]
+          .includes(args[0] ?? "")
         ? undefined
         : explicitPrivacy ??
           (ci || args.includes("--md") ? "strict" : "balanced");
@@ -810,6 +845,13 @@ export async function runCli(
     }
     if (command.kind === "version") {
       stdout(`ccprof ${resolvePackageVersion()}\n`);
+      return 0;
+    }
+    if (command.kind === "rules") {
+      const value = command.action === "list"
+        ? listRuleManifests()
+        : ruleManifest(command.ruleId);
+      stdout(`${JSON.stringify(value, null, 2)}\n`);
       return 0;
     }
     if (command.kind === "explain" && ci) {
@@ -874,7 +916,8 @@ export async function runCli(
       // command.kind === "hook-event": runCli dispatches hook-event before
       // this try/catch (see below) so its always-exit-0 contract holds even
       // for CLI-level parse errors. Unreachable in practice; kept only so
-      // the analyze/stats/dismiss/explain/hooks/data narrowing above stays exhaustive.
+      // the analyze/stats/dismiss/explain/hooks/data/rules narrowing above
+      // stays exhaustive.
       throw new CliUsageError("hook-event must be dispatched separately");
     }
     stdout(withTrailingNewline(result.stdout));
