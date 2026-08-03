@@ -3124,6 +3124,59 @@ test("rejects hostile canonical finding shapes without invoking or disclosing th
   assert.equal(getterCalled, false);
 });
 
+test("rejects hostile finding containers without invoking or disclosing them", () => {
+  const source = finding("hostile-container", "npm test", 2);
+  const canary = "FINDINGS_CONTAINER_CANARY";
+  let getterCalled = false;
+  const accessor = new Array<Finding>(1);
+  Object.defineProperty(accessor, "0", {
+    enumerable: true,
+    get() {
+      getterCalled = true;
+      throw new Error(canary);
+    },
+  });
+  const nonEnumerable = [source];
+  Object.defineProperty(nonEnumerable, "0", {
+    value: source,
+    enumerable: false,
+  });
+  const extra = [source];
+  Object.defineProperty(extra, "extra", { value: canary, enumerable: true });
+  const symbol = [source];
+  Object.defineProperty(symbol, Symbol(canary), {
+    value: canary,
+    enumerable: true,
+  });
+  const revocable = Proxy.revocable([source], {});
+  revocable.revoke();
+  const hostileContainers: readonly (readonly Finding[])[] = [
+    new Proxy([source], {}),
+    revocable.proxy,
+    new Array<Finding>(1),
+    extra,
+    symbol,
+    nonEnumerable,
+    accessor,
+  ];
+
+  const outcomes = hostileContainers.map((findings) => {
+    try {
+      makeAnalysisRecord({
+        ...record("hostile-container-record", 31),
+        findings,
+      });
+      return "accepted";
+    } catch (error) {
+      return error instanceof TypeError ? error.message : "unexpected error";
+    }
+  });
+  assert.deepEqual({ outcomes, getterCalled }, {
+    outcomes: hostileContainers.map(() => "invalid finding"),
+    getterCalled: false,
+  });
+});
+
 test("privacy projections preserve canonical numeric and fixed finding fields", () => {
   const canonical = finding("privacy-canonical", "npm test", 2);
   const report: ReportV2 = {
