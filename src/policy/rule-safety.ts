@@ -123,8 +123,12 @@ const UNSAFE_GIT_OPTIONS = [
   "--textconv",
   "--open-files-in-pager",
 ] as const;
-const GIT_GREP_PAGER_OPTION = "--open-files-in-pager";
-const GIT_GREP_PAGER_MINIMUM_PREFIX = "--op";
+const UNSAFE_GIT_GREP_LONG_OPTIONS = [
+  { full: "--open-files-in-pager", minimum: "--op" },
+  { full: "--textconv", minimum: "--textc" },
+  { full: "--ext-grep", minimum: "--ext-" },
+] as const;
+const UNSAFE_RG_HELPER_OPTIONS = ["--pre", "--hostname-bin"] as const;
 
 export class RuleSafetyPolicyValidationError extends Error {
   constructor() {
@@ -213,13 +217,37 @@ function boundedUtf8(value: string, maxBytes: number): boolean {
   return value.length <= maxBytes && Buffer.byteLength(value, "utf8") <= maxBytes;
 }
 
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function compareUtf8(left: string, right: string): number {
+  if (
+    typeof left !== "string" || typeof right !== "string" ||
+    hasUnpairedSurrogate(left) || hasUnpairedSurrogate(right)
+  ) {
+    invalid();
+  }
   return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
 export function normalizeCommandPattern(value: string): string {
   return validated(() => {
-    if (typeof value !== "string" || !boundedUtf8(value, MAX_PATTERN_BYTES)) {
+    if (
+      typeof value !== "string" || value.length > MAX_PATTERN_BYTES ||
+      hasUnpairedSurrogate(value) ||
+      !boundedUtf8(value, MAX_PATTERN_BYTES)
+    ) {
       invalid();
     }
     const normalized = value
@@ -539,6 +567,34 @@ function mappedCommandTokens(raw: string): string[] | undefined {
   return [mapped, ...tokenized.tokens.slice(1)];
 }
 
+function containsDelimitedExpansion(
+  raw: string,
+  delimiter: "%" | "!",
+): boolean {
+  let opening = -1;
+  for (let index = 0; index < raw.length; index += 1) {
+    if (raw[index] !== delimiter) continue;
+    if (opening >= 0 && index > opening + 1) return true;
+    opening = index;
+  }
+  return false;
+}
+
+function containsEnvironmentExpansion(raw: string): boolean {
+  return raw.includes("$") || containsDelimitedExpansion(raw, "%") ||
+    containsDelimitedExpansion(raw, "!");
+}
+
+function matchesLongOptionPrefix(
+  value: string,
+  full: string,
+  minimum: string,
+): boolean {
+  const equals = value.indexOf("=");
+  const name = equals < 0 ? value : value.slice(0, equals);
+  return name.length >= minimum.length && full.startsWith(name);
+}
+
 function unsafeGitOption(value: string, subcommand: string): boolean {
   const fixedUnsafe = UNSAFE_GIT_OPTIONS.some(
     (option) => value === option || value.startsWith(`${option}=`),
@@ -546,30 +602,34 @@ function unsafeGitOption(value: string, subcommand: string): boolean {
   if (fixedUnsafe || subcommand !== "grep") return fixedUnsafe;
 
   // Git parse-options accepts bundled short options and unambiguous long
-  // abbreviations. In `git grep`, uppercase O takes an optional pager value,
-  // and `--op` is already a unique prefix of --open-files-in-pager.
+  // abbreviations. These minimums are the first unique prefixes in git-grep.
   if (
     value.startsWith("-") && !value.startsWith("--") &&
     value.slice(1).includes("O")
   ) {
     return true;
   }
-  const equals = value.indexOf("=");
-  const name = equals < 0 ? value : value.slice(0, equals);
-  return name.length >= GIT_GREP_PAGER_MINIMUM_PREFIX.length &&
-    GIT_GREP_PAGER_OPTION.startsWith(name);
+  return UNSAFE_GIT_GREP_LONG_OPTIONS.some(({ full, minimum }) =>
+    matchesLongOptionPrefix(value, full, minimum)
+  );
 }
 
 function unsafeInspectOption(executable: string, value: string): boolean {
   return executable === "rg" &&
-    (value === "--pre" || value.startsWith("--pre="));
+    UNSAFE_RG_HELPER_OPTIONS.some(
+      (option) => value === option || value.startsWith(`${option}=`),
+    );
 }
 
 export function safeCanonicalCommand(
   raw: string,
   budget?: DecisionBudget,
 ): string | undefined {
-  if (typeof raw !== "string" || !boundedUtf8(raw, MAX_COMMAND_BYTES)) {
+  if (
+    typeof raw !== "string" || raw.length > MAX_COMMAND_BYTES ||
+    hasUnpairedSurrogate(raw) || !boundedUtf8(raw, MAX_COMMAND_BYTES) ||
+    containsEnvironmentExpansion(raw)
+  ) {
     return undefined;
   }
   if (
