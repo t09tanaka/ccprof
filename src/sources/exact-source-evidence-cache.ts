@@ -6,20 +6,18 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { Session, SourceWarning } from "../core/model.js";
 import type { SourceAdapterId } from "../core/source-descriptor.js";
 import { canonicalizeSessionCwds, cwdMatchesRepository } from "./cwd.js";
-import type { ParserStateReadResult } from "./jsonl-budget.js";
-import { commitEligibleSourceEvidence, createSourceEvidencePair,
-  getSourceEvidencePair, normalizeSourceEvidenceEnvelope,
-  sourceEvidenceIdentity } from "../store/source-evidence-cache.js";
+import { IncrementalParserStateCapacityError, type ParserStateReadResult } from "./jsonl-budget.js";
+import { commitEligibleSourceEvidence, createSourceEvidencePair, getSourceEvidencePair,
+  normalizeSourceEvidenceEnvelope, sourceEvidenceIdentity } from "../store/source-evidence-cache.js";
 import type { StorePaths } from "../store/paths.js";
 import { openStoreDatabase } from "../store/sqlite.js";
 
 const RANGE_BYTES = 4_096;
 const CACHE_WARNING: SourceWarning = { code: "source_cache_unavailable",
-  message: "Exact source evidence cache was unavailable; cold evidence was used.",
-  source_path: "" };
+  message: "Exact source evidence cache was unavailable; cold evidence was used.", source_path: "" };
 interface ConsumeOptions<State, Result> {
   adapterId: SourceAdapterId; sourceRoot: string; sourcePath: string;
-  endedAtMs?: number;
+  endedAtMs?: number; coldFallback?: () => Promise<Result>;
   readState(options: { sourcePath: string; fileHandle: FileHandle }):
     Promise<ParserStateReadResult<State>>;
   projectState(state: State, options?: { endedAtMs?: number }): Result;
@@ -71,8 +69,7 @@ async function stable(handle: FileHandle, path: string, initial: Stats,
 }
 
 export class ExactSourceEvidenceCache {
-  readonly #paths: StorePaths; readonly #root: string;
-  readonly #observedAtMs: number | undefined;
+  readonly #paths: StorePaths; readonly #root: string; readonly #observedAtMs: number | undefined;
   readonly #onWarning: ((warning: SourceWarning) => void) | undefined;
   constructor(options: { storePaths: StorePaths; eligibilityRoot: string;
     observedAtMs?: number; onWarning?: (warning: SourceWarning) => void }) {
@@ -113,7 +110,12 @@ export class ExactSourceEvidenceCache {
         evidence(options.adapterId, projected);
         if (await stable(handle, sourcePath, held, observation.contentRevision)) return projected;
       }
-      const read = await options.readState({ sourcePath, fileHandle: handle });
+      let read: ParserStateReadResult<State>;
+      try { read = await options.readState({ sourcePath, fileHandle: handle }); }
+      catch (error) {
+        if (!(error instanceof IncrementalParserStateCapacityError) || options.coldFallback === undefined) throw error;
+        return await options.coldFallback();
+      }
       const full = options.projectState(read.state);
       const requested = options.projectState(read.state,
         options.endedAtMs === undefined ? {} : { endedAtMs: options.endedAtMs });
@@ -136,7 +138,7 @@ export class ExactSourceEvidenceCache {
           const committed = commitEligibleSourceEvidence(database, this.#paths.repo_hash, eligibilityIdentity,
             createSourceEvidencePair({ adapterId: options.adapterId, canonicalPath: sourcePath,
               repositoryIdentity: this.#paths.repo_hash, eligibilityIdentity,
-              observedAtMs: this.#observedAtMs ?? Date.now(), observation,
+              observedAtMs: this.#observedAtMs ?? observation.mtimeMs, observation,
               parserState: read.state as never, evidence: { ...found, ...publish } }));
           if (negativeReason !== undefined && committed !== "stale" && committed !== "conflict")
             return (options.adapterId === "claude" ? { sessions: [], warnings: [] } : null) as Result;

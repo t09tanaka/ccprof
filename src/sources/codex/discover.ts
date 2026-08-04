@@ -188,7 +188,8 @@ async function discoverCodexSessionsUnbudgeted(
         ? await parseCodexSession({ sourcePath: file, endedAtMs: query.endedAtMs })
         : await evidenceCache.consume({ adapterId: "codex", sourceRoot: root,
             sourcePath: file, endedAtMs: query.endedAtMs,
-            readState: readCodexParserState, projectState: projectCodexParserState });
+            readState: readCodexParserState, projectState: projectCodexParserState,
+            coldFallback: () => parseCodexSession({ sourcePath: file, endedAtMs: query.endedAtMs }) });
     } catch {
       globalWarnings.push(
         sourceWarning(

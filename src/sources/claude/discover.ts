@@ -458,7 +458,8 @@ export async function discoverClaudeSessions(
               : { budgets: { maxFileBytes: admittedFileBytes } }) })
         : await evidenceCache.consume({ adapterId: "claude", sourceRoot: projectsRoot,
             sourcePath: file, endedAtMs: query.endedAtMs,
-            readState: readClaudeParserState, projectState: projectClaudeParserState });
+            readState: readClaudeParserState, projectState: projectClaudeParserState,
+            coldFallback: () => parseClaudeTranscriptDetailed(file, { endedAtMs: query.endedAtMs }) });
     } catch {
       const readWarning = sourceWarning(
         "source_read_error",
