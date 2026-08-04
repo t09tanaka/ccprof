@@ -669,7 +669,7 @@ function causalActions(
           if (
             pendingAssistant !== undefined &&
             pendingAssistant.event.timestamp_ms === event.timestamp_ms &&
-            event.approval !== undefined
+            event.approval?.required === true
           ) {
             pendingAssistant = {
               ...pendingAssistant,

@@ -566,7 +566,6 @@ function mappedCommandTokens(raw: string): string[] | undefined {
   }
   const windowsLauncher = WINDOWS_LAUNCHERS.get(first.toLowerCase());
   if (
-    windowsLauncher !== undefined &&
     (raw.includes("'") || raw.includes("\\") || raw.includes("^"))
   ) {
     return undefined;
