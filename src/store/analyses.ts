@@ -928,7 +928,6 @@ function asRecord(
 ): AnalysisRecord {
   let descriptors: PropertyDescriptorMap;
   try {
-    if (utilTypes.isProxy(input)) throw new TypeError();
     descriptors = Object.getOwnPropertyDescriptors(input);
   } catch {
     throw new TypeError("Invalid analysis budget result.");

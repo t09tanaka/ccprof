@@ -1986,7 +1986,16 @@ test("analysis audit identities label omitted snapshots as content fallbacks", (
   assert.notEqual(fallback.snapshot_id, canonical.snapshot_id);
 });
 
-test("analysis audit identities reject hostile records without evaluating them", () => {
+test("analysis audit identities accept transparent record proxies", () => {
+  const input = record("audit-identity-transparent-proxy", 100);
+
+  assert.deepEqual(
+    analysisAuditIdentity(new Proxy(input, {})),
+    analysisAuditIdentity(input),
+  );
+});
+
+test("analysis audit identities reject hostile records without leaking trap errors", () => {
   const canary = "AUDIT_IDENTITY_CANARY";
   let getterReads = 0;
   const accessor = record("audit-identity-accessor", 100) as AnalysisRecord & {
@@ -2014,7 +2023,7 @@ test("analysis audit identities reject hostile records without evaluating them",
       return true;
     });
   }
-  assert.deepEqual({ getterReads, proxyReads }, { getterReads: 0, proxyReads: 0 });
+  assert.deepEqual({ getterReads, proxyReads }, { getterReads: 0, proxyReads: 1 });
 });
 
 test("analysis audit identities reject hostile snapshot options without evaluating them", async () => {
