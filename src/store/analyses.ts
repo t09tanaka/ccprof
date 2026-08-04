@@ -90,8 +90,29 @@ export interface AnalysisSaveResult {
   warnings: StoreWarning[];
 }
 
+export type AnalysisSelectorIdentity =
+  | { kind: "github_pr"; number: number }
+  | {
+      kind: "explicit_range";
+      range: "double_dot" | "triple_dot";
+      base_ref_digest: string;
+      head_ref_digest: string;
+    }
+  | {
+      kind: "inferred_local_range";
+      base_ref_digest: string;
+      head_ref_digest: string;
+    };
+
+export interface AnalysisHistoryEntry {
+  snapshot_id: string;
+  identity: AnalysisSnapshotIdentity | { mode: "content-fallback" };
+  record: AnalysisRecord;
+}
+
 export interface AnalysisHistoryResult {
   records: AnalysisRecord[];
+  entries?: AnalysisHistoryEntry[];
   warnings: StoreWarning[];
 }
 
@@ -103,6 +124,7 @@ export interface AnalysisSnapshotIdentity {
   };
   source_digest: string; config_digest: string;
   policy_digest: string; history_digest: string;
+  selector?: AnalysisSelectorIdentity;
 }
 
 export interface AnalysisSaveOptions { snapshot?: AnalysisSnapshotIdentity; }
@@ -838,7 +860,99 @@ function closeDatabase(database: StoreDatabase | undefined): void { try { databa
 type SnapshotEnvelope = { schema_version: 1; identity: AnalysisSnapshotIdentity |
   { mode: "content-fallback" }; payload: Omit<AnalysisRecord, "analysis_id" | "created_at_ms"> };
 const LEGACY_ANALYSES_MIGRATION = "legacy-analyses-json-v1", HEX_64 = /^[0-9a-f]{64}$/u;
+const SELECTOR_DIGEST = /^sha256:[0-9a-f]{64}$/u;
 const WINDOW_STARTS = new Set(["explicit", "branch_reflog", "session_branch_transition", "commit_anchor_lookback"]);
+function selectorDataObject(value: unknown): Record<string, unknown> {
+  if (!isObjectRecord(value) || utilTypes.isProxy(value)) {
+    throw new TypeError("invalid snapshot selector");
+  }
+  let descriptors: PropertyDescriptorMap;
+  let ownKeys: (string | symbol)[];
+  try {
+    if (Object.getPrototypeOf(value) !== Object.prototype) {
+      throw new TypeError();
+    }
+    descriptors = Object.getOwnPropertyDescriptors(value);
+    ownKeys = Reflect.ownKeys(value);
+  } catch {
+    throw new TypeError("invalid snapshot selector");
+  }
+  if (ownKeys.some((key) => typeof key !== "string")) {
+    throw new TypeError("invalid snapshot selector");
+  }
+  const data: Record<string, unknown> = {};
+  for (const key of ownKeys as string[]) {
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || descriptor.enumerable !== true ||
+      !("value" in descriptor)) {
+      throw new TypeError("invalid snapshot selector");
+    }
+    data[key] = descriptor.value;
+  }
+  return data;
+}
+function exactSelectorFields(
+  value: Record<string, unknown>, fields: readonly string[],
+): boolean {
+  const keys = Object.keys(value);
+  return keys.length === fields.length && fields.every((field) => field in value);
+}
+function normalizeSelectorIdentity(value: unknown): AnalysisSelectorIdentity {
+  const selector = selectorDataObject(value);
+  if (selector.kind === "github_pr") {
+    if (!exactSelectorFields(selector, ["kind", "number"]) ||
+      !Number.isSafeInteger(selector.number) || (selector.number as number) <= 0) {
+      throw new TypeError("invalid snapshot selector");
+    }
+    return { kind: "github_pr", number: selector.number as number };
+  }
+  const refDigests = (): { base_ref_digest: string; head_ref_digest: string } => {
+    if (typeof selector.base_ref_digest !== "string" ||
+      !SELECTOR_DIGEST.test(selector.base_ref_digest) ||
+      typeof selector.head_ref_digest !== "string" ||
+      !SELECTOR_DIGEST.test(selector.head_ref_digest)) {
+      throw new TypeError("invalid snapshot selector");
+    }
+    return {
+      base_ref_digest: selector.base_ref_digest,
+      head_ref_digest: selector.head_ref_digest,
+    };
+  };
+  if (selector.kind === "explicit_range") {
+    if (!exactSelectorFields(selector, [
+      "kind", "range", "base_ref_digest", "head_ref_digest",
+    ]) || (selector.range !== "double_dot" && selector.range !== "triple_dot")) {
+      throw new TypeError("invalid snapshot selector");
+    }
+    return { kind: "explicit_range", range: selector.range, ...refDigests() };
+  }
+  if (selector.kind === "inferred_local_range") {
+    if (!exactSelectorFields(selector, [
+      "kind", "base_ref_digest", "head_ref_digest",
+    ])) {
+      throw new TypeError("invalid snapshot selector");
+    }
+    return { kind: "inferred_local_range", ...refDigests() };
+  }
+  throw new TypeError("invalid snapshot selector");
+}
+function snapshotSelector(value: AnalysisSnapshotIdentity): AnalysisSelectorIdentity | undefined {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    if (utilTypes.isProxy(value)) throw new TypeError();
+    descriptor = Object.getOwnPropertyDescriptor(value, "selector");
+    if (descriptor === undefined && "selector" in value) throw new TypeError();
+  } catch {
+    throw new TypeError("invalid snapshot selector");
+  }
+  if (descriptor === undefined) return undefined;
+  if (descriptor.enumerable !== true || !("value" in descriptor)) {
+    throw new TypeError("invalid snapshot selector");
+  }
+  return descriptor.value === undefined
+    ? undefined
+    : normalizeSelectorIdentity(descriptor.value);
+}
 function normalizeSnapshotIdentity(value: AnalysisSnapshotIdentity): AnalysisSnapshotIdentity {
   const oid = (entry: unknown, label: string, pattern = OID_PATTERN): string => {
     const normalized = typeof entry === "string" ? entry.toLowerCase() : "";
@@ -846,6 +960,7 @@ function normalizeSnapshotIdentity(value: AnalysisSnapshotIdentity): AnalysisSna
     return normalized;
   };
   const window = value?.window;
+  const selector = snapshotSelector(value);
   if (!isObjectRecord(window) || !Number.isSafeInteger(window.started_at_ms) || window.started_at_ms < 0 ||
     !WINDOW_STARTS.has(window.start_source) || (window.end_source !== "explicit" &&
       window.end_source !== "analysis_time") || (window.completeness !== "complete" &&
@@ -864,6 +979,7 @@ function normalizeSnapshotIdentity(value: AnalysisSnapshotIdentity): AnalysisSna
     source_digest: oid(value.source_digest, "source_digest", HEX_64),
     config_digest: oid(value.config_digest, "config_digest", HEX_64),
     policy_digest: oid(value.policy_digest, "policy_digest", HEX_64), history_digest: oid(value.history_digest, "history_digest", HEX_64),
+    ...(selector === undefined ? {} : { selector }),
   };
 }
 function snapshotEnvelope(record: AnalysisRecord, identity?: AnalysisSnapshotIdentity): SnapshotEnvelope {
@@ -1125,7 +1241,10 @@ function migrateLegacyAnalyses(database: StoreDatabase, paths: StorePaths): Stor
   }).immediate();
 }
 function parseSnapshot(recordJson: string, snapshotId: string,
-  executionId: string, executedAtMs: number): AnalysisRecord {
+  executionId: string, executedAtMs: number): {
+    identity: AnalysisHistoryEntry["identity"];
+    record: AnalysisRecord;
+  } {
   const value = JSON.parse(recordJson) as unknown;
   if (!isObjectRecord(value) || value.schema_version !== 1 ||
     !isObjectRecord(value.payload) || "analysis_id" in value.payload ||
@@ -1134,16 +1253,19 @@ function parseSnapshot(recordJson: string, snapshotId: string,
     analysisDigest("analysis-snapshot-v1", value) !== snapshotId) {
     throw new TypeError("unsupported or invalid analysis snapshot");
   }
+  let identity: AnalysisHistoryEntry["identity"];
   if (value.identity.mode === "content-fallback") {
     if (Object.keys(value.identity).length !== 1) throw new TypeError("invalid fallback identity");
+    identity = { mode: "content-fallback" };
   } else {
     const normalized = normalizeSnapshotIdentity(value.identity as unknown as AnalysisSnapshotIdentity);
     if (canonicalJson(normalized) !== canonicalJson(value.identity))
       throw new TypeError("non-canonical snapshot identity");
+    identity = normalized;
   }
   const record = { ...value.payload, analysis_id: executionId, created_at_ms: executedAtMs };
   if (!isRecord(record)) throw new TypeError("unsupported or invalid analysis record");
-  return normalizeRecordFindings(record);
+  return { identity, record: normalizeRecordFindings(record) };
 }
 
 export async function loadAnalyses(paths: StorePaths): Promise<AnalysisHistoryResult> {
@@ -1163,10 +1285,12 @@ export async function loadAnalyses(paths: StorePaths): Promise<AnalysisHistoryRe
       ORDER BY e.executed_at_ms, e.execution_id`).all() as {
         snapshot_id: string; record_json: string; execution_id: string; executed_at_ms: number }[];
     const records: AnalysisRecord[] = [];
+    const entries: AnalysisHistoryEntry[] = [];
     for (const row of rows) {
       try {
-        const record = parseSnapshot(row.record_json, row.snapshot_id,
+        const parsed = parseSnapshot(row.record_json, row.snapshot_id,
           row.execution_id, row.executed_at_ms);
+        const record = parsed.record;
         const storedBudget = readBudgetRow(database, row.execution_id);
         if (record.analysis_budget === undefined) {
           if (storedBudget !== undefined) {
@@ -1179,14 +1303,23 @@ export async function loadAnalyses(paths: StorePaths): Promise<AnalysisHistoryRe
           }
         }
         records.push(record);
+        entries.push({
+          snapshot_id: row.snapshot_id,
+          identity: parsed.identity,
+          record,
+        });
       }
       catch (error) { warnings.push(migrationWarning("corrupt_analysis_record",
         `Analysis snapshot was skipped: ${errorMessage(error)}`,
         `${storeDatabasePath(paths)}#analysis_snapshots/${row.snapshot_id}`)); }
     }
-    return { records: records.sort(recordOrder), warnings };
+    return {
+      records: records.sort(recordOrder),
+      entries: entries.sort((left, right) => recordOrder(left.record, right.record)),
+      warnings,
+    };
   } catch (error) {
-    return { records: [], warnings: [...warnings, migrationWarning("history_read_failed",
+    return { records: [], entries: [], warnings: [...warnings, migrationWarning("history_read_failed",
       `Analysis history could not be read: ${errorMessage(error)}`, storeDatabasePath(paths))] };
   } finally { closeDatabase(database); }
 }
