@@ -187,9 +187,10 @@ function userEvent(
   text: string,
   timestampMs = 0,
   entryUuid = "user",
+  sourceIndex = 0,
 ): GenuineUserEvent {
   return {
-    ...eventBase(entryUuid, timestampMs, 0),
+    ...eventBase(entryUuid, timestampMs, sourceIndex),
     kind: "genuine_user",
     text,
   };
@@ -199,9 +200,10 @@ function assistantEvent(
   text: string,
   timestampMs: number,
   entryUuid: string,
+  sourceIndex = 0,
 ): AssistantEvent {
   return {
-    ...eventBase(entryUuid, timestampMs, 0),
+    ...eventBase(entryUuid, timestampMs, sourceIndex),
     kind: "assistant",
     text,
   };
@@ -2030,10 +2032,10 @@ test("timeline binds one same-turn approval command only to its causal human wai
     timelineSession([
       assistantEvent("This command needs approval.", 0, "approval-prompt"),
       use,
-      userEvent("approved", 100, "approval-answer"),
+      userEvent("approved", 100, "approval-answer", 2),
       successfulToolResult(use.tool_use_id, 3),
-      assistantEvent("Do you want a summary?", 200, "ordinary-prompt"),
-      userEvent("yes", 300, "ordinary-answer"),
+      assistantEvent("Do you want a summary?", 200, "ordinary-prompt", 4),
+      userEvent("yes", 300, "ordinary-answer", 5),
     ]),
   ]);
   const waits = timeline.actions.filter(({ kind }) => kind === "human_wait");
@@ -2071,9 +2073,9 @@ test("timeline makes multiple same-turn approval commands irreversibly ambiguous
       timelineSession([
         assistantEvent("Choose whether to approve.", 0, "prompt"),
         ...orderedUses,
-        userEvent("approved", 100, "answer"),
+        userEvent("approved", 100, "answer", 4),
         ...uses.map((use, index) =>
-          successfulToolResult(use.tool_use_id, 4 + index, 110 + index)
+          successfulToolResult(use.tool_use_id, 5 + index, 110 + index)
         ),
       ]),
     ]);
