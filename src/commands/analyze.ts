@@ -21,6 +21,13 @@ import {
 } from "../reporters/privacy.js";
 import { sanitizeHumanText } from "../reporters/sanitize.js";
 import { renderTtyReport } from "../reporters/tty.js";
+import {
+  resolveRepositoryPolicy,
+  type RepositoryPolicyResolver,
+} from "../policy/organization-policy.js";
+
+const POLICY_ADVISORY_DISABLED_WARNING =
+  "[policy_advisory_disabled] Advisory execution is disabled by active policy.";
 
 export type AnalyzeOutputFormat = "tty" | "json" | "markdown";
 
@@ -50,6 +57,8 @@ export interface AnalyzeCommandDependencies {
   ) => Promise<CommandAnalysis>;
   /** Runner for the external `claude` CLI behind `--advisory`. */
   runCommand?: CommandRunner;
+  resolvePolicy?: RepositoryPolicyResolver;
+  onPrivacyResolved?: (privacy: PrivacyProfile) => void;
 }
 
 export async function runAnalyzeCommand(
@@ -71,8 +80,17 @@ export async function runAnalyzeCommand(
       ? {}
       : { testMapPath: resolve(options.cwd, options.testMapPath) }),
   });
-  const privacy = options.privacy ?? defaultPrivacyProfile(options.format, false);
   const repoRoot = result.report.unit.repo;
+  const requestedPrivacy = options.privacy ??
+    defaultPrivacyProfile(options.format, false);
+  const effectivePolicy = await (
+    dependencies.resolvePolicy ?? resolveRepositoryPolicy
+  )(repoRoot, {
+    privacy: requestedPrivacy,
+    advisory: options.advisory === true,
+  });
+  const privacy = effectivePolicy.privacy;
+  dependencies.onPrivacyResolved?.(privacy);
   const report = projectReportPrivacy(result.report, privacy);
   const sessions = result.report.unit.sessions;
   const warnings = privacyWarningTexts(
@@ -83,21 +101,36 @@ export async function runAnalyzeCommand(
   // text can never reach AnalysisRecord or the baseline.
   let advisory: AdvisoryText | undefined;
   if (options.advisory === true) {
-    const outcome = await requestAdvisory(
-      renderJsonReport(report),
-      dependencies.runCommand ?? runCommand,
-    );
-    if (outcome.kind === "available") {
-      advisory = {
-        ...outcome.advisory,
-        text: privacy === "strict"
-          ? "[advisory hidden by strict privacy]"
-          : sanitizePrivacyText(outcome.advisory.text, privacy, repoRoot, sessions),
-      };
+    if (
+      !effectivePolicy.allow_advisory ||
+      !effectivePolicy.advisory_enabled
+    ) {
+      warnings.push(POLICY_ADVISORY_DISABLED_WARNING);
     } else {
-      warnings.push(sanitizeHumanText(sanitizePrivacyText(
-        `advisory unavailable: ${outcome.reason}`, privacy, repoRoot, sessions,
-      )));
+      const outcome = await requestAdvisory(
+        renderJsonReport(report),
+        dependencies.runCommand ?? runCommand,
+      );
+      if (outcome.kind === "available") {
+        advisory = {
+          ...outcome.advisory,
+          text: privacy === "strict"
+            ? "[advisory hidden by strict privacy]"
+            : sanitizePrivacyText(
+              outcome.advisory.text,
+              privacy,
+              repoRoot,
+              sessions,
+            ),
+        };
+      } else {
+        warnings.push(sanitizeHumanText(sanitizePrivacyText(
+          `advisory unavailable: ${outcome.reason}`,
+          privacy,
+          repoRoot,
+          sessions,
+        )));
+      }
     }
   }
   const advisoryOption = advisory === undefined ? {} : { advisory };

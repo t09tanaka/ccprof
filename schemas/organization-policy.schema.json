@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/organization-policy.schema.json",
+  "title": "ccprof signed organization policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "policy_schema_version",
+    "organization",
+    "minimum_privacy",
+    "allow_raw",
+    "allow_advisory",
+    "allow_export",
+    "raw_retention_days_max",
+    "required_source_coverage"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "pattern": "\\S"
+    },
+    "policy_schema_version": {
+      "const": 1
+    },
+    "organization": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "minimum_privacy": {
+      "enum": ["strict", "balanced", "raw"]
+    },
+    "allow_raw": {
+      "type": "boolean"
+    },
+    "allow_advisory": {
+      "type": "boolean"
+    },
+    "allow_export": {
+      "type": "boolean"
+    },
+    "raw_retention_days_max": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "required_source_coverage": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "kill_switches": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["raw", "advisory", "export"],
+      "properties": {
+        "raw": { "type": "boolean" },
+        "advisory": { "type": "boolean" },
+        "export": { "type": "boolean" }
+      }
+    }
+  }
+}

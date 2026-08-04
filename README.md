@@ -607,9 +607,123 @@ operational, home, platform, Claude/Anthropic configuration and authentication,
 temporary-directory, and locale variables. Unrelated GitHub, AWS, npm, proxy,
 and `NODE_OPTIONS` values are excluded. Authentication values can still be
 sensitive; they are passed only to the child environment and are never copied
-into advisory warnings. Signed organization policy and an administrative
-advisory kill switch are intentionally deferred to a later enterprise-policy
-change.
+into advisory warnings. A signed organization policy can centrally raise the
+privacy floor or disable advisory execution as described below.
+
+### Signed organization policy
+
+Operators can provide a detached Ed25519-signed policy to every ccprof process
+through four managed environment settings:
+
+| Setting | Value |
+|---|---|
+| `CCPROF_ORGANIZATION` | Organization identifier that must exactly match the signed document |
+| `CCPROF_ORGANIZATION_POLICY_PATH` | Local path to the policy JSON |
+| `CCPROF_ORGANIZATION_POLICY_SIGNATURE_PATH` | Local path to its standard-base64 detached signature |
+| `CCPROF_ORGANIZATION_POLICY_PUBLIC_KEY_PATH` | Local path to the trusted Ed25519 public key |
+
+With all four settings absent, ccprof is ungoverned and keeps its existing CLI
+behavior. If any setting is present, all four must be non-empty. Partial
+configuration, unreadable or unsafe files, invalid JSON or fields, an
+organization mismatch, a non-Ed25519 key, or a failed signature fails closed
+with a fixed error that does not echo paths or untrusted contents. Policy,
+signature, and public-key inputs must be stable, non-symlink regular files and
+are limited to 64 KiB, 1 KiB, and 16 KiB respectively.
+
+The v1 document is closed and is described by the packaged
+`schemas/organization-policy.schema.json`. Every field below except `$schema`
+and `kill_switches` is required; when `kill_switches` is present, all three of
+its booleans are required.
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/organization-policy.schema.json",
+  "policy_schema_version": 1,
+  "organization": "example-corp",
+  "minimum_privacy": "balanced",
+  "allow_raw": false,
+  "allow_advisory": true,
+  "allow_export": false,
+  "raw_retention_days_max": 14,
+  "required_source_coverage": 0.9,
+  "kill_switches": {
+    "raw": false,
+    "advisory": false,
+    "export": false
+  }
+}
+```
+
+Sign the canonical semantic JSON, not the policy file's original whitespace or
+key order. Canonical JSON omits `$schema`, uses the field order shown below, has
+no insignificant whitespace or trailing newline, and orders kill switches as
+`raw`, `advisory`, then `export`. For example, save this one-time helper as
+`canonicalize-policy.mjs`:
+
+```js
+import { readFile, writeFile } from "node:fs/promises";
+
+const input = JSON.parse(await readFile(process.argv[2], "utf8"));
+const canonical = {
+  policy_schema_version: input.policy_schema_version,
+  organization: input.organization,
+  minimum_privacy: input.minimum_privacy,
+  allow_raw: input.allow_raw,
+  allow_advisory: input.allow_advisory,
+  allow_export: input.allow_export,
+  raw_retention_days_max: input.raw_retention_days_max,
+  required_source_coverage: input.required_source_coverage,
+  ...(input.kill_switches === undefined
+    ? {}
+    : {
+        kill_switches: {
+          raw: input.kill_switches.raw,
+          advisory: input.kill_switches.advisory,
+          export: input.kill_switches.export,
+        },
+      }),
+};
+await writeFile(process.argv[3], JSON.stringify(canonical));
+```
+
+Generate a key pair, canonicalize the document, and create a standard-base64
+detached signature. Keep the private key out of endpoint configuration:
+
+```sh
+openssl genpkey -algorithm ED25519 -out organization-policy-private.pem
+openssl pkey -in organization-policy-private.pem -pubout -out organization-policy-public.pem
+node canonicalize-policy.mjs organization-policy.json organization-policy.canonical.json
+openssl pkeyutl -sign -rawin -inkey organization-policy-private.pem -in organization-policy.canonical.json | openssl base64 -A > organization-policy.sig
+```
+
+Distribute the readable policy, signature, and public key, then set the managed
+environment. The configured policy path may point to the readable policy;
+ccprof independently derives the same canonical bytes before verification.
+
+```sh
+export CCPROF_ORGANIZATION=example-corp
+export CCPROF_ORGANIZATION_POLICY_PATH=/managed/ccprof/organization-policy.json
+export CCPROF_ORGANIZATION_POLICY_SIGNATURE_PATH=/managed/ccprof/organization-policy.sig
+export CCPROF_ORGANIZATION_POLICY_PUBLIC_KEY_PATH=/managed/ccprof/organization-policy-public.pem
+```
+
+An optional `.ccprof/config.json` `policy` object can tighten the signed policy
+for one repository using the same fields except organization, schema version,
+and kill switches. Organization, repository, and CLI layers combine
+monotonically: the strongest requested privacy wins; permission booleans use
+logical AND; the minimum retention limit wins; and the maximum source coverage
+requirement wins. A signed `kill_switches` value of `true` disables raw,
+advisory, or export regardless of lower layers. When raw is disabled, a `raw`
+request is raised to `balanced`; when advisory is disabled, ccprof never starts
+the advisory child process.
+
+Today `analyze` and `stats` consume the effective privacy policy, and `analyze`
+also consumes advisory permission. The following resolved values are not yet consumed
+by downstream features: `allow_export`, `raw_retention_days_max`, and
+`required_source_coverage`. There is no export command, policy-driven retention
+or deletion job, source-coverage gate, or encryption/key-management consumer in
+this feature. The Store therefore remains raw and `ccprof data gc` keeps its
+documented fixed retention behavior.
 
 The store lives outside the repository, in a per-repository directory:
 
