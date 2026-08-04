@@ -2275,9 +2275,9 @@ test("R004 partitions denied actions from sorted repeated-safe command groups", 
 test("R004 preserves UTF-8 canonical command order under input reversal", () => {
   const actions = [
     approvalWait("accent-1", 0, 100, "npm test -- é"),
-    approvalWait("ascii-1", 200, 300, "npm test -- z"),
+    approvalWait("ascii-1", 200, 300, 'npm test -- "z z"'),
     approvalWait("accent-2", 400, 500, "npm test -- é"),
-    approvalWait("ascii-2", 600, 700, "npm test -- z"),
+    approvalWait("ascii-2", 600, 700, 'npm test -- "z z"'),
   ];
   const options = {
     ruleSafety: approvalRuleSafety(["npm test -- *"]),
@@ -2288,11 +2288,11 @@ test("R004 preserves UTF-8 canonical command order under input reversal", () => 
   assert.ok(forward);
   assert.ok(reversed);
   assert.deepEqual(forward.evidence.canonical_commands, [
-    "npm test -- z",
+    'npm test -- "z z"',
     'npm test -- "é"',
   ]);
   assert.ok(
-    forward.fix_recipe.suggestion.indexOf("npm test -- z") <
+    forward.fix_recipe.suggestion.indexOf('npm test -- "z z"') <
       forward.fix_recipe.suggestion.indexOf('npm test -- "é"'),
   );
   assert.equal(JSON.stringify(forward), JSON.stringify(reversed));
