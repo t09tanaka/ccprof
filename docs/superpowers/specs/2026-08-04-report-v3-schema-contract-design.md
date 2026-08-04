@@ -73,10 +73,11 @@ The sections follow the approved audit contract:
 - `work_unit`: logical `repository_id`, `pr_ref`, real `base_oid`, `head_oid`,
   `merge_base_oid`, and unique `workspace_ids`.
 - `window`: integer start/end timestamps, their source identifiers, and
-  `full`/`partial` completeness.
+  `complete`/`partial` completeness, matching the current analysis-window
+  vocabulary.
 - each source: adapter identifier and SemVer, schema fingerprint, unique
   declared capabilities, and measured file/row/event coverage counters.
-- `policy`: positive schema version, SHA-256 digest, and
+- `policy`: schema version `1`, SHA-256 digest, and
   `strict`/`balanced`/`raw` privacy profile.
 - `summary`: the audit's critical-path and resource-cost counters, all as
   nonnegative safe integers.
@@ -136,6 +137,8 @@ producer/runtime must enforce all of the following:
   `finding_key`.
 - A rule's `compatibility_epoch` equals the major component of its SemVer
   `version`.
+- `producer.ruleset_version` is a real calendar date and identifies the
+  effective manifest set used by the report.
 - Coverage entries are unique and canonical by `rule_id`, contain exactly the
   rules selected by the effective manifest, and obey
   `eligible_sessions <= total_sessions`.
