@@ -949,6 +949,20 @@ test("collectDiffEvidence counts complete text additions and deletions only", as
   ]);
 });
 
+test("collectDiffEvidence omits line count when patch and status are empty", async () => {
+  const fixture = fakeRunner(() => ok(""));
+
+  const evidence = await collectDiffEvidence({
+    cwd: "/repo",
+    baseOid: BASE,
+    headOid: HEAD,
+    runner: fixture.runner,
+  });
+
+  assert.deepEqual(evidence.files, []);
+  assert.equal("changedLineCount" in evidence, false);
+});
+
 test("collectDiffEvidence pairs status with patch order and parses only hunk additions", async () => {
   const binaryPath = "assets/a\nb.bin";
   const status = [
