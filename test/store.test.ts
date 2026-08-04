@@ -2955,6 +2955,28 @@ test("legacy finding normalization is idempotent across save, load, and migratio
     },
   );
 
+  const mismatchedDomain = structuredClone(
+    normalized.findings[0] as Finding,
+  );
+  mismatchedDomain.impact = {
+    ...mismatchedDomain.impact as ImpactEstimate,
+    kind: "resource_cost",
+  };
+  mismatchedDomain.scoring_rationale = [
+    "estimated_upper_only",
+    "resource_cost_only",
+    "partial_source",
+    "legacy_projection",
+  ];
+  assert.throws(
+    () => makeAnalysisRecord({ ...legacy, findings: [mismatchedDomain] }),
+    (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.equal(error.message, "invalid finding");
+      return true;
+    },
+  );
+
   await temporaryStore(async (paths) => {
     const saved = await saveAnalysis(paths, legacy);
     assert.deepEqual(saved.warnings, []);

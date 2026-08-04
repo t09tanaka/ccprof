@@ -518,7 +518,27 @@ test("Store records preserve new metadata and legacy findings remain readable", 
 
   assert.equal(current.findings[0]?.rule_version, "1.0.0");
   assert.equal(current.findings[0]?.compatibility_epoch, 1);
-  assert.deepEqual(old.findings[0], legacy);
+  assert.deepEqual(old.findings[0], {
+    ...legacy,
+    confidence: "medium",
+    recoverable: { min: 1, bound: "upper" },
+    impact: {
+      lower_ms: 0,
+      upper_ms: 60_000,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "medium",
+      source_completeness: 0.5,
+    },
+    severity: "medium",
+    scoring_rationale: [
+      "estimated_upper_only",
+      "partial_source",
+      "legacy_projection",
+    ],
+  });
   assert.equal(Object.hasOwn(old.findings[0] ?? {}, "rule_version"), false);
   assert.equal(Object.hasOwn(old.findings[0] ?? {}, "compatibility_epoch"), false);
 
@@ -528,12 +548,13 @@ test("Store records preserve new metadata and legacy findings remain readable", 
   ]) {
     assert.throws(
       () => makeAnalysisRecord({ ...common, findings: [invalid] }),
-      /invalid finding compatibility metadata/u,
+      (error: unknown) =>
+        error instanceof TypeError && error.message === "invalid finding",
     );
   }
 });
 
-test("Store snapshots compatibility metadata without reading Proxy values", () => {
+test("Store rejects finding Proxies without reading their values", () => {
   const decorated = withRuleManifest(finding("R001"));
   const common = {
     created_at_ms: 1,
@@ -553,9 +574,11 @@ test("Store snapshots compatibility metadata without reading Proxy values", () =
       return Reflect.getOwnPropertyDescriptor(target, property);
     },
   });
-  const record = makeAnalysisRecord({ ...common, findings: [lying] });
-  assert.equal(record.findings[0]?.rule_version, "1.0.0");
-  assert.equal(record.findings[0]?.compatibility_epoch, 1);
+  assert.throws(
+    () => makeAnalysisRecord({ ...common, findings: [lying] }),
+    (error: unknown) =>
+      error instanceof TypeError && error.message === "invalid finding",
+  );
   assert.equal(metadataGets, 0);
 
   for (const trapped of [
@@ -583,7 +606,7 @@ test("Store snapshots compatibility metadata without reading Proxy values", () =
   }
 });
 
-test("saveAnalysis snapshots compatibility metadata on every input path", async () => {
+test("saveAnalysis rejects finding Proxies on every input path", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-rule-manifest-store-"));
   try {
     const repo = join(root, "repo");
@@ -613,11 +636,17 @@ test("saveAnalysis snapshots compatibility metadata on every input path", async 
         return Reflect.getOwnPropertyDescriptor(target, property);
       },
     });
-    const saved = await saveAnalysis(paths, { ...base, findings: [lying] });
+    await assert.rejects(
+      saveAnalysis(paths, { ...base, findings: [lying] }),
+      (error: unknown) =>
+        error instanceof TypeError && error.message === "invalid analysis record",
+    );
+    assert.equal(metadataGets, 0);
+
+    const saved = await saveAnalysis(paths, base);
     assert.deepEqual(saved.warnings, []);
     assert.equal(saved.record.findings[0]?.rule_version, "1.0.0");
     assert.equal(saved.record.findings[0]?.compatibility_epoch, 1);
-    assert.equal(metadataGets, 0);
 
     const loaded = await loadAnalyses(paths);
     assert.deepEqual(loaded.warnings, []);
@@ -756,10 +785,11 @@ test("stored and private compatibility metadata accepts only a canonical complet
     },
   });
   for (const profile of ["strict", "balanced"] as const) {
-    const projected = projectReportPrivacy(reportWith(lyingFinding), profile);
-    assert.equal(projected.findings[0]?.rule_version, "1.0.0");
-    assert.equal(projected.findings[0]?.compatibility_epoch, 1);
-    assert.doesNotMatch(JSON.stringify(projected), /token-secret/u);
+    assert.throws(
+      () => projectReportPrivacy(reportWith(lyingFinding), profile),
+      (error: unknown) =>
+        error instanceof TypeError && error.message === "invalid finding",
+    );
   }
   assert.equal(metadataGets, 0);
 
@@ -773,10 +803,11 @@ test("stored and private compatibility metadata accepts only a canonical complet
   });
   assert.deepEqual(findingCompatibilityMetadata(throwingDescriptor), { valid: false });
   for (const profile of ["strict", "balanced"] as const) {
-    const projected = projectReportPrivacy(reportWith(throwingDescriptor), profile);
-    assert.equal(Object.hasOwn(projected.findings[0] ?? {}, "rule_version"), false);
-    assert.equal(Object.hasOwn(projected.findings[0] ?? {}, "compatibility_epoch"), false);
-    assert.doesNotMatch(JSON.stringify(projected), /token-secret/u);
+    assert.throws(
+      () => projectReportPrivacy(reportWith(throwingDescriptor), profile),
+      (error: unknown) =>
+        error instanceof TypeError && error.message === "invalid finding",
+    );
   }
 });
 

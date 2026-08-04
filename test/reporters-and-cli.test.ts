@@ -717,6 +717,61 @@ test("renderers and privacy reject partial or hostile canonical finding fields",
       throw new Error(canary);
     },
   });
+  const hostileTitle = { ...canonical };
+  Object.defineProperty(hostileTitle, "title", {
+    enumerable: true,
+    get() {
+      getterCalled = true;
+      throw new Error(canary);
+    },
+  });
+  const hostileRecipe = {
+    ...canonical,
+    fix_recipe: { ...canonical.fix_recipe },
+  };
+  Object.defineProperty(hostileRecipe.fix_recipe, "suggestion", {
+    enumerable: true,
+    get() {
+      getterCalled = true;
+      throw new Error(canary);
+    },
+  });
+  const hostileCaveats = { ...canonical, caveats: ["safe"] };
+  Object.defineProperty(hostileCaveats.caveats, "0", {
+    enumerable: true,
+    get() {
+      getterCalled = true;
+      throw new Error(canary);
+    },
+  });
+  const hostileSerializer = {
+    ...canonical,
+    toJSON() {
+      throw new Error(canary);
+    },
+  } as Finding;
+  const mismatchedLegacyDomain = finding(2, {
+    rule_id: "R002",
+    confidence: "medium",
+    recoverable: { min: 2, bound: "upper" },
+    impact: {
+      lower_ms: 0,
+      upper_ms: 120_000,
+      kind: "resource_cost",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "medium",
+      source_completeness: 0.5,
+    },
+    severity: "medium",
+    scoring_rationale: [
+      "estimated_upper_only",
+      "resource_cost_only",
+      "partial_source",
+      "legacy_projection",
+    ],
+  });
 
   const renderers = [
     (value: Finding) => renderTtyReport({ ...report(), findings: [value] }),
@@ -727,7 +782,15 @@ test("renderers and privacy reject partial or hostile canonical finding fields",
       "strict",
     ),
   ];
-  for (const value of [partial, hostile]) {
+  for (const value of [
+    partial,
+    hostile,
+    hostileTitle,
+    hostileRecipe,
+    hostileCaveats,
+    hostileSerializer,
+    mismatchedLegacyDomain,
+  ]) {
     for (const render of renderers) {
       assert.throws(() => render(value), (error: unknown) => {
         assert.ok(error instanceof TypeError);
