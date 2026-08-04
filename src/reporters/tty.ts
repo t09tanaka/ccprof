@@ -95,6 +95,16 @@ export function sourcesLine(report: ReportV2): string | null {
   return `Sources: ${detail}.`;
 }
 
+export function analysisBudgetLine(report: ReportV2): string | null {
+  const budget = report.analysis_budget;
+  if (budget === undefined) return null;
+  const coverage = Math.round(budget.coverage * 10_000) / 100;
+  const reason = budget.truncation_reason === undefined
+    ? ""
+    : ` — ${budget.truncation_reason}`;
+  return `Analysis budget: ${budget.completeness}${reason} (${coverage}% coverage).`;
+}
+
 function caveatLines(report: ReportV2): string[] {
   const caveats = [
     ...report.caveats,
@@ -121,6 +131,8 @@ export function renderTtyReport(
   const lines = [
     paint(conclusion, report.summary.recoverable_min > 0 ? 33 : 32, color),
   ];
+  const budgetSummary = analysisBudgetLine(report);
+  if (budgetSummary !== null) lines.push(budgetSummary);
   const sourceSummary = sourcesLine(report);
   if (sourceSummary !== null) lines.push(sourceSummary);
   const findings = report.findings.slice(0, 3);

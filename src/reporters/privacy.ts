@@ -210,6 +210,22 @@ function reportCaveats(report: ReportV2, profile: DisplayProfile,
     ...limitations,
   ];
 }
+
+function projectedAnalysisBudget(
+  budget: NonNullable<ReportV2["analysis_budget"]>,
+): NonNullable<ReportV2["analysis_budget"]> {
+  return {
+    configured: { ...budget.configured },
+    consumed: { ...budget.consumed },
+    observed: { ...budget.observed },
+    completeness: budget.completeness,
+    ...(budget.truncation_reason === undefined
+      ? {}
+      : { truncation_reason: budget.truncation_reason }),
+    coverage: budget.coverage,
+  };
+}
+
 export function projectReportPrivacy(report: ReportV2, profile: PrivacyProfile): ReportV2 {
   if (profile === "raw") return report;
   const scope = createHash("sha256").update(JSON.stringify(report)).digest("hex");
@@ -222,6 +238,9 @@ export function projectReportPrivacy(report: ReportV2, profile: PrivacyProfile):
       pr_ref: opaque(scope, "ref", report.unit.pr_ref),
       sessions: sessions.map((session) => opaque(scope, "session", session)),
     },
+    ...(report.analysis_budget === undefined
+      ? {}
+      : { analysis_budget: projectedAnalysisBudget(report.analysis_budget) }),
     ...(report.sources === undefined
       ? {}
       : { sources: structuredClone(report.sources) }),

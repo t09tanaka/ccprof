@@ -4,6 +4,10 @@ import {
   requestAdvisory,
   type AdvisoryText,
 } from "../advisory/advisory.js";
+import type {
+  AnalysisBudgetClock,
+  AnalysisBudgets,
+} from "../analysis/budgets.js";
 import {
   analyze as analyzeCore,
   type AnalyzeOptions,
@@ -23,6 +27,7 @@ import { sanitizeHumanText } from "../reporters/sanitize.js";
 import { renderTtyReport } from "../reporters/tty.js";
 import {
   resolveRepositoryPolicy,
+  type EffectivePolicy,
   type RepositoryPolicyResolver,
 } from "../policy/organization-policy.js";
 
@@ -42,6 +47,8 @@ export interface AnalyzeCommandOptions {
   testMapPath?: string;
   advisory?: boolean;
   privacy?: PrivacyProfile;
+  budgets?: AnalysisBudgets;
+  budgetClock?: AnalysisBudgetClock;
 }
 
 export interface CommandExecutionResult {
@@ -49,7 +56,10 @@ export interface CommandExecutionResult {
   warnings: string[];
 }
 
-type CommandAnalysis = Pick<AnalyzeResult, "report" | "warnings">;
+type CommandAnalysis = Pick<
+  AnalyzeResult,
+  "report" | "warnings" | "preparedOutput"
+>;
 
 export interface AnalyzeCommandDependencies {
   analyze?: (
@@ -61,12 +71,46 @@ export interface AnalyzeCommandDependencies {
   onPrivacyResolved?: (privacy: PrivacyProfile) => void;
 }
 
+function renderOutput(
+  format: AnalyzeOutputFormat,
+  report: AnalyzeResult["report"],
+  color: boolean,
+  advisory?: AdvisoryText,
+): string {
+  const advisoryOption = advisory === undefined ? {} : { advisory };
+  return format === "json"
+    ? renderJsonReport(report, advisoryOption)
+    : format === "markdown"
+      ? renderMarkdownReport(report, advisoryOption)
+      : renderTtyReport(report, { color, ...advisoryOption });
+}
+
 export async function runAnalyzeCommand(
   options: AnalyzeCommandOptions,
   dependencies: AnalyzeCommandDependencies = {},
 ): Promise<CommandExecutionResult> {
   const analyze = dependencies.analyze ?? analyzeCore;
-  const result = await analyze({
+  const requestedPrivacy = options.privacy ??
+    defaultPrivacyProfile(options.format, false);
+  let resolvedPolicy:
+    | { repoRoot: string; value: EffectivePolicy }
+    | undefined;
+  const policyFor = async (repoRoot: string): Promise<EffectivePolicy> => {
+    if (resolvedPolicy?.repoRoot === repoRoot) return resolvedPolicy.value;
+    const value = await (
+      dependencies.resolvePolicy ?? resolveRepositoryPolicy
+    )(repoRoot, {
+      privacy: requestedPrivacy,
+      advisory: options.advisory === true,
+    });
+    resolvedPolicy = { repoRoot, value };
+    dependencies.onPrivacyResolved?.(value.privacy);
+    return value;
+  };
+  const projectorWarnings: string[] = [];
+  let projectorAdvisory: AdvisoryText | undefined;
+  let projectorInvoked = false;
+  const analyzeOptions: AnalyzeOptions = {
     cwd: options.cwd,
     ...(options.pr === undefined ? {} : { pr: options.pr }),
     ...(options.sinceMs === undefined ? {} : { sinceMs: options.sinceMs }),
@@ -79,28 +123,96 @@ export async function runAnalyzeCommand(
     ...(options.testMapPath === undefined
       ? {}
       : { testMapPath: resolve(options.cwd, options.testMapPath) }),
-  });
+    ...(options.budgets === undefined
+      ? {}
+      : {
+        budgets: options.budgets,
+        ...(options.budgetClock === undefined
+          ? {}
+          : { budgetClock: options.budgetClock }),
+        outputProjector: async (unprojectedReport) => {
+          projectorInvoked = true;
+          const repoRoot = unprojectedReport.unit.repo;
+          const sessions = unprojectedReport.unit.sessions;
+          const effectivePolicy = await policyFor(repoRoot);
+          const privacy = effectivePolicy.privacy;
+          const promptReport = projectReportPrivacy(unprojectedReport, privacy);
+          if (options.advisory === true) {
+            if (
+              !effectivePolicy.allow_advisory ||
+              !effectivePolicy.advisory_enabled
+            ) {
+              projectorWarnings.push(POLICY_ADVISORY_DISABLED_WARNING);
+            } else {
+              const outcome = await requestAdvisory(
+                renderJsonReport(promptReport),
+                dependencies.runCommand ?? runCommand,
+              );
+              if (outcome.kind === "available") {
+                projectorAdvisory = {
+                  ...outcome.advisory,
+                  text: privacy === "strict"
+                    ? "[advisory hidden by strict privacy]"
+                    : sanitizePrivacyText(
+                        outcome.advisory.text,
+                        privacy,
+                        repoRoot,
+                        sessions,
+                      ),
+                };
+              } else {
+                projectorWarnings.push(sanitizeHumanText(sanitizePrivacyText(
+                  `advisory unavailable: ${outcome.reason}`,
+                  privacy,
+                  repoRoot,
+                  sessions,
+                )));
+              }
+            }
+          }
+          return {
+            format: options.format,
+            render: (candidate) => {
+              const projected = projectReportPrivacy(candidate, privacy);
+              const deterministic = renderOutput(
+                options.format,
+                projected,
+                options.color,
+              );
+              return projectorAdvisory === undefined
+                ? { output: deterministic }
+                : {
+                  output: renderOutput(
+                    options.format,
+                    projected,
+                    options.color,
+                    projectorAdvisory,
+                  ),
+                  withoutAdvisory: deterministic,
+                };
+            },
+          };
+        },
+      }),
+  };
+  const result = await analyze(analyzeOptions);
   const repoRoot = result.report.unit.repo;
-  const requestedPrivacy = options.privacy ??
-    defaultPrivacyProfile(options.format, false);
-  const effectivePolicy = await (
-    dependencies.resolvePolicy ?? resolveRepositoryPolicy
-  )(repoRoot, {
-    privacy: requestedPrivacy,
-    advisory: options.advisory === true,
-  });
+  const effectivePolicy = await policyFor(repoRoot);
   const privacy = effectivePolicy.privacy;
-  dependencies.onPrivacyResolved?.(privacy);
   const report = projectReportPrivacy(result.report, privacy);
   const sessions = result.report.unit.sessions;
   const warnings = privacyWarningTexts(
     result.warnings, privacy, repoRoot, sessions,
   ).map((warning) => sanitizeHumanText(warning));
+  warnings.push(...projectorWarnings);
+  if (result.preparedOutput !== undefined) {
+    return { stdout: result.preparedOutput, warnings };
+  }
   // Requested only after analyze() returned, so the store write inside it
   // has already completed with the deterministic report alone: advisory
   // text can never reach AnalysisRecord or the baseline.
-  let advisory: AdvisoryText | undefined;
-  if (options.advisory === true) {
+  let advisory = projectorAdvisory;
+  if (options.advisory === true && !projectorInvoked) {
     if (
       !effectivePolicy.allow_advisory ||
       !effectivePolicy.advisory_enabled
@@ -133,17 +245,8 @@ export async function runAnalyzeCommand(
       }
     }
   }
-  const advisoryOption = advisory === undefined ? {} : { advisory };
-  const stdout = options.format === "json"
-    ? renderJsonReport(report, advisoryOption)
-    : options.format === "markdown"
-      ? renderMarkdownReport(report, advisoryOption)
-      : renderTtyReport(report, {
-        color: options.color,
-        ...advisoryOption,
-      });
   return {
-    stdout,
+    stdout: renderOutput(options.format, report, options.color, advisory),
     warnings,
   };
 }

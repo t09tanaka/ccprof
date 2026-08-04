@@ -79,6 +79,13 @@ import {
   type PrContext,
 } from "../git/pr-context.js";
 import {
+  finalizeBudgetedOutput,
+  type AnalysisOutputProjector,
+  type FinalizedBudgetedOutput,
+} from "../reporters/budget.js";
+import { renderJsonReport } from "../reporters/json.js";
+import { projectReportPrivacy } from "../reporters/privacy.js";
+import {
   ruleCoverage,
   sessionSupportsRule,
 } from "../rules/capabilities.js";
@@ -170,6 +177,8 @@ export interface AnalyzeOptions {
   persist?: boolean;
   budgets?: AnalysisBudgets;
   budgetClock?: AnalysisBudgetClock;
+  /** Internal display adapter used only when an analysis budget is active. */
+  outputProjector?: AnalysisOutputProjector;
 }
 
 export interface AnalyzeWarning {
@@ -189,6 +198,8 @@ export interface AnalyzeResult {
   suppressedKeys: string[];
   ledger: LedgerResult;
   adoptions: AdoptionRecord[];
+  /** Exact privacy-projected bytes finalized before an active-budget save. */
+  preparedOutput?: string;
 }
 
 export class NoMatchingSessionsError extends Error {
@@ -1123,6 +1134,20 @@ function adoptionCandidates(
     .filter((candidate) => detectability(candidate) !== "undetectable");
 }
 
+async function prepareBudgetedOutput(
+  options: AnalyzeOptions,
+  report: ReportV2,
+  meter: AnalysisBudgetMeter,
+): Promise<FinalizedBudgetedOutput> {
+  const projection = await (options.outputProjector ?? (async () => ({
+    format: "json" as const,
+    render: (candidate: ReportV2) => ({
+      output: renderJsonReport(projectReportPrivacy(candidate, "strict")),
+    }),
+  })))(report);
+  return finalizeBudgetedOutput({ report, meter, projection });
+}
+
 async function finishBudgetedPartialAnalysis(
   options: AnalyzeOptions,
   meter: AnalysisBudgetMeter,
@@ -1160,27 +1185,11 @@ async function finishBudgetedPartialAnalysis(
     pr_ref: context.prRef,
     sessions: uniqueSorted(sessions.map(({ session_id }) => session_id)),
   };
-  const analysisBudget = meter.result();
-  const record = makeAnalysisRecord({
-    created_at_ms: context.resolvedAtMs,
-    unit,
-    summary: ledger.summary,
-    findings: [],
-    metrics: analysisMetrics(timeline),
-    command_costs: [],
-    read_observations: [],
-    analysis_budget: analysisBudget,
-  });
-  const saveResult = persist
-    ? await saveAnalysis(paths as StorePaths, record)
-    : { record, warnings: [] as StoreWarning[] };
-  warnings.push(...saveResult.warnings.map(storeWarning));
-  const normalizedWarnings = normalizeWarnings(warnings);
+  const normalizedWarningsBeforeSave = normalizeWarnings(warnings);
   const caveats = uniqueSorted([
     ...KNOWN_LIMITATIONS,
-    ...normalizedWarnings.map(warningCaveat),
+    ...normalizedWarningsBeforeSave.map(warningCaveat),
   ]);
-  const storedBudget = saveResult.record.analysis_budget ?? analysisBudget;
   const report: ReportV2 = {
     version: 2,
     unit,
@@ -1192,8 +1201,25 @@ async function finishBudgetedPartialAnalysis(
     ...(inapplicableRules.length === 0
       ? {}
       : { skipped_rules: inapplicableRules }),
-    analysis_budget: storedBudget,
+    analysis_budget: meter.result(),
   };
+  const prepared = await prepareBudgetedOutput(options, report, meter);
+  report.analysis_budget = prepared.analysisBudget;
+  const record = makeAnalysisRecord({
+    created_at_ms: context.resolvedAtMs,
+    unit,
+    summary: ledger.summary,
+    findings: [],
+    metrics: analysisMetrics(timeline),
+    command_costs: [],
+    read_observations: [],
+    analysis_budget: prepared.analysisBudget,
+  });
+  const saveResult = persist
+    ? await saveAnalysis(paths as StorePaths, record)
+    : { record, warnings: [] as StoreWarning[] };
+  warnings.push(...saveResult.warnings.map(storeWarning));
+  const normalizedWarnings = normalizeWarnings(warnings);
   return {
     report,
     window,
@@ -1203,6 +1229,7 @@ async function finishBudgetedPartialAnalysis(
     suppressedKeys: [],
     ledger,
     adoptions: [],
+    preparedOutput: prepared.stdout,
   };
 }
 
@@ -1624,7 +1651,65 @@ export async function analyze(
     : reconcileLedger({ ...ledgerInput, baseline });
   const allFindings = ledger.findings.map(withRuleManifest).sort(findingOrder);
   budgetMeter?.checkpoint();
-  const analysisBudget = budgetMeter?.result();
+  if (budgetMeter !== undefined) {
+    const applied = applyDismissals(
+      allFindings,
+      dismissalResult.records,
+      context.resolvedAtMs,
+    );
+    const normalizedWarningsBeforeSave = normalizeWarnings(warnings);
+    const caveats = uniqueSorted([
+      ...KNOWN_LIMITATIONS,
+      ...normalizedWarningsBeforeSave.map(warningCaveat),
+    ]);
+    const report: ReportV2 = {
+      version: 2,
+      unit,
+      sources: sourceDescriptorsForSessions(sessions),
+      summary: ledger.summary,
+      findings: [...applied.findings]
+        .filter((finding) => finding.recoverable.min > 0)
+        .sort(findingOrder)
+        .slice(0, 3),
+      caveats,
+      rule_coverage: coverage,
+      ...(inapplicableRules.length === 0
+        ? {}
+        : { skipped_rules: inapplicableRules }),
+      analysis_budget: budgetMeter.result(),
+    };
+    const prepared = await prepareBudgetedOutput(options, report, budgetMeter);
+    report.analysis_budget = prepared.analysisBudget;
+    const record = makeAnalysisRecord({
+      created_at_ms: context.resolvedAtMs,
+      unit,
+      summary: ledger.summary,
+      findings: allFindings,
+      metrics,
+      command_costs: costs,
+      read_observations: reads.observations,
+      analysis_budget: prepared.analysisBudget,
+    });
+    const saveResult = persist
+      ? await saveAnalysis(paths, record, { snapshot: snapshotIdentity(
+          paths, context, window, sessions, testMap, options, history, coverage,
+          inapplicableRules,
+          sourceErrors, hookEvents.warnings,
+        ) })
+      : { record, warnings: [] as StoreWarning[] };
+    warnings.push(...saveResult.warnings.map(storeWarning));
+    return {
+      report,
+      window,
+      allFindings,
+      record: saveResult.record,
+      warnings: normalizeWarnings(warnings),
+      suppressedKeys: applied.suppressed_keys,
+      ledger,
+      adoptions,
+      preparedOutput: prepared.stdout,
+    };
+  }
   const record = makeAnalysisRecord({
     created_at_ms: context.resolvedAtMs,
     unit,
@@ -1633,9 +1718,6 @@ export async function analyze(
     metrics,
     command_costs: costs,
     read_observations: reads.observations,
-    ...(analysisBudget === undefined
-      ? {}
-      : { analysis_budget: analysisBudget }),
   });
   const saveResult = persist
     ? await saveAnalysis(paths, record, { snapshot: snapshotIdentity(
@@ -1670,9 +1752,6 @@ export async function analyze(
     ...(inapplicableRules.length === 0
       ? {}
       : { skipped_rules: inapplicableRules }),
-    ...(analysisBudget === undefined
-      ? {}
-      : { analysis_budget: analysisBudget }),
   };
   return {
     report,

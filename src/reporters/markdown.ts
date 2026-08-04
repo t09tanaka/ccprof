@@ -1,7 +1,12 @@
 import type { AdvisoryText } from "../advisory/advisory.js";
 import type { Finding, ReportV2 } from "../core/model.js";
 import { sanitizeHumanText } from "./sanitize.js";
-import { formatMinutes, skippedRulesLine, sourcesLine } from "./tty.js";
+import {
+  analysisBudgetLine,
+  formatMinutes,
+  skippedRulesLine,
+  sourcesLine,
+} from "./tty.js";
 
 export interface MarkdownReportOptions {
   advisory?: AdvisoryText;
@@ -52,6 +57,9 @@ export function renderMarkdownReport(
     "## ccprof",
     "",
     `**Conclusion:** ${formatMinutes(report.summary.recoverable_min)} point-recoverable from ${formatMinutes(report.summary.measured_min)} measured; estimated floor ${formatMinutes(report.summary.estimated_floor_min)}.`,
+    ...(analysisBudgetLine(report) === null
+      ? []
+      : [analysisBudgetLine(report) as string]),
     ...(sourcesLine(report) === null
       ? []
       : [`**${sourcesLine(report)?.replace(/^Sources: /u, "Sources:** ")}`]),
