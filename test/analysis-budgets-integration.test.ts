@@ -626,6 +626,87 @@ test("simultaneous wall and CPU exhaustion returns a stable empty partial result
   }
 });
 
+test("early budget partials expose content-fallback audit identity without a transient Store", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-budget-audit-identity-"));
+  try {
+    const repo = await makeRepository(root);
+    const persistedPaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "persisted-data") },
+    });
+    const transientPaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "transient-data") },
+    });
+    const common = {
+      cwd: repo,
+      pr: "main...feature",
+      sinceMs: NOW_MS - 20 * 60_000,
+      nowMs: NOW_MS,
+      sessionSource: {
+        contract: CLAUDE_SESSION_SOURCE_CONTRACT,
+        discover: async () => [session(repo)],
+      },
+      budgets: budgets({ max_wall_ms: 0, max_cpu_ms: 0 }),
+    } as const;
+    const persisted = await analyze({
+      ...common,
+      storePaths: persistedPaths,
+      persist: true,
+      budgetClock: new ScriptedClock([0, 1], [0, 1]),
+    });
+    const transient = await analyze({
+      ...common,
+      storePaths: transientPaths,
+      persist: false,
+      budgetClock: new ScriptedClock([0, 1], [0, 1]),
+    });
+
+    assert.equal(
+      persisted.report.analysis_budget?.truncation_reason,
+      "max_wall_ms",
+    );
+    assert.deepEqual(persisted.record, transient.record);
+    assert.equal(
+      persisted.audit_identity.snapshot_id,
+      transient.audit_identity.snapshot_id,
+    );
+    assert.equal(
+      persisted.audit_identity.deterministic_digest,
+      transient.audit_identity.deterministic_digest,
+    );
+    for (const result of [persisted, transient]) {
+      assert.equal(result.audit_identity.analysis_id, result.record.analysis_id);
+      assert.equal(
+        result.audit_identity.created_at_ms,
+        result.record.created_at_ms,
+      );
+      assert.deepEqual(result.audit_identity.snapshot_identity, {
+        mode: "content-fallback",
+      });
+    }
+    const database = openStoreDatabase(persistedPaths);
+    try {
+      assert.equal(
+        database.prepare(
+          "SELECT snapshot_id FROM analysis_executions WHERE execution_id = ?",
+        ).pluck().get(persisted.record.analysis_id),
+        persisted.audit_identity.snapshot_id,
+      );
+    } finally {
+      database.close();
+    }
+    await assert.rejects(
+      access(storeDatabasePath(transientPaths)),
+      (error: unknown) =>
+        error !== null &&
+        typeof error === "object" &&
+        "code" in error &&
+        error.code === "ENOENT",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("a budgeted custom source failure returns content-free partial output", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-budget-source-failure-"));
   try {

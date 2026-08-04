@@ -148,10 +148,12 @@ import {
 } from "../sources/session-source.js";
 import {
   analysisDigest,
+  analysisAuditIdentity,
   computeBaseline,
   loadAnalyses,
   makeAnalysisRecord,
   saveAnalysis,
+  type AnalysisAuditIdentity,
   type AnalysisHistoryEntry,
   type AnalysisRecord,
   type AnalysisSnapshotIdentity,
@@ -233,6 +235,7 @@ export interface AnalyzeResult {
   window: AnalysisWindow;
   allFindings: Finding[];
   record: AnalysisRecord;
+  audit_identity: AnalysisAuditIdentity;
   warnings: AnalyzeWarning[];
   suppressedKeys: string[];
   ledger: LedgerResult;
@@ -1432,7 +1435,11 @@ async function finishBudgetedPartialAnalysis(
   });
   const saveResult = persist
     ? await saveAnalysis(paths as StorePaths, record)
-    : { record, warnings: [] as StoreWarning[] };
+    : {
+      record,
+      audit_identity: analysisAuditIdentity(record),
+      warnings: [] as StoreWarning[],
+    };
   warnings.push(...saveResult.warnings.map(storeWarning));
   const normalizedWarnings = normalizeWarnings(warnings);
   return {
@@ -1440,6 +1447,7 @@ async function finishBudgetedPartialAnalysis(
     window,
     allFindings: [],
     record: saveResult.record,
+    audit_identity: saveResult.audit_identity,
     warnings: normalizedWarnings,
     suppressedKeys: [],
     ledger,
@@ -2116,13 +2124,20 @@ export async function analyze(
     });
     const saveResult = persist
       ? await saveAnalysis(paths, record, { snapshot: currentSnapshotIdentity })
-      : { record, warnings: [] as StoreWarning[] };
+      : {
+        record,
+        audit_identity: analysisAuditIdentity(record, {
+          snapshot: currentSnapshotIdentity,
+        }),
+        warnings: [] as StoreWarning[],
+      };
     warnings.push(...saveResult.warnings.map(storeWarning));
     return {
       report,
       window,
       allFindings,
       record: saveResult.record,
+      audit_identity: saveResult.audit_identity,
       warnings: normalizeWarnings(warnings),
       suppressedKeys: applied.suppressed_keys,
       ledger,
@@ -2142,7 +2157,13 @@ export async function analyze(
   });
   const saveResult = persist
     ? await saveAnalysis(paths, record, { snapshot: currentSnapshotIdentity })
-    : { record, warnings: [] as StoreWarning[] };
+    : {
+      record,
+      audit_identity: analysisAuditIdentity(record, {
+        snapshot: currentSnapshotIdentity,
+      }),
+      warnings: [] as StoreWarning[],
+    };
   warnings.push(...saveResult.warnings.map(storeWarning));
 
   const applied = applyDismissals(
@@ -2175,6 +2196,7 @@ export async function analyze(
     window,
     allFindings,
     record: saveResult.record,
+    audit_identity: saveResult.audit_identity,
     warnings: normalizedWarnings,
     suppressedKeys: applied.suppressed_keys,
     ledger,

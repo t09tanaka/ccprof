@@ -66,6 +66,7 @@ import {
   type AdoptionRecord,
 } from "../src/store/adoptions.js";
 import {
+  analysisAuditIdentity,
   analysisDigest,
   computeBaseline,
   loadAnalyses,
@@ -73,6 +74,7 @@ import {
   saveAnalysis,
   type AnalysisHistoryEntry,
   type AnalysisRecord,
+  type AnalysisSaveOptions,
   type AnalysisSnapshotIdentity,
 } from "../src/store/analyses.js";
 import {
@@ -1925,6 +1927,165 @@ test("analysis snapshots ignore invocation identity while retaining every execut
   });
 });
 
+test("analysis audit identities exclude execution fields and normalize snapshots", () => {
+  const firstRecord = record("audit-identity-first", 100);
+  const secondRecord = {
+    ...firstRecord,
+    analysis_id: "audit-identity-second",
+    created_at_ms: 200,
+  };
+  const snapshot = {
+    ...snapshotOptions().snapshot,
+    repo_id: "A".repeat(64),
+    base_oid: "B".repeat(40),
+    head_oid: "C".repeat(40),
+    merge_base_oid: "D".repeat(40),
+    source_digest: "E".repeat(64),
+    config_digest: "F".repeat(64),
+    policy_digest: "A".repeat(64),
+    history_digest: "B".repeat(64),
+  };
+  const expectedIdentity = {
+    ...snapshot,
+    repo_id: snapshot.repo_id.toLowerCase(),
+    base_oid: snapshot.base_oid.toLowerCase(),
+    head_oid: snapshot.head_oid.toLowerCase(),
+    merge_base_oid: snapshot.merge_base_oid.toLowerCase(),
+    source_digest: snapshot.source_digest.toLowerCase(),
+    config_digest: snapshot.config_digest.toLowerCase(),
+    policy_digest: snapshot.policy_digest.toLowerCase(),
+    history_digest: snapshot.history_digest.toLowerCase(),
+  };
+
+  const first = analysisAuditIdentity(firstRecord, { snapshot });
+  const second = analysisAuditIdentity(secondRecord, { snapshot });
+
+  assert.match(first.snapshot_id, /^[0-9a-f]{64}$/u);
+  assert.equal(second.snapshot_id, first.snapshot_id);
+  assert.equal(first.deterministic_digest, `sha256:${first.snapshot_id}`);
+  assert.equal(second.deterministic_digest, `sha256:${second.snapshot_id}`);
+  assert.deepEqual(first.snapshot_identity, expectedIdentity);
+  assert.deepEqual(second.snapshot_identity, expectedIdentity);
+  assert.deepEqual(
+    { analysis_id: first.analysis_id, created_at_ms: first.created_at_ms },
+    { analysis_id: firstRecord.analysis_id, created_at_ms: firstRecord.created_at_ms },
+  );
+  assert.deepEqual(
+    { analysis_id: second.analysis_id, created_at_ms: second.created_at_ms },
+    { analysis_id: secondRecord.analysis_id, created_at_ms: secondRecord.created_at_ms },
+  );
+});
+
+test("analysis audit identities label omitted snapshots as content fallbacks", () => {
+  const input = record("audit-identity-fallback", 100);
+  const fallback = analysisAuditIdentity(input);
+  const canonical = analysisAuditIdentity(input, snapshotOptions());
+
+  assert.deepEqual(fallback.snapshot_identity, { mode: "content-fallback" });
+  assert.notDeepEqual(fallback.snapshot_identity, canonical.snapshot_identity);
+  assert.notEqual(fallback.snapshot_id, canonical.snapshot_id);
+});
+
+test("analysis audit identities accept transparent record proxies", () => {
+  const input = record("audit-identity-transparent-proxy", 100);
+
+  assert.deepEqual(
+    analysisAuditIdentity(new Proxy(input, {})),
+    analysisAuditIdentity(input),
+  );
+});
+
+test("analysis audit identities reject hostile records without leaking trap errors", () => {
+  const canary = "AUDIT_IDENTITY_CANARY";
+  let getterReads = 0;
+  const accessor = record("audit-identity-accessor", 100) as AnalysisRecord & {
+    analysis_budget?: AnalysisBudgetResult;
+  };
+  Object.defineProperty(accessor, "analysis_budget", {
+    enumerable: true,
+    get() {
+      getterReads += 1;
+      throw new Error(canary);
+    },
+  });
+  let proxyReads = 0;
+  const proxy = new Proxy(record("audit-identity-proxy", 200), {
+    ownKeys() {
+      proxyReads += 1;
+      throw new Error(canary);
+    },
+  });
+
+  for (const hostile of [accessor, proxy]) {
+    assert.throws(() => analysisAuditIdentity(hostile), (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.equal(error.message.includes(canary), false);
+      return true;
+    });
+  }
+  assert.deepEqual({ getterReads, proxyReads }, { getterReads: 0, proxyReads: 1 });
+});
+
+test("analysis audit identities reject hostile snapshot options without evaluating them", async () => {
+  await temporaryStore(async (paths) => {
+    const canary = "AUDIT_OPTIONS_CANARY";
+    const input = record("audit-options-hostile", 100);
+    let getterReads = 0;
+    const accessor = Object.defineProperty({}, "snapshot", {
+      enumerable: true,
+      get() {
+        getterReads += 1;
+        throw new Error(canary);
+      },
+    }) as AnalysisSaveOptions;
+    let proxyReads = 0;
+    const proxy = new Proxy({} as AnalysisSaveOptions, {
+      get(target, property, receiver) {
+        if (property === "snapshot") {
+          proxyReads += 1;
+          throw new Error(canary);
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    const rejectsSafely = (error: unknown): boolean => {
+      assert.ok(error instanceof TypeError);
+      assert.equal(error.message.includes(canary), false);
+      return true;
+    };
+    for (const options of [accessor, proxy]) {
+      assert.throws(() => analysisAuditIdentity(input, options), rejectsSafely);
+      await assert.rejects(() => saveAnalysis(paths, input, options), rejectsSafely);
+    }
+    assert.deepEqual({ getterReads, proxyReads }, { getterReads: 0, proxyReads: 0 });
+  });
+});
+
+test("saved analysis audit identity matches its execution snapshot and replay", async () => {
+  await temporaryStore(async (paths) => {
+    const input = record("audit-identity-saved", 100);
+    const options = snapshotOptions();
+    const expected = analysisAuditIdentity(input, options);
+    const saved = await saveAnalysis(paths, input, options);
+
+    assert.deepEqual(saved.warnings, []);
+    assert.deepEqual(saved.audit_identity, expected);
+    const database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT snapshot_id FROM analysis_executions WHERE execution_id = ?",
+      ).pluck().get(input.analysis_id), saved.audit_identity.snapshot_id);
+    } finally {
+      database.close();
+    }
+
+    const replay = await saveAnalysis(paths, input, options);
+    assert.deepEqual(replay.warnings, []);
+    assert.deepEqual(replay.audit_identity, saved.audit_identity);
+  });
+});
+
 test("rich snapshot input and normalized-result changes create distinct snapshots", async () => {
   await temporaryStore(async (paths) => {
     const first = record("first-input", 100);
@@ -2509,6 +2670,7 @@ test("budget conflicts and mirror corruption fail closed without mutation", asyn
     assert.ok(conflict.warnings.some(
       ({ code }) => code === "analysis_record_conflict",
     ));
+    assert.deepEqual(conflict.audit_identity, analysisAuditIdentity(conflicting));
 
     let database = openStoreDatabase(paths);
     try {
@@ -2528,6 +2690,7 @@ test("budget conflicts and mirror corruption fail closed without mutation", asyn
     assert.ok(replay.warnings.some(
       ({ code }) => code === "analysis_record_conflict",
     ));
+    assert.deepEqual(replay.audit_identity, analysisAuditIdentity(original));
     const loaded = await loadAnalyses(paths);
     assert.deepEqual(loaded.records, []);
     assert.ok(loaded.warnings.some(
@@ -2569,6 +2732,10 @@ test("analysis execution and snapshot-envelope conflicts roll back atomically", 
       snapshotOptions("2".repeat(64)),
     );
     assert.ok(executionConflict.warnings.length > 0);
+    assert.deepEqual(
+      executionConflict.audit_identity,
+      analysisAuditIdentity(conflictingExecution, snapshotOptions("2".repeat(64))),
+    );
 
     const database = openStoreDatabase(paths);
     try {
@@ -2592,6 +2759,14 @@ test("analysis execution and snapshot-envelope conflicts roll back atomically", 
         created_at_ms: 300,
       }, snapshotOptions());
       assert.ok(envelopeConflict.warnings.length > 0);
+      assert.deepEqual(
+        envelopeConflict.audit_identity,
+        analysisAuditIdentity({
+          ...first,
+          analysis_id: "new-execution",
+          created_at_ms: 300,
+        }, snapshotOptions()),
+      );
       assert.equal(database.prepare(
         "SELECT count(*) FROM analysis_snapshots",
       ).pluck().get(), 1);
@@ -2930,9 +3105,12 @@ test("analysis write failures return warnings without throwing", async () => {
       adoptions_path: join(blockingFile, "adoptions.json"),
       hook_events_path: join(blockingFile, "hook-events.jsonl"),
     };
-    const result = await saveAnalysis(paths, record("write-failure", 100));
+    const input = record("write-failure", 100);
+    const result = await saveAnalysis(paths, input);
     assert.equal(result.record.analysis_id, "write-failure");
     assert.ok(result.warnings.some(({ code }) => code === "analysis_write_failed"));
+    assert.deepEqual(result.audit_identity, analysisAuditIdentity(input));
+    assert.deepEqual(await readdir(root), ["blocked"]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -3726,7 +3904,11 @@ test("legacy finding normalization is idempotent across save, load, and migratio
     assert.deepEqual(loaded.records, [normalized]);
     assert.deepEqual(loaded.warnings, []);
     const savedAgain = await saveAnalysis(paths, loaded.records[0]!);
-    assert.deepEqual(savedAgain, { record: normalized, warnings: [] });
+    assert.deepEqual(savedAgain, {
+      record: normalized,
+      audit_identity: analysisAuditIdentity(normalized),
+      warnings: [],
+    });
     const loadedAgain = await loadAnalyses(paths);
     assert.deepEqual(loadedAgain.records, [normalized]);
     assert.deepEqual(loadedAgain.warnings, []);
