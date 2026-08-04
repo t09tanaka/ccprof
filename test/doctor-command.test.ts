@@ -274,7 +274,13 @@ test("doctor reads WAL state without creating Store sidecars", async (t) => {
     "--input-type=module", "-e", writer, path,
     INCREMENTAL_SOURCES_MIGRATION,
   ], { cwd: process.cwd() });
-  assert.equal(child.signal, "SIGKILL");
+  if (process.platform === "win32") {
+    assert.equal(child.signal, null);
+    assert.notEqual(child.status, null);
+    assert.notEqual(child.status, 0);
+  } else {
+    assert.equal(child.signal, "SIGKILL");
+  }
   await rm(`${path}-shm`, { force: true });
   const snapshot = async () => Object.fromEntries(await Promise.all(
     (await readdir(paths.repo_dir)).sort().map(async (name) => {
