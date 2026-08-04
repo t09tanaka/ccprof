@@ -178,9 +178,9 @@ export async function runStatsCommand(
     (warning) => ({
       code: warning.code,
       message: warning.message,
-      source: "path" in warning && typeof warning.path === "string"
-        ? warning.path
-        : undefined,
+      ...("path" in warning && typeof warning.path === "string"
+        ? { source: warning.path }
+        : {}),
     }),
   );
   return {

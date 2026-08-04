@@ -3558,8 +3558,12 @@ test("terminal history window keeps deterministic recent ties and reports trunca
     .sort((left, right) =>
       left.created_at_ms - right.created_at_ms ||
       left.snapshot_id.localeCompare(right.snapshot_id));
-  ordered.at(-2)!.work_unit_key = ordered[0]!.work_unit_key;
-  ordered.at(-1)!.work_unit_key = ordered[1]!.work_unit_key;
+  const firstDroppedWorkUnit = ordered[0]?.work_unit_key;
+  const secondDroppedWorkUnit = ordered[1]?.work_unit_key;
+  assert.ok(firstDroppedWorkUnit !== undefined);
+  assert.ok(secondDroppedWorkUnit !== undefined);
+  ordered.at(-2)!.work_unit_key = firstDroppedWorkUnit;
+  ordered.at(-1)!.work_unit_key = secondDroppedWorkUnit;
   const dropped = ordered.slice(0, 2);
   const droppedWorkUnitKeys = new Set(dropped.map(({ work_unit_key }) =>
     work_unit_key!));
