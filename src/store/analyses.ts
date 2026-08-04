@@ -1497,12 +1497,7 @@ export async function saveAnalysis(
       path: targetPath,
     });
   } finally { closeDatabase(database); }
-  return Object.defineProperty({ record, warnings }, "audit_identity", {
-    configurable: true,
-    enumerable: false,
-    value: audit,
-    writable: true,
-  }) as AnalysisSaveResult;
+  return { record, audit_identity: audit, warnings };
 }
 
 function roundedMetric(value: number): number {

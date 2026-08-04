@@ -3858,7 +3858,11 @@ test("legacy finding normalization is idempotent across save, load, and migratio
     assert.deepEqual(loaded.records, [normalized]);
     assert.deepEqual(loaded.warnings, []);
     const savedAgain = await saveAnalysis(paths, loaded.records[0]!);
-    assert.deepEqual(savedAgain, { record: normalized, warnings: [] });
+    assert.deepEqual(savedAgain, {
+      record: normalized,
+      audit_identity: analysisAuditIdentity(normalized),
+      warnings: [],
+    });
     const loadedAgain = await loadAnalyses(paths);
     assert.deepEqual(loadedAgain.records, [normalized]);
     assert.deepEqual(loadedAgain.warnings, []);
