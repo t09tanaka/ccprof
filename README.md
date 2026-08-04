@@ -132,6 +132,38 @@ This publishes the future wire contract only. Current `--json` output remains
 JSON/Report v2; schema publication does not switch the analyzer or any other
 producer to Report v3.
 
+### Published Trace Envelope v1 schema
+
+The vendor- and forge-neutral Trace Envelope v1 contract is published as JSON
+Schema Draft 2020-12 at `schemas/trace-envelope-v1.schema.json`. It is included
+at the same path in the npm package and identifies itself as:
+
+```text
+https://schemas.ccprof.dev/trace-envelope/v1.json
+```
+
+Envelope instances carry that URI in `$schema` and use
+`protocol_version: "1.0.0"`. W3C-compatible trace and span identifiers are
+fixed-width lowercase hexadecimal values and cannot be all zero. Wall-clock
+nanoseconds, monotonic offsets, and uncertainty are canonical nonnegative
+decimal strings, preserving values beyond JSON's safe-integer range.
+
+`sequence` is a nonnegative JSON-safe integer. For events with the same
+producer ID, producer instance ID, and trace ID, producers emit increasing
+sequence values in observation order; gaps are allowed. The schema validates a
+single envelope and therefore cannot compare ordering across envelopes.
+
+Envelope-owned objects fail closed on unknown fields. `event.payload` is the
+one intentional exception: first validate the envelope with the ccprof schema,
+then resolve an allowed `event.payload_schema` URI and validate the payload
+against that external schema. ccprof does not fetch payload schemas as part of
+this contract.
+
+The validating neutral example is
+`test/fixtures/protocol/dummy-agent-trace-envelope-v1.json`. Publishing this
+schema does not change existing session models, ingestion, adapters, analysis,
+storage, or report output.
+
 ### Analysis
 
 There are three output formats.
