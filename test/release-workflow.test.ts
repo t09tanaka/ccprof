@@ -182,6 +182,10 @@ test("CI package smoke exercises the installed schema and strict stats privacy",
     packageJob,
     /"\$RUNNER_TEMP\/ccprof-prefix\/bin\/ccprof" schema report-v3\s*>\s*"\$RUNNER_TEMP\/ccprof-report-v3\.schema\.json"/u,
   );
+  assert.match(
+    packageJob,
+    /cd "\$RUNNER_TEMP"\s*\n\s+"\$RUNNER_TEMP\/ccprof-prefix\/bin\/ccprof" schema report-v3/u,
+  );
   assert.match(packageJob, /const schema = JSON\.parse\(/u);
   assert.match(
     packageJob,

@@ -109,6 +109,7 @@ jobs:
           npm install --global --prefix "$RUNNER_TEMP/ccprof-prefix" "$RUNNER_TEMP/ccprof-pack"/*.tgz
           "$RUNNER_TEMP/ccprof-prefix/bin/ccprof" --version
           "$RUNNER_TEMP/ccprof-prefix/bin/ccprof" --help
+          cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/ccprof-prefix/bin/ccprof" schema report-v3 > "$RUNNER_TEMP/ccprof-report-v3.schema.json"
           node -e '
             const fs = require("node:fs");
