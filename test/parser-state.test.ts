@@ -567,6 +567,184 @@ test("closed state normalizers reject unknown variants and inconsistent physical
   assert.throws(() => normalizeCodexParserState(inconsistentCodex));
 });
 
+test("Claude state validation closes row payloads, tool results, and derived indexes", async (t) => {
+  const toolResult = JSON.stringify({
+    sessionId: "closed-claude",
+    cwd: "/workspace/repo",
+    gitBranch: "feature/closed",
+    type: "user",
+    uuid: "tool-result",
+    parentUuid: "assistant-two",
+    agentId: "agent-a",
+    timestamp: at(3),
+    message: {
+      role: "user",
+      content: [{
+        type: "tool_result",
+        tool_use_id: "call-1",
+        content: "ok",
+      }],
+    },
+  });
+  const rows = [
+    claudeUser("closed-claude", "parent", 0, "request", {
+      gitBranch: "main",
+    }),
+    claudeAssistant("closed-claude", "assistant-one", "group-1", 1, [{
+      type: "tool_use",
+      id: "call-1",
+      name: "Read",
+      input: { file_path: "/workspace/repo/input.txt" },
+    }], { gitBranch: "feature/closed" }),
+    claudeAssistant("closed-claude", "assistant-two", "group-1", 2, [{
+      type: "text",
+      text: "done",
+    }], {
+      gitBranch: "feature/closed",
+      parentUuid: "parent",
+      agentId: "agent-a",
+    }),
+    toolResult,
+  ];
+  const path = await tempJsonl(
+    t,
+    "closed-claude-payloads.jsonl",
+    `${rows.join("\n")}\n`,
+  );
+  const { state } = await readClaudeState(path);
+  type MutableClaudeState = {
+    rows: Array<{
+      value: Record<string, unknown>;
+      tool_results: Array<Record<string, unknown>>;
+    }>;
+    branch_lanes: Array<Record<string, unknown>>;
+    ancestry: Array<Record<string, unknown>>;
+    assistant_groups: Array<Record<string, unknown> & {
+      source_indexes: number[];
+    }>;
+    result_positions: Array<Record<string, unknown>>;
+  };
+  const corruptions: Array<[
+    string,
+    (candidate: MutableClaudeState) => void,
+  ]> = [
+    ["unknown row-value field", (candidate) => {
+      candidate.rows[0]!.value.unexpected = true;
+    }],
+    ["unknown row-value discriminator", (candidate) => {
+      candidate.rows[0]!.value.type = "future-row";
+    }],
+    ["unknown assistant content field", (candidate) => {
+      const message = candidate.rows[1]!.value.message as Record<string, unknown>;
+      const content = message.content as Array<Record<string, unknown>>;
+      content[0]!.unexpected = true;
+    }],
+    ["unknown tool-result field", (candidate) => {
+      const resultRow = candidate.rows.find((row) => row.tool_results.length > 0)!;
+      resultRow.tool_results[0]!.unexpected = true;
+    }],
+    ["invalid tool-result status", (candidate) => {
+      const resultRow = candidate.rows.find((row) => row.tool_results.length > 0)!;
+      const evidence = resultRow.tool_results[0]!.status_evidence as
+        Record<string, unknown>;
+      evidence.status = "forged";
+    }],
+    ["reordered branch index", (candidate) => {
+      candidate.branch_lanes.reverse();
+    }],
+    ["forged ancestry index", (candidate) => {
+      candidate.ancestry[0]!.parent_uuid = "forged-parent";
+    }],
+    ["reordered assistant-group members", (candidate) => {
+      candidate.assistant_groups[0]!.source_indexes.reverse();
+    }],
+    ["forged result-position index", (candidate) => {
+      candidate.result_positions[0]!.source_index = 0;
+    }],
+  ];
+
+  assert.ok(state.branch_lanes.length > 1);
+  assert.ok(state.ancestry.length > 0);
+  assert.ok(state.assistant_groups[0]!.source_indexes.length > 1);
+  assert.ok(state.result_positions.length > 0);
+  for (const [name, corrupt] of corruptions) {
+    await t.test(name, () => {
+      const candidate = JSON.parse(JSON.stringify(state)) as MutableClaudeState;
+      corrupt(candidate);
+      assert.throws(() => normalizeClaudeParserState(candidate));
+    });
+  }
+});
+
+test("Codex state validation closes payloads and recomputes derived metadata", async (t) => {
+  const rows = [
+    codexRow(0, "session_meta", {
+      id: "closed-codex",
+      cwd: "/workspace/repo",
+      git: { branch: "feature/closed" },
+    }),
+    codexRow(1, "response_item", {
+      type: "message",
+      role: "user",
+      content: "request",
+    }),
+    codexRow(2, "response_item", {
+      type: "local_shell_call",
+      call_id: "local-1",
+    }),
+    codexRow(3, "response_item", {
+      type: "web_search_call",
+      call_id: "search-1",
+    }),
+  ];
+  const path = await tempJsonl(
+    t,
+    "closed-codex-payloads.jsonl",
+    `${rows.join("\n")}\n`,
+  );
+  const { state } = await readCodexState(path);
+  type MutableCodexState = {
+    rows: Array<{ type: string; payload: Record<string, unknown> }>;
+    session_metadata: Record<string, unknown> | null;
+    seen_subtypes: string[];
+  };
+  const corruptions: Array<[
+    string,
+    (candidate: MutableCodexState) => void,
+  ]> = [
+    ["unknown payload field", (candidate) => {
+      candidate.rows[1]!.payload.unexpected = true;
+    }],
+    ["invalid message payload type", (candidate) => {
+      candidate.rows[1]!.payload.content = 42;
+    }],
+    ["unknown physical-row discriminator", (candidate) => {
+      candidate.rows[1]!.type = "forged-row";
+    }],
+    ["unknown metadata field", (candidate) => {
+      candidate.session_metadata!.unexpected = true;
+    }],
+    ["forged derived metadata", (candidate) => {
+      candidate.session_metadata!.session_id = "forged-session";
+    }],
+    ["reordered subtype index", (candidate) => {
+      candidate.seen_subtypes.reverse();
+    }],
+    ["forged subtype index", (candidate) => {
+      candidate.seen_subtypes = ["forged-subtype"];
+    }],
+  ];
+
+  assert.equal(state.seen_subtypes.length, 2);
+  for (const [name, corrupt] of corruptions) {
+    await t.test(name, () => {
+      const candidate = JSON.parse(JSON.stringify(state)) as MutableCodexState;
+      corrupt(candidate);
+      assert.throws(() => normalizeCodexParserState(candidate));
+    });
+  }
+});
+
 test("read limits stay physical while retained-byte and warning limits stay in projection", async (t) => {
   let deep: unknown = "leaf";
   for (let depth = 0; depth < 12; depth += 1) deep = [deep];
@@ -667,14 +845,50 @@ test("the closed-state normalizer accepts the exact fixed capacity and rejects o
   assert.ok(warning);
   const baseBytes = Buffer.byteLength(JSON.stringify(exact));
   assert.ok(baseBytes < MAX_INCREMENTAL_PARSER_STATE_BYTES);
+  const privateMarker = "CAPACITY_PAYLOAD_DO_NOT_ECHO:";
+  warning.warning.message += privateMarker;
+  const markedBytes = Buffer.byteLength(JSON.stringify(exact));
   warning.warning.message += "x".repeat(
-    MAX_INCREMENTAL_PARSER_STATE_BYTES - baseBytes,
+    MAX_INCREMENTAL_PARSER_STATE_BYTES - markedBytes,
   );
   assert.equal(
     Buffer.byteLength(JSON.stringify(exact)),
     MAX_INCREMENTAL_PARSER_STATE_BYTES,
   );
   assert.doesNotThrow(() => normalizeClaudeParserState(exact));
+
+  const seed = normalizeClaudeParserState(exact);
+  const seedMessage = seed.warnings[0]!.warning.message;
+  const seedDigest = digest(seedMessage);
+  const suffix = `${claudeUser("capacity", "suffix", 1, "tiny suffix", {
+    gitBranch: "feature/capacity",
+  })}\n`;
+  await appendFile(path, suffix);
+  await assert.rejects(
+    () => readClaudeState(path, {
+      range: {
+        start_offset: base.state.parsed_offset,
+        starting_line: base.state.line_count + 1,
+      },
+      seed,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof IncrementalParserStateCapacityError);
+      const bounded = error as IncrementalParserStateCapacityError & {
+        limit: number;
+        observed: number;
+      };
+      assert.equal(bounded.code, "incremental_state_capacity");
+      assert.equal(bounded.limit, MAX_INCREMENTAL_PARSER_STATE_BYTES);
+      assert.ok(Number.isSafeInteger(bounded.observed));
+      assert.ok(bounded.observed > bounded.limit);
+      assert.equal(bounded.message.includes(privateMarker), false);
+      return true;
+    },
+  );
+  assert.equal(seed.rows.length, 0);
+  assert.equal(seed.warnings.length, 1);
+  assert.equal(digest(seed.warnings[0]!.warning.message), seedDigest);
 
   warning.warning.message += "x";
   assert.equal(
