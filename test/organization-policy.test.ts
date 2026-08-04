@@ -111,7 +111,7 @@ function assertPolicyError(
   assert.equal(policyError.code, code);
   assert.match(policyError.message, /^organization policy /u);
   for (const canary of canaries) {
-    assert.doesNotMatch(policyError.message, new RegExp(canary, "u"));
+    assert.equal(policyError.message.includes(canary), false);
   }
   return true;
 }
@@ -411,8 +411,8 @@ test("repository policy validation is closed, bounded, and content-free", async 
       (error: unknown) => {
         assert.ok(error instanceof RepositoryConfigError);
         assert.match(error.message, /^\.ccprof\/config\.json:/u);
-        assert.doesNotMatch(error.message, new RegExp(sentinel, "u"));
-        assert.doesNotMatch(error.message, new RegExp(repoRoot, "u"));
+        assert.equal(error.message.includes(sentinel), false);
+        assert.equal(error.message.includes(repoRoot), false);
         return true;
       },
     );
@@ -1131,7 +1131,7 @@ test("analyze applies effective privacy and denies advisory before spawning", as
   assert.equal(resolvedRepo, repoRoot);
   assert.deepEqual(resolvedRequest, { privacy: "raw", advisory: true });
   assert.equal(runnerCalls, 0);
-  assert.doesNotMatch(output.stdout, new RegExp(repoRoot, "u"));
+  assert.equal(output.stdout.includes(repoRoot), false);
   assert.deepEqual(output.warnings, [
     "[private_policy_warning] 1 warning",
     "[policy_advisory_disabled] Advisory execution is disabled by active policy.",
@@ -1238,7 +1238,7 @@ test("CLI preloads the signed privacy floor before analyze parsing", async (t) =
 
     assert.equal(code, 2, scenario.label);
     assert.equal(loads, 1, scenario.label);
-    assert.doesNotMatch(stderr, new RegExp(privatePath, "u"), scenario.label);
+    assert.equal(stderr.includes(privatePath), false, scenario.label);
     if (scenario.hidden) {
       assert.match(
         stderr,
@@ -1300,7 +1300,7 @@ test("CLI signed privacy floor covers analyze and stats operational errors", asy
       /analysis failed \(details hidden by strict privacy\)/u,
       scenario.label,
     );
-    assert.doesNotMatch(stderr, new RegExp(scenario.canary, "u"));
+    assert.equal(stderr.includes(scenario.canary), false);
   }
 });
 
