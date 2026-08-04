@@ -128,8 +128,10 @@ test("doctor contains malformed configuration and organization paths", async (t)
   });
   assert.ok(malformed.stdout.length <= 4_096);
   assert.ok(malformed.stderr.length <= 1_024);
-  assert.doesNotMatch(malformed.stdout + malformed.stderr,
-    new RegExp(`${secret}|${repo}|${dataRoot}`, "u"));
+  const malformedOutput = malformed.stdout + malformed.stderr;
+  for (const value of [secret, repo, dataRoot]) {
+    assert.equal(malformedOutput.includes(value), false);
+  }
 
   await writeFile(join(repo, ".ccprof", "config.json"),
     JSON.stringify({ schema_version: 1 }));
@@ -154,8 +156,10 @@ test("doctor contains malformed configuration and organization paths", async (t)
   });
   assert.ok(partial.stdout.length <= 4_096);
   assert.ok(partial.stderr.length <= 1_024);
-  assert.doesNotMatch(partial.stdout + partial.stderr,
-    new RegExp(`${secret}|${policyPath}`, "u"));
+  const partialOutput = partial.stdout + partial.stderr;
+  for (const value of [secret, policyPath]) {
+    assert.equal(partialOutput.includes(value), false);
+  }
 });
 
 test("doctor usage failures remain exit 2", async (t) => {
