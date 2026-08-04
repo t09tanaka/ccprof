@@ -309,6 +309,7 @@ function commandPolicy(
     allow_advisory: true,
     advisory_enabled: true,
     allow_export: true,
+    minimum_cohort_size: 5,
     required_source_coverage: 0,
     ...overrides,
   };
