@@ -3583,8 +3583,16 @@ test("terminal history window keeps deterministic recent ties and reports trunca
 
 test("terminal history window does not weaken the aggregation collection guard", () => {
   const entry = task6TerminalInput({ id: "nested-guard", createdAtMs: 1 });
+  entry.command_costs = Array.from({ length: 10_001 }, (_, index) => ({
+    command_key: statsOpaqueDigest(
+      "nested-guard-command-v1",
+      index.toString(10),
+    ),
+    cache_state: "cold" as const,
+    duration_ms: index,
+  }));
   assert.throws(
-    () => selectTerminalSnapshots(Array.from({ length: 10_001 }, () => entry)),
+    () => selectTerminalSnapshots([entry]),
     /invalid stats aggregation input/u,
   );
 });
