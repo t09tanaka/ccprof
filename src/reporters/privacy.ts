@@ -390,6 +390,13 @@ export function projectStatsPrivacy(
       metric: projectText(entry.metric),
       value: entry.value,
       baseline: entry.baseline,
+      ...(entry.median === undefined ? {} : { median: entry.median }),
+      ...(entry.p50 === undefined ? {} : { p50: entry.p50 }),
+      ...(entry.p75 === undefined ? {} : { p75: entry.p75 }),
+      ...(entry.mad === undefined ? {} : { mad: entry.mad }),
+      ...(entry.sample_count === undefined
+        ? {}
+        : { sample_count: entry.sample_count }),
     })),
     chronic_commands: stats.chronic_commands.map((entry) => {
       const command = safeCommand(entry.command, profile, repoRoot, []) ??
