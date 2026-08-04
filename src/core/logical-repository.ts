@@ -39,6 +39,7 @@ export type LogicalRepositoryIdentityResult =
     };
 
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/u;
+const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 const RFC_4122_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
@@ -58,13 +59,12 @@ function identityDigest(tuple: readonly unknown[]): `sha256:${string}` {
 }
 
 function normalizeHost(host: string): string | undefined {
-  if (!isBoundedValue(host, 253) || /[@/:\\?#]/u.test(host)) return undefined;
-  const normalized = domainToASCII(host).toLowerCase();
+  if (!isBoundedValue(host, 253) || /[%@/:\\?#]/u.test(host)) return undefined;
+  const undotted = host.endsWith(".") ? host.slice(0, -1) : host;
+  const normalized = domainToASCII(undotted).toLowerCase();
   if (
     !isBoundedValue(normalized, 253) ||
-    normalized === "." ||
-    normalized.startsWith(".") ||
-    normalized.includes("..")
+    !normalized.split(".").every((label) => DNS_LABEL.test(label))
   ) {
     return undefined;
   }
@@ -111,10 +111,19 @@ function resolveOffline(uuid: string): LogicalRepositoryIdentityResult {
 function normalizeLocalPath(path: string): string | undefined {
   if (!isBoundedValue(path, 2048)) return undefined;
   const windowsPath = /^[a-z]:[\\/]/iu.test(path);
-  if (!path.startsWith("/") && !windowsPath && !/^\\\\/u.test(path)) {
+  const uncPath = path.startsWith("\\\\") || path.startsWith("//");
+  const posixPath = path.startsWith("/") && !uncPath;
+  if (
+    (!posixPath && !windowsPath && !uncPath) ||
+    (posixPath && path.includes("\\"))
+  ) {
     return undefined;
   }
   let normalized = path.normalize("NFC").replaceAll("\\", "/");
+  if (uncPath) {
+    const [server, share] = normalized.slice(2).split("/");
+    if (server === "" || share === undefined || share === "") return undefined;
+  }
   if (windowsPath) {
     normalized = normalized[0]!.toLowerCase() + normalized.slice(1);
   }

@@ -56,6 +56,41 @@ test("logical repository normalizes provider hosts with IDNA", () => {
   assert.deepEqual(unicode, ascii);
 });
 
+test("logical repository normalizes one trailing provider DNS dot", () => {
+  const dotted = resolveLogicalRepositoryIdentity({
+    trusted_provider: {
+      provider: "forge",
+      host: "github.com.",
+      repository_id: "Repo",
+    },
+  });
+  const plain = resolveLogicalRepositoryIdentity({
+    trusted_provider: {
+      provider: "forge",
+      host: "github.com",
+      repository_id: "Repo",
+    },
+  });
+
+  assert.deepEqual(dotted, plain);
+});
+
+test("logical repository rejects encoded and invalid provider DNS labels", () => {
+  for (const host of [
+    "github%2ecom",
+    "bad_label.example",
+    "-bad.example",
+    "bad-.example",
+  ]) {
+    assert.deepEqual(
+      resolveLogicalRepositoryIdentity({
+        trusted_provider: { provider: "forge", host, repository_id: "Repo" },
+      }),
+      { status: "unavailable", reason: "invalid_provider" },
+    );
+  }
+});
+
 test("logical repository provider wins over every lower-priority source", () => {
   const input: LogicalRepositoryIdentityInput = {
     trusted_provider: {
@@ -161,6 +196,20 @@ test("logical repository rejects supplied relative local paths", () => {
     resolveLogicalRepositoryIdentity({ local_path: "\\repository" }),
     { status: "unavailable", reason: "invalid_local_path" },
   );
+});
+
+test("logical repository rejects POSIX backslashes and malformed UNC roots", () => {
+  for (const local_path of [
+    "/srv/repo\\alias",
+    "\\\\server",
+    "\\\\server\\",
+    "\\\\\\share",
+  ]) {
+    assert.deepEqual(resolveLogicalRepositoryIdentity({ local_path }), {
+      status: "unavailable",
+      reason: "invalid_local_path",
+    });
+  }
 });
 
 test("logical repository results do not expose raw identity inputs", () => {
