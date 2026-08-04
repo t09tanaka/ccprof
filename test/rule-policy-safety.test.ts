@@ -445,6 +445,31 @@ test("normalizes only the fixed bare Windows launcher aliases", () => {
   }
 });
 
+test("rejects rg preprocessors and git grep pagers through every decision path", () => {
+  const dangerous = [
+    "rg --pre cat TODO src",
+    "rg --pre=cat TODO src",
+    "git grep -O TODO",
+    "git grep -Oless TODO",
+    "git grep --open-files-in-pager TODO",
+    "git grep --open-files-in-pager=less TODO",
+  ];
+  const wildcard = resolvedPolicy(
+    { safe_patterns: ["*"], allow_rule_recommendation: true },
+    [{ match: ["*"], domain: "read-only", parallel_safe: true }],
+  );
+  for (const raw of dangerous) {
+    assert.equal(safeCanonicalCommand(raw), undefined, raw);
+    assert.deepEqual(approvalRecommendationDecision([raw], wildcard), {
+      kind: "evaluated",
+      commands: [{ allowed: false }],
+    }, raw);
+    assert.deepEqual(resourceDomainDecision([raw], wildcard), {
+      kind: "investigation_candidate",
+    }, raw);
+  }
+});
+
 test("rejects over-limit raw commands before safety classification", () => {
   const prefix = "npm test -- ";
   const exact = `${prefix}${"a".repeat(4_096 - Buffer.byteLength(prefix))}`;
@@ -719,6 +744,63 @@ test("fails the complete decision when the shared matcher budget is exhausted", 
   assert.deepEqual(resourceDomainDecision([command], effective), {
     kind: "investigation_candidate",
   });
+});
+
+test("allows exactly 65,536 matcher steps and rejects the next step", () => {
+  const budget = createDecisionBudget();
+  for (let step = 0; step < 65_536; step += 1) {
+    assert.equal(commandPatternMatches("a", "a", budget), true, String(step));
+  }
+  assert.deepEqual(budget, { remaining: 0, exhausted: false });
+  assert.equal(commandPatternMatches("a", "a", budget), false);
+  assert.deepEqual(budget, { remaining: 0, exhausted: true });
+});
+
+test("discards an authorized prefix when a later action exhausts the budget", () => {
+  const prefix = "npm test -- z";
+  const expensive = `${prefix}${"a".repeat(
+    4_096 - Buffer.byteLength(prefix),
+  )}`;
+  const expensiveMisses = Array.from(
+    { length: 16 },
+    (_, index) => `npm *never-${index.toString().padStart(2, "0")}`,
+  );
+  const effective = resolvedPolicy(
+    {
+      safe_patterns: [
+        "cargo test",
+        ...expensiveMisses,
+        "npm test -- z*",
+      ],
+      allow_rule_recommendation: true,
+    },
+    [
+      {
+        match: ["cargo test"],
+        domain: "validation",
+        parallel_safe: true,
+      },
+      ...expensiveMisses.map((pattern) => ({
+        match: [pattern],
+        domain: "validation",
+        parallel_safe: true,
+      })),
+      {
+        match: ["npm test -- z*"],
+        domain: "validation",
+        parallel_safe: true,
+      },
+    ],
+  );
+
+  assert.deepEqual(
+    approvalRecommendationDecision(["cargo test", expensive], effective),
+    { kind: "denied" },
+  );
+  assert.deepEqual(
+    resourceDomainDecision(["cargo test", expensive], effective),
+    { kind: "investigation_candidate" },
+  );
 });
 
 test("snapshots effective values defensively and canonicalizes equivalent input", () => {
