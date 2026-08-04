@@ -270,6 +270,46 @@ function legacyFindingConfidence(confidence: Confidence): FindingConfidence {
   };
 }
 
+function isLegacyProjectedConfidence(value: FindingConfidence): boolean {
+  return (
+    value.evidence === "low" &&
+    value.causal === "low" &&
+    value.source_completeness === 0
+  ) || (
+    (value.evidence === "medium" || value.evidence === "high") &&
+    value.causal === "medium" &&
+    value.source_completeness === 0.5
+  );
+}
+
+function exactRationale(
+  actual: readonly FindingScoringRationale[],
+  expected: readonly FindingScoringRationale[],
+): boolean {
+  return actual.length === expected.length &&
+    actual.every((entry, index) => entry === expected[index]);
+}
+
+function isCanonicalLegacyProjection(
+  base: Finding,
+  impact: ImpactEstimate,
+  confidence: FindingConfidence,
+  rationale: readonly FindingScoringRationale[],
+): boolean {
+  const projectedRecoverable = projectFindingRecoverable(impact);
+  const expectedRationale = findingScoringRationale(impact, confidence, {
+    ...(base.rule_id === "R004" ? { policy_dependent: true } : {}),
+    legacy_projection: true,
+  });
+  return impact.lower_ms === 0 &&
+    !("expected_ms" in impact) &&
+    isLegacyProjectedConfidence(confidence) &&
+    base.confidence === projectFindingConfidence(confidence) &&
+    base.recoverable.min === projectedRecoverable.min &&
+    base.recoverable.bound === projectedRecoverable.bound &&
+    exactRationale(rationale, expectedRationale);
+}
+
 function snapshotStoredFinding(value: Finding): Finding {
   try {
     if (
@@ -350,10 +390,12 @@ function snapshotStoredFinding(value: Finding): Finding {
       const expectedRationale = findingScoringRationale(impact, confidence, {
         ...(base.rule_id === "R004" ? { policy_dependent: true } : {}),
       });
+      const legacyProjection = rationale.includes("legacy_projection");
       if (
         read("severity") !== expectedSeverity ||
-        rationale.length !== expectedRationale.length ||
-        rationale.some((entry, index) => entry !== expectedRationale[index])
+        (legacyProjection
+          ? !isCanonicalLegacyProjection(base, impact, confidence, rationale)
+          : !exactRationale(rationale, expectedRationale))
       ) throw new TypeError();
     }
     const { target, ...baseWithoutTarget } = base;

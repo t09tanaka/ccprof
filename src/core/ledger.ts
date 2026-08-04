@@ -1,11 +1,13 @@
 import {
   durationMs,
   intersectIntervals,
-  roundMinutes,
   subtractIntervals,
   unionIntervals,
 } from "./intervals.js";
-import { isStrictHighConfidence } from "./model.js";
+import {
+  isStrictHighConfidence,
+  projectFindingRecoverable,
+} from "./model.js";
 import type {
   AnalysisSummary,
   BaselineComparison,
@@ -212,17 +214,11 @@ function upperEstimateMs(candidate: FindingCandidate): number {
   return Number.isFinite(estimate) && estimate > 0 ? estimate : 0;
 }
 
-function publicFinding(
-  candidate: FindingCandidate,
-  reportedMs: number,
-): Finding {
+function publicFinding(candidate: FindingCandidate): Finding {
   const { recoverable, ...metadata } = candidate;
   return {
     ...metadata,
-    recoverable: {
-      min: roundMinutes(reportedMs),
-      bound: recoverable.bound,
-    },
+    recoverable: projectFindingRecoverable(candidate.impact),
   };
 }
 
@@ -356,12 +352,7 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
       ),
       baseline: input.baseline ?? null,
     },
-    findings: indexed.map(({ candidate, index }) =>
-      publicFinding(
-        candidate,
-        attributionsByIndex.get(index)?.reported_ms ?? 0,
-      )
-    ),
+    findings: indexed.map(({ candidate }) => publicFinding(candidate)),
     raw_observed_min: minutesFromHundredths(rawObservedHundredths),
     normal_min: minutesFromHundredths(partitionHundredths.normal),
     totals_ms: totalsMs,
