@@ -129,6 +129,7 @@ const UNSAFE_GIT_GREP_LONG_OPTIONS = [
   { full: "--ext-grep", minimum: "--ext-" },
 ] as const;
 const UNSAFE_RG_HELPER_OPTIONS = ["--pre", "--hostname-bin"] as const;
+const RG_SEARCH_ZIP_OPTION = "--search-zip";
 
 export class RuleSafetyPolicyValidationError extends Error {
   constructor() {
@@ -563,26 +564,34 @@ function mappedCommandTokens(raw: string): string[] | undefined {
   ) {
     return undefined;
   }
-  const mapped = WINDOWS_LAUNCHERS.get(first.toLowerCase()) ?? first;
+  const windowsLauncher = WINDOWS_LAUNCHERS.get(first.toLowerCase());
+  if (
+    windowsLauncher !== undefined &&
+    (raw.includes("'") || raw.includes("\\"))
+  ) {
+    return undefined;
+  }
+  const mapped = windowsLauncher ?? first;
   return [mapped, ...tokenized.tokens.slice(1)];
 }
 
-function containsDelimitedExpansion(
-  raw: string,
-  delimiter: "%" | "!",
-): boolean {
-  let opening = -1;
+function containsPercentExpansion(raw: string): boolean {
   for (let index = 0; index < raw.length; index += 1) {
-    if (raw[index] !== delimiter) continue;
-    if (opening >= 0 && index > opening + 1) return true;
-    opening = index;
+    if (raw[index] !== "%") continue;
+    const next = raw[index + 1];
+    if (next === "*" || (next !== undefined && /^[0-9]$/u.test(next))) {
+      return true;
+    }
+    if (next === "%" && raw[index + 2] !== undefined) return true;
+    const closing = raw.indexOf("%", index + 1);
+    if (closing > index + 1) return true;
   }
   return false;
 }
 
 function containsEnvironmentExpansion(raw: string): boolean {
-  return raw.includes("$") || containsDelimitedExpansion(raw, "%") ||
-    containsDelimitedExpansion(raw, "!");
+  return raw.includes("$") || raw.includes("!") ||
+    containsPercentExpansion(raw);
 }
 
 function matchesLongOptionPrefix(
@@ -614,11 +623,28 @@ function unsafeGitOption(value: string, subcommand: string): boolean {
   );
 }
 
-function unsafeInspectOption(executable: string, value: string): boolean {
-  return executable === "rg" &&
-    UNSAFE_RG_HELPER_OPTIONS.some(
+function unsafeInspectOptions(
+  executable: string,
+  values: readonly string[],
+): boolean {
+  if (executable !== "rg") return false;
+  for (const value of values) {
+    if (value === "--") return false;
+    if (UNSAFE_RG_HELPER_OPTIONS.some(
       (option) => value === option || value.startsWith(`${option}=`),
-    );
+    )) {
+      return true;
+    }
+    if (
+      value === RG_SEARCH_ZIP_OPTION ||
+      value.startsWith(`${RG_SEARCH_ZIP_OPTION}=`) ||
+      (value.startsWith("-") && !value.startsWith("--") &&
+        value.slice(1).includes("z"))
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function safeCanonicalCommand(
@@ -671,7 +697,7 @@ export function safeCanonicalCommand(
   if (
     descriptor.family === "inspect" &&
     READ_ONLY_EXECUTABLES.has(executable) &&
-    !tokens.slice(1).some((value) => unsafeInspectOption(executable, value))
+    !unsafeInspectOptions(executable, tokens.slice(1))
   ) {
     return canonical;
   }
