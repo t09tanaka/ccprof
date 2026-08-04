@@ -58,6 +58,7 @@ export interface AnalyzeCommandDependencies {
   /** Runner for the external `claude` CLI behind `--advisory`. */
   runCommand?: CommandRunner;
   resolvePolicy?: RepositoryPolicyResolver;
+  onPrivacyResolved?: (privacy: PrivacyProfile) => void;
 }
 
 export async function runAnalyzeCommand(
@@ -89,6 +90,7 @@ export async function runAnalyzeCommand(
     advisory: options.advisory === true,
   });
   const privacy = effectivePolicy.privacy;
+  dependencies.onPrivacyResolved?.(privacy);
   const report = projectReportPrivacy(result.report, privacy);
   const sessions = result.report.unit.sessions;
   const warnings = privacyWarningTexts(

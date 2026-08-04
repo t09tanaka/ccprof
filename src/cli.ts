@@ -42,6 +42,11 @@ import {
 import type { RuleId } from "./core/model.js";
 import { GitContextError } from "./git/pr-context.js";
 import {
+  loadConfiguredOrganizationPolicy,
+  resolveEffectivePolicy,
+  type OrganizationPolicy,
+} from "./policy/organization-policy.js";
+import {
   defaultPrivacyProfile,
   sanitizePrivacyText,
   type PrivacyProfile,
@@ -205,6 +210,7 @@ export interface CliRuntime {
   stdout?: (value: string) => void;
   stdoutIsTTY?: boolean;
   stderr?: (value: string) => void;
+  loadOrganizationPolicy?: () => Promise<OrganizationPolicy | undefined>;
   /**
    * Pre-collected stdin text for the `hook-event` command. Tests inject
    * this to avoid touching `process.stdin`; when omitted, `runCli` reads
@@ -213,14 +219,18 @@ export interface CliRuntime {
   stdinText?: string;
 }
 
-const defaultHandlers: CliHandlers = {
-  analyze: runAnalyzeCommand,
-  stats: runStatsCommand,
-  dismiss: runDismissCommand,
-  explain: runExplainCommand,
-  hookEvent: runHookEventCommand,
-  hooks: runHooksCommand,
-};
+function defaultHandlers(
+  onPrivacyResolved: (privacy: PrivacyProfile) => void,
+): CliHandlers {
+  return {
+    analyze: (options) => runAnalyzeCommand(options, { onPrivacyResolved }),
+    stats: (options) => runStatsCommand(options, { onPrivacyResolved }),
+    dismiss: runDismissCommand,
+    explain: runExplainCommand,
+    hookEvent: runHookEventCommand,
+    hooks: runHooksCommand,
+  };
+}
 
 function requiredOptionValue(
   args: readonly string[],
@@ -797,6 +807,27 @@ async function runHookEventDispatch(
   }
 }
 
+function usesOrganizationPolicy(args: readonly string[]): boolean {
+  if (
+    args.includes("--help") || args.includes("-h") ||
+    args.includes("--version") || args.includes("-v")
+  ) {
+    return false;
+  }
+  return args[0] === "stats" ||
+    !["dismiss", "explain", "hook-event", "hooks", "data", "rules"]
+      .includes(args[0] ?? "");
+}
+
+function strongestActivePrivacy(
+  current: PrivacyProfile | undefined,
+  resolved: PrivacyProfile,
+): PrivacyProfile {
+  if (current === "strict" || resolved === "strict") return "strict";
+  if (current === "balanced" || resolved === "balanced") return "balanced";
+  return "raw";
+}
+
 export async function runCli(
   args: readonly string[],
   runtime: CliRuntime = {},
@@ -828,9 +859,12 @@ export async function runCli(
       return code;
     }
   }
-  const handlers = runtime.handlers ?? defaultHandlers;
   const cwd = runtime.cwd ?? process.cwd();
   const ci = runtime.ci ?? detectedCi(process.env.CI);
+  let activePrivacy: PrivacyProfile | undefined;
+  const handlers = runtime.handlers ?? defaultHandlers((privacy) => {
+    activePrivacy = strongestActivePrivacy(activePrivacy, privacy);
+  });
   if (args[0] === "hook-event") {
     await runHookEventDispatch(
       args.slice(1),
@@ -846,7 +880,7 @@ export async function runCli(
     token.startsWith("--privacy=") ? token.slice(10) :
       args[index - 1] === "--privacy" ? token : ""
   ).find(isPrivacyProfile);
-  let activePrivacy: PrivacyProfile | undefined = args[0] === "stats"
+  activePrivacy = args[0] === "stats"
     ? ci ? "strict" : explicitPrivacy ?? "balanced"
     : args[0] === "explain" && ci
       ? "strict"
@@ -856,6 +890,17 @@ export async function runCli(
         : explicitPrivacy ??
           (ci || args.includes("--md") ? "strict" : "balanced");
   try {
+    if (usesOrganizationPolicy(args)) {
+      const organization = await (
+        runtime.loadOrganizationPolicy ?? loadConfiguredOrganizationPolicy
+      )();
+      if (organization !== undefined && activePrivacy !== undefined) {
+        activePrivacy = resolveEffectivePolicy({
+          organization,
+          request: { privacy: activePrivacy, advisory: false },
+        }).privacy;
+      }
+    }
     const command = parseCliArgs(args);
     if (command.kind === "help") {
       stdout(USAGE);
@@ -877,7 +922,7 @@ export async function runCli(
     }
     let result: CommandExecutionResult;
     if (command.kind === "analyze") {
-      activePrivacy = command.privacy ??
+      const requestedPrivacy = command.privacy ??
         defaultPrivacyProfile(command.format, ci);
       result = await handlers.analyze({
         cwd,
@@ -885,7 +930,7 @@ export async function runCli(
         color: command.color ||
           (command.format === "tty" && stdoutIsTTY),
         ...(command.advisory ? { advisory: true } : {}),
-        privacy: activePrivacy,
+        privacy: requestedPrivacy,
         ...(command.pr === undefined ? {} : { pr: command.pr }),
         ...(command.sinceMs === undefined
           ? {}
@@ -901,11 +946,13 @@ export async function runCli(
           : { testMapPath: command.testMapPath }),
       });
     } else if (command.kind === "stats") {
-      activePrivacy = ci ? "strict" : command.privacy ?? "balanced";
+      const requestedPrivacy = ci
+        ? "strict"
+        : command.privacy ?? "balanced";
       result = await handlers.stats({
         cwd,
         json: command.json,
-        privacy: activePrivacy,
+        privacy: requestedPrivacy,
       });
     } else if (command.kind === "dismiss") {
       result = await handlers.dismiss({

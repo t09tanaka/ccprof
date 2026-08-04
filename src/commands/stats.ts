@@ -49,6 +49,7 @@ export interface StatsCommandDependencies {
     paths: StorePaths,
   ) => Promise<AdoptionLoadResult>;
   resolvePolicy?: RepositoryPolicyResolver;
+  onPrivacyResolved?: (privacy: PrivacyProfile) => void;
 }
 
 export async function resolveCurrentRepoRoot(
@@ -90,6 +91,7 @@ export async function runStatsCommand(
     dependencies.resolvePolicy ?? resolveRepositoryPolicy
   )(policyRepoRoot, { privacy: options.privacy, advisory: false });
   const privacy = effectivePolicy.privacy;
+  dependencies.onPrivacyResolved?.(privacy);
   const history = await (
     dependencies.loadAnalyses ?? loadAnalyses
   )(paths);

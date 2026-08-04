@@ -1,4 +1,5 @@
 import {
+  createPrivateKey,
   createPublicKey,
   verify,
 } from "node:crypto";
@@ -402,6 +403,13 @@ export async function loadConfiguredOrganizationPolicy(
   const policy = parseOrganizationPolicy(policyContent.toString("utf8"));
   if (policy.organization !== configured.organization) {
     throw new OrganizationPolicyError("untrusted_policy");
+  }
+
+  try {
+    createPrivateKey(publicKeyContent);
+    throw new OrganizationPolicyError("untrusted_policy");
+  } catch (error) {
+    if (error instanceof OrganizationPolicyError) throw error;
   }
 
   let publicKey: ReturnType<typeof createPublicKey>;
