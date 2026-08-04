@@ -3517,11 +3517,35 @@ test("incomplete selected terminals remain in recurrence and adoption history", 
     rule_id: "R002",
     title: "Observe every terminal work unit",
     recoverable: { min: 6, bound: "point" },
+    impact: {
+      lower_ms: 360_000,
+      upper_ms: 360_000,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "high",
+      source_completeness: 1,
+    },
+    severity: "high",
+    scoring_rationale: ["observed_lower_bound"],
   });
   const after = adoptionFinding(findingKey, {
     rule_id: "R002",
     title: "Observe every terminal work unit",
     recoverable: { min: 2, bound: "point" },
+    impact: {
+      lower_ms: 120_000,
+      upper_ms: 120_000,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "high",
+      source_completeness: 1,
+    },
+    severity: "high",
+    scoring_rationale: ["observed_lower_bound"],
   });
   const recordsBySnapshot = new Map<string, AnalysisRecord>([
     [incomplete.snapshot_id, adoptionAnalysisRecord(
