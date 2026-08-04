@@ -563,6 +563,92 @@ test("Claude public parsing matches fresh and round-tripped state for a finite n
   );
 });
 
+test("Claude public parsing matches fresh and round-tripped state when a negative timestamp gates a warning", async (t) => {
+  const rawTimestamp = -1.75;
+  const path = await tempJsonl(
+    t,
+    "claude-negative-warning-timestamp.jsonl",
+    `${JSON.stringify({
+      cwd: "/workspace/repo",
+      type: "user",
+      uuid: "negative-warning-timestamp",
+      timestamp: rawTimestamp,
+      message: { role: "user", content: "missing session before the epoch" },
+    })}\n`,
+  );
+  const { state, parsed } = await assertClaudePublicStateRoundTrip(path);
+
+  assert.deepEqual(state.rows, []);
+  assert.deepEqual(
+    state.warnings.map(({ applicability, warning }) => ({
+      applicability,
+      code: warning.code,
+    })),
+    [{
+      applicability: {
+        kind: "timestamp",
+        timestamp_ms: Math.trunc(rawTimestamp),
+      },
+      code: "missing_session_id",
+    }],
+  );
+  assert.deepEqual(parsed.sessions, []);
+  assert.deepEqual(
+    parsed.warnings.map(({ code }) => code),
+    ["missing_session_id"],
+  );
+});
+
+test("Claude unsafe numeric timestamps stay out of state with existing invalid-timestamp and missing-session warnings", async (t) => {
+  const unsafeTimestamp = 9_007_199_254_740_992;
+  const rows = [
+    {
+      sessionId: "claude-unsafe-timestamp",
+      cwd: "/workspace/repo",
+      type: "user",
+      uuid: "unsafe-timestamp-with-session",
+      timestamp: unsafeTimestamp,
+      message: { role: "user", content: "unsafe timestamp" },
+    },
+    {
+      cwd: "/workspace/repo",
+      type: "user",
+      uuid: "unsafe-timestamp-without-session",
+      timestamp: unsafeTimestamp,
+      message: { role: "user", content: "unsafe timestamp and no session" },
+    },
+  ];
+  const path = await tempJsonl(
+    t,
+    "claude-unsafe-timestamp.jsonl",
+    `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`,
+  );
+  const { state, parsed } = await assertClaudePublicStateRoundTrip(path);
+
+  assert.deepEqual(state.rows, []);
+  assert.deepEqual(
+    state.warnings.map(({ applicability, warning }) => ({
+      applicability,
+      code: warning.code,
+    })),
+    [
+      {
+        applicability: { kind: "unconditional" },
+        code: "invalid_timestamp",
+      },
+      {
+        applicability: { kind: "unconditional" },
+        code: "missing_session_id",
+      },
+    ],
+  );
+  assert.deepEqual(parsed.sessions, []);
+  assert.deepEqual(
+    parsed.warnings.map(({ code }) => code),
+    ["invalid_timestamp", "missing_session_id"],
+  );
+});
+
 test("Claude seeded state preserves branch lanes, cross-suffix ancestry, grouping, results, and multiple sessions", async (t) => {
   const prefixRows = [
     claudeAssistant("claude-a", "agent-parent", "agent-message", 0, [
