@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import {
   runCommand,
   type CommandResult,
@@ -18,6 +20,20 @@ export interface FrozenRef {
   oid: string;
 }
 
+export type PrContextSelector =
+  | { kind: "github_pr"; number: number }
+  | {
+      kind: "explicit_range";
+      range: "double_dot" | "triple_dot";
+      base_ref_digest: string;
+      head_ref_digest: string;
+    }
+  | {
+      kind: "inferred_local_range";
+      base_ref_digest: string;
+      head_ref_digest: string;
+    };
+
 export interface PrContext {
   repoRoot: string;
   base: FrozenRef;
@@ -25,6 +41,7 @@ export interface PrContext {
   mergeBaseOid: string;
   prRef: string;
   headBranch: string;
+  selector?: PrContextSelector;
   number?: number;
   url?: string;
   isCrossRepository?: boolean;
@@ -49,6 +66,7 @@ export interface ExplicitRange {
   baseLabel: string;
   headLabel: string;
   prRef: string;
+  range: "double_dot" | "triple_dot";
 }
 
 export interface GhPrMetadata {
@@ -76,6 +94,40 @@ function canonicalLabel(ref: string): string {
     .replace(/^refs\/tags\//, "");
 }
 
+export function selectorRefDigest(
+  kind: "explicit_range" | "inferred_local_range",
+  role: "base" | "head",
+  ref: string,
+): string {
+  if (kind !== "explicit_range" && kind !== "inferred_local_range") {
+    throw new TypeError("invalid selector kind");
+  }
+  if (role !== "base" && role !== "head") {
+    throw new TypeError("invalid selector ref role");
+  }
+  if (typeof ref !== "string") throw new TypeError("selector ref must be a string");
+  for (let index = 0; index < ref.length; index += 1) {
+    const codeUnit = ref.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const nextCodeUnit = ref.charCodeAt(index + 1);
+      if (index + 1 >= ref.length ||
+        nextCodeUnit < 0xdc00 || nextCodeUnit > 0xdfff) {
+        throw new TypeError("selector ref contains an unpaired UTF-16 surrogate");
+      }
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      throw new TypeError("selector ref contains an unpaired UTF-16 surrogate");
+    }
+  }
+  const normalized = ref.normalize("NFC");
+  if (normalized.length === 0) throw new TypeError("selector ref must be non-empty");
+  const digest = createHash("sha256")
+    .update(`ccprof\0selector-ref-v1\0${kind}\0${role}\0`, "utf8")
+    .update(normalized, "utf8")
+    .digest("hex");
+  return `sha256:${digest}`;
+}
+
 export function parseExplicitRange(input: string): ExplicitRange | null {
   const separators = [...input.matchAll(/\.{2,}/g)];
   const separator = separators[0];
@@ -92,12 +144,14 @@ export function parseExplicitRange(input: string): ExplicitRange | null {
   if (baseRef.length === 0 || headRef.length === 0) return null;
   const baseLabel = canonicalLabel(baseRef);
   const headLabel = canonicalLabel(headRef);
+  const range = separator[0] === ".." ? "double_dot" : "triple_dot";
   return {
     baseRef,
     headRef,
     baseLabel,
     headLabel,
     prRef: `${baseLabel}...${headLabel}`,
+    range,
   };
 }
 
@@ -305,6 +359,7 @@ interface Resolution {
   headRef: string;
   baseLabel: string;
   headLabel: string;
+  selector: PrContextSelector;
   number?: number;
   url?: string;
   isCrossRepository?: boolean;
@@ -314,7 +369,7 @@ interface Resolution {
 
 export async function resolvePrContext(
   options: ResolvePrContextOptions,
-): Promise<PrContext> {
+): Promise<PrContext & { selector: PrContextSelector }> {
   const runner = options.runner ?? runCommand;
   const rootArgs = ["rev-parse", "--show-toplevel"];
   const rootResult = await git(runner, options.cwd, rootArgs);
@@ -331,6 +386,20 @@ export async function resolvePrContext(
       headRef: explicit.headRef,
       baseLabel: explicit.baseLabel,
       headLabel: explicit.headLabel,
+      selector: {
+        kind: "explicit_range",
+        range: explicit.range,
+        base_ref_digest: selectorRefDigest(
+          "explicit_range",
+          "base",
+          explicit.baseRef,
+        ),
+        head_ref_digest: selectorRefDigest(
+          "explicit_range",
+          "head",
+          explicit.headRef,
+        ),
+      },
     };
   } else if (options.input !== undefined) {
     if (!isPrSelector(options.input)) {
@@ -345,6 +414,7 @@ export async function resolvePrContext(
       headRef: gh.metadata.headRefOid,
       baseLabel: gh.metadata.baseRefName,
       headLabel: gh.metadata.headRefName,
+      selector: { kind: "github_pr", number: gh.metadata.number },
       number: gh.metadata.number,
       url: gh.metadata.url,
       isCrossRepository: gh.metadata.isCrossRepository,
@@ -363,6 +433,7 @@ export async function resolvePrContext(
         headRef: gh.metadata.headRefOid,
         baseLabel: gh.metadata.baseRefName,
         headLabel: gh.metadata.headRefName,
+        selector: { kind: "github_pr", number: gh.metadata.number },
         number: gh.metadata.number,
         url: gh.metadata.url,
         isCrossRepository: gh.metadata.isCrossRepository,
@@ -407,6 +478,19 @@ export async function resolvePrContext(
         headRef: "HEAD",
         baseLabel: canonicalLabel(baseRef),
         headLabel: canonicalLabel(headLabel),
+        selector: {
+          kind: "inferred_local_range",
+          base_ref_digest: selectorRefDigest(
+            "inferred_local_range",
+            "base",
+            baseRef,
+          ),
+          head_ref_digest: selectorRefDigest(
+            "inferred_local_range",
+            "head",
+            headLabel,
+          ),
+        },
         ...(frozenBaseOid === undefined ? {} : { frozenBaseOid }),
       };
     }
@@ -453,6 +537,7 @@ export async function resolvePrContext(
     mergeBaseOid,
     prRef: `${resolution.baseLabel}...${resolution.headLabel}`,
     headBranch: resolution.headLabel,
+    selector: resolution.selector,
     ...(resolution.number === undefined ? {} : { number: resolution.number }),
     ...(resolution.url === undefined ? {} : { url: resolution.url }),
     ...(resolution.isCrossRepository === undefined

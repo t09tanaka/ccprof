@@ -68,6 +68,7 @@ export interface LedgerResult {
   totals_ms: LedgerTotalsMs;
   highConfidenceLowerBoundIntervals: Interval[];
   pointRecoverableIntervals: Interval[];
+  observedHumanWaitIntervals: Interval[];
   humanWaitIntervals: Interval[];
   normalIntervals: Interval[];
   unexplainedIntervals: Interval[];
@@ -252,6 +253,10 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
     input.activeIntervals,
     rawIntervals,
   );
+  const observedHumanWaitIntervals = intersectIntervals(
+    input.humanWaitIntervals ?? [],
+    activeIntervals,
+  );
   const highConfidenceLowerBoundIntervals = confirmedLowerBoundIntervals(
     input.candidates,
     activeIntervals,
@@ -303,7 +308,7 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
     activeIntervals,
   );
   const humanWaitIntervals = subtractIntervals(
-    intersectIntervals(input.humanWaitIntervals ?? [], activeIntervals),
+    observedHumanWaitIntervals,
     pointRecoverableIntervals,
   );
   const normalIntervals = subtractIntervals(contributingIntervals, [
@@ -385,6 +390,9 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
     totals_ms: totalsMs,
     highConfidenceLowerBoundIntervals,
     pointRecoverableIntervals,
+    observedHumanWaitIntervals: observedHumanWaitIntervals.map(
+      (interval) => ({ ...interval }),
+    ),
     humanWaitIntervals,
     normalIntervals,
     unexplainedIntervals,

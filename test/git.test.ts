@@ -17,6 +17,7 @@ import {
   parseExplicitRange,
   parseGhMetadata,
   resolvePrContext,
+  selectorRefDigest,
 } from "../src/git/pr-context.js";
 import {
   collectDiffEvidence,
@@ -354,12 +355,15 @@ test("runCommand hard-settles after timeout when a descendant keeps stdout open"
 });
 
 test("parseExplicitRange accepts exactly two or three dots and canonicalizes labels", () => {
+  assert.equal(parseExplicitRange("main..feature")?.range, "double_dot");
+  assert.equal(parseExplicitRange("main...feature")?.range, "triple_dot");
   assert.deepEqual(parseExplicitRange("refs/heads/main..refs/heads/feature"), {
     baseRef: "refs/heads/main",
     headRef: "refs/heads/feature",
     baseLabel: "main",
     headLabel: "feature",
     prRef: "main...feature",
+    range: "double_dot",
   });
   assert.deepEqual(parseExplicitRange("origin/main...feature"), {
     baseRef: "origin/main",
@@ -367,6 +371,7 @@ test("parseExplicitRange accepts exactly two or three dots and canonicalizes lab
     baseLabel: "origin/main",
     headLabel: "feature",
     prRef: "origin/main...feature",
+    range: "triple_dot",
   });
   assert.equal(parseExplicitRange("main....feature"), null);
   assert.equal(parseExplicitRange("main"), null);
@@ -425,6 +430,12 @@ test("explicit range freezes refs, computes merge-base, and keeps time facts", a
     mergeBaseOid: MERGE_BASE,
     prRef: "main...feature",
     headBranch: "feature",
+    selector: {
+      kind: "explicit_range",
+      range: "double_dot",
+      base_ref_digest: selectorRefDigest("explicit_range", "base", "main"),
+      head_ref_digest: selectorRefDigest("explicit_range", "head", "feature"),
+    },
     earliestUniqueCommitAtMs: 100_000,
     resolvedAtMs: 999_000,
     warnings: [],
@@ -456,8 +467,77 @@ test("explicit range freezes refs, computes merge-base, and keeps time facts", a
   assert.equal(fixture.calls.some(({ args }) => args.includes("fetch")), false);
 });
 
+test("selector ref digests preserve exact NFC tokens before label stripping", async () => {
+  const tokens = [
+    "refs/heads/release",
+    "refs/tags/release",
+    "refs/remotes/origin/release",
+    "release",
+    "HEAD",
+  ] as const;
+  const sharedOid = "9".repeat(40);
+  const fixture = fakeRunner(({ args }) => {
+    if (args[0] === "rev-parse" && args[1] === "--show-toplevel") {
+      return ok("/repo\n");
+    }
+    if (args[0] === "rev-parse" && args[1] === "--verify") {
+      return ok(`${sharedOid}\n`);
+    }
+    if (args[0] === "merge-base") return ok(`${sharedOid}\n`);
+    if (args[0] === "log") return ok("");
+    return { code: 2, stdout: "", stderr: `unexpected ${args.join(" ")}` };
+  });
+  const resolveExplicit = async (input: string) =>
+    await resolvePrContext({
+      cwd: "/repo",
+      input,
+      runner: fixture.runner,
+      nowMs: 1,
+      includeBranchReflog: false,
+    });
+
+  const baseDigests: string[] = [];
+  for (const token of tokens) {
+    const context = await resolveExplicit(`${token}..feature`);
+    assert.equal(context.base.oid, sharedOid);
+    assert.equal(context.head.oid, sharedOid);
+    if (context.selector.kind !== "explicit_range") {
+      assert.fail("expected an explicit range selector");
+    }
+    assert.equal(
+      context.selector.base_ref_digest,
+      selectorRefDigest("explicit_range", "base", token.normalize("NFC")),
+    );
+    assert.match(context.selector.base_ref_digest, /^sha256:[0-9a-f]{64}$/u);
+    const serialized = JSON.stringify(context.selector);
+    for (const rawToken of [...tokens, "feature"]) {
+      assert.equal(serialized.includes(rawToken), false);
+    }
+    baseDigests.push(context.selector.base_ref_digest);
+  }
+  assert.equal(new Set(baseDigests).size, tokens.length);
+
+  const doubleDot = await resolveExplicit("release..HEAD");
+  const tripleDot = await resolveExplicit("release...HEAD");
+  assert.notDeepEqual(doubleDot.selector, tripleDot.selector);
+  for (const selector of [doubleDot.selector, tripleDot.selector]) {
+    const serialized = JSON.stringify(selector);
+    assert.equal(serialized.includes("release"), false);
+    assert.equal(serialized.includes("HEAD"), false);
+  }
+});
+
+test("selector ref digests reject unpaired UTF-16 surrogates", () => {
+  for (const malformedRef of ["\uD800", "\uD801"]) {
+    assert.throws(
+      () => selectorRefDigest("explicit_range", "base", malformedRef),
+      /unpaired UTF-16 surrogate/u,
+    );
+  }
+});
+
 test("PR URL uses exact gh metadata, disables prompts, and preserves creation", async () => {
-  const url = "https://github.example/acme/widget/pull/17";
+  const url = "https://github.example/acme/widget/pull/42";
   const fixture = fakeRunner(({ command, args }) => {
     if (command === "git" && args[0] === "rev-parse" && args[1] === "--show-toplevel") {
       return ok("/repo\n");
@@ -465,7 +545,7 @@ test("PR URL uses exact gh metadata, disables prompts, and preserves creation", 
     if (command === "gh") {
       return ok(
         JSON.stringify({
-          number: 17,
+          number: 42,
           url,
           baseRefName: "main",
           baseRefOid: BASE,
@@ -496,7 +576,8 @@ test("PR URL uses exact gh metadata, disables prompts, and preserves creation", 
     includeBranchReflog: false,
   });
 
-  assert.equal(context.number, 17);
+  assert.equal(context.number, 42);
+  assert.deepEqual(context.selector, { kind: "github_pr", number: 42 });
   assert.equal(context.url, url);
   assert.equal(context.isCrossRepository, false);
   assert.equal(context.createdAtMs, Date.parse("2026-07-01T02:03:04.000Z"));
@@ -647,11 +728,11 @@ test("implicit resolution falls back from gh to the remote default without fetch
           "--short",
           "refs/remotes/origin/HEAD",
         ].join("\0"),
-        ok("origin/trunk\n"),
+        ok("origin/main\n"),
       ],
       [
         ["git", "symbolic-ref", "--quiet", "--short", "HEAD"].join("\0"),
-        ok("topic\n"),
+        ok("feature\n"),
       ],
       [
         [
@@ -660,7 +741,7 @@ test("implicit resolution falls back from gh to the remote default without fetch
           "--verify",
           "--quiet",
           "--end-of-options",
-          "origin/trunk^{commit}",
+          "origin/main^{commit}",
         ].join("\0"),
         ok(`${BASE}\n`),
       ],
@@ -694,8 +775,21 @@ test("implicit resolution falls back from gh to the remote default without fetch
     nowMs: 123,
   });
 
-  assert.equal(context.prRef, "origin/trunk...topic");
-  assert.equal(context.headBranch, "topic");
+  assert.equal(context.prRef, "origin/main...feature");
+  assert.equal(context.headBranch, "feature");
+  assert.deepEqual(context.selector, {
+    kind: "inferred_local_range",
+    base_ref_digest: selectorRefDigest(
+      "inferred_local_range",
+      "base",
+      "origin/main",
+    ),
+    head_ref_digest: selectorRefDigest(
+      "inferred_local_range",
+      "head",
+      "feature",
+    ),
+  });
   assert.equal(context.earliestUniqueCommitAtMs, undefined);
   assert.match(context.warnings[0] ?? "", /gh pr view/);
   assert.equal(
@@ -810,6 +904,63 @@ test("malformed git log rows are ignored and reported as warnings", async () => 
   assert.equal(context.warnings.length, 1);
   assert.match(context.warnings[0] ?? "", /ignored malformed git log row/);
   assert.match(context.warnings[0] ?? "", /not-a-timestamp/);
+});
+
+test("collectDiffEvidence counts complete text additions and deletions only", async () => {
+  const fixture = fakeRunner(({ args }) => {
+    if (args[1] === "diff" && args.includes("--name-status")) {
+      return ok("M\0src/a.ts\0A\0src/b.ts\0");
+    }
+    if (args[1] === "diff") {
+      return ok([
+        "diff --git a/src/a.ts b/src/a.ts",
+        "index 111..222 100644",
+        "--- a/src/a.ts",
+        "+++ b/src/a.ts",
+        "@@ -1,2 +1,3 @@",
+        "-old",
+        " context",
+        "+new",
+        "+++starts-with-plus",
+        "diff --git a/src/b.ts b/src/b.ts",
+        "new file mode 100644",
+        "--- /dev/null",
+        "+++ b/src/b.ts",
+        "@@ -0,0 +1,2 @@",
+        "+first",
+        "+second",
+        "",
+      ].join("\n"));
+    }
+    return ok("");
+  });
+
+  const evidence = await collectDiffEvidence({
+    cwd: "/repo",
+    baseOid: BASE,
+    headOid: HEAD,
+    runner: fixture.runner,
+  });
+
+  assert.equal(evidence.changedLineCount, 5);
+  assert.deepEqual(evidence.files.map(({ addedLines }) => addedLines), [
+    ["new", "++starts-with-plus"],
+    ["first", "second"],
+  ]);
+});
+
+test("collectDiffEvidence omits line count when patch and status are empty", async () => {
+  const fixture = fakeRunner(() => ok(""));
+
+  const evidence = await collectDiffEvidence({
+    cwd: "/repo",
+    baseOid: BASE,
+    headOid: HEAD,
+    runner: fixture.runner,
+  });
+
+  assert.deepEqual(evidence.files, []);
+  assert.equal("changedLineCount" in evidence, false);
 });
 
 test("collectDiffEvidence pairs status with patch order and parses only hunk additions", async () => {
@@ -970,6 +1121,7 @@ test("collectDiffEvidence pairs status with patch order and parses only hunk add
   assert.equal(evidence.files[0]?.contentComplete, true);
   assert.equal(evidence.files[2]?.binary, true);
   assert.equal(evidence.files[2]?.contentComplete, false);
+  assert.equal("changedLineCount" in evidence, false);
   assert.deepEqual(evidence.reverts, [
     {
       commitOid: revertOid,
@@ -1020,6 +1172,7 @@ test("patch/status mismatch does not attribute patch content by shifted index", 
       { path: "src/second.ts", addedLines: [], contentComplete: false },
     ],
   );
+  assert.equal("changedLineCount" in evidence, false);
   assert.match(evidence.caveats[0] ?? "", /paired completely/i);
 });
 
@@ -1046,12 +1199,27 @@ test("truncated patch marks textual content incomplete without losing status evi
 
   assert.equal(evidence.truncated, true);
   assert.equal(evidence.files[0]?.contentComplete, false);
+  assert.equal("changedLineCount" in evidence, false);
   assert.match(evidence.caveats[0] ?? "", /truncated/i);
 });
 
-test("mid-record commit-log truncation returns incomplete evidence instead of throwing", async () => {
+test("log-only truncation preserves complete diff line evidence", async () => {
   const partialLog = ["a".repeat(40), "100", "subject without body"].join("\0");
   const fixture = fakeRunner(({ args }) => {
+    if (args[1] === "diff" && args.includes("--name-status")) {
+      return ok("M\0src/a.ts\0");
+    }
+    if (args[1] === "diff") {
+      return ok([
+        "diff --git a/src/a.ts b/src/a.ts",
+        "--- a/src/a.ts",
+        "+++ b/src/a.ts",
+        "@@ -1 +1 @@",
+        "-before",
+        "+after",
+        "",
+      ].join("\n"));
+    }
     if (args[1] === "log") {
       return ok(partialLog, { stdoutTruncated: true });
     }
@@ -1066,6 +1234,8 @@ test("mid-record commit-log truncation returns incomplete evidence instead of th
   });
 
   assert.equal(evidence.truncated, true);
+  assert.equal(evidence.changedLineCount, 2);
+  assert.equal(evidence.files[0]?.contentComplete, true);
   assert.deepEqual(evidence.commits, []);
   assert.deepEqual(evidence.reverts, []);
   assert.match(

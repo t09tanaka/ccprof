@@ -26,12 +26,18 @@ import type {
   FindingConfidence,
   ImpactEstimate,
   ReportV2,
+  RuleId,
 } from "../src/core/model.js";
 import type { AnalysisBudgetResult } from "../src/analysis/budgets.js";
+import type {
+  TerminalStatsSnapshotV1 as ExportedTerminalStatsSnapshotV1,
+} from "../src/analysis/stats-aggregation.js";
 import { commandIdentityKey } from "../src/analysis/command-identity.js";
 import { detectChronicCost } from "../src/rules/chronic-cost.js";
 import { projectReportPrivacy } from "../src/reporters/privacy.js";
 import { findingKey } from "../src/rules/shared.js";
+import { ruleManifest } from "../src/rules/manifest.js";
+import { selectorRefDigest } from "../src/git/pr-context.js";
 import {
   loadAdoptions,
   saveAdoptions,
@@ -44,6 +50,7 @@ import {
   makeAnalysisRecord,
   saveAnalysis,
   type AnalysisRecord,
+  type AnalysisSnapshotIdentity,
 } from "../src/store/analyses.js";
 import {
   applyDismissals,
@@ -1419,6 +1426,179 @@ test("rich snapshot input and normalized-result changes create distinct snapshot
   });
 });
 
+test("snapshot selector validation rejects own __proto__ field attacks", async () => {
+  await temporaryStore(async (paths) => {
+    const selector = JSON.parse(
+      '{"kind":"github_pr","extra":true,"__proto__":{"number":42}}',
+    ) as AnalysisSnapshotIdentity["selector"];
+    const snapshot = {
+      ...snapshotOptions().snapshot,
+      selector,
+    } as AnalysisSnapshotIdentity;
+
+    await assert.rejects(
+      () => saveAnalysis(paths, record("selector-proto-attack", 100), { snapshot }),
+      /invalid snapshot selector/u,
+    );
+
+    const database = openStoreDatabase(paths);
+    try {
+      assert.equal(
+        database.prepare("SELECT count(*) FROM analysis_executions").pluck().get(),
+        0,
+      );
+    } finally {
+      database.close();
+    }
+  });
+});
+
+test("snapshot-aware history preserves records and exposes exact normalized entries", async () => {
+  await temporaryStore(async (paths) => {
+    const selector = {
+      kind: "explicit_range",
+      range: "double_dot",
+      base_ref_digest: selectorRefDigest("explicit_range", "base", "main"),
+      head_ref_digest: selectorRefDigest("explicit_range", "head", "feature"),
+    } as const;
+    const rawStateAIdentity = {
+      repo_id: "A".repeat(64),
+      base_oid: "B".repeat(40),
+      head_oid: "C".repeat(40),
+      merge_base_oid: "B".repeat(40),
+      window: {
+        started_at_ms: 1,
+        start_source: "commit_anchor_lookback",
+        end_source: "analysis_time",
+        completeness: "partial",
+      },
+      source_digest: "D".repeat(64),
+      config_digest: "E".repeat(64),
+      policy_digest: "F".repeat(64),
+      history_digest: "1".repeat(64),
+      selector,
+    } satisfies AnalysisSnapshotIdentity;
+    const stateAIdentity = {
+      ...rawStateAIdentity,
+      repo_id: rawStateAIdentity.repo_id.toLowerCase(),
+      base_oid: rawStateAIdentity.base_oid.toLowerCase(),
+      head_oid: rawStateAIdentity.head_oid.toLowerCase(),
+      merge_base_oid: rawStateAIdentity.merge_base_oid.toLowerCase(),
+      source_digest: rawStateAIdentity.source_digest.toLowerCase(),
+      config_digest: rawStateAIdentity.config_digest.toLowerCase(),
+      policy_digest: rawStateAIdentity.policy_digest.toLowerCase(),
+    } satisfies AnalysisSnapshotIdentity;
+    const stateBIdentity = {
+      ...stateAIdentity,
+      head_oid: "2".repeat(40),
+    } satisfies AnalysisSnapshotIdentity;
+    const stateAVariantIdentity = {
+      ...stateAIdentity,
+      history_digest: "3".repeat(64),
+    } satisfies AnalysisSnapshotIdentity;
+    const selectorlessIdentity = snapshotOptions("7".repeat(64)).snapshot;
+
+    const stateA = record("state-a", 1_000);
+    const stateB = record("state-b", 2_000);
+    const stateAVariant = {
+      ...stateA,
+      analysis_id: "state-a-variant",
+      created_at_ms: 3_000,
+    };
+    const selectorless = record("selectorless-legacy", 4_000);
+    const contentFallback = record("content-fallback-legacy", 5_000);
+    const stateARerun = {
+      ...stateA,
+      analysis_id: "state-a-rerun",
+      created_at_ms: 6_000,
+    };
+    await mkdir(paths.analyses_dir, { recursive: true });
+    await writeFile(
+      join(paths.analyses_dir, "content-fallback.json"),
+      `${JSON.stringify(contentFallback)}\n`,
+      "utf8",
+    );
+
+    assert.deepEqual(
+      (await saveAnalysis(paths, stateA, { snapshot: rawStateAIdentity })).warnings,
+      [],
+    );
+    assert.deepEqual(
+      (await saveAnalysis(paths, stateB, { snapshot: stateBIdentity })).warnings,
+      [],
+    );
+    assert.deepEqual(
+      (await saveAnalysis(paths, stateAVariant, {
+        snapshot: stateAVariantIdentity,
+      })).warnings,
+      [],
+    );
+    assert.deepEqual(
+      (await saveAnalysis(paths, selectorless, {
+        snapshot: selectorlessIdentity,
+      })).warnings,
+      [],
+    );
+    assert.deepEqual(
+      (await saveAnalysis(paths, stateARerun, { snapshot: stateAIdentity }))
+        .warnings,
+      [],
+    );
+
+    const snapshotId = (
+      storedRecord: AnalysisRecord,
+      identity: AnalysisSnapshotIdentity | { mode: "content-fallback" },
+    ): string => {
+      const {
+        analysis_id: _analysisId,
+        created_at_ms: _createdAtMs,
+        ...payload
+      } = storedRecord;
+      return analysisDigest("analysis-snapshot-v1", {
+        schema_version: 1,
+        identity,
+        payload,
+      });
+    };
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded.warnings, []);
+    assert.deepEqual(loaded.records, [
+      stateA,
+      stateB,
+      stateAVariant,
+      selectorless,
+      contentFallback,
+    ]);
+    assert.deepEqual(loaded.entries, [
+      {
+        snapshot_id: snapshotId(stateA, stateAIdentity),
+        identity: stateAIdentity,
+        record: stateA,
+      },
+      {
+        snapshot_id: snapshotId(stateB, stateBIdentity),
+        identity: stateBIdentity,
+        record: stateB,
+      },
+      {
+        snapshot_id: snapshotId(stateAVariant, stateAVariantIdentity),
+        identity: stateAVariantIdentity,
+        record: stateAVariant,
+      },
+      {
+        snapshot_id: snapshotId(selectorless, selectorlessIdentity),
+        identity: selectorlessIdentity,
+        record: selectorless,
+      },
+      {
+        snapshot_id: snapshotId(contentFallback, { mode: "content-fallback" }),
+        identity: { mode: "content-fallback" },
+        record: contentFallback,
+      },
+    ]);
+  });
+});
+
 test("analysis budget results save and load through normalized Store v4 rows", async () => {
   await temporaryStore(async (paths) => {
     const complete = budgetRecord("budget-complete", 100, "complete");
@@ -1515,7 +1695,8 @@ test("legacy analysis snapshots remain readable with no synthetic budget result"
     assert.deepEqual((await saveAnalysis(paths, legacy)).warnings, []);
 
     const loaded = await loadAnalyses(paths);
-    assert.deepEqual(loaded, { records: [legacy], warnings: [] });
+    assert.deepEqual(loaded.records, [legacy]);
+    assert.deepEqual(loaded.warnings, []);
     assert.equal("analysis_budget" in (loaded.records[0] ?? {}), false);
 
     const database = openStoreDatabase(paths);
@@ -1776,7 +1957,8 @@ test("legacy analysis migration leaves a non-directory source incomplete and ret
     );
 
     const retried = await loadAnalyses(paths);
-    assert.deepEqual(retried, { records: [repaired], warnings: [] });
+    assert.deepEqual(retried.records, [repaired]);
+    assert.deepEqual(retried.warnings, []);
     database = openStoreDatabase(paths);
     try {
       assert.equal(database.prepare(
@@ -1831,7 +2013,8 @@ test("legacy analysis migration rolls back rows and marker after an operational 
     }
 
     const retried = await loadAnalyses(paths);
-    assert.deepEqual(retried, { records: [legacy], warnings: [] });
+    assert.deepEqual(retried.records, [legacy]);
+    assert.deepEqual(retried.warnings, []);
     database = openStoreDatabase(paths);
     try {
       assert.equal(database.prepare(
@@ -1851,7 +2034,9 @@ test("legacy analysis migration rolls back rows and marker after an operational 
 
 test("completed legacy migration remains readable while another connection holds the writer lock", async () => {
   await temporaryStore(async (paths) => {
-    assert.deepEqual(await loadAnalyses(paths), { records: [], warnings: [] });
+    const initial = await loadAnalyses(paths);
+    assert.deepEqual(initial.records, []);
+    assert.deepEqual(initial.warnings, []);
 
     const writer = openStoreDatabase(paths);
     writer.exec("BEGIN IMMEDIATE");
@@ -1859,7 +2044,8 @@ test("completed legacy migration remains readable while another connection holds
       const startedAtMs = Date.now();
       const loaded = await loadAnalyses(paths);
       const elapsedMs = Date.now() - startedAtMs;
-      assert.deepEqual(loaded, { records: [], warnings: [] });
+      assert.deepEqual(loaded.records, []);
+      assert.deepEqual(loaded.warnings, []);
       assert.ok(
         elapsedMs < 2_000,
         `marker fast path waited ${elapsedMs}ms for an unnecessary writer lock`,
@@ -2982,13 +3168,13 @@ test("legacy finding normalization is idempotent across save, load, and migratio
     assert.deepEqual(saved.warnings, []);
     assert.deepEqual(saved.record, normalized);
     const loaded = await loadAnalyses(paths);
-    assert.deepEqual(loaded, { records: [normalized], warnings: [] });
+    assert.deepEqual(loaded.records, [normalized]);
+    assert.deepEqual(loaded.warnings, []);
     const savedAgain = await saveAnalysis(paths, loaded.records[0]!);
     assert.deepEqual(savedAgain, { record: normalized, warnings: [] });
-    assert.deepEqual(await loadAnalyses(paths), {
-      records: [normalized],
-      warnings: [],
-    });
+    const loadedAgain = await loadAnalyses(paths);
+    assert.deepEqual(loadedAgain.records, [normalized]);
+    assert.deepEqual(loadedAgain.warnings, []);
   });
 
   await temporaryStore(async (paths) => {
@@ -2998,14 +3184,12 @@ test("legacy finding normalization is idempotent across save, load, and migratio
       `${JSON.stringify(legacy)}\n`,
       "utf8",
     );
-    assert.deepEqual(await loadAnalyses(paths), {
-      records: [normalized],
-      warnings: [],
-    });
-    assert.deepEqual(await loadAnalyses(paths), {
-      records: [normalized],
-      warnings: [],
-    });
+    const migrated = await loadAnalyses(paths);
+    assert.deepEqual(migrated.records, [normalized]);
+    assert.deepEqual(migrated.warnings, []);
+    const loadedAgain = await loadAnalyses(paths);
+    assert.deepEqual(loadedAgain.records, [normalized]);
+    assert.deepEqual(loadedAgain.warnings, []);
   });
 });
 
@@ -3294,4 +3478,224 @@ test("privacy projections preserve canonical numeric and fixed finding fields", 
     );
     assert.notEqual(projected?.scoring_rationale, canonical.scoring_rationale);
   }
+});
+
+interface TerminalStatsSnapshotV1 {
+  schema_version: 1;
+  measured_wall_ms: number;
+  confirmed_critical_path_ms: number;
+  estimated_critical_path_upper_ms: number;
+  resource_cost_ms: number;
+  human_wait_ms: number;
+  unexplained_ms: number;
+  cohort: {
+    repository_id: string;
+    workspace_id: string;
+    changed_files: number;
+    changed_lines?: number;
+  };
+  rules: Array<{
+    rule_id: RuleId;
+    rule_version: string;
+    compatibility_epoch: number;
+    confirmed_critical_path_ms: number;
+    estimated_critical_path_upper_ms: number;
+    resource_cost_ms: number;
+  }>;
+  incomplete_interval_findings: number;
+}
+
+type StoredTerminalStatsExportContract =
+  ExportedTerminalStatsSnapshotV1 extends TerminalStatsSnapshotV1
+    ? true
+    : false;
+const storedTerminalStatsExportContract: StoredTerminalStatsExportContract = true;
+void storedTerminalStatsExportContract;
+
+type AnalysisRecordWithTerminalSnapshot = AnalysisRecord & {
+  terminal_stats_snapshot?: TerminalStatsSnapshotV1;
+};
+
+function storedTerminalStatsSnapshot(): TerminalStatsSnapshotV1 {
+  const ruleIds: readonly RuleId[] = [
+    "R001", "R002", "R003", "R004", "R005", "R006", "R007", "R008",
+  ];
+  return {
+    schema_version: 1,
+    measured_wall_ms: 1_000,
+    confirmed_critical_path_ms: 100,
+    estimated_critical_path_upper_ms: 200,
+    resource_cost_ms: 300,
+    human_wait_ms: 50,
+    unexplained_ms: 25,
+    cohort: {
+      repository_id: "1".repeat(64),
+      workspace_id: "2".repeat(64),
+      changed_files: 4,
+      changed_lines: 199,
+    },
+    rules: ruleIds.map((ruleId) => {
+      const manifest = ruleManifest(ruleId);
+      return {
+        rule_id: ruleId,
+        rule_version: manifest.version,
+        compatibility_epoch: manifest.compatibility_epoch,
+        confirmed_critical_path_ms: ruleId === "R001" ? 100 : 0,
+        estimated_critical_path_upper_ms: ruleId === "R001" ? 200 : 0,
+        resource_cost_ms: ruleId === "R005" ? 300 : 0,
+      };
+    }),
+    incomplete_interval_findings: 2,
+  };
+}
+
+test("analysis records clone and persist optional terminal stats snapshots", async () => {
+  const source = storedTerminalStatsSnapshot();
+  const expected = structuredClone(source);
+  const input = {
+    ...record("terminal-stats-round-trip", 100),
+    terminal_stats_snapshot: source,
+  };
+  const normalized = makeAnalysisRecord(input) as AnalysisRecordWithTerminalSnapshot;
+
+  assert.deepEqual(normalized.terminal_stats_snapshot, expected);
+  assert.notEqual(normalized.terminal_stats_snapshot, source);
+  assert.notEqual(normalized.terminal_stats_snapshot?.cohort, source.cohort);
+  assert.notEqual(normalized.terminal_stats_snapshot?.rules, source.rules);
+  source.cohort.changed_files = 99;
+  source.rules[0]!.confirmed_critical_path_ms = 99;
+  assert.deepEqual(normalized.terminal_stats_snapshot, expected);
+
+  await temporaryStore(async (paths) => {
+    assert.deepEqual((await saveAnalysis(paths, normalized)).warnings, []);
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded.warnings, []);
+    assert.deepEqual(loaded.records, [normalized]);
+    const loadedRecord = loaded.records[0] as
+      AnalysisRecordWithTerminalSnapshot | undefined;
+    assert.deepEqual(loadedRecord?.terminal_stats_snapshot, expected);
+    assert.notEqual(
+      loadedRecord?.terminal_stats_snapshot,
+      normalized.terminal_stats_snapshot,
+    );
+  });
+});
+
+test("legacy records omit rather than synthesize terminal stats snapshots", () => {
+  const legacy = makeAnalysisRecord(record("legacy-terminal-stats", 101)) as
+    AnalysisRecordWithTerminalSnapshot;
+  assert.equal("terminal_stats_snapshot" in legacy, false);
+
+  const omitted = { ...record("omitted-terminal-stats", 102) };
+  const normalized = makeAnalysisRecord(omitted) as
+    AnalysisRecordWithTerminalSnapshot;
+  assert.equal("terminal_stats_snapshot" in normalized, false);
+});
+
+test("analysis records reject malformed terminal stats snapshot presence", () => {
+  const canonical = storedTerminalStatsSnapshot();
+  const malformed: unknown[] = [
+    null,
+    { ...canonical, schema_version: 2 },
+    { ...canonical, measured_wall_ms: -1 },
+    { ...canonical, unknown: "raw/private/path" },
+    { ...canonical, confirmed_critical_path_ms: 201 },
+    { ...canonical, resource_cost_ms: 301 },
+  ];
+
+  for (const terminalStats of malformed) {
+    const input = {
+      ...record("malformed-terminal-stats", 103),
+      terminal_stats_snapshot: terminalStats,
+    };
+    assert.throws(
+      () => makeAnalysisRecord(
+        input as unknown as Parameters<typeof makeAnalysisRecord>[0],
+      ),
+      TypeError,
+    );
+  }
+});
+
+test("terminal stats descriptors fail closed without evaluating hostile input", () => {
+  const canary = "TERMINAL_STORE_CANARY";
+  let reads = 0;
+  const accessor = record("terminal-stats-accessor", 104) as
+    AnalysisRecordWithTerminalSnapshot;
+  Object.defineProperty(accessor, "terminal_stats_snapshot", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      throw new Error(canary);
+    },
+  });
+  const hidden = record("terminal-stats-hidden", 105) as
+    AnalysisRecordWithTerminalSnapshot;
+  Object.defineProperty(hidden, "terminal_stats_snapshot", {
+    enumerable: false,
+    value: storedTerminalStatsSnapshot(),
+  });
+  const proxiedSnapshot = new Proxy(storedTerminalStatsSnapshot(), {
+    get() {
+      reads += 1;
+      throw new Error(canary);
+    },
+  });
+
+  for (const input of [
+    accessor,
+    hidden,
+    {
+      ...record("terminal-stats-proxy", 106),
+      terminal_stats_snapshot: proxiedSnapshot,
+    },
+  ]) {
+    assert.throws(
+      () => makeAnalysisRecord(input),
+      (error: unknown) => {
+        assert.ok(error instanceof TypeError);
+        assert.equal(String(error).includes(canary), false);
+        return true;
+      },
+    );
+  }
+  assert.equal(reads, 0);
+});
+
+test("snapshot reads reject malformed terminal stats despite a valid digest", async () => {
+  await temporaryStore(async (paths) => {
+    const stored = record("malformed-terminal-read", 107);
+    const { analysis_id: executionId, created_at_ms: executedAtMs, ...payload } =
+      stored;
+    const envelope = {
+      schema_version: 1 as const,
+      identity: { mode: "content-fallback" as const },
+      payload: {
+        ...payload,
+        terminal_stats_snapshot: {
+          ...storedTerminalStatsSnapshot(),
+          measured_wall_ms: -1,
+        },
+      },
+    };
+    const recordJson = canonicalJson(envelope);
+    const snapshotId = analysisDigest("analysis-snapshot-v1", envelope);
+    const database = openStoreDatabase(paths);
+    try {
+      database.prepare(`INSERT INTO analysis_snapshots
+        (snapshot_id, created_at_ms, record_json) VALUES (?, ?, ?)`)
+        .run(snapshotId, executedAtMs, recordJson);
+      database.prepare(`INSERT INTO analysis_executions
+        (execution_id, snapshot_id, executed_at_ms) VALUES (?, ?, ?)`)
+        .run(executionId, snapshotId, executedAtMs);
+    } finally {
+      database.close();
+    }
+
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded.records, []);
+    assert.ok(loaded.warnings.some(
+      ({ code }) => code === "corrupt_analysis_record",
+    ));
+  });
 });
