@@ -22,12 +22,17 @@ import {
   type SessionSource,
 } from "../session-source.js";
 import {
+  CLAUDE_PARSER_VERSION,
+  PARSER_STATE_SCHEMA_FINGERPRINT,
   parseClaudeTranscriptDetailed,
+  parseClaudeTranscriptObserved,
   projectClaudeParserState,
   readClaudeParserState,
   type ClaudeTranscriptParseResult,
 } from "./parser.js";
 import type { ExactSourceEvidenceCache } from "../exact-source-evidence-cache.js";
+import { createBuiltInSourceCoverageAccumulator,
+  type BuiltInSourceCoverageAccumulator } from "../source-coverage.js";
 
 export class ClaudeDiscoveryError extends Error {
   readonly warnings: SourceWarning[];
@@ -371,10 +376,11 @@ async function canonicalizeSession(session: Session): Promise<Session> {
   };
 }
 
-export async function discoverClaudeSessions(
+async function discoverClaudeSessionsImpl(
   projectsDirectory: string,
   query: SessionQuery,
   evidenceCache?: ExactSourceEvidenceCache,
+  coverage?: BuiltInSourceCoverageAccumulator,
 ): Promise<Session[]> {
   const meter = query.analysisBudgetMeter;
   if (meter !== undefined && !meter.checkpoint()) return [];
@@ -408,6 +414,7 @@ export async function discoverClaudeSessions(
         sourceFailures,
         meter,
       );
+  if (globalSourceWarnings.length > 0) coverage?.markPartial();
   if (meter === undefined) sourceFailures.push(...globalSourceWarnings);
   const sessions: Session[] = [];
   const seen = new Set<string>();
@@ -430,12 +437,14 @@ export async function discoverClaudeSessions(
       }
       fileSize = status.size;
     } catch {
+      coverage?.markPartial();
       if (meter !== undefined) {
         meter.recordSourceFailure();
         break;
       }
       // Fall through to the parse path, which reports unreadable files.
     }
+    coverage?.recordDiscoveredFile();
     let admittedFileBytes: number | undefined;
     if (meter !== undefined) {
       if (!meter.checkpoint()) break;
@@ -452,7 +461,14 @@ export async function discoverClaudeSessions(
     }
     let parsed: ClaudeTranscriptParseResult;
     try {
-      parsed = evidenceCache === undefined
+      if (coverage !== undefined) {
+        const observed = await parseClaudeTranscriptObserved(file,
+          { endedAtMs: query.endedAtMs });
+        parsed = observed.result;
+        coverage.recordParsedFile(observed.observation.rows_seen,
+          observed.observation.rows_accepted, observed.observation.events_emitted,
+          observed.observation.completeness);
+      } else parsed = evidenceCache === undefined
         ? await parseClaudeTranscriptDetailed(file, { endedAtMs: query.endedAtMs,
             ...(admittedFileBytes === undefined ? {}
               : { budgets: { maxFileBytes: admittedFileBytes } }) })
@@ -461,6 +477,7 @@ export async function discoverClaudeSessions(
             readState: readClaudeParserState, projectState: projectClaudeParserState,
             coldFallback: () => parseClaudeTranscriptDetailed(file, { endedAtMs: query.endedAtMs }) });
     } catch {
+      coverage?.markPartial();
       const readWarning = sourceWarning(
         "source_read_error",
         "Could not read a Claude JSONL transcript.",
@@ -571,6 +588,25 @@ export async function discoverClaudeSessions(
     ...session,
     warnings: [...session.warnings, ...globalSourceWarnings],
   }));
+}
+
+export function discoverClaudeSessions(
+  projectsDirectory: string, query: SessionQuery,
+  evidenceCache?: ExactSourceEvidenceCache,
+): Promise<Session[]> {
+  return discoverClaudeSessionsImpl(projectsDirectory, query, evidenceCache);
+}
+
+export async function discoverClaudeSessionsObserved(
+  projectsDirectory: string, query: SessionQuery,
+) {
+  if (query.analysisBudgetMeter !== undefined)
+    throw new TypeError("Observed Claude discovery is cold and unbudgeted.");
+  const coverage = createBuiltInSourceCoverageAccumulator("claude", "1.0.0",
+    CLAUDE_PARSER_VERSION, PARSER_STATE_SCHEMA_FINGERPRINT);
+  const sessions = await discoverClaudeSessionsImpl(projectsDirectory, query,
+    undefined, coverage);
+  return { sessions, source_coverage: coverage.snapshot() };
 }
 
 export class ClaudeSessionSource implements SessionSource {

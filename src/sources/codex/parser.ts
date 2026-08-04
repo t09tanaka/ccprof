@@ -37,6 +37,7 @@ import {
   type ParserStateWarningV1,
   type SourceReadReceipt,
 } from "../jsonl-budget.js";
+import type { SourceFileCoverageObservation } from "../source-coverage.js";
 
 export { PARSER_STATE_SCHEMA_FINGERPRINT } from "../jsonl-budget.js";
 
@@ -1656,23 +1657,27 @@ export function projectCodexParserState(
 async function parseCodexSessionLegacy(
   options: ParseCodexSessionOptions,
   fileHandle: FileHandle,
-): Promise<Session | null> {
+): Promise<{ result: Session | null; observation: SourceFileCoverageObservation }> {
   const { rows, warnings, tracker, firstBudgetError } = await parseRows(
     options,
     fileHandle,
   );
-  return projectCodexRows(
+  const result = projectCodexRows(
     options.sourcePath,
     rows,
     warnings,
     tracker,
     firstBudgetError,
   );
+  return { result, observation: { rows_seen: tracker.lastPhysicalLine,
+    rows_accepted: rows.length, events_emitted: result?.events.length ?? 0,
+    completeness: tracker.readStops.length === 0 && warnings.length === 0 &&
+      firstBudgetError === undefined ? "complete" : "partial" } };
 }
 
-export async function parseCodexSession(
+export async function parseCodexSessionObserved(
   options: ParseCodexSessionOptions,
-): Promise<Session | null> {
+): Promise<{ result: Session | null; observation: SourceFileCoverageObservation }> {
   const fileHandle = await openFile(options.sourcePath, "r");
   try {
     try {
@@ -1682,13 +1687,24 @@ export async function parseCodexSession(
         ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
-      return projectCodexParserState(read.state, {
+      const result = projectCodexParserState(read.state, {
         ...(options.endedAtMs === undefined
           ? {}
           : { endedAtMs: options.endedAtMs }),
         ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
+      const emitted = options.endedAtMs === undefined ? result :
+        projectCodexParserState(read.state, {
+          ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        });
+      return { result, observation: { rows_seen: read.state.line_count,
+        rows_accepted: read.state.rows.length, events_emitted: emitted?.events.length ?? 0,
+        completeness: read.completeness === "complete" &&
+          read.state.warnings.length === 0 && read.state.seen_subtypes.length === 0 &&
+          (result?.warnings.length ?? 0) === 0 && (emitted?.warnings.length ?? 0) === 0
+          ? "complete" : "partial" } };
     } catch (error) {
       if (!(error instanceof IncrementalParserStateCapacityError)) throw error;
       return await parseCodexSessionLegacy(options, fileHandle);
@@ -1696,4 +1712,10 @@ export async function parseCodexSession(
   } finally {
     await fileHandle.close();
   }
+}
+
+export async function parseCodexSession(
+  options: ParseCodexSessionOptions,
+): Promise<Session | null> {
+  return (await parseCodexSessionObserved(options)).result;
 }

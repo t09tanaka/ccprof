@@ -36,6 +36,7 @@ import {
   type ParserStateWarningV1,
   type SourceReadReceipt,
 } from "../jsonl-budget.js";
+import type { SourceFileCoverageObservation } from "../source-coverage.js";
 
 export {
   IncrementalParserStateCapacityError,
@@ -2913,7 +2914,8 @@ async function parseClaudeTranscriptDetailedLegacy(
   sourcePath: string,
   instrumentation: ClaudeTranscriptParseOptions,
   fileHandle: FileHandle,
-): Promise<ClaudeTranscriptParseResult> {
+): Promise<{ result: ClaudeTranscriptParseResult;
+  observation: SourceFileCoverageObservation }> {
   const { rows, warnings, tracker } = await readRows(
     sourcePath,
     instrumentation,
@@ -2941,19 +2943,25 @@ async function parseClaudeTranscriptDetailedLegacy(
     );
     if (session !== undefined) sessions.push(session);
   }
-  return {
+  const result = {
     sessions,
     warnings: warnings.map(
       ({ targetSessionId: _targetSessionId, ...sourceWarning }) =>
         sourceWarning,
     ),
   };
+  return { result, observation: { rows_seen: tracker.lastPhysicalLine,
+    rows_accepted: rows.length,
+    events_emitted: sessions.reduce((count, session) => count + session.events.length, 0),
+    completeness: tracker.readStops.length === 0 && warnings.length === 0
+      ? "complete" : "partial" } };
 }
 
-export async function parseClaudeTranscriptDetailed(
+export async function parseClaudeTranscriptObserved(
   sourcePath: string,
   instrumentation: ClaudeTranscriptParseOptions = {},
-): Promise<ClaudeTranscriptParseResult> {
+): Promise<{ result: ClaudeTranscriptParseResult;
+  observation: SourceFileCoverageObservation }> {
   const fileHandle = await openFile(sourcePath, "r");
   try {
     try {
@@ -2967,7 +2975,7 @@ export async function parseClaudeTranscriptDetailed(
           ? {}
           : { signal: instrumentation.signal }),
       });
-      return projectClaudeParserState(read.state, {
+      const result = projectClaudeParserState(read.state, {
         ...(instrumentation.endedAtMs === undefined
           ? {}
           : { endedAtMs: instrumentation.endedAtMs }),
@@ -2984,6 +2992,19 @@ export async function parseClaudeTranscriptDetailed(
           ? {}
           : { onAssistantPrefixProbe: instrumentation.onAssistantPrefixProbe }),
       });
+      const emitted = instrumentation.endedAtMs === undefined ? result :
+        projectClaudeParserState(read.state, {
+          ...(instrumentation.budgets === undefined ? {} : { budgets: instrumentation.budgets }),
+          ...(instrumentation.signal === undefined ? {} : { signal: instrumentation.signal }),
+        });
+      const warned = read.state.warnings.length > 0 || emitted.warnings.length > 0 ||
+        emitted.sessions.some((session) => session.warnings.length > 0);
+      return { result, observation: { rows_seen: read.state.line_count,
+        rows_accepted: read.state.rows.length,
+        events_emitted: emitted.sessions.reduce((count, session) =>
+          count + session.events.length, 0),
+        completeness: read.completeness === "complete" && !warned
+          ? "complete" : "partial" } };
     } catch (error) {
       if (!(error instanceof IncrementalParserStateCapacityError)) throw error;
       return await parseClaudeTranscriptDetailedLegacy(
@@ -2995,6 +3016,13 @@ export async function parseClaudeTranscriptDetailed(
   } finally {
     await fileHandle.close();
   }
+}
+
+export async function parseClaudeTranscriptDetailed(
+  sourcePath: string,
+  instrumentation: ClaudeTranscriptParseOptions = {},
+): Promise<ClaudeTranscriptParseResult> {
+  return (await parseClaudeTranscriptObserved(sourcePath, instrumentation)).result;
 }
 
 export async function parseClaudeTranscript(

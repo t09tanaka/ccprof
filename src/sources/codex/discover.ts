@@ -22,8 +22,12 @@ import {
   type SessionSource,
 } from "../session-source.js";
 import { ParserBudgetExceededError } from "../jsonl-budget.js";
-import { parseCodexSession, projectCodexParserState, readCodexParserState } from "./parser.js";
+import { CODEX_PARSER_VERSION, PARSER_STATE_SCHEMA_FINGERPRINT,
+  parseCodexSession, parseCodexSessionObserved, projectCodexParserState,
+  readCodexParserState } from "./parser.js";
 import type { ExactSourceEvidenceCache } from "../exact-source-evidence-cache.js";
+import { createBuiltInSourceCoverageAccumulator, unavailableSourceCoverage,
+  type BuiltInSourceCoverageAccumulator } from "../source-coverage.js";
 
 export interface CodexDiscoverOptions {
   sessionsDirectory?: string;
@@ -70,20 +74,24 @@ function missingBranchWarning(session: Session): SourceWarning {
 }
 
 /** Recursively collects `rollout-*.jsonl` files anywhere under `directory`. */
-async function findRolloutFiles(directory: string): Promise<string[]> {
+async function findRolloutFiles(directory: string,
+  failed?: () => void): Promise<string[]> {
   let entries;
   try {
     entries = await readdir(directory, { withFileTypes: true });
   } catch {
+    failed?.();
     return [];
   }
   const files: string[] = [];
   for (const entry of entries) {
     const path = join(directory, entry.name);
     if (entry.isDirectory()) {
-      files.push(...(await findRolloutFiles(path)));
+      files.push(...(await findRolloutFiles(path, failed)));
     } else if (entry.isFile() && ROLLOUT_FILE_PATTERN.test(entry.name)) {
       files.push(path);
+    } else if (entry.isSymbolicLink() && ROLLOUT_FILE_PATTERN.test(entry.name)) {
+      failed?.();
     }
   }
   return files;
@@ -167,14 +175,15 @@ async function discoverCodexSessionsUnbudgeted(
   sessionsDirectory: string,
   query: SessionQuery,
   evidenceCache?: ExactSourceEvidenceCache,
-): Promise<Session[]> {
+  coverage?: BuiltInSourceCoverageAccumulator,
+): Promise<Session[] | undefined> {
   let root: string;
   try {
     root = await realpath(sessionsDirectory);
   } catch {
-    return [];
+    return coverage === undefined ? [] : undefined;
   }
-  const files = (await findRolloutFiles(root)).sort((left, right) =>
+  const files = (await findRolloutFiles(root, () => coverage?.markPartial())).sort((left, right) =>
     left.localeCompare(right)
   );
   const repoRoot = await canonicalPath(query.repoRoot);
@@ -182,15 +191,24 @@ async function discoverCodexSessionsUnbudgeted(
   const sessions: Session[] = [];
   for (const file of files) {
     if (!withinDiscoveryWindow(root, file, query)) continue;
+    coverage?.recordDiscoveredFile();
     let parsed: Session | null;
     try {
-      parsed = evidenceCache === undefined
+      if (coverage !== undefined) {
+        const observed = await parseCodexSessionObserved(
+          { sourcePath: file, endedAtMs: query.endedAtMs });
+        parsed = observed.result;
+        coverage.recordParsedFile(observed.observation.rows_seen,
+          observed.observation.rows_accepted, observed.observation.events_emitted,
+          observed.observation.completeness);
+      } else parsed = evidenceCache === undefined
         ? await parseCodexSession({ sourcePath: file, endedAtMs: query.endedAtMs })
         : await evidenceCache.consume({ adapterId: "codex", sourceRoot: root,
             sourcePath: file, endedAtMs: query.endedAtMs,
             readState: readCodexParserState, projectState: projectCodexParserState,
             coldFallback: () => parseCodexSession({ sourcePath: file, endedAtMs: query.endedAtMs }) });
     } catch {
+      coverage?.markPartial();
       globalWarnings.push(
         sourceWarning(
           "codex_source_read_error",
@@ -238,7 +256,8 @@ export async function discoverCodexSessions(
 ): Promise<Session[]> {
   const meter = query.analysisBudgetMeter;
   if (meter === undefined) {
-    return discoverCodexSessionsUnbudgeted(sessionsDirectory, query, evidenceCache);
+    return (await discoverCodexSessionsUnbudgeted(
+      sessionsDirectory, query, evidenceCache)) ?? [];
   }
   if (!meter.checkpoint()) return [];
   let root: string;
@@ -370,6 +389,20 @@ export async function discoverCodexSessions(
     ...session,
     warnings: [...session.warnings, ...globalWarnings],
   }));
+}
+
+export async function discoverCodexSessionsObserved(
+  sessionsDirectory: string, query: SessionQuery,
+) {
+  if (query.analysisBudgetMeter !== undefined)
+    throw new TypeError("Observed Codex discovery is cold and unbudgeted.");
+  const coverage = createBuiltInSourceCoverageAccumulator("codex", "1.0.0",
+    CODEX_PARSER_VERSION, PARSER_STATE_SCHEMA_FINGERPRINT);
+  const sessions = await discoverCodexSessionsUnbudgeted(
+    sessionsDirectory, query, undefined, coverage);
+  return sessions === undefined
+    ? { sessions: [], source_coverage: unavailableSourceCoverage() }
+    : { sessions, source_coverage: coverage.snapshot() };
 }
 
 export class CodexSessionSource implements SessionSource {
