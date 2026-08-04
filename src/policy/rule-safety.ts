@@ -567,7 +567,7 @@ function mappedCommandTokens(raw: string): string[] | undefined {
   const windowsLauncher = WINDOWS_LAUNCHERS.get(first.toLowerCase());
   if (
     windowsLauncher !== undefined &&
-    (raw.includes("'") || raw.includes("\\"))
+    (raw.includes("'") || raw.includes("\\") || raw.includes("^"))
   ) {
     return undefined;
   }
@@ -579,7 +579,10 @@ function containsPercentExpansion(raw: string): boolean {
   for (let index = 0; index < raw.length; index += 1) {
     if (raw[index] !== "%") continue;
     const next = raw[index + 1];
-    if (next === "*" || (next !== undefined && /^[0-9]$/u.test(next))) {
+    if (
+      next === "*" || next === "~" ||
+      (next !== undefined && /^[0-9]$/u.test(next))
+    ) {
       return true;
     }
     if (next === "%" && raw[index + 2] !== undefined) return true;
