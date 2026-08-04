@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { getEventListeners } from "node:events";
+import { renameSync, writeFileSync } from "node:fs";
 import {
   appendFile,
   mkdtemp,
@@ -730,28 +732,32 @@ test("state snapshots reject proxies before reflection and close own __proto__ d
   }
 });
 
-test("capacity fallback keeps same-handle overlong-line skip-and-continue semantics", async (t) => {
-  const runWithForcedCapacity = async <T>(task: () => Promise<T>): Promise<T> => {
+test("mid-yield capacity fallback cleans the reader before same-handle replay", async (t) => {
+  const runWithForcedCapacity = async <T>(
+    onCapacity: () => void,
+    task: () => Promise<T>,
+  ): Promise<T> => {
     const prototype = IncrementalParserStateByteTracker.prototype;
-    const original = prototype.replaceBytes;
+    const original = prototype.addArrayItem;
     let forced = false;
-    prototype.replaceBytes = function(previousBytes, nextBytes): void {
+    prototype.addArrayItem = function(value, currentLength): void {
       if (!forced) {
         forced = true;
+        onCapacity();
         throw new IncrementalParserStateCapacityError(
           MAX_INCREMENTAL_PARSER_STATE_BYTES + 1,
         );
       }
-      original.call(this, previousBytes, nextBytes);
+      original.call(this, value, currentLength);
     };
     try {
       return await task();
     } finally {
-      prototype.replaceBytes = original;
+      prototype.addArrayItem = original;
     }
   };
 
-  await t.test("Claude retains a valid row after the skipped line", async () => {
+  await t.test("Claude closes the suspended reader and retains the later row", async () => {
     const valid = claudeUser("fallback-claude", "later", 1, "later");
     const maxLineBytes = Buffer.byteLength(valid);
     const path = await tempJsonl(
@@ -759,12 +765,28 @@ test("capacity fallback keeps same-handle overlong-line skip-and-continue semant
       "capacity-fallback-claude.jsonl",
       `${"x".repeat(maxLineBytes + 1)}\r\n${valid}\n`,
     );
-    const parsed = await runWithForcedCapacity(() =>
-      parseClaudeTranscriptDetailed(path, {
+    const controller = new AbortController();
+    const heldPath = `${path}.held`;
+    let listenersAtCapacity = 0;
+    const parsed = await runWithForcedCapacity(
+      () => {
+        listenersAtCapacity = getEventListeners(
+          controller.signal,
+          "abort",
+        ).length;
+        renameSync(path, heldPath);
+        writeFileSync(
+          path,
+          `${claudeUser("replacement", "replacement", 2, "replacement")}\n`,
+        );
+      },
+      () => parseClaudeTranscriptDetailed(path, {
         budgets: { maxLineBytes },
-      })
+        signal: controller.signal,
+      }),
     );
 
+    assert.ok(listenersAtCapacity > 0);
     assert.deepEqual(
       parsed.sessions.flatMap((session) =>
         session.events.map((event) => event.entry_uuid)
@@ -774,9 +796,10 @@ test("capacity fallback keeps same-handle overlong-line skip-and-continue semant
     assert.ok(parsed.warnings.some((warning) =>
       warning.code === "parser_line_budget_exceeded"
     ));
+    assert.equal(getEventListeners(controller.signal, "abort").length, 0);
   });
 
-  await t.test("Codex retains a valid row after the skipped line", async () => {
+  await t.test("Codex closes the suspended reader and retains the later row", async () => {
     const metadata = codexRow(1, "session_meta", { id: "fallback-codex" });
     const valid = codexRow(2, "response_item", {
       type: "message",
@@ -792,19 +815,40 @@ test("capacity fallback keeps same-handle overlong-line skip-and-continue semant
       "capacity-fallback-codex.jsonl",
       `${"x".repeat(maxLineBytes + 1)}\n${metadata}\n${valid}\n`,
     );
-    const parsed = await runWithForcedCapacity(() =>
-      parseCodexSession({
+    const controller = new AbortController();
+    const heldPath = `${path}.held`;
+    let listenersAtCapacity = 0;
+    const parsed = await runWithForcedCapacity(
+      () => {
+        listenersAtCapacity = getEventListeners(
+          controller.signal,
+          "abort",
+        ).length;
+        renameSync(path, heldPath);
+        writeFileSync(
+          path,
+          `${codexRow(3, "response_item", {
+            type: "message",
+            role: "user",
+            content: "replacement",
+          })}\n`,
+        );
+      },
+      () => parseCodexSession({
         sourcePath: path,
         budgets: { maxLineBytes },
-      })
+        signal: controller.signal,
+      }),
     );
 
+    assert.ok(listenersAtCapacity > 0);
     assert.ok(parsed?.events.some((event) =>
       event.kind === "genuine_user" && event.text === "later"
     ));
     assert.ok(parsed?.warnings.some((warning) =>
       warning.code === "parser_line_budget_exceeded"
     ));
+    assert.equal(getEventListeners(controller.signal, "abort").length, 0);
   });
 });
 
