@@ -25,6 +25,11 @@ const ORG_KEYS = [
   "CCPROF_ORGANIZATION_POLICY_SIGNATURE_PATH",
   "CCPROF_ORGANIZATION_POLICY_PUBLIC_KEY_PATH",
 ] as const;
+interface DoctorJson {
+  status: "pass" | "warn" | "fail";
+  checks: { id: string; status: "pass" | "warn" | "fail";
+    code: string; message: string }[];
+}
 
 async function fixture(t: TestContext): Promise<{
   root: string; repo: string; dataRoot: string;
@@ -86,11 +91,15 @@ test("doctor is deterministic, ordered, warning-safe, and read-only", async (t) 
   assert.equal(second.code, 0);
   assert.equal(first.stdout, second.stdout);
   assert.equal(first.stderr, "");
+  const report = JSON.parse(first.stdout) as DoctorJson;
+  assert.equal(report.status, "warn");
   assert.deepEqual(
-    (JSON.parse(first.stdout) as { checks: { id: string }[] }).checks
-      .map((check) => check.id),
+    report.checks.map((check) => check.id),
     IDS,
   );
+  for (const id of ["parser_budgets", "encryption"] as const) {
+    assert.equal(report.checks.find((check) => check.id === id)?.status, "warn");
+  }
   const textFirst = await capture(["doctor"], repo, dataRoot);
   const textSecond = await capture(["doctor"], repo, dataRoot);
   assert.equal(textFirst.code, 0);
@@ -104,19 +113,47 @@ test("doctor contains malformed configuration and organization paths", async (t)
   const secret = "DISTINCTIVE_DOCTOR_SECRET_CANARY";
   await mkdir(join(repo, ".ccprof"));
   await writeFile(join(repo, ".ccprof", "config.json"),
-    JSON.stringify({ unknown_secret: secret }));
+    `{"unknown_secret":"${secret}"`);
   const malformed = await capture(["doctor", "--json"], repo, dataRoot);
+  const malformedAgain = await capture(["doctor", "--json"], repo, dataRoot);
   assert.equal(malformed.code, 1);
+  assert.deepEqual(malformedAgain, malformed);
+  const malformedCheck = (JSON.parse(malformed.stdout) as DoctorJson).checks
+    .find((check) => check.id === "configuration");
+  assert.deepEqual(malformedCheck, {
+    id: "configuration",
+    status: "fail",
+    code: "configuration_invalid",
+    message: "Repository configuration is invalid.",
+  });
+  assert.ok(malformed.stdout.length <= 4_096);
+  assert.ok(malformed.stderr.length <= 1_024);
   assert.doesNotMatch(malformed.stdout + malformed.stderr,
     new RegExp(`${secret}|${repo}|${dataRoot}`, "u"));
 
-  await writeFile(join(repo, ".ccprof", "config.json"), "{}");
+  await writeFile(join(repo, ".ccprof", "config.json"),
+    JSON.stringify({ schema_version: 1 }));
   const policyPath = join(root, `${secret}-policy.json`);
   const partial = await capture(["doctor", "--json"], repo, dataRoot, {
     CCPROF_ORGANIZATION: "example-org",
     CCPROF_ORGANIZATION_POLICY_PATH: policyPath,
   });
+  const partialAgain = await capture(["doctor", "--json"], repo, dataRoot, {
+    CCPROF_ORGANIZATION: "example-org",
+    CCPROF_ORGANIZATION_POLICY_PATH: policyPath,
+  });
   assert.equal(partial.code, 1);
+  assert.deepEqual(partialAgain, partial);
+  const policyCheck = (JSON.parse(partial.stdout) as DoctorJson).checks
+    .find((check) => check.id === "organization_policy");
+  assert.deepEqual(policyCheck, {
+    id: "organization_policy",
+    status: "fail",
+    code: "organization_policy_invalid",
+    message: "Organization policy configuration is invalid.",
+  });
+  assert.ok(partial.stdout.length <= 4_096);
+  assert.ok(partial.stderr.length <= 1_024);
   assert.doesNotMatch(partial.stdout + partial.stderr,
     new RegExp(`${secret}|${policyPath}`, "u"));
 });
