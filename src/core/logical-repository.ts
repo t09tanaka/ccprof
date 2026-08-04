@@ -108,6 +108,131 @@ function resolveOffline(uuid: string): LogicalRepositoryIdentityResult {
   };
 }
 
+type RemoteTuple = readonly ["remote", string, number | null, string];
+
+function normalizeRemotePath(path: string, host: string): string | undefined {
+  let normalized: string;
+  try {
+    normalized = decodeURIComponent(path).normalize("NFC");
+  } catch {
+    return undefined;
+  }
+  normalized = normalized.replace(/^\/+|\/+$/gu, "");
+  if (
+    normalized === "" ||
+    CONTROL_CHARACTER.test(normalized) ||
+    normalized.split("/").some((part) => part === "." || part === "..")
+  ) {
+    return undefined;
+  }
+  normalized = normalized.replace(/\.git$/iu, "");
+  if (normalized === "") return undefined;
+  return host === "github.com" || host === "gitlab.com"
+    ? normalized.toLowerCase()
+    : normalized;
+}
+
+function canonicalRemote(remote: LogicalRepositoryRemote): RemoteTuple | undefined {
+  const raw = remote.fetch_url;
+  if (
+    !isBoundedValue(raw, 2048) ||
+    raw.includes("\\") ||
+    /^[a-z]:\//iu.test(raw) ||
+    /%2f|%5c/iu.test(raw)
+  ) {
+    return undefined;
+  }
+  try {
+    if (CONTROL_CHARACTER.test(decodeURIComponent(raw))) return undefined;
+  } catch {
+    return undefined;
+  }
+
+  let host: string | undefined;
+  let port: number | null = null;
+  let path: string;
+  const urlParts = /^(https|ssh):\/\/([^/?#]*)(\/[^?#]*)?(?:[?#].*)?$/iu.exec(raw);
+  if (urlParts !== null) {
+    const scheme = urlParts[1]!.toLowerCase();
+    const authority = urlParts[2]!;
+    if (authority.slice(authority.lastIndexOf("@") + 1).includes("%")) {
+      return undefined;
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      return undefined;
+    }
+    host = normalizeHost(parsed.hostname);
+    const parsedPort = parsed.port;
+    if (parsedPort !== "" && !(scheme === "ssh" && parsedPort === "22")) {
+      port = Number(parsedPort);
+    }
+    path = urlParts[3] ?? "";
+  } else {
+    if (raw.includes("://")) return undefined;
+    const scp = /^(?:[^@/:]+@)?([^@/:]+):([^?#]*)(?:[?#].*)?$/u.exec(raw);
+    if (scp === null) return undefined;
+    host = normalizeHost(scp[1]!);
+    path = scp[2]!;
+  }
+  if (host === undefined) return undefined;
+  const repositoryPath = normalizeRemotePath(path, host);
+  return repositoryPath === undefined
+    ? undefined
+    : ["remote", host, port, repositoryPath];
+}
+
+function remoteResult(tuple: RemoteTuple): LogicalRepositoryIdentityResult {
+  return {
+    status: "available",
+    logical_repository_id: identityDigest(tuple),
+    source: "remote",
+    portability: "portable",
+  };
+}
+
+function resolveRemotes(
+  remotes: readonly LogicalRepositoryRemote[],
+): LogicalRepositoryIdentityResult {
+  if (
+    remotes.length > 32 ||
+    remotes.some(
+      ({ name, fetch_url: url }) =>
+        !isBoundedValue(name, 128) || !isBoundedValue(url, 2048),
+    )
+  ) {
+    return { status: "unavailable", reason: "invalid_remote" };
+  }
+  const explicit = remotes.filter(({ explicit_identity: value }) => value === true);
+  if (explicit.length > 1) {
+    return { status: "unavailable", reason: "ambiguous_remote" };
+  }
+  const origins = explicit.length === 0
+    ? remotes.filter(({ name }) => name === "origin")
+    : [];
+  if (origins.length > 1) {
+    return { status: "unavailable", reason: "ambiguous_remote" };
+  }
+  const selected = explicit[0] ?? origins[0];
+  if (selected !== undefined) {
+    const tuple = canonicalRemote(selected);
+    return tuple === undefined
+      ? { status: "unavailable", reason: "invalid_remote" }
+      : remoteResult(tuple);
+  }
+  const tuples = remotes.map(canonicalRemote);
+  if (tuples.some((tuple) => tuple === undefined)) {
+    return { status: "unavailable", reason: "invalid_remote" };
+  }
+  const encoded = tuples.map((tuple) => JSON.stringify(tuple));
+  if (new Set(encoded).size !== 1) {
+    return { status: "unavailable", reason: "ambiguous_remote" };
+  }
+  return remoteResult(tuples[0]!);
+}
+
 function normalizeLocalPath(path: string): string | undefined {
   if (!isBoundedValue(path, 2048)) return undefined;
   const windowsPath = /^[a-z]:[\\/]/iu.test(path);
@@ -154,7 +279,7 @@ export function resolveLogicalRepositoryIdentity(
     return resolveProvider(input.trusted_provider);
   }
   if (input.remotes !== undefined && input.remotes.length > 0) {
-    return { status: "unavailable", reason: "invalid_remote" };
+    return resolveRemotes(input.remotes);
   }
   if (input.offline_uuid !== undefined) return resolveOffline(input.offline_uuid);
   if (input.local_path !== undefined) return resolveLocal(input.local_path);
