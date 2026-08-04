@@ -30,6 +30,7 @@ import {
   runHooksCommand,
   type HooksCommandOptions,
 } from "./commands/hooks.js";
+import { runSchemaCommand } from "./commands/schema.js";
 import {
   runStatsCommand,
   type StatsCommandOptions,
@@ -66,6 +67,7 @@ export const USAGE = `Usage: ccprof [--pr [<number|url|base...head>]] [--json|--
        ccprof data gc|delete
        ccprof rules list
        ccprof rules explain <rule-id>
+       ccprof schema report-v3
        ccprof --version
 `;
 
@@ -158,6 +160,11 @@ export type ParsedRulesCommand =
   | { kind: "rules"; action: "list" }
   | { kind: "rules"; action: "explain"; ruleId: RuleId };
 
+export interface ParsedSchemaCommand {
+  kind: "schema";
+  target: "report-v3";
+}
+
 export interface ParsedHelpCommand {
   kind: "help";
 }
@@ -175,6 +182,7 @@ export type ParsedCliCommand =
   | ParsedHooksCommand
   | ParsedDataCommand
   | ParsedRulesCommand
+  | ParsedSchemaCommand
   | ParsedHelpCommand
   | ParsedVersionCommand;
 
@@ -211,6 +219,8 @@ export interface CliRuntime {
   stdoutIsTTY?: boolean;
   stderr?: (value: string) => void;
   loadOrganizationPolicy?: () => Promise<OrganizationPolicy | undefined>;
+  /** Override only the packaged Report v3 schema read for failure tests. */
+  readReportV3Schema?: () => string;
   /**
    * Pre-collected stdin text for the `hook-event` command. Tests inject
    * this to avoid touching `process.stdin`; when omitted, `runCli` reads
@@ -721,6 +731,13 @@ function parseRulesArgs(args: readonly string[]): ParsedRulesCommand {
   throw new CliUsageError("rules requires list or explain <rule-id>");
 }
 
+function parseSchemaArgs(args: readonly string[]): ParsedSchemaCommand {
+  if (args.length !== 1 || args[0] !== "report-v3") {
+    throw new CliUsageError("schema requires exactly one report-v3 target");
+  }
+  return { kind: "schema", target: "report-v3" };
+}
+
 export function parseCliArgs(
   args: readonly string[],
 ): ParsedCliCommand {
@@ -728,6 +745,7 @@ export function parseCliArgs(
   if (args.includes("--help") || args.includes("-h")) {
     return { kind: "help" };
   }
+  if (args[0] === "schema") return parseSchemaArgs(args.slice(1));
   if (args.includes("--version") || args.includes("-v")) {
     return { kind: "version" };
   }
@@ -815,7 +833,7 @@ function usesOrganizationPolicy(args: readonly string[]): boolean {
     return false;
   }
   return args[0] === "stats" ||
-    !["dismiss", "explain", "hook-event", "hooks", "data", "rules"]
+    !["dismiss", "explain", "hook-event", "hooks", "data", "rules", "schema"]
       .includes(args[0] ?? "");
 }
 
@@ -841,6 +859,27 @@ export async function runCli(
   const stderr = runtime.stderr ?? ((value: string) => {
     process.stderr.write(value);
   });
+  if (args[0] === "schema") {
+    try {
+      const command = parseCliArgs(args);
+      if (command.kind === "help") {
+        stdout(USAGE);
+        return 0;
+      }
+      if (command.kind !== "schema") {
+        throw new CliUsageError(
+          "schema requires exactly one report-v3 target",
+        );
+      }
+      stdout(runSchemaCommand(runtime.readReportV3Schema));
+      return 0;
+    } catch (error) {
+      const code = exitCodeFor(error);
+      stderr(`ccprof: ${sanitizeHumanText(errorMessage(error))}\n`);
+      if (code === 2 && error instanceof CliUsageError) stderr(USAGE);
+      return code;
+    }
+  }
   if (args[0] === "rules") {
     try {
       const command = parseCliArgs(args);
@@ -884,7 +923,7 @@ export async function runCli(
     ? ci ? "strict" : explicitPrivacy ?? "balanced"
     : args[0] === "explain" && ci
       ? "strict"
-      : ["stats", "dismiss", "explain", "hooks", "data", "rules"]
+      : ["stats", "dismiss", "explain", "hooks", "data", "rules", "schema"]
           .includes(args[0] ?? "")
         ? undefined
         : explicitPrivacy ??
@@ -908,6 +947,10 @@ export async function runCli(
     }
     if (command.kind === "version") {
       stdout(`ccprof ${resolvePackageVersion()}\n`);
+      return 0;
+    }
+    if (command.kind === "schema") {
+      stdout(runSchemaCommand(runtime.readReportV3Schema));
       return 0;
     }
     if (command.kind === "rules") {

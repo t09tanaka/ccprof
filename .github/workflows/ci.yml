@@ -109,6 +109,15 @@ jobs:
           npm install --global --prefix "$RUNNER_TEMP/ccprof-prefix" "$RUNNER_TEMP/ccprof-pack"/*.tgz
           "$RUNNER_TEMP/ccprof-prefix/bin/ccprof" --version
           "$RUNNER_TEMP/ccprof-prefix/bin/ccprof" --help
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/ccprof-prefix/bin/ccprof" schema report-v3 > "$RUNNER_TEMP/ccprof-report-v3.schema.json"
+          node -e '
+            const fs = require("node:fs");
+            const schema = JSON.parse(
+              fs.readFileSync(process.argv[1], "utf8"),
+            );
+            if (schema.properties.schema_version.const !== 3) process.exit(1);
+          ' "$RUNNER_TEMP/ccprof-report-v3.schema.json"
           mkdir -p "$RUNNER_TEMP/ccprof-smoke-repo" "$RUNNER_TEMP/ccprof-smoke-data"
           git -C "$RUNNER_TEMP/ccprof-smoke-repo" init
           (

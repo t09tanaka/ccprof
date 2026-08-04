@@ -94,11 +94,26 @@ ccprof dismiss <finding-key> [--reason <text>]
 ccprof hook-event [--notify]
 ccprof hooks install|uninstall [--global] [--yes]
 ccprof data gc|delete
+ccprof schema report-v3
 ccprof --version
 ```
 
 `--version` (or `-v`) prints `ccprof <version>` and exits 0; `--help` (or `-h`)
 prints the usage above. When both are given, `--help` wins.
+
+### Published Report v3 schema
+
+`ccprof schema report-v3` prints the packaged Report v3 JSON Schema. The
+command is independent of the current directory, repository, Store, policy,
+and privacy settings, so automation can save the contract directly:
+
+```sh
+ccprof schema report-v3 > report-v3.schema.json
+```
+
+This publishes the future wire contract only. Current `--json` output remains
+JSON/Report v2; schema publication does not switch the analyzer or any other
+producer to Report v3.
 
 ### Analysis
 

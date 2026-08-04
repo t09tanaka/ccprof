@@ -1,0 +1,618 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/report-v3.schema.json",
+  "title": "ccprof Report v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "producer",
+    "analysis",
+    "work_unit",
+    "window",
+    "sources",
+    "policy",
+    "summary",
+    "findings",
+    "rule_coverage",
+    "diagnostics"
+  ],
+  "x-ccprof-runtime-constraints": [
+    "window.started_at_ms <= window.ended_at_ms <= analysis.created_at_ms.",
+    "For each finding, impact.lower_ms <= impact.upper_ms, and optional impact.expected_ms lies inclusively between them.",
+    "findings.returned === findings.items.length, findings.total >= findings.returned, and findings.truncated is true if and only if fewer than total findings are returned.",
+    "finding_id values are unique within a report. Their instance-identity derivation is distinct from the stable recurrence semantics of finding_key.",
+    "A rule's compatibility_epoch equals the major component of its SemVer version.",
+    "producer.ruleset_version is a real calendar date and identifies the effective manifest set used by the report.",
+    "Coverage entries are unique and canonical by rule_id, contain exactly the rules selected by the effective manifest, and obey eligible_sessions <= total_sessions.",
+    "Coverage is full exactly when eligible equals total; completeness is 1 for 0/0, otherwise eligible divided by total; missing capabilities are the canonical sorted unique runtime projection; truncation reflects the actual analysis window and admitted evidence.",
+    "Per-source files_parsed <= files_discovered and rows_accepted <= rows_seen; all source coverage is measured rather than synthesized.",
+    "confirmed_recoverable_ms <= possible_recoverable_upper_ms <= measured_ms.",
+    "Analysis/snapshot/digest identities use their documented canonical runtime derivations, and logical repository identity, build SHA, Git OIDs, and source coverage come from authoritative inputs. Missing values make Report v3 emission unavailable; path hashes, all-zero values, empty sentinels, and other fabricated substitutes are forbidden."
+  ],
+  "$defs": {
+    "nonnegativeSafeInteger": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "positiveSafeInteger": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "confidenceFraction": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "gitOid": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "opaqueString": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "\\S"
+    },
+    "token": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9._-]{0,127}$"
+    },
+    "findingIdentifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"
+    },
+    "ruleId": {
+      "type": "string",
+      "pattern": "^R[0-9]{3}$"
+    },
+    "capability": {
+      "enum": [
+        "tool_timestamps",
+        "token_usage",
+        "sidechains",
+        "branch_rows",
+        "edit_fragments",
+        "approvals"
+      ]
+    },
+    "jsonPrimitive": {
+      "type": ["string", "number", "boolean", "null"]
+    },
+    "jsonArray": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/jsonValue"
+      }
+    },
+    "jsonObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[A-Za-z_][A-Za-z0-9_.-]{0,127}$": {
+          "$ref": "#/$defs/jsonValue"
+        }
+      }
+    },
+    "jsonValue": {
+      "anyOf": [
+        { "$ref": "#/$defs/jsonPrimitive" },
+        { "$ref": "#/$defs/jsonArray" },
+        { "$ref": "#/$defs/jsonObject" }
+      ]
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "build_sha", "ruleset_version"],
+      "properties": {
+        "name": {
+          "const": "ccprof"
+        },
+        "version": {
+          "$ref": "#/$defs/semver"
+        },
+        "build_sha": {
+          "$ref": "#/$defs/gitOid"
+        },
+        "ruleset_version": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:[0-2][0-9]|3[01])$"
+        }
+      }
+    },
+    "analysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "analysis_id",
+        "snapshot_id",
+        "created_at_ms",
+        "deterministic_digest"
+      ],
+      "properties": {
+        "analysis_id": {
+          "$ref": "#/$defs/opaqueString"
+        },
+        "snapshot_id": {
+          "$ref": "#/$defs/opaqueString"
+        },
+        "created_at_ms": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "deterministic_digest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "workUnit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository_id",
+        "pr_ref",
+        "base_oid",
+        "head_oid",
+        "merge_base_oid",
+        "workspace_ids"
+      ],
+      "properties": {
+        "repository_id": {
+          "$ref": "#/$defs/opaqueString"
+        },
+        "pr_ref": {
+          "$ref": "#/$defs/opaqueString"
+        },
+        "base_oid": {
+          "$ref": "#/$defs/gitOid"
+        },
+        "head_oid": {
+          "$ref": "#/$defs/gitOid"
+        },
+        "merge_base_oid": {
+          "$ref": "#/$defs/gitOid"
+        },
+        "workspace_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/opaqueString"
+          }
+        }
+      }
+    },
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "started_at_ms",
+        "ended_at_ms",
+        "start_source",
+        "end_source",
+        "completeness"
+      ],
+      "properties": {
+        "started_at_ms": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "ended_at_ms": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "start_source": {
+          "enum": [
+            "explicit",
+            "branch_reflog",
+            "session_branch_transition",
+            "commit_anchor_lookback"
+          ]
+        },
+        "end_source": {
+          "enum": ["explicit", "analysis_time"]
+        },
+        "completeness": {
+          "enum": ["complete", "partial"]
+        }
+      }
+    },
+    "sourceCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "files_discovered",
+        "files_parsed",
+        "rows_seen",
+        "rows_accepted",
+        "events_emitted"
+      ],
+      "properties": {
+        "files_discovered": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "files_parsed": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "rows_seen": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "rows_accepted": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "events_emitted": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "adapter_id",
+        "adapter_version",
+        "schema_fingerprint",
+        "capabilities",
+        "coverage"
+      ],
+      "properties": {
+        "adapter_id": {
+          "$ref": "#/$defs/token"
+        },
+        "adapter_version": {
+          "$ref": "#/$defs/semver"
+        },
+        "schema_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/capability"
+          }
+        },
+        "coverage": {
+          "$ref": "#/$defs/sourceCoverage"
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "digest", "privacy_profile"],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "privacy_profile": {
+          "enum": ["strict", "balanced", "raw"]
+        }
+      }
+    },
+    "criticalPathSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "measured_ms",
+        "confirmed_recoverable_ms",
+        "possible_recoverable_upper_ms",
+        "human_wait_ms",
+        "unexplained_ms"
+      ],
+      "properties": {
+        "measured_ms": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "confirmed_recoverable_ms": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "possible_recoverable_upper_ms": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "human_wait_ms": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "unexplained_ms": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        }
+      }
+    },
+    "resourceCostSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool_runtime_ms",
+        "estimated_input_tokens",
+        "estimated_output_tokens"
+      ],
+      "properties": {
+        "tool_runtime_ms": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "estimated_input_tokens": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "estimated_output_tokens": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["critical_path", "resource_cost"],
+      "properties": {
+        "critical_path": {
+          "$ref": "#/$defs/criticalPathSummary"
+        },
+        "resource_cost": {
+          "$ref": "#/$defs/resourceCostSummary"
+        }
+      }
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "compatibility_epoch"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/ruleId"
+        },
+        "version": {
+          "$ref": "#/$defs/semver"
+        },
+        "compatibility_epoch": {
+          "$ref": "#/$defs/positiveSafeInteger"
+        }
+      }
+    },
+    "impact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "lower_ms", "upper_ms"],
+      "properties": {
+        "kind": {
+          "enum": ["critical_path_latency", "resource_cost"]
+        },
+        "lower_ms": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "expected_ms": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "upper_ms": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        }
+      }
+    },
+    "confidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence", "causal", "source_completeness"],
+      "properties": {
+        "evidence": {
+          "enum": ["low", "medium", "high"]
+        },
+        "causal": {
+          "enum": ["low", "medium", "high"]
+        },
+        "source_completeness": {
+          "$ref": "#/$defs/confidenceFraction"
+        }
+      }
+    },
+    "recipe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "trust", "suggestion", "verification"],
+      "properties": {
+        "kind": {
+          "const": "proposal"
+        },
+        "trust": {
+          "const": "untrusted"
+        },
+        "suggestion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192,
+          "pattern": "\\S"
+        },
+        "verification": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192,
+              "pattern": "\\S"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "finding_id",
+        "finding_key",
+        "rule",
+        "classification",
+        "scope",
+        "impact",
+        "confidence",
+        "evidence",
+        "recipe"
+      ],
+      "properties": {
+        "finding_id": {
+          "$ref": "#/$defs/findingIdentifier"
+        },
+        "finding_key": {
+          "$ref": "#/$defs/findingIdentifier"
+        },
+        "rule": {
+          "$ref": "#/$defs/rule"
+        },
+        "classification": {
+          "$ref": "#/$defs/token"
+        },
+        "scope": {
+          "enum": ["this_pr", "separate_issue", "claude_md"]
+        },
+        "impact": {
+          "$ref": "#/$defs/impact"
+        },
+        "confidence": {
+          "$ref": "#/$defs/confidence"
+        },
+        "evidence": {
+          "$ref": "#/$defs/jsonObject"
+        },
+        "recipe": {
+          "$ref": "#/$defs/recipe"
+        }
+      }
+    },
+    "findings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "returned", "truncated", "items"],
+      "properties": {
+        "total": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "returned": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/finding"
+          }
+        }
+      }
+    },
+    "ruleCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "eligible_sessions",
+        "total_sessions",
+        "status",
+        "missing_capabilities",
+        "completeness",
+        "truncated"
+      ],
+      "properties": {
+        "rule_id": {
+          "$ref": "#/$defs/ruleId"
+        },
+        "eligible_sessions": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "total_sessions": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        },
+        "status": {
+          "enum": ["full", "partial"]
+        },
+        "missing_capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/capability"
+          }
+        },
+        "completeness": {
+          "$ref": "#/$defs/confidenceFraction"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      }
+    },
+    "warningCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[a-z][a-z0-9_]{0,127}$": {
+          "$ref": "#/$defs/nonnegativeSafeInteger"
+        }
+      }
+    },
+    "diagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["warning_counts"],
+      "properties": {
+        "warning_counts": {
+          "$ref": "#/$defs/warningCounts"
+        }
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {
+      "const": 3
+    },
+    "producer": {
+      "$ref": "#/$defs/producer"
+    },
+    "analysis": {
+      "$ref": "#/$defs/analysis"
+    },
+    "work_unit": {
+      "$ref": "#/$defs/workUnit"
+    },
+    "window": {
+      "$ref": "#/$defs/window"
+    },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/source"
+      }
+    },
+    "policy": {
+      "$ref": "#/$defs/policy"
+    },
+    "summary": {
+      "$ref": "#/$defs/summary"
+    },
+    "findings": {
+      "$ref": "#/$defs/findings"
+    },
+    "rule_coverage": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/ruleCoverage"
+      }
+    },
+    "diagnostics": {
+      "$ref": "#/$defs/diagnostics"
+    }
+  }
+}
