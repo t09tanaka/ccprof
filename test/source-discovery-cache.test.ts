@@ -13,6 +13,7 @@ import {
 import {
   commitSourceDiscoveryRoot,
   getSourceDiscoveryRoot,
+  MAX_DISCOVERY_TREE_BYTES,
   validateSourceDiscoveryRoot,
   type SourceDiscoveryRoot,
 } from "../src/store/source-discovery.js";
@@ -20,7 +21,6 @@ import { openStoreDatabase } from "../src/store/sqlite.js";
 import { resolveStorePaths, type StorePaths } from "../src/store/paths.js";
 
 const SECRET_CANARY = "SECRET_DISCOVERY_CACHE_CANARY";
-const MAX_DISCOVERY_TREE_JSON_BYTES = 128 * 1024 * 1024;
 const MAX_DISCOVERY_ENTRIES = 100_000;
 const MAX_DISCOVERY_DEPTH = 64;
 const ROOT_COLUMNS = [
@@ -216,6 +216,31 @@ function entryCountTree(
     }),
   ))];
   return tree;
+}
+
+function globalEntryBudgetTree(
+  canonicalRoot: string,
+  directoryRows: number,
+  childEntries: number,
+): DiscoveryTreeV1 {
+  assert.ok(directoryRows >= 1);
+  const tree = entryCountTree(canonicalRoot, childEntries);
+  tree.directories.push(...Array.from(
+    { length: directoryRows - 1 },
+    (_, index) => directory(
+      `directory-${index.toString().padStart(6, "0")}`,
+      (index + 12).toString(10),
+      [],
+    ),
+  ));
+  return tree;
+}
+
+function globalEntryCount(tree: DiscoveryTreeV1): number {
+  return tree.directories.length + tree.directories.reduce(
+    (count, row) => count + row.entries.length,
+    0,
+  );
 }
 
 function depthTree(
@@ -515,22 +540,23 @@ test("discovery trees reject unknown fields, noncanonical order, and invalid sta
 test("discovery trees enforce exact UTF-8, entry-count, and path-depth bounds", {
   timeout: 120_000,
 }, () => {
+  assert.equal(MAX_DISCOVERY_TREE_BYTES, 8 * 1024 * 1024);
   const sizeRoot = "/sessions/tree-size-bound";
   const exactSize = discoveryRoot({
     canonicalRoot: sizeRoot,
-    tree: treeWithJsonBytes(sizeRoot, MAX_DISCOVERY_TREE_JSON_BYTES),
+    tree: treeWithJsonBytes(sizeRoot, MAX_DISCOVERY_TREE_BYTES),
   });
   assert.equal(
     Buffer.byteLength(exactSize.tree_json),
-    MAX_DISCOVERY_TREE_JSON_BYTES,
+    MAX_DISCOVERY_TREE_BYTES,
   );
   assert.doesNotThrow(() => validateSourceDiscoveryRoot(exactSize));
 
   const overSizeTree = cloneTree(exactSize);
-  overSizeTree.directories[0]!.entries[0]!.name += "界";
-  assert.ok(
-    Buffer.byteLength(canonicalJson(overSizeTree)) >
-      MAX_DISCOVERY_TREE_JSON_BYTES,
+  overSizeTree.directories[0]!.entries[0]!.name += "x";
+  assert.equal(
+    Buffer.byteLength(canonicalJson(overSizeTree)),
+    MAX_DISCOVERY_TREE_BYTES + 1,
   );
   assertDiscoveryError(
     () => validateSourceDiscoveryRoot(discoveryRoot({
@@ -541,14 +567,25 @@ test("discovery trees enforce exact UTF-8, entry-count, and path-depth bounds", 
   );
 
   const entryRoot = "/sessions/tree-entry-bound";
+  const exactEntryBudget = globalEntryBudgetTree(
+    entryRoot,
+    2,
+    MAX_DISCOVERY_ENTRIES - 2,
+  );
+  assert.equal(globalEntryCount(exactEntryBudget), MAX_DISCOVERY_ENTRIES);
   assert.doesNotThrow(() => validateSourceDiscoveryRoot(discoveryRoot({
     canonicalRoot: entryRoot,
-    tree: entryCountTree(entryRoot, MAX_DISCOVERY_ENTRIES),
+    tree: exactEntryBudget,
   })));
+
+  exactEntryBudget.directories.push(
+    directory("directory-000001", "13", []),
+  );
+  assert.equal(globalEntryCount(exactEntryBudget), MAX_DISCOVERY_ENTRIES + 1);
   assertDiscoveryError(
     () => validateSourceDiscoveryRoot(discoveryRoot({
       canonicalRoot: entryRoot,
-      tree: entryCountTree(entryRoot, MAX_DISCOVERY_ENTRIES + 1),
+      tree: exactEntryBudget,
     })),
     "invalid_state",
   );
