@@ -27,6 +27,7 @@ export const DEFAULT_IDLE_THRESHOLD_MS = 30 * 60 * 1_000;
 
 export interface AttributedTimelineAction extends TimelineAction {
   approval?: ApprovalRequest;
+  approval_command_ambiguous?: true;
 }
 
 export interface TimelineOptions {
@@ -62,9 +63,33 @@ interface InternalAction {
   agentKey: string;
 }
 
+type ApprovalBinding =
+  | { kind: "none" }
+  | {
+      kind: "one";
+      use: ToolUseEvent & { approval: ApprovalRequest };
+    }
+  | { kind: "ambiguous" };
+
 interface PendingAssistant {
   event: Extract<NormalizedEvent, { kind: "assistant" }>;
-  approval?: ApprovalRequest;
+  approvalBinding: ApprovalBinding;
+}
+
+function defensiveApprovalUse(
+  use: ToolUseEvent,
+  approval: ApprovalRequest,
+): ToolUseEvent & { approval: ApprovalRequest } {
+  return {
+    ...use,
+    input: { ...use.input },
+    paths: [...use.paths],
+    edit_fragments: [...use.edit_fragments],
+    ...(use.event_identity === undefined
+      ? {}
+      : { event_identity: { ...use.event_identity } }),
+    approval: { ...approval },
+  };
 }
 
 function actionConfidence(
@@ -486,6 +511,7 @@ function causalAction(
   details?: {
     use?: ToolUseEvent;
     approval?: ApprovalRequest;
+    approvalCommandAmbiguous?: true;
   },
 ): InternalAction {
   const use = details?.use;
@@ -514,6 +540,9 @@ function causalAction(
     ...(details?.approval === undefined
       ? {}
       : { approval: { ...details.approval } }),
+    ...(details?.approvalCommandAmbiguous === true
+      ? { approval_command_ambiguous: true as const }
+      : {}),
   };
   return { action, agentKey };
 }
@@ -577,9 +606,18 @@ function causalActions(
                   event,
                   identities.get(pendingAssistant.event)!,
                   agentKey,
-                  pendingAssistant.approval === undefined
+                  pendingAssistant.approvalBinding.kind === "none"
                     ? undefined
-                    : { approval: pendingAssistant.approval },
+                    : pendingAssistant.approvalBinding.kind === "ambiguous"
+                      ? {
+                          approval: { required: true },
+                          approvalCommandAmbiguous: true,
+                        }
+                      : {
+                          use: pendingAssistant.approvalBinding.use,
+                          approval:
+                            pendingAssistant.approvalBinding.use.approval,
+                        },
                 ),
               );
             } else {
@@ -616,7 +654,10 @@ function causalActions(
             }
           }
           pendingInference = undefined;
-          pendingAssistant = { event };
+          pendingAssistant = {
+            event,
+            approvalBinding: { kind: "none" },
+          };
           break;
         }
         case "tool_use": {
@@ -632,7 +673,13 @@ function causalActions(
           ) {
             pendingAssistant = {
               ...pendingAssistant,
-              approval: { ...event.approval },
+              approvalBinding:
+                pendingAssistant.approvalBinding.kind === "none"
+                  ? {
+                      kind: "one",
+                      use: defensiveApprovalUse(event, event.approval),
+                    }
+                  : { kind: "ambiguous" },
             };
           } else if (
             pendingAssistant !== undefined &&
