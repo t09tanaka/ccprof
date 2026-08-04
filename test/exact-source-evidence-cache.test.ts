@@ -55,10 +55,14 @@ async function fixture(t: TestContext, raw = ""): Promise<Fixture> {
   return { root, repo, sourceRoot, sourcePath, paths };
 }
 
-function rows(paths: StorePaths): number {
+function rows(
+  paths: StorePaths,
+  table: "source_catalog" | "source_evidence_cache" =
+    "source_evidence_cache",
+): number {
   const database = openStoreDatabase(paths);
   try {
-    return (database.prepare("SELECT count(*) count FROM source_evidence_cache")
+    return (database.prepare(`SELECT count(*) count FROM ${table}`)
       .get() as { count: number }).count;
   } finally { database.close(); }
 }
@@ -184,6 +188,25 @@ test("warning-free negatives reuse; warning and mixed evidence never commit", as
   assert.equal(reads, 2); assert.equal(rows(mixed.paths), 0);
 });
 
+test("all-other-repository evidence persists a reusable negative", async (t) => {
+  const value = await fixture(t, `${claude("/other/repository", "other", 1)}\n`);
+  let reads = 0;
+  const readState: typeof readClaudeParserState = async (options) => {
+    reads += 1; return await readClaudeParserState(options);
+  };
+  assert.deepEqual(await consumeClaude(value, { readState }),
+    await consumeClaude(value, { readState }));
+  assert.equal(reads, 1);
+  assert.equal(rows(value.paths), 1);
+  const database = openStoreDatabase(value.paths);
+  try {
+    const { payload_json } = database.prepare(
+      "SELECT payload_json FROM source_evidence_cache",
+    ).get() as { payload_json: string };
+    assert.equal(JSON.parse(payload_json).reason, "other-repository-only");
+  } finally { database.close(); }
+});
+
 test("root/parser/schema/corrupt bindings and a different path miss", async (t) => {
   const value = await fixture(t);
   await writeFile(value.sourcePath, `${claude(value.repo, "binding", 1)}\n`);
@@ -222,17 +245,26 @@ test("LF/no-LF, Claude multiple sessions, and Codex zero/one remain canonical", 
       codex(1, "session_meta", { id: "codex-one", cwd: value.repo }),
       codex(2, "response_item", { type: "message", role: "user", content: "hi" }),
     ].join("\n")}\n`);
+    let reads = 0;
+    const readState: typeof readCodexParserState = async (options) => {
+      reads += 1; return await readCodexParserState(options);
+    };
     const consume = () => consumer(value).consume({
       adapterId: "codex", sourceRoot: value.sourceRoot, sourcePath: value.sourcePath,
-      readState: readCodexParserState, projectState: projectCodexParserState,
+      readState, projectState: projectCodexParserState,
     }) as Promise<Session | null>;
     assert.deepEqual(await consume(), await consume());
+    assert.equal(reads, 1);
+    assert.equal(rows(value.paths), 1);
   }
 });
 
 test("mutation/path swap/symlink and Store failure preserve cold evidence without publishing", async (t) => {
   for (const mode of ["mutation", "swap", "symlink"] as const) {
     const value = await fixture(t, `${claude("/other", mode, 1)}\n`);
+    const before = {
+      cache: rows(value.paths), catalog: rows(value.paths, "source_catalog"),
+    };
     const held = `${value.sourcePath}.held`;
     const readState: typeof readClaudeParserState = async (options) => {
       const read = await readClaudeParserState(options);
@@ -245,7 +277,9 @@ test("mutation/path swap/symlink and Store failure preserve cold evidence withou
       return read;
     };
     assert.equal((await consumeClaude(value, { readState })).sessions.length, 1);
-    assert.equal(rows(value.paths), 0);
+    assert.deepEqual({
+      cache: rows(value.paths), catalog: rows(value.paths, "source_catalog"),
+    }, before);
   }
   const failed = await fixture(t, `${claude("/other", "store", 1)}\n`);
   await mkdir(failed.paths.root_dir, { recursive: true });

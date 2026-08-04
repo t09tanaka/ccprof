@@ -59,6 +59,7 @@ import {
   type EffectiveRuleSafetyPolicy,
 } from "../src/policy/rule-safety.js";
 import type { EffectivePolicy } from "../src/policy/organization-policy.js";
+import { renderJsonReport } from "../src/reporters/json.js";
 
 const NOW_MS = Date.parse("2026-01-01T01:00:00.000Z");
 const FEATURE_COMMIT_DATE = "2026-01-01T00:00:00.000Z";
@@ -3517,12 +3518,14 @@ test("built-in exact evidence is report-transparent and disabled by analyzer gat
     } as const;
     const storePaths = await pathsFor("cold-warm-data");
     const cold = await analyze({ ...common, storePaths });
+    const coldOutput = renderJsonReport(cold.report);
     const coldDigest = snapshotDigest(storePaths);
     const warm = await analyze({ ...common, storePaths });
     assert.equal(cold.report.version, 2);
     assert.deepEqual(warm.report, cold.report);
     assert.deepEqual(warm.report.sources, cold.report.sources);
     assert.deepEqual(warm.warnings, cold.warnings);
+    assert.equal(renderJsonReport(warm.report), coldOutput);
     assert.equal(snapshotDigest(storePaths), coldDigest);
     assert.ok(evidenceCount(storePaths) > 0);
 
@@ -3547,6 +3550,53 @@ test("built-in exact evidence is report-transparent and disabled by analyzer gat
       },
     });
     assert.equal(evidenceCount(budgetPaths), 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("linked worktrees keep exact evidence eligibility rows isolated in one Store", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-linked-exact-evidence-"));
+  try {
+    const repo = await makeRepository(root);
+    const linkedPath = join(repo, ".test-worktrees", "exact-evidence-linked");
+    await mkdir(dirname(linkedPath), { recursive: true });
+    await git(repo, ["worktree", "add", "--detach", linkedPath, "feature"]);
+    const linkedRepo = await realpath(linkedPath);
+    const projects = await makeClaudeProjects(root, repo);
+    const transcript = join(projects, "fixture", "e2e-session.jsonl");
+    const raw = await readFile(transcript, "utf8");
+    await writeFile(transcript, `${raw.endsWith("\n") ? raw : `${raw}\n`}${JSON.stringify({
+      type: "user", sessionId: "e2e-session", uuid: "linked-root-row",
+      timestamp: "2026-01-01T00:02:55.000Z", cwd: linkedRepo,
+      gitBranch: "feature", message: { content: "linked root evidence" },
+    })}\n`);
+    const codexSessionsDirectory = join(root, "codex-empty-linked");
+    await mkdir(codexSessionsDirectory);
+    const dataRoot = join(root, "shared-data");
+    const mainPaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: dataRoot },
+    });
+    const linkedPaths = await resolveStorePaths(linkedRepo, {
+      env: { CCPROF_DATA_DIR: dataRoot },
+    });
+    assert.equal(linkedPaths.repo_dir, mainPaths.repo_dir);
+    const common = {
+      pr: "main...feature", nowMs: NOW_MS,
+      claudeProjectsDirectory: projects, codexSessionsDirectory,
+    } as const;
+    await analyze({ ...common, cwd: repo, storePaths: mainPaths });
+    await analyze({ ...common, cwd: linkedRepo, storePaths: linkedPaths });
+
+    const database = openStoreDatabase(mainPaths);
+    try {
+      const counts = database.prepare(`SELECT count(*) AS rows,
+        count(DISTINCT eligibility_identity) AS roots
+        FROM source_evidence_cache`).get() as { rows: number; roots: number };
+      assert.deepEqual(counts, { rows: 2, roots: 2 });
+    } finally {
+      database.close();
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
