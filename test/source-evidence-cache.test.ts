@@ -80,6 +80,10 @@ function boundDigest(domain: string, value: unknown): string {
     .digest("hex")}`;
 }
 
+function detachedContractValue<T>(value: T): T {
+  return JSON.parse(canonicalJson(value)) as T;
+}
+
 function cacheBinding(
   cache: Omit<SourceEvidenceCacheEntry, "payload_digest" | "descriptor_digest">,
 ): Record<string, unknown> {
@@ -327,7 +331,7 @@ async function claudeEvidenceFixture(
   const projected = projectClaudeParserState(continuation);
   assert.equal(projected.sessions.length, 2);
   assert.deepEqual(projected.warnings, []);
-  const envelope: SourceEvidenceEnvelopeV1 = {
+  const envelope = detachedContractValue<SourceEvidenceEnvelopeV1>({
     schema_version: 1,
     kind: "eligible-evidence-v1",
     adapter_id: "claude",
@@ -335,7 +339,7 @@ async function claudeEvidenceFixture(
     full_sessions: projected.sessions,
     parse_warnings: projected.warnings,
     continuation,
-  };
+  });
   const catalog = catalogEntry({
     adapter: "claude",
     canonicalPath: path,
@@ -379,7 +383,7 @@ async function codexEnvelopeFixture(
   const continuation = await readCodexState(path);
   const session = projectCodexParserState(continuation);
   assert.ok(session !== null);
-  return {
+  return detachedContractValue<SourceEvidenceEnvelopeV1>({
     schema_version: 1,
     kind: "eligible-evidence-v1",
     adapter_id: "codex",
@@ -387,7 +391,7 @@ async function codexEnvelopeFixture(
     full_sessions: [session],
     parse_warnings: [...session.warnings],
     continuation,
-  };
+  });
 }
 
 function negativeEnvelope(
@@ -500,7 +504,10 @@ test("evidence envelope validation rejects hostile shapes and foreign path, adap
     "unknown_field",
   );
 
-  const hiddenUnknown = structuredClone(envelope) as Record<PropertyKey, unknown>;
+  const hiddenUnknown = structuredClone(envelope) as unknown as Record<
+    PropertyKey,
+    unknown
+  >;
   Object.defineProperty(hiddenUnknown, "raw_line", {
     enumerable: false,
     value: SECRET_CANARY,
@@ -509,7 +516,10 @@ test("evidence envelope validation rejects hostile shapes and foreign path, adap
     () => normalizeSourceEvidenceEnvelope(hiddenUnknown),
     "unknown_field",
   );
-  const symbolUnknown = structuredClone(envelope) as Record<PropertyKey, unknown>;
+  const symbolUnknown = structuredClone(envelope) as unknown as Record<
+    PropertyKey,
+    unknown
+  >;
   symbolUnknown[Symbol(SECRET_CANARY)] = SECRET_CANARY;
   assertEvidenceError(
     () => normalizeSourceEvidenceEnvelope(symbolUnknown),
@@ -957,7 +967,7 @@ test("pair reads require one valid joined complete catalog/cache pair and turn c
       database,
       store.paths.repo_hash,
       ROOT_A,
-      fixture,
+      { catalog: fixture.catalog, cache: fixture.cache },
     ),
     "inserted",
   );
@@ -1044,13 +1054,16 @@ test("atomic pair writes cover replay, same-time conflict, newer, stale, progres
     database,
     store.paths.repo_hash,
     ROOT_A,
-    initial,
+    { catalog: initial.catalog, cache: initial.cache },
   ), "inserted");
   assert.equal(commitEligibleSourceEvidence(
     database,
     store.paths.repo_hash,
     ROOT_A,
-    structuredClone(initial),
+    {
+      catalog: structuredClone(initial.catalog),
+      cache: structuredClone(initial.cache),
+    },
   ), "unchanged");
 
   const conflict = reboundFixture(initial, {
@@ -1061,7 +1074,7 @@ test("atomic pair writes cover replay, same-time conflict, newer, stale, progres
     database,
     store.paths.repo_hash,
     ROOT_A,
-    conflict,
+    { catalog: conflict.catalog, cache: conflict.cache },
   ), "conflict");
   assert.deepEqual(getSourceEvidencePair(
     database,
@@ -1078,7 +1091,7 @@ test("atomic pair writes cover replay, same-time conflict, newer, stale, progres
     database,
     store.paths.repo_hash,
     ROOT_A,
-    newer,
+    { catalog: newer.catalog, cache: newer.cache },
   ), "updated");
   assert.deepEqual(getSourceEvidencePair(
     database,
@@ -1094,7 +1107,7 @@ test("atomic pair writes cover replay, same-time conflict, newer, stale, progres
     database,
     store.paths.repo_hash,
     ROOT_A,
-    stale,
+    { catalog: stale.catalog, cache: stale.cache },
   ), "stale");
   assert.deepEqual(getSourceEvidencePair(
     database,
@@ -1112,7 +1125,7 @@ test("atomic pair writes cover replay, same-time conflict, newer, stale, progres
       database,
       store.paths.repo_hash,
       ROOT_A,
-      regressed,
+      { catalog: regressed.catalog, cache: regressed.cache },
     ),
     "progress_regression",
   );
@@ -1178,7 +1191,7 @@ test("atomic pair writes cover replay, same-time conflict, newer, stale, progres
       database,
       "3".repeat(64),
       ROOT_A,
-      newer,
+      { catalog: newer.catalog, cache: newer.cache },
     ),
     "foreign_binding",
   );
@@ -1192,7 +1205,7 @@ test("a cache-write failure rolls the catalog and cache pair back together", asy
     database,
     store.paths.repo_hash,
     ROOT_A,
-    initial,
+    { catalog: initial.catalog, cache: initial.cache },
   ), "inserted");
   const newer = reboundFixture(initial, {
     observedAtMs: initial.catalog.observed_at_ms + 1,
@@ -1209,7 +1222,7 @@ test("a cache-write failure rolls the catalog and cache pair back together", asy
       database,
       store.paths.repo_hash,
       ROOT_A,
-      newer,
+      { catalog: newer.catalog, cache: newer.cache },
     ),
     /forced evidence cache rollback/u,
   );
@@ -1235,7 +1248,7 @@ test("a second WAL connection observes an old or new complete pair, never the wr
       writer,
       store.paths.repo_hash,
       ROOT_A,
-      initial,
+      { catalog: initial.catalog, cache: initial.cache },
     ), "inserted");
     const newer = reboundFixture(initial, {
       observedAtMs: initial.catalog.observed_at_ms + 1,
@@ -1262,7 +1275,7 @@ test("a second WAL connection observes an old or new complete pair, never the wr
       writer,
       store.paths.repo_hash,
       ROOT_A,
-      newer,
+      { catalog: newer.catalog, cache: newer.cache },
     ), "updated");
     assert.deepEqual(observed, [{
       catalog: initial.catalog,
