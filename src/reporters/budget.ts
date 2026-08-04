@@ -188,12 +188,11 @@ export function finalizeBudgetedOutput(
   budget = outputResult(base, 0, consumedBytes, true);
 
   // The envelope is content-free and has a fixed size, but the attempted
-  // deterministic report can contain its own final budget facts. Stabilize
-  // only that observed count; the emitted bytes never change.
+  // rendered output can contain its own final budget facts. Stabilize only
+  // that full observed count; the emitted bytes never change.
   for (let pass = 0; pass < MAX_STABILIZATION_PASSES; pass += 1) {
     const rendered = options.projection.render(withBudget(options.report, budget));
-    const deterministic = rendered.withoutAdvisory ?? rendered.output;
-    const observedBytes = measuredBytes(deterministic, byteLength);
+    const observedBytes = measuredBytes(rendered.output, byteLength);
     const next = outputResult(base, observedBytes, consumedBytes, true);
     if (sameBudget(next, budget)) {
       return { stdout, analysisBudget: next };
