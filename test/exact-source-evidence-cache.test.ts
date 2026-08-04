@@ -173,8 +173,10 @@ test("same metadata with changed bytes misses exact revision", async (t) => {
   await writeFile(value.sourcePath, second);
   await utimes(value.sourcePath, before.atime, before.mtime);
   const replaced = await consumeClaude(value, { readState: reader });
+  const warmReplacement = await consumeClaude(value, { readState: reader });
   assert.equal(reads, 2);
   assert.equal(replaced.sessions[0]?.session_id, "replace-b");
+  assert.equal(warmReplacement.sessions[0]?.session_id, "replace-b");
 });
 
 test("warning-free negatives reuse; warning and mixed evidence never commit", async (t) => {
