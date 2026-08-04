@@ -21,6 +21,7 @@ import {
   type RepositoryApprovalRulePolicy,
   type ResourceDomainPolicy,
 } from "../src/policy/rule-safety.js";
+import { analysisDigest } from "../src/store/analyses.js";
 
 function assertInvalid(
   action: () => unknown,
@@ -477,6 +478,128 @@ test("rejects rg preprocessors and git grep pagers through every decision path",
       kind: "investigation_candidate",
     }, raw);
   }
+});
+
+test("rejects shell and environment expansion regardless of quote provenance", () => {
+  const dangerous = [
+    "npm test -- $HOME",
+    "npm test -- '${HOME}'",
+    "npm test -- '$HOME'",
+    "npm test -- '$?'",
+    "npm test -- '%TEMP%'",
+    "npm test -- \"%TEMP%\"",
+    "npm test -- '!TEMP!'",
+    "npm test -- \"!TEMP!\"",
+  ];
+  const wildcard = resolvedPolicy(
+    { safe_patterns: ["*"], allow_rule_recommendation: true },
+    [{ match: ["*"], domain: "validation", parallel_safe: true }],
+  );
+  for (const raw of dangerous) {
+    assert.equal(safeCanonicalCommand(raw), undefined, raw);
+    assert.deepEqual(approvalRecommendationDecision([raw], wildcard), {
+      kind: "evaluated",
+      commands: [{ allowed: false }],
+    }, raw);
+    assert.deepEqual(resourceDomainDecision([raw], wildcard), {
+      kind: "investigation_candidate",
+    }, raw);
+  }
+});
+
+test("rejects every bounded external-helper option abbreviation", () => {
+  const textconv = "--textconv";
+  const extGrep = "--ext-grep";
+  const textconvAbbreviations = Array.from(
+    { length: textconv.length - "--textc".length + 1 },
+    (_, index) => textconv.slice(0, "--textc".length + index),
+  );
+  const extGrepAbbreviations = Array.from(
+    { length: extGrep.length - "--ext-".length + 1 },
+    (_, index) => extGrep.slice(0, "--ext-".length + index),
+  );
+  const dangerous = [
+    "rg --hostname-bin hostname TODO src",
+    "rg --hostname-bin=hostname TODO src",
+    ...textconvAbbreviations.flatMap((option) => [
+      `git grep ${option} TODO`,
+      `git grep ${option}=true TODO`,
+    ]),
+    ...extGrepAbbreviations.map((option) => `git grep ${option} TODO`),
+  ];
+  const wildcard = resolvedPolicy(
+    { safe_patterns: ["*"], allow_rule_recommendation: true },
+    [{ match: ["*"], domain: "read-only", parallel_safe: true }],
+  );
+  for (const raw of dangerous) {
+    assert.equal(safeCanonicalCommand(raw), undefined, raw);
+    assert.deepEqual(approvalRecommendationDecision([raw], wildcard), {
+      kind: "evaluated",
+      commands: [{ allowed: false }],
+    }, raw);
+    assert.deepEqual(resourceDomainDecision([raw], wildcard), {
+      kind: "investigation_candidate",
+    }, raw);
+  }
+});
+
+test("rejects unpaired UTF-16 before NFC and UTF-8 canonicalization", () => {
+  for (const invalidUnicode of [
+    "\ud800",
+    "\udfff",
+    "before\ud800after",
+    "before\udfffafter",
+  ]) {
+    assertInvalid(() => normalizeCommandPattern(invalidUnicode));
+    assertInvalid(() => compareUtf8(invalidUnicode, "valid"));
+    assertInvalid(() => snapshotApprovalRulePolicy({
+      safe_patterns: [invalidUnicode],
+      allow_rule_recommendation: true,
+    }));
+    assertInvalid(() => snapshotResourceDomains([{
+      match: [invalidUnicode],
+      domain: "validation",
+      parallel_safe: true,
+    }]));
+    assert.equal(
+      safeCanonicalCommand(`npm test -- ${invalidUnicode}`),
+      undefined,
+    );
+  }
+});
+
+test("keeps supplementary Unicode policy digests invariant under reversal", () => {
+  const patterns = ["npm test 😀", "npm test 𐀀", "npm test 🧪"];
+  const forward = resolveRuleSafetyPolicy(
+    { safe_patterns: patterns, allow_rule_recommendation: true },
+    patterns.map((pattern, index) => ({
+      match: [pattern],
+      domain: `unicode-${index}`,
+      parallel_safe: index % 2 === 0,
+    })),
+  );
+  const reverse = resolveRuleSafetyPolicy(
+    { safe_patterns: [...patterns].reverse(), allow_rule_recommendation: true },
+    patterns.map((pattern, index) => ({
+      match: [pattern],
+      domain: `unicode-${index}`,
+      parallel_safe: index % 2 === 0,
+    })).reverse(),
+  );
+  assert.deepEqual(
+    canonicalRuleSafetySnapshot(reverse),
+    canonicalRuleSafetySnapshot(forward),
+  );
+  assert.equal(
+    analysisDigest(
+      "effective-rule-safety-v1",
+      canonicalRuleSafetySnapshot(reverse),
+    ),
+    analysisDigest(
+      "effective-rule-safety-v1",
+      canonicalRuleSafetySnapshot(forward),
+    ),
+  );
 });
 
 test("rejects over-limit raw commands before safety classification", () => {
