@@ -1478,6 +1478,7 @@ test("captures one cohort floor for baseline eligibility and persisted policy id
       ...currentOptions,
       nowMs: NOW_MS + 11,
       sessionSource: new ClaudeSessionSource(projects),
+      externalToolNames: new Set(["cohort-policy-digest-fixture"]),
       minimumCohortSize: 5,
     });
     const immutableTwenty = await analyze({
@@ -1487,8 +1488,27 @@ test("captures one cohort floor for baseline eligibility and persisted policy id
       minimumCohortSize: 20,
     });
 
+    const analysisPayload = (record: typeof capturedFive.record) => {
+      const {
+        analysis_id: analysisId,
+        created_at_ms: createdAtMs,
+        ...payload
+      } = record;
+      void analysisId;
+      void createdAtMs;
+      return payload;
+    };
+    assert.deepEqual(
+      analysisPayload(immutableFive.record),
+      analysisPayload(capturedFive.record),
+      "an unused config marker cannot alter the analysis payload",
+    );
     assert.equal(capturedFive.record.summary.baseline?.prs, 5);
     assert.equal(immutableFive.record.summary.baseline?.prs, 5);
+    assert.deepEqual(
+      immutableFive.record.summary.baseline,
+      capturedFive.record.summary.baseline,
+    );
     assert.equal(immutableTwenty.record.summary.baseline, null);
 
     const entries = (await loadAnalyses(storePaths)).entries ?? [];
