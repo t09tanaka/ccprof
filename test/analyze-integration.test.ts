@@ -3555,6 +3555,87 @@ test("built-in exact evidence is report-transparent and disabled by analyzer gat
   }
 });
 
+test("complete analyses expose canonical audit identity without altering report JSON", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-analyze-audit-identity-"));
+  try {
+    const repo = await makeRepository(root);
+    const projects = await makeClaudeProjects(root, repo);
+    const codexSessionsDirectory = join(root, "codex-sessions-empty");
+    await mkdir(codexSessionsDirectory);
+    const pathsFor = async (name: string) => await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, name) },
+    });
+    const common = {
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      claudeProjectsDirectory: projects,
+      codexSessionsDirectory,
+    } as const;
+    const persistedPaths = await pathsFor("persisted-data");
+    const transientPaths = await pathsFor("transient-data");
+
+    const persisted = await analyze({
+      ...common,
+      storePaths: persistedPaths,
+      persist: true,
+    });
+    const transient = await analyze({
+      ...common,
+      storePaths: transientPaths,
+      persist: false,
+    });
+
+    assert.deepEqual(persisted.record, transient.record);
+    assert.equal(
+      persisted.audit_identity.snapshot_id,
+      transient.audit_identity.snapshot_id,
+    );
+    assert.equal(
+      persisted.audit_identity.deterministic_digest,
+      transient.audit_identity.deterministic_digest,
+    );
+    for (const result of [persisted, transient]) {
+      assert.equal(result.audit_identity.analysis_id, result.record.analysis_id);
+      assert.equal(
+        result.audit_identity.created_at_ms,
+        result.record.created_at_ms,
+      );
+      assert.equal(
+        result.audit_identity.deterministic_digest,
+        `sha256:${result.audit_identity.snapshot_id}`,
+      );
+      assert.equal("mode" in result.audit_identity.snapshot_identity, false);
+    }
+    const database = openStoreDatabase(persistedPaths);
+    try {
+      assert.equal(
+        database.prepare(
+          "SELECT snapshot_id FROM analysis_executions WHERE execution_id = ?",
+        ).pluck().get(persisted.record.analysis_id),
+        persisted.audit_identity.snapshot_id,
+      );
+    } finally {
+      database.close();
+    }
+    const rendered = JSON.parse(renderJsonReport(persisted.report)) as Record<
+      string,
+      unknown
+    >;
+    assert.equal(rendered.version, 2);
+    for (const key of [
+      "audit_identity",
+      "analysis",
+      "snapshot_id",
+      "deterministic_digest",
+    ]) {
+      assert.equal(key in rendered, false);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("linked worktrees keep exact evidence eligibility rows isolated in one Store", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-linked-exact-evidence-"));
   try {
