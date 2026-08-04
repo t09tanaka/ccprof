@@ -8,7 +8,7 @@ import type {
   JsonValue,
   ReportV2,
 } from "../core/model.js";
-import type { StatsReport } from "./stats.js";
+import { STATS_PROJECTION, type StatsReport } from "./stats.js";
 import { findingForDisplay } from "./tty.js";
 export type PrivacyProfile = "strict" | "balanced" | "raw";
 type DisplayProfile = Exclude<PrivacyProfile, "raw">;
@@ -359,11 +359,33 @@ export function projectStatsPrivacy(
   profile: PrivacyProfile,
   repoRoot: string,
 ): StatsReport {
-  if (profile === "raw") return stats;
+  if (profile === "raw") return structuredClone(stats);
   const projectText = (value: string): string =>
     safeText(value, profile, repoRoot, []);
   return {
     history_count: stats.history_count,
+    ...(stats.metadata === undefined ? {} : {
+      metadata: {
+        ...stats.metadata,
+        privacy_profile: profile,
+        projection: STATS_PROJECTION,
+        reason_codes: [...stats.metadata.reason_codes],
+      },
+    }),
+    ...(stats.terminal_metrics === undefined ? {} : {
+      terminal_metrics: { ...stats.terminal_metrics },
+    }),
+    ...(stats.cohorts === undefined ? {} : {
+      cohorts: stats.cohorts.map((cohort) => ({
+        metadata: {
+          ...cohort.metadata,
+          reason_codes: [...cohort.metadata.reason_codes],
+        },
+        ...(cohort.distributions === undefined ? {} : {
+          distributions: structuredClone(cohort.distributions),
+        }),
+      })),
+    }),
     baseline_metrics: stats.baseline_metrics.map((entry) => ({
       metric: projectText(entry.metric),
       value: entry.value,

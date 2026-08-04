@@ -1096,7 +1096,7 @@ export function buildChronicCostMaterializationEntries(
         if (command === null) return [];
         const commandKey = statsCommandKey(cost.command_identity);
         const projectedLane = `${commandKey}\0${cost.cache_state}`;
-        if (!expected.has(projectedLane) || seen.has(projectedLane)) return [];
+        if (!expected.has(projectedLane)) return [];
         seen.add(projectedLane);
         const key = `${terminal.cohort_key}\0${projectedLane}`;
         const identity = {

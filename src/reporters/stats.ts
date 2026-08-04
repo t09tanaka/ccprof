@@ -13,7 +13,11 @@ import type {
   Finding,
   RuleId,
 } from "../core/model.js";
-import { detectChronicCost } from "../rules/chronic-cost.js";
+import {
+  detectChronicCost,
+  type ChronicCostAggregate,
+  type ChronicCostMaterializationEntry,
+} from "../rules/chronic-cost.js";
 import type { AnalysisRecord } from "../store/analyses.js";
 import type { AdoptionMethod, AdoptionRecord } from "../store/adoptions.js";
 import { sanitizeHumanText } from "./sanitize.js";
@@ -83,11 +87,23 @@ export interface StatsAdoptionCoverage {
   undetectable: number;
 }
 
+export const STATS_PROJECTION = "numeric_bounded_opaque_v1" as const;
+
+export interface StatsMetadata extends TerminalStatsAggregateMetadata {
+  privacy_profile?: "strict" | "balanced" | "raw";
+  projection?: typeof STATS_PROJECTION;
+}
+
+export interface StatsCohortAggregate
+  extends Omit<TerminalStatsCohortAggregate, "cohort_key"> {
+  cohort_key?: string;
+}
+
 export interface StatsReport {
   history_count: number;
-  metadata?: TerminalStatsAggregateMetadata;
+  metadata?: StatsMetadata;
   terminal_metrics?: TerminalMetricAggregate;
-  cohorts?: TerminalStatsCohortAggregate[];
+  cohorts?: StatsCohortAggregate[];
   baseline_metrics: StatsBaselineMetric[];
   chronic_commands: StatsChronicCommand[];
   rule_minutes: StatsRuleMinutes[];
@@ -371,17 +387,70 @@ export function summarizeStats(
 }
 
 function cloneCohortDistributions(
-  distributions: NonNullable<TerminalStatsCohortAggregate["distributions"]>,
-): NonNullable<TerminalStatsCohortAggregate["distributions"]> {
+  distributions: NonNullable<StatsCohortAggregate["distributions"]>,
+): NonNullable<StatsCohortAggregate["distributions"]> {
   return Object.fromEntries(Object.entries(distributions).map(
     ([axis, distribution]) => [axis, { ...distribution }],
   )) as NonNullable<TerminalStatsCohortAggregate["distributions"]>;
+}
+
+function chronicLaneKey(entry: {
+  cohort_key: string;
+  command_key: string;
+  cache_state: "cold" | "warm";
+}): string {
+  return `${entry.cohort_key}\0${entry.command_key}\0${entry.cache_state}`;
+}
+
+function chronicCommandRows(
+  aggregates: readonly ChronicCostAggregate[],
+  entries: readonly ChronicCostMaterializationEntry[],
+): StatsChronicCommand[] {
+  const labels = new Map<string, ChronicCostMaterializationEntry>();
+  const invalid = new Set<string>();
+  for (const entry of entries) {
+    const key = chronicLaneKey(entry);
+    if (labels.has(key)) {
+      labels.delete(key);
+      invalid.add(key);
+    } else if (!invalid.has(key)) {
+      labels.set(key, entry);
+    }
+  }
+  return aggregates.flatMap((aggregate): StatsChronicCommand[] => {
+    const key = chronicLaneKey(aggregate);
+    const label = labels.get(key);
+    if (label === undefined || invalid.has(key)) return [];
+    return [{
+      command: label.command,
+      command_identity: {
+        ...label.command_identity,
+        normalized_argv: [...label.command_identity.normalized_argv],
+      },
+      cache_state: aggregate.cache_state,
+      history_count: aggregate.history_count,
+      presence_count: aggregate.presence_count,
+      sample_count: aggregate.distribution.sample_count,
+      ratio: aggregate.ratio,
+      resource_upper_ms: aggregate.resource_upper_ms,
+      median: aggregate.distribution.median,
+      p50: aggregate.distribution.p50,
+      p75: aggregate.distribution.p75,
+      mad: aggregate.distribution.mad,
+      cost_ratio: aggregate.ratio,
+      estimated_min: Math.round(
+        aggregate.resource_upper_ms / 60_000 * 10_000,
+      ) / 10_000,
+    }];
+  });
 }
 
 export function summarizeTerminalStats(
   aggregate: TerminalStatsAggregateResult,
   terminalRecords: readonly AnalysisRecord[],
   adoptions: readonly AdoptionRecord[] = [],
+  chronicAggregates?: readonly ChronicCostAggregate[],
+  chronicEntries: readonly ChronicCostMaterializationEntry[] = [],
 ): StatsReport {
   const observational = summarizeStats(terminalRecords, adoptions);
   return {
@@ -404,7 +473,9 @@ export function summarizeTerminalStats(
       }),
     })),
     baseline_metrics: observational.baseline_metrics,
-    chronic_commands: observational.chronic_commands,
+    chronic_commands: chronicAggregates === undefined
+      ? observational.chronic_commands
+      : chronicCommandRows(chronicAggregates, chronicEntries),
     rule_minutes: aggregate.rule_minutes.map((entry) => ({ ...entry })),
     recurring_findings: observational.recurring_findings,
     adoptions: observational.adoptions,
@@ -506,12 +577,66 @@ function chronicCommandDetail(entry: StatsChronicCommand): string {
   )}%, ${entry.presence_count} analyses)`;
 }
 
+const TERMINAL_METRIC_LABELS = [
+  ["confirmed_critical_path_ms", "Confirmed critical path"],
+  ["estimated_critical_path_upper_ms", "Estimated critical-path upper"],
+  ["resource_cost_ms", "Resource cost"],
+  ["human_wait_ms", "Human wait"],
+  ["unexplained_ms", "Unexplained"],
+] as const;
+
+function terminalMetricLines(stats: StatsReport): string[] {
+  if (stats.metadata === undefined) return [];
+  const population = stats.metadata;
+  const status = `suppressed (${population.sample_count}/${
+    population.minimum_cohort_size
+  } comparable samples)`;
+  const metricLines = stats.terminal_metrics === undefined
+    ? [`Terminal metrics: ${status}`]
+    : [
+        "Terminal metrics:",
+        ...TERMINAL_METRIC_LABELS.map(([axis, label]) =>
+          `- ${label}: ${formatMinutes(stats.terminal_metrics![axis] / 60_000)}`),
+      ];
+  const cohortLines = stats.cohorts === undefined || stats.cohorts.length === 0
+    ? []
+    : [
+        "Comparable cohort distributions:",
+        ...stats.cohorts.flatMap((cohort, index) => {
+          if (cohort.distributions === undefined) {
+            return [`- Cohort ${index + 1}: suppressed (${
+              cohort.metadata.sample_count
+            }/${cohort.metadata.minimum_cohort_size} comparable samples)`];
+          }
+          return [
+            `- Cohort ${index + 1}:`,
+            ...TERMINAL_METRIC_LABELS.map(([axis, label]) => {
+              const distribution = cohort.distributions![axis];
+              return `  ${label}: median ${distribution.median} ms, p50 ${
+                distribution.p50
+              }, p75 ${distribution.p75}, MAD ${distribution.mad}, samples ${
+                distribution.sample_count
+              }`;
+            }),
+          ];
+        }),
+      ];
+  return [
+    ...(population.privacy_profile === undefined ? [] : [
+      `Privacy: ${population.privacy_profile} (${population.projection})`,
+    ]),
+    ...metricLines,
+    ...cohortLines,
+  ];
+}
+
 export function renderStatsTty(stats: StatsReport): string {
   const terminalStats = stats.metadata !== undefined;
   const lines = [
     `History: ${stats.history_count} ${
       terminalStats ? "terminal work units" : "analyses"
     }`,
+    ...terminalMetricLines(stats),
     terminalStats
       ? "Confirmed critical-path minutes by rule:"
       : "Aggregate rule minutes:",

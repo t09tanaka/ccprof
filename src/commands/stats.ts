@@ -1,5 +1,8 @@
 import { resolve } from "node:path";
 
+import { aggregateTerminalStats } from "../analysis/stats-aggregation.js";
+import { projectStatsAggregationInput } from "../analysis/stats-input.js";
+import { buildChronicCostMaterializationEntries } from "../core/analyze.js";
 import {
   runCommand,
   type CommandRunner,
@@ -9,6 +12,7 @@ import {
   renderStatsJson,
   renderStatsTty,
   summarizeStats,
+  summarizeTerminalStats,
 } from "../reporters/stats.js";
 import {
   privacyWarningTexts,
@@ -32,6 +36,7 @@ import {
   resolveRepositoryPolicy,
   type RepositoryPolicyResolver,
 } from "../policy/organization-policy.js";
+import { buildChronicCostAggregates } from "../rules/chronic-cost.js";
 
 export interface StatsCommandOptions {
   cwd: string;
@@ -98,8 +103,47 @@ export async function runStatsCommand(
   const adoptions = await (
     dependencies.loadAdoptions ?? loadAdoptions
   )(paths);
+  const rawStats = history.entries === undefined
+    ? summarizeStats(history.records, adoptions.records)
+    : (() => {
+      const mode = { mode: "stats_all_groups" } as const;
+      const projected = history.entries.map((entry) =>
+        projectStatsAggregationInput(entry)
+      );
+      const aggregate = aggregateTerminalStats(
+        projected,
+        mode,
+        effectivePolicy.minimum_cohort_size,
+      );
+      const recordsBySnapshot = new Map(history.entries.map((entry) =>
+        [entry.snapshot_id, entry.record] as const
+      ));
+      const terminalRecords = aggregate.selected_snapshot_ids.flatMap(
+        (snapshotId) => {
+          const record = recordsBySnapshot.get(snapshotId);
+          return record === undefined ? [] : [record];
+        },
+      );
+      const chronicAggregates = buildChronicCostAggregates(
+        projected,
+        mode,
+        effectivePolicy.minimum_cohort_size,
+      );
+      const chronicEntries = buildChronicCostMaterializationEntries(
+        projected,
+        history.entries,
+        mode,
+      );
+      return summarizeTerminalStats(
+        aggregate,
+        terminalRecords,
+        adoptions.records,
+        chronicAggregates,
+        chronicEntries,
+      );
+    })();
   const stats = projectStatsPrivacy(
-    summarizeStats(history.records, adoptions.records),
+    rawStats,
     privacy,
     repoRoot,
   );

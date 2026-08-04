@@ -188,10 +188,20 @@ report/package version.
 
 ### Stats
 
-Shows the analysis history, baseline, per-rule time, and chronic command cost
-stored for the current repository. When the same `finding_key` appears in two or
-more analyses it is listed under Recurring findings with the trend between its
-first and latest recoverable estimate (improved / worsened / flat).
+Shows terminal work-unit history, baseline, confirmed per-rule critical-path
+time, and chronic command cost stored for the current repository. Repeated
+snapshots of one work unit are collapsed to its latest newly observed git state.
+For example, A@1/B@2/A@3 contributes B and excludes the later rerun of A.
+Comparable terminal snapshots are grouped by an exact
+repository/workspace/change-size cohort and summarized across confirmed critical
+path, estimated critical-path upper bound, resource cost, human wait, and
+unexplained time. Each cohort reports median, p50, p75, and MAD only after it
+reaches the effective minimum cohort size; otherwise stats explicitly reports
+`suppressed (N/M comparable samples)`.
+
+When the same `finding_key` appears in two or more selected terminal snapshots
+it is listed under Recurring findings with the trend between its first and
+latest recoverable estimate (improved / worsened / flat).
 
 Adoption is detected deterministically: once a suggestion from a past analysis
 is acted on — a `CLAUDE.md` edit, or an edit to the finding's target file, that
@@ -213,8 +223,12 @@ ccprof stats --privacy strict --json
 Local stats output defaults to `balanced`; an explicit local `--privacy`
 selection wins. Detected CI always enforces `strict` for stats, so
 `--privacy balanced` or `--privacy raw` cannot weaken shared-log protection.
-The projection is display-only and does not alter analysis history or adoption
-records in the Store.
+Stats first projects raw history to a numeric, bounded, opaque in-memory shape;
+only after aggregation does it join selected terminal snapshots to display
+labels and observational recurrence/adoption data. `strict` and `balanced`
+output never exposes internal cohort or command keys. The projection is
+display-only and does not alter analysis history or adoption records in the
+Store.
 
 ### Dismissing a finding
 
@@ -525,11 +539,15 @@ the JSON Report contract at v2, and the Store schema at v2.
 | R007 | Results over 50,000 tokens and compaction | upper | `claude_md` / `separate_issue` |
 | R008 | The same test failing then passing with no related edit | point or upper | `separate_issue` |
 
-R006 requires at least 5 past analyses, occurrences in at least 3 of them, and at
-least 30% of all measured time. In Phase 1, R008 decides per normalized command
-rather than per test name; failed test names are extracted deterministically from
-the failing run's output and included in the evidence (`failed_tests`), for TAP,
-jest, vitest, cargo, and pytest.
+R006 evaluates an exact cohort × normalized-command × observed-cache-state
+lane. Both the cohort history and positive command samples must reach the
+effective minimum cohort size, and the command must account for at least 30% of
+the cohort's measured wall time. Snapshots where the command is absent remain
+in the history denominator. A command cost without an observed `cold` or `warm`
+cache state is not inferred and does not produce an R006 row. In Phase 1, R008
+decides per normalized command rather than per test name; failed test names are
+extracted deterministically from the failing run's output and included in the
+evidence (`failed_tests`), for TAP, jest, vitest, cargo, and pytest.
 
 ## Supported sources and schema drift
 
@@ -932,8 +950,10 @@ manifest version `2.0.0`, compatibility epoch 2, and evidence schema v2.
 Explicit epoch-1 records and legacy findings remain readable without migration
 or backfill.
 
-Today `analyze` and `stats` consume the effective privacy policy, and `analyze`
-also consumes advisory permission. The following resolved values are not yet consumed
+Today `analyze` and `stats` consume the effective privacy policy and minimum
+cohort size, and `analyze` also consumes advisory permission. Stats aggregation
+is computed in memory from existing Store snapshots; it adds no aggregate table,
+migration, or backfill. The following resolved values are not yet consumed
 by downstream features: `allow_export`, `raw_retention_days_max`, and
 `required_source_coverage`. There is no export command, policy-driven retention
 or deletion job, source-coverage gate, or encryption/key-management consumer in
