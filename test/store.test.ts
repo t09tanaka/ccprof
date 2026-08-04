@@ -24,6 +24,7 @@ import type {
   CommandIdentity,
   Finding,
 } from "../src/core/model.js";
+import type { AnalysisBudgetResult } from "../src/analysis/budgets.js";
 import { commandIdentityKey } from "../src/analysis/command-identity.js";
 import { detectChronicCost } from "../src/rules/chronic-cost.js";
 import { findingKey } from "../src/rules/shared.js";
@@ -152,6 +153,119 @@ function record(
           session_refs: [`session-${id}#run`],
         }],
   });
+}
+
+function budgetResult(
+  completeness: "complete" | "partial" = "complete",
+): AnalysisBudgetResult {
+  return {
+    configured: {
+      max_input_bytes: 10,
+      max_input_events: 3,
+      max_wall_ms: 20,
+      max_cpu_ms: 15,
+      max_output_bytes: 200,
+      max_source_items: 2,
+    },
+    consumed: {
+      input_bytes: completeness === "complete" ? 10 : 5,
+      input_events: 3,
+      wall_ms: 20,
+      cpu_ms: 15,
+      output_bytes: 200,
+      source_items: 2,
+    },
+    observed: {
+      input_bytes: completeness === "complete" ? 10 : 11,
+      input_events: 3,
+      wall_ms: 20,
+      cpu_ms: 15,
+      output_bytes: 200,
+      source_items: 2,
+    },
+    completeness,
+    ...(completeness === "complete"
+      ? {}
+      : { truncation_reason: "max_input_bytes" as const }),
+    coverage: completeness === "complete" ? 1 : 5 / 11,
+  };
+}
+
+function budgetRecord(
+  id: string,
+  createdAtMs: number,
+  completeness: "complete" | "partial" = "complete",
+): AnalysisRecord & { analysis_budget: AnalysisBudgetResult } {
+  return {
+    ...record(id, createdAtMs),
+    analysis_budget: budgetResult(completeness),
+  };
+}
+
+function storedBudgetRow(
+  executionId: string,
+  result: AnalysisBudgetResult,
+) {
+  return {
+    execution_id: executionId,
+    max_input_bytes: result.configured.max_input_bytes,
+    max_input_events: result.configured.max_input_events,
+    max_wall_ms: result.configured.max_wall_ms,
+    max_cpu_ms: result.configured.max_cpu_ms,
+    max_output_bytes: result.configured.max_output_bytes,
+    max_source_items: result.configured.max_source_items,
+    consumed_input_bytes: result.consumed.input_bytes,
+    consumed_input_events: result.consumed.input_events,
+    consumed_wall_ms: result.consumed.wall_ms,
+    consumed_cpu_ms: result.consumed.cpu_ms,
+    consumed_output_bytes: result.consumed.output_bytes,
+    consumed_source_items: result.consumed.source_items,
+    observed_input_bytes: result.observed.input_bytes,
+    observed_input_events: result.observed.input_events,
+    observed_wall_ms: result.observed.wall_ms,
+    observed_cpu_ms: result.observed.cpu_ms,
+    observed_output_bytes: result.observed.output_bytes,
+    observed_source_items: result.observed.source_items,
+    completeness: result.completeness,
+    truncation_reason: result.truncation_reason ?? null,
+    coverage: result.coverage,
+  };
+}
+
+const BUDGET_ROW_COLUMNS = [
+  "execution_id",
+  "max_input_bytes",
+  "max_input_events",
+  "max_wall_ms",
+  "max_cpu_ms",
+  "max_output_bytes",
+  "max_source_items",
+  "consumed_input_bytes",
+  "consumed_input_events",
+  "consumed_wall_ms",
+  "consumed_cpu_ms",
+  "consumed_output_bytes",
+  "consumed_source_items",
+  "observed_input_bytes",
+  "observed_input_events",
+  "observed_wall_ms",
+  "observed_cpu_ms",
+  "observed_output_bytes",
+  "observed_source_items",
+  "completeness",
+  "truncation_reason",
+  "coverage",
+] as const;
+
+function insertBudgetRow(
+  database: StoreDatabase,
+  executionId: string,
+  result: AnalysisBudgetResult,
+): void {
+  const placeholders = BUDGET_ROW_COLUMNS.map((column) => `@${column}`);
+  database.prepare(`INSERT INTO analysis_budget_runs
+    (${BUDGET_ROW_COLUMNS.join(", ")}) VALUES (${placeholders.join(", ")})`)
+    .run(storedBudgetRow(executionId, result));
 }
 
 function snapshotOptions(sourceDigest = "1".repeat(64)) {
@@ -403,6 +517,9 @@ function assertConnectionPragmas(database: StoreDatabase): void {
 function populatedV2Store(paths: StorePaths): StoreDatabase {
   const database = openStoreDatabase(paths);
   const downgrade = database.transaction(() => {
+    database.exec("DROP TABLE IF EXISTS analysis_budget_runs");
+    database.prepare("DELETE FROM store_migrations WHERE name = ?")
+      .run("schema-v4-analysis-budgets");
     database.exec("DROP TABLE IF EXISTS source_catalog");
     database.prepare("DELETE FROM store_migrations WHERE name = ?")
       .run("schema-v3-source-catalog");
@@ -420,6 +537,35 @@ function populatedV2Store(paths: StorePaths): StoreDatabase {
       VALUES ('dismissal-v2', 14, '{"dismissal":true}');
     INSERT INTO adoptions(finding_key, detected_at_ms, record_json)
       VALUES ('adoption-v2', 15, '{"adoption":true}');
+  `);
+  return database;
+}
+
+function populatedV3Store(paths: StorePaths): StoreDatabase {
+  const database = openStoreDatabase(paths);
+  const downgrade = database.transaction(() => {
+    database.exec("DROP TABLE IF EXISTS analysis_budget_runs");
+    database.prepare("DELETE FROM store_migrations WHERE name = ?")
+      .run("schema-v4-analysis-budgets");
+    database.pragma("user_version = 3");
+  });
+  downgrade.immediate();
+  database.exec(`
+    INSERT INTO store_migrations(name, completed_at_ms)
+      VALUES ('legacy-sentinel-v3', 21);
+    INSERT INTO source_catalog(
+      adapter_id, adapter_version, source_identity, canonical_path,
+      device, inode, mtime_ms, size_bytes, prefix_hash, suffix_hash,
+      content_revision, discovery_cursor, last_parsed_offset,
+      last_normalized_event_index, parser_version, schema_fingerprint,
+      observed_at_ms, completeness
+    ) VALUES (
+      'claude', '1.0.0', 'source-' || lower(hex(zeroblob(32))), '/repo/v3.jsonl',
+      1, 2, 3, 4, 'sha256:' || lower(hex(zeroblob(32))),
+      'sha256:' || lower(hex(zeroblob(32))),
+      'sha256:' || lower(hex(zeroblob(32))), 5, 4, 6,
+      'parser-v3', 'sha256:' || lower(hex(zeroblob(32))), 7, 'complete'
+    );
   `);
   return database;
 }
@@ -543,17 +689,17 @@ test("SQLite paths are deterministic and shared by linked worktrees", async () =
   }
 });
 
-test("SQLite bootstrap is private, idempotent, and creates the Store v3 schema", async () => {
+test("SQLite bootstrap is private, idempotent, and creates the Store v4 schema", async () => {
   await temporaryStore(async (paths) => {
-    assert.equal(STORE_SCHEMA_VERSION, 3);
+    assert.equal(STORE_SCHEMA_VERSION, 4);
     const databasePath = storeDatabasePath(paths);
     const first = openStoreDatabase(paths);
     const second = openStoreDatabase(paths);
     try {
       assertConnectionPragmas(first);
       assertConnectionPragmas(second);
-      assert.equal(Number(first.pragma("user_version", { simple: true })), 3);
-      assert.equal(Number(second.pragma("user_version", { simple: true })), 3);
+      assert.equal(Number(first.pragma("user_version", { simple: true })), 4);
+      assert.equal(Number(second.pragma("user_version", { simple: true })), 4);
 
       if (process.platform !== "win32") {
         assert.equal((await stat(paths.repo_dir)).mode & 0o777, 0o700);
@@ -565,6 +711,7 @@ test("SQLite bootstrap is private, idempotent, and creates the Store v3 schema",
       ).all() as { name: string }[];
       assert.deepEqual(tables.map(({ name }) => name), [
         "adoptions",
+        "analysis_budget_runs",
         "analysis_executions",
         "analysis_snapshots",
         "dismissals",
@@ -594,6 +741,30 @@ test("SQLite bootstrap is private, idempotent, and creates the Store v3 schema",
           ["execution_id", "TEXT", 1],
           ["snapshot_id", "TEXT", 0],
           ["executed_at_ms", "INTEGER", 0],
+        ],
+        analysis_budget_runs: [
+          ["execution_id", "TEXT", 1],
+          ["max_input_bytes", "INTEGER", 0],
+          ["max_input_events", "INTEGER", 0],
+          ["max_wall_ms", "INTEGER", 0],
+          ["max_cpu_ms", "INTEGER", 0],
+          ["max_output_bytes", "INTEGER", 0],
+          ["max_source_items", "INTEGER", 0],
+          ["consumed_input_bytes", "INTEGER", 0],
+          ["consumed_input_events", "INTEGER", 0],
+          ["consumed_wall_ms", "INTEGER", 0],
+          ["consumed_cpu_ms", "INTEGER", 0],
+          ["consumed_output_bytes", "INTEGER", 0],
+          ["consumed_source_items", "INTEGER", 0],
+          ["observed_input_bytes", "INTEGER", 0],
+          ["observed_input_events", "INTEGER", 0],
+          ["observed_wall_ms", "INTEGER", 0],
+          ["observed_cpu_ms", "INTEGER", 0],
+          ["observed_output_bytes", "INTEGER", 0],
+          ["observed_source_items", "INTEGER", 0],
+          ["completeness", "TEXT", 0],
+          ["truncation_reason", "TEXT", 0],
+          ["coverage", "REAL", 0],
         ],
         dismissals: [
           ["finding_key", "TEXT", 1],
@@ -632,7 +803,11 @@ test("SQLite bootstrap is private, idempotent, and creates the Store v3 schema",
           columns.map(({ name, type, pk }) => [name, type.toUpperCase(), pk]),
           expected,
         );
-        const nullable = table === "source_catalog" ? new Set(["device", "inode"]) : new Set();
+        const nullable = table === "source_catalog"
+          ? new Set(["device", "inode"])
+          : table === "analysis_budget_runs"
+          ? new Set(["truncation_reason"])
+          : new Set();
         assert.ok(columns.every(({ name, notnull }) =>
           notnull === (nullable.has(name) ? 0 : 1)
         ));
@@ -642,6 +817,9 @@ test("SQLite bootstrap is private, idempotent, and creates the Store v3 schema",
       assert.equal(first.prepare(
         "SELECT count(*) FROM store_migrations WHERE name = ?",
       ).pluck().get("schema-v3-source-catalog"), 1);
+      assert.equal(first.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("schema-v4-analysis-budgets"), 1);
 
       const foreignKeys = first
         .prepare("PRAGMA foreign_key_list(analysis_executions)")
@@ -654,9 +832,65 @@ test("SQLite bootstrap is private, idempotent, and creates the Store v3 schema",
         to: "snapshot_id",
         on_delete: "CASCADE",
       }]);
+
+      const budgetForeignKeys = first
+        .prepare("PRAGMA foreign_key_list(analysis_budget_runs)")
+        .all() as { table: string; from: string; to: string; on_delete: string }[];
+      assert.deepEqual(budgetForeignKeys.map(({ table, from, to, on_delete }) => ({
+        table, from, to, on_delete,
+      })), [{
+        table: "analysis_executions",
+        from: "execution_id",
+        to: "execution_id",
+        on_delete: "CASCADE",
+      }]);
     } finally {
       second.close();
       first.close();
+    }
+  });
+});
+
+test("Store v4 budget rows enforce typed counters, result state, and execution ownership", async () => {
+  await temporaryStore(async (paths) => {
+    const database = openStoreDatabase(paths);
+    try {
+      database.prepare(`INSERT INTO analysis_snapshots
+        (snapshot_id, created_at_ms, record_json) VALUES (?, ?, ?)`)
+        .run("budget-constraints-snapshot", 1, "{}");
+      database.prepare(`INSERT INTO analysis_executions
+        (execution_id, snapshot_id, executed_at_ms) VALUES (?, ?, ?)`)
+        .run("budget-constraints", "budget-constraints-snapshot", 1);
+      insertBudgetRow(database, "budget-constraints", budgetResult("partial"));
+
+      assert.throws(() => database.prepare(`UPDATE analysis_budget_runs
+        SET max_input_bytes = -1 WHERE execution_id = ?`)
+        .run("budget-constraints"), /constraint/iu);
+      assert.throws(() => database.prepare(`UPDATE analysis_budget_runs
+        SET consumed_input_events = 0.5 WHERE execution_id = ?`)
+        .run("budget-constraints"), /constraint/iu);
+      assert.throws(() => database.prepare(`UPDATE analysis_budget_runs
+        SET truncation_reason = 'raw-secret' WHERE execution_id = ?`)
+        .run("budget-constraints"), /constraint/iu);
+      assert.throws(() => database.prepare(`UPDATE analysis_budget_runs
+        SET coverage = 2 WHERE execution_id = ?`)
+        .run("budget-constraints"), /constraint/iu);
+      assert.throws(() => database.prepare(`UPDATE analysis_budget_runs
+        SET completeness = 'complete' WHERE execution_id = ?`)
+        .run("budget-constraints"), /constraint/iu);
+      assert.throws(() => insertBudgetRow(
+        database,
+        "missing-execution",
+        budgetResult(),
+      ), /constraint/iu);
+
+      database.prepare("DELETE FROM analysis_executions WHERE execution_id = ?")
+        .run("budget-constraints");
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_budget_runs",
+      ).pluck().get(), 0);
+    } finally {
+      database.close();
     }
   });
 });
@@ -696,7 +930,7 @@ test("SQLite connections share commits and immediate transactions roll back comp
   });
 });
 
-test("opening an existing v3 schema does not contend with an active writer", async () => {
+test("opening an existing v4 schema does not contend with an active writer", async () => {
   await temporaryStore(async (paths) => {
     const writer = openStoreDatabase(paths);
     let reader: StoreDatabase | undefined;
@@ -713,15 +947,15 @@ test("opening an existing v3 schema does not contend with an active writer", asy
   });
 });
 
-test("a populated Store v2 migrates transactionally to v3 without data loss", async () => {
+test("a populated Store v2 migrates transactionally through v3 to v4 without data loss", async () => {
   await temporaryStore(async (paths) => {
     populatedV2Store(paths).close();
 
     const migrated = openStoreDatabase(paths);
     const reopened = openStoreDatabase(paths);
     try {
-      assert.equal(Number(migrated.pragma("user_version", { simple: true })), 3);
-      assert.equal(Number(reopened.pragma("user_version", { simple: true })), 3);
+      assert.equal(Number(migrated.pragma("user_version", { simple: true })), 4);
+      assert.equal(Number(reopened.pragma("user_version", { simple: true })), 4);
       assert.equal(migrated.prepare(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'source_catalog'",
       ).pluck().get(), 1);
@@ -731,10 +965,13 @@ test("a populated Store v2 migrates transactionally to v3 without data loss", as
       assert.deepEqual(migrations.map(({ name }) => name), [
         "legacy-sentinel",
         "schema-v3-source-catalog",
+        "schema-v4-analysis-budgets",
       ]);
       assert.equal(migrations[0]?.completed_at_ms, 11);
       assert.ok(Number.isSafeInteger(migrations[1]?.completed_at_ms));
       assert.ok((migrations[1]?.completed_at_ms ?? -1) >= 0);
+      assert.ok(Number.isSafeInteger(migrations[2]?.completed_at_ms));
+      assert.ok((migrations[2]?.completed_at_ms ?? -1) >= 0);
       assert.deepEqual(migrated.prepare(
         "SELECT snapshot_id, created_at_ms, record_json FROM analysis_snapshots",
       ).get(), {
@@ -754,6 +991,12 @@ test("a populated Store v2 migrates transactionally to v3 without data loss", as
       assert.equal(migrated.prepare(
         "SELECT count(*) FROM store_migrations WHERE name = ?",
       ).pluck().get("schema-v3-source-catalog"), 1);
+      assert.equal(migrated.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("schema-v4-analysis-budgets"), 1);
+      assert.equal(migrated.prepare(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'analysis_budget_runs'",
+      ).pluck().get(), 1);
     } finally {
       reopened.close();
       migrated.close();
@@ -761,22 +1004,22 @@ test("a populated Store v2 migrates transactionally to v3 without data loss", as
   });
 });
 
-test("Store v2 migration failure rolls back table, marker, version, and preserves rows", async () => {
+test("Store v2 migration failure rolls back both new tables, markers, version, and preserves rows", async () => {
   await temporaryStore(async (paths) => {
     const v2 = populatedV2Store(paths);
     try {
       v2.exec(`
-        CREATE TRIGGER fail_source_catalog_migration
+        CREATE TRIGGER fail_analysis_budgets_migration
         BEFORE INSERT ON store_migrations
-        WHEN NEW.name = 'schema-v3-source-catalog'
+        WHEN NEW.name = 'schema-v4-analysis-budgets'
         BEGIN
-          SELECT RAISE(ABORT, 'forced Store v3 migration failure');
+          SELECT RAISE(ABORT, 'forced Store v4 migration failure');
         END;
       `);
 
       assert.throws(
         () => openStoreDatabase(paths),
-        /forced Store v3 migration failure/u,
+        /forced Store v4 migration failure/u,
       );
       assert.equal(Number(v2.pragma("user_version", { simple: true })), 2);
       assert.equal(v2.prepare(
@@ -786,21 +1029,119 @@ test("Store v2 migration failure rolls back table, marker, version, and preserve
         "SELECT count(*) FROM store_migrations WHERE name = ?",
       ).pluck().get("schema-v3-source-catalog"), 0);
       assert.equal(v2.prepare(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'analysis_budget_runs'",
+      ).pluck().get(), 0);
+      assert.equal(v2.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("schema-v4-analysis-budgets"), 0);
+      assert.equal(v2.prepare(
         "SELECT record_json FROM analysis_snapshots WHERE snapshot_id = ?",
       ).pluck().get("snapshot-v2"), '{"schema":"v2"}');
 
-      v2.exec("DROP TRIGGER fail_source_catalog_migration");
+      v2.exec("DROP TRIGGER fail_analysis_budgets_migration");
     } finally {
       v2.close();
     }
 
     const retried = openStoreDatabase(paths);
     try {
-      assert.equal(Number(retried.pragma("user_version", { simple: true })), 3);
+      assert.equal(Number(retried.pragma("user_version", { simple: true })), 4);
       assert.equal(retried.prepare(
         "SELECT count(*) FROM store_migrations WHERE name = ?",
       ).pluck().get("schema-v3-source-catalog"), 1);
+      assert.equal(retried.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("schema-v4-analysis-budgets"), 1);
       assert.equal(retried.prepare("SELECT count(*) FROM analysis_snapshots").pluck().get(), 1);
+    } finally {
+      retried.close();
+    }
+  });
+});
+
+test("a populated Store v3 migrates transactionally to v4 and reopens idempotently", async () => {
+  await temporaryStore(async (paths) => {
+    populatedV3Store(paths).close();
+
+    const migrated = openStoreDatabase(paths);
+    const reopened = openStoreDatabase(paths);
+    try {
+      assert.equal(Number(migrated.pragma("user_version", { simple: true })), 4);
+      assert.equal(Number(reopened.pragma("user_version", { simple: true })), 4);
+      assert.equal(migrated.prepare(
+        "SELECT count(*) FROM source_catalog WHERE canonical_path = ?",
+      ).pluck().get("/repo/v3.jsonl"), 1);
+      assert.equal(migrated.prepare(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'analysis_budget_runs'",
+      ).pluck().get(), 1);
+      assert.deepEqual(migrated.prepare(
+        "SELECT name FROM store_migrations ORDER BY name",
+      ).pluck().all(), [
+        "legacy-sentinel-v3",
+        "schema-v3-source-catalog",
+        "schema-v4-analysis-budgets",
+      ]);
+    } finally {
+      reopened.close();
+      migrated.close();
+    }
+  });
+});
+
+test("Store v3 migration failure rolls back budget table, marker, and version without data loss", async () => {
+  await temporaryStore(async (paths) => {
+    const v3 = populatedV3Store(paths);
+    try {
+      v3.prepare(`INSERT INTO analysis_snapshots
+        (snapshot_id, created_at_ms, record_json) VALUES (?, ?, ?)`)
+        .run("snapshot-v3", 22, '{"schema":"v3"}');
+      v3.prepare(`INSERT INTO analysis_executions
+        (execution_id, snapshot_id, executed_at_ms) VALUES (?, ?, ?)`)
+        .run("execution-v3", "snapshot-v3", 23);
+      v3.exec(`
+        CREATE TRIGGER fail_analysis_budgets_migration
+        BEFORE INSERT ON store_migrations
+        WHEN NEW.name = 'schema-v4-analysis-budgets'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced Store v4 migration failure');
+        END;
+      `);
+
+      assert.throws(
+        () => openStoreDatabase(paths),
+        /forced Store v4 migration failure/u,
+      );
+      assert.equal(Number(v3.pragma("user_version", { simple: true })), 3);
+      assert.equal(v3.prepare(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'analysis_budget_runs'",
+      ).pluck().get(), 0);
+      assert.equal(v3.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("schema-v4-analysis-budgets"), 0);
+      assert.equal(v3.prepare(
+        "SELECT record_json FROM analysis_snapshots WHERE snapshot_id = ?",
+      ).pluck().get("snapshot-v3"), '{"schema":"v3"}');
+      assert.equal(v3.prepare(
+        "SELECT count(*) FROM source_catalog WHERE canonical_path = ?",
+      ).pluck().get("/repo/v3.jsonl"), 1);
+
+      v3.exec("DROP TRIGGER fail_analysis_budgets_migration");
+    } finally {
+      v3.close();
+    }
+
+    const retried = openStoreDatabase(paths);
+    try {
+      assert.equal(Number(retried.pragma("user_version", { simple: true })), 4);
+      assert.equal(retried.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get("schema-v4-analysis-budgets"), 1);
+      assert.equal(retried.prepare(
+        "SELECT count(*) FROM analysis_executions WHERE execution_id = ?",
+      ).pluck().get("execution-v3"), 1);
+      assert.equal(retried.prepare(
+        "SELECT count(*) FROM source_catalog WHERE canonical_path = ?",
+      ).pluck().get("/repo/v3.jsonl"), 1);
     } finally {
       retried.close();
     }
@@ -1027,6 +1368,218 @@ test("rich snapshot input and normalized-result changes create distinct snapshot
       assert.equal(database.prepare(
         "SELECT count(*) FROM analysis_executions",
       ).pluck().get(), 3);
+    } finally {
+      database.close();
+    }
+  });
+});
+
+test("analysis budget results save and load through normalized Store v4 rows", async () => {
+  await temporaryStore(async (paths) => {
+    const complete = budgetRecord("budget-complete", 100, "complete");
+    const partial = budgetRecord("budget-partial", 200, "partial");
+
+    assert.deepEqual((await saveAnalysis(paths, complete)).warnings, []);
+    assert.deepEqual((await saveAnalysis(paths, partial)).warnings, []);
+    assert.deepEqual((await saveAnalysis(paths, complete)).warnings, []);
+
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded.warnings, []);
+    assert.deepEqual(loaded.records, [complete, partial]);
+
+    const database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_snapshots",
+      ).pluck().get(), 2);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_executions",
+      ).pluck().get(), 2);
+      assert.deepEqual(database.prepare(`SELECT ${BUDGET_ROW_COLUMNS.join(", ")}
+        FROM analysis_budget_runs ORDER BY execution_id`).all(), [
+        storedBudgetRow(complete.analysis_id, complete.analysis_budget),
+        storedBudgetRow(partial.analysis_id, partial.analysis_budget),
+      ]);
+    } finally {
+      database.close();
+    }
+  });
+});
+
+test("analysis record budget descriptors fail closed without evaluating hostile input", async () => {
+  await temporaryStore(async (paths) => {
+    let getterReads = 0;
+    const accessor = record("budget-accessor", 100) as AnalysisRecord & {
+      analysis_budget?: AnalysisBudgetResult;
+    };
+    Object.defineProperty(accessor, "analysis_budget", {
+      enumerable: true,
+      get() {
+        getterReads += 1;
+        throw new Error("token-canary");
+      },
+    });
+    await assert.rejects(() => saveAnalysis(paths, accessor), (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.ok(!String(error).includes("token-canary"));
+      return true;
+    });
+    assert.equal(getterReads, 0);
+
+    const hidden = record("budget-hidden", 200) as AnalysisRecord & {
+      analysis_budget?: AnalysisBudgetResult;
+    };
+    Object.defineProperty(hidden, "analysis_budget", {
+      enumerable: false,
+      value: budgetResult(),
+    });
+    await assert.rejects(() => saveAnalysis(paths, hidden), (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.ok(!String(error).includes("budget-hidden"));
+      return true;
+    });
+
+    const proxy = new Proxy(budgetRecord("budget-proxy", 300), {
+      ownKeys() {
+        throw new Error("token-canary");
+      },
+    });
+    await assert.rejects(() => saveAnalysis(paths, proxy), (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.ok(!String(error).includes("token-canary"));
+      return true;
+    });
+
+    const database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_executions",
+      ).pluck().get(), 0);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_budget_runs",
+      ).pluck().get(), 0);
+    } finally {
+      database.close();
+    }
+  });
+});
+
+test("legacy analysis snapshots remain readable with no synthetic budget result", async () => {
+  await temporaryStore(async (paths) => {
+    const legacy = record("legacy-without-budget", 100);
+    assert.deepEqual((await saveAnalysis(paths, legacy)).warnings, []);
+
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded, { records: [legacy], warnings: [] });
+    assert.equal("analysis_budget" in (loaded.records[0] ?? {}), false);
+
+    const database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_budget_runs",
+      ).pluck().get(), 0);
+    } finally {
+      database.close();
+    }
+  });
+});
+
+test("analysis execution, snapshot, and budget row roll back atomically", async () => {
+  await temporaryStore(async (paths) => {
+    const database = openStoreDatabase(paths);
+    try {
+      database.exec(`CREATE TRIGGER reject_analysis_budget
+        BEFORE INSERT ON analysis_budget_runs BEGIN
+          SELECT RAISE(ABORT, 'forced analysis budget write failure');
+        END`);
+    } finally {
+      database.close();
+    }
+
+    const saved = await saveAnalysis(
+      paths,
+      budgetRecord("budget-atomic-failure", 100, "partial"),
+    );
+    assert.ok(saved.warnings.some(({ code, message }) =>
+      code === "analysis_write_failed" &&
+      /forced analysis budget write failure/u.test(message)
+    ));
+
+    const reopened = openStoreDatabase(paths);
+    try {
+      assert.equal(reopened.prepare(
+        "SELECT count(*) FROM analysis_snapshots",
+      ).pluck().get(), 0);
+      assert.equal(reopened.prepare(
+        "SELECT count(*) FROM analysis_executions",
+      ).pluck().get(), 0);
+      assert.equal(reopened.prepare(
+        "SELECT count(*) FROM analysis_budget_runs",
+      ).pluck().get(), 0);
+    } finally {
+      reopened.close();
+    }
+  });
+});
+
+test("budget conflicts and mirror corruption fail closed without mutation", async () => {
+  await temporaryStore(async (paths) => {
+    const original = budgetRecord("budget-immutable", 100, "partial");
+    assert.deepEqual((await saveAnalysis(paths, original)).warnings, []);
+
+    const conflicting = {
+      ...original,
+      analysis_budget: {
+        ...original.analysis_budget,
+        configured: {
+          ...original.analysis_budget.configured,
+          max_input_bytes: 11,
+        },
+      },
+    };
+    const conflict = await saveAnalysis(paths, conflicting);
+    assert.ok(conflict.warnings.some(
+      ({ code }) => code === "analysis_record_conflict",
+    ));
+
+    let database = openStoreDatabase(paths);
+    try {
+      assert.deepEqual(database.prepare(`SELECT ${BUDGET_ROW_COLUMNS.join(", ")}
+        FROM analysis_budget_runs WHERE execution_id = ?`)
+        .get(original.analysis_id), storedBudgetRow(
+          original.analysis_id,
+          original.analysis_budget,
+        ));
+      database.prepare(`UPDATE analysis_budget_runs SET coverage = ?
+        WHERE execution_id = ?`).run(0.25, original.analysis_id);
+    } finally {
+      database.close();
+    }
+
+    const replay = await saveAnalysis(paths, original);
+    assert.ok(replay.warnings.some(
+      ({ code }) => code === "analysis_record_conflict",
+    ));
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded.records, []);
+    assert.ok(loaded.warnings.some(
+      ({ code }) => code === "corrupt_analysis_record",
+    ));
+
+    database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT coverage FROM analysis_budget_runs WHERE execution_id = ?",
+      ).pluck().get(original.analysis_id), 0.25);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_snapshots",
+      ).pluck().get(), 1);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_executions",
+      ).pluck().get(), 1);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM analysis_budget_runs",
+      ).pluck().get(), 1);
     } finally {
       database.close();
     }

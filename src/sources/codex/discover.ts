@@ -1,4 +1,4 @@
-import { readdir, realpath } from "node:fs/promises";
+import { readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import {
   join,
@@ -7,6 +7,7 @@ import {
   sep,
 } from "node:path";
 
+import type { AnalysisBudgetMeter } from "../../analysis/budgets.js";
 import type { Session, SourceWarning } from "../../core/model.js";
 import { canonicalPath } from "../../git/common-dir.js";
 import {
@@ -18,6 +19,8 @@ import type {
   SessionQuery,
   SessionSource,
 } from "../session-source.js";
+import { admitSessionEventPrefix } from "../session-source.js";
+import { ParserBudgetExceededError } from "../jsonl-budget.js";
 import { parseCodexSession } from "./parser.js";
 
 export interface CodexDiscoverOptions {
@@ -27,6 +30,10 @@ export interface CodexDiscoverOptions {
 
 const ROLLOUT_FILE_PATTERN = /^rollout-.*\.jsonl$/u;
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
 
 function intersects(session: Session, query: SessionQuery): boolean {
   return (
@@ -80,6 +87,39 @@ async function findRolloutFiles(directory: string): Promise<string[]> {
   return files;
 }
 
+async function* findRolloutFilesBudgeted(
+  directory: string,
+  warnings: SourceWarning[],
+  meter: AnalysisBudgetMeter,
+): AsyncGenerator<string> {
+  if (!meter.checkpoint()) return;
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch {
+    warnings.push(
+      sourceWarning(
+        "codex_source_read_error",
+        "Could not read a Codex sessions directory.",
+        directory,
+      ),
+    );
+    meter.recordSourceFailure();
+    return;
+  }
+  entries.sort((left, right) => compareCodeUnits(left.name, right.name));
+  for (const entry of entries) {
+    if (!meter.checkpoint()) return;
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      yield* findRolloutFilesBudgeted(path, warnings, meter);
+      if (meter.stopped) return;
+    } else if (entry.isFile() && ROLLOUT_FILE_PATTERN.test(entry.name)) {
+      yield path;
+    }
+  }
+}
+
 /**
  * Reads the `YYYY/MM/DD` the rollout file lives under, relative to the
  * sessions root, as a UTC midnight timestamp. Returns undefined when the
@@ -121,7 +161,7 @@ function withinDiscoveryWindow(
   );
 }
 
-export async function discoverCodexSessions(
+async function discoverCodexSessionsUnbudgeted(
   sessionsDirectory: string,
   query: SessionQuery,
 ): Promise<Session[]> {
@@ -131,18 +171,14 @@ export async function discoverCodexSessions(
   } catch {
     return [];
   }
-
   const files = (await findRolloutFiles(root)).sort((left, right) =>
     left.localeCompare(right)
   );
   const repoRoot = await canonicalPath(query.repoRoot);
   const globalWarnings: SourceWarning[] = [];
   const sessions: Session[] = [];
-
   for (const file of files) {
-    if (!withinDiscoveryWindow(root, file, query)) {
-      continue;
-    }
+    if (!withinDiscoveryWindow(root, file, query)) continue;
     let parsed: Session | null;
     try {
       parsed = await parseCodexSession({
@@ -159,13 +195,137 @@ export async function discoverCodexSessions(
       );
       continue;
     }
+    if (parsed === null) continue;
+    const canonicalSession = await canonicalizeSessionCwds(parsed);
+    if (!intersects(canonicalSession, query)) continue;
+    if (
+      !(await cwdMatchesRepository(repoRoot, canonicalSession.observed_cwds))
+    ) {
+      continue;
+    }
+    const session = await alignSessionCwdsToRepository(
+      canonicalSession,
+      repoRoot,
+    );
+    const branch = session.observed_branches[0];
+    if (branch === undefined) {
+      sessions.push({
+        ...session,
+        confidence: "low",
+        warnings: [...session.warnings, missingBranchWarning(session)],
+      });
+      continue;
+    }
+    if (branch === query.headBranch) sessions.push(session);
+  }
+  return globalWarnings.length === 0
+    ? sessions
+    : sessions.map((session) => ({
+        ...session,
+        warnings: [...session.warnings, ...globalWarnings],
+      }));
+}
+
+export async function discoverCodexSessions(
+  sessionsDirectory: string,
+  query: SessionQuery,
+): Promise<Session[]> {
+  const meter = query.analysisBudgetMeter;
+  if (meter === undefined) {
+    return discoverCodexSessionsUnbudgeted(sessionsDirectory, query);
+  }
+  if (!meter.checkpoint()) return [];
+  let root: string;
+  try {
+    root = await realpath(sessionsDirectory);
+  } catch {
+    meter.recordSourceFailure();
+    return [];
+  }
+
+  if (!meter.checkpoint()) return [];
+  const repoRoot = await canonicalPath(query.repoRoot);
+  if (!meter.checkpoint()) return [];
+  const globalWarnings: SourceWarning[] = [];
+  const files = findRolloutFilesBudgeted(root, globalWarnings, meter);
+  const sessions: Session[] = [];
+
+  fileLoop: for await (const file of files) {
+    if (!meter.checkpoint()) break;
+    if (!withinDiscoveryWindow(root, file, query)) {
+      continue;
+    }
+    let fileSize: number | undefined;
+    let admittedFileBytes: number | undefined;
+    if (!meter.admitSourceItem()) break;
+    try {
+      fileSize = (await stat(file)).size;
+    } catch {
+      meter.recordSourceFailure();
+      globalWarnings.push(
+        sourceWarning(
+          "codex_source_read_error",
+          "Could not inspect a Codex rollout transcript.",
+          file,
+        ),
+      );
+      break;
+    }
+    if (!meter.checkpoint()) break;
+    if (
+      fileSize === undefined ||
+      !Number.isSafeInteger(fileSize) ||
+      fileSize < 0
+    ) {
+      meter.recordSourceFailure();
+      break;
+    }
+    admittedFileBytes = meter.admitInputBytes(fileSize);
+    if (admittedFileBytes === 0 && fileSize > 0) break;
+    let parsed: Session | null;
+    try {
+      parsed = await parseCodexSession({
+        sourcePath: file,
+        endedAtMs: query.endedAtMs,
+        ...(admittedFileBytes === undefined
+          ? {}
+          : { budgets: { maxFileBytes: admittedFileBytes } }),
+      });
+    } catch (error) {
+      const expectedByteTruncation =
+        admittedFileBytes !== undefined &&
+        fileSize !== undefined &&
+        admittedFileBytes < fileSize &&
+        error instanceof ParserBudgetExceededError &&
+        error.budget === "file";
+      if (!expectedByteTruncation) {
+        globalWarnings.push(
+          sourceWarning(
+            "codex_source_read_error",
+            "Could not read a Codex rollout transcript.",
+            file,
+          ),
+        );
+        meter.recordSourceFailure();
+      }
+      break;
+    }
     if (parsed === null) {
       continue;
     }
-    const canonicalSession = await canonicalizeSessionCwds(parsed);
+    const knownBranchMismatch = parsed.observed_branches.some(
+      (branch) => branch !== query.headBranch,
+    );
+    const admitted = admitSessionEventPrefix([parsed], meter);
+    const admittedSession = admitted[0];
+    if (admittedSession === undefined) break;
+    if (knownBranchMismatch) continue;
+    if (!meter.stopped && !meter.checkpoint()) break;
+    const canonicalSession = await canonicalizeSessionCwds(admittedSession);
     if (!intersects(canonicalSession, query)) {
       continue;
     }
+    if (!meter.stopped && !meter.checkpoint()) break;
     if (
       !(await cwdMatchesRepository(
         repoRoot,
@@ -173,6 +333,9 @@ export async function discoverCodexSessions(
       ))
     ) {
       continue;
+    }
+    if (!meter.stopped && !meter.checkpoint()) {
+      break fileLoop;
     }
     const session = await alignSessionCwdsToRepository(
       canonicalSession,

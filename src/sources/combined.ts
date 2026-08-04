@@ -28,6 +28,20 @@ export class CombinedSessionSource implements SessionSource {
   }
 
   async discover(query: SessionQuery): Promise<Session[]> {
+    const meter = query.analysisBudgetMeter;
+    if (meter !== undefined) {
+      const sessions: Session[] = [];
+      for (const source of this.#sources) {
+        if (!meter.checkpoint()) break;
+        try {
+          sessions.push(...await source.discover(query));
+        } catch (error) {
+          this.#onSourceError?.(error);
+          meter.recordSourceFailure();
+        }
+      }
+      return sessions;
+    }
     const results = await Promise.all(
       this.#sources.map(async (source) => {
         try {

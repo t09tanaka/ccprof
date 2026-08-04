@@ -2,8 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { Session } from "../src/core/model.js";
+import {
+  AnalysisBudgetMeter,
+  type AnalysisBudgetClock,
+  type AnalysisBudgets,
+} from "../src/analysis/budgets.js";
 import { CombinedSessionSource } from "../src/sources/combined.js";
-import type { SessionQuery, SessionSource } from "../src/sources/session-source.js";
+import {
+  admitSessionEventPrefix,
+  type SessionQuery,
+  type SessionSource,
+} from "../src/sources/session-source.js";
 
 const query: SessionQuery = {
   repoRoot: "/repo",
@@ -36,6 +45,23 @@ function throwingSource(error: unknown): SessionSource {
     discover: async () => {
       throw error;
     },
+  };
+}
+
+const clock: AnalysisBudgetClock = {
+  wall_ms: () => 0,
+  cpu_ms: () => 0,
+};
+
+function budgets(overrides: Partial<AnalysisBudgets> = {}): AnalysisBudgets {
+  return {
+    max_input_bytes: 1_000,
+    max_input_events: 100,
+    max_wall_ms: 1_000,
+    max_cpu_ms: 1_000,
+    max_output_bytes: 1_000,
+    max_source_items: 1,
+    ...overrides,
   };
 }
 
@@ -96,4 +122,410 @@ test("discover() never rejects because of a source failure, even without an onSo
   ]);
 
   await assert.doesNotReject(combined.discover(query));
+});
+
+test("unbudgeted combined discovery starts independent sources in parallel", async () => {
+  const order: string[] = [];
+  let releaseFirst = (): void => undefined;
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const first: SessionSource = {
+    discover: async () => {
+      order.push("first:start");
+      await firstGate;
+      order.push("first:end");
+      return [fakeSession("first")];
+    },
+  };
+  const second: SessionSource = {
+    discover: async () => {
+      order.push("second:start");
+      return [fakeSession("second")];
+    },
+  };
+  const pending = new CombinedSessionSource([first, second]).discover(query);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(order, ["first:start", "second:start"]);
+  releaseFirst();
+  await pending;
+});
+
+test("budgeted combined discovery is sequential and stops at the shared source-item boundary", async () => {
+  const meter = new AnalysisBudgetMeter(budgets(), clock);
+  const budgetedQuery = { ...query, analysisBudgetMeter: meter };
+  const order: string[] = [];
+  const budgetAware = (
+    name: string,
+  ): SessionSource => ({
+    discover: async (sourceQuery) => {
+      order.push(`${name}:start`);
+      await Promise.resolve();
+      const admitted = (sourceQuery as SessionQuery & {
+        analysisBudgetMeter: AnalysisBudgetMeter;
+      }).analysisBudgetMeter.admitSourceItem();
+      order.push(`${name}:end`);
+      return admitted ? [fakeSession(name)] : [];
+    },
+  });
+  const errors: unknown[] = [];
+  const combined = new CombinedSessionSource(
+    [budgetAware("first"), budgetAware("second")],
+    (error) => errors.push(error),
+  );
+
+  const sessions = await combined.discover(budgetedQuery);
+
+  assert.deepEqual(order, [
+    "first:start",
+    "first:end",
+    "second:start",
+    "second:end",
+  ]);
+  assert.deepEqual(sessions.map(({ source_path }) => source_path), ["first"]);
+  assert.deepEqual(errors, []);
+  assert.equal(meter.result().truncation_reason, "max_source_items");
+  assert.equal(meter.result().consumed.source_items, 1);
+  assert.equal(meter.result().observed.source_items, 2);
+});
+
+test("budgeted source failure is content-free and prevents the next source from starting", async () => {
+  const meter = new AnalysisBudgetMeter(budgets(), clock);
+  const started: string[] = [];
+  const failure = new Error("token-canary");
+  const combined = new CombinedSessionSource([
+    {
+      discover: async () => {
+        started.push("first");
+        throw failure;
+      },
+    },
+    {
+      discover: async () => {
+        started.push("second");
+        return [fakeSession("second")];
+      },
+    },
+  ]);
+
+  const budgetedQuery = {
+    ...query,
+    analysisBudgetMeter: meter,
+  };
+  const sessions = await combined.discover(budgetedQuery);
+
+  assert.deepEqual(sessions, []);
+  assert.deepEqual(started, ["first"]);
+  assert.equal(meter.result().truncation_reason, "source_failure");
+  assert.equal(meter.result().coverage, 0);
+  assert.ok(!JSON.stringify(meter.result()).includes("token-canary"));
+});
+
+test("budgeted combined discovery checkpoints before starting an adapter", async () => {
+  let wallReads = 0;
+  const expiringClock: AnalysisBudgetClock = {
+    wall_ms: () => wallReads++ === 0 ? 0 : 1,
+    cpu_ms: () => 0,
+  };
+  const meter = new AnalysisBudgetMeter(
+    budgets({ max_wall_ms: 0 }),
+    expiringClock,
+  );
+  let sourceCalls = 0;
+  const combined = new CombinedSessionSource([{
+    discover: async () => {
+      sourceCalls += 1;
+      return [fakeSession("must-not-start")];
+    },
+  }]);
+
+  const sessions = await combined.discover({
+    ...query,
+    analysisBudgetMeter: meter,
+  });
+
+  assert.deepEqual(sessions, []);
+  assert.equal(sourceCalls, 0);
+  assert.equal(meter.result().truncation_reason, "max_wall_ms");
+});
+
+test("event admission follows one physical source-index prefix across interleaved sessions", () => {
+  const event = (sessionId: string, sourceIndex: number): Session["events"][number] => ({
+    kind: "assistant",
+    timestamp_ms: sourceIndex + 1,
+    session_id: sessionId,
+    entry_uuid: `${sessionId}-${sourceIndex.toString(10)}`,
+    session_ref: `${sessionId}#${sourceIndex.toString(10)}`,
+    source_index: sourceIndex,
+    agent_id: sessionId,
+    is_sidechain: false,
+    confidence: "high",
+    text: sessionId,
+  });
+  const first: Session = {
+    ...fakeSession("shared.jsonl"),
+    session_id: "first",
+    events: [event("first", 0), event("first", 2)],
+  };
+  const second: Session = {
+    ...fakeSession("shared.jsonl"),
+    session_id: "second",
+    events: [event("second", 1), event("second", 3)],
+  };
+  const meter = new AnalysisBudgetMeter(
+    budgets({ max_input_events: 2 }),
+    clock,
+  );
+
+  const admitted = admitSessionEventPrefix([first, second], meter);
+
+  assert.deepEqual(
+    admitted.map(({ session_id, events }) => ({
+      session_id,
+      source_indices: events.map(({ source_index }) => source_index),
+    })),
+    [
+      { session_id: "first", source_indices: [0] },
+      { session_id: "second", source_indices: [1] },
+    ],
+  );
+  assert.equal(meter.result().consumed.input_events, 2);
+  assert.equal(meter.result().observed.input_events, 4);
+  assert.equal(meter.result().truncation_reason, "max_input_events");
+});
+
+test("event admission removes suffix-derived session metadata and warnings", () => {
+  const sourcePath = "/repo/shared.jsonl";
+  const tool = (
+    entry: string,
+    sourceIndex: number,
+    cwd: string,
+    branch: string,
+  ): Session["events"][number] => ({
+    kind: "tool_use",
+    timestamp_ms: sourceIndex + 1,
+    session_id: "shared",
+    entry_uuid: entry,
+    session_ref: `shared#${entry}`,
+    source_index: sourceIndex,
+    agent_id: "shared",
+    is_sidechain: false,
+    confidence: "high",
+    branch,
+    tool_use_id: entry,
+    tool_name: "Read",
+    input: {},
+    paths: [],
+    edit_fragments: [],
+    cwd,
+  });
+  const prefix = tool("prefix", 0, "/repo/prefix", "feature/prefix");
+  const suffix = tool("suffix", 1, "/repo/suffix", "feature/suffix");
+  const meter = new AnalysisBudgetMeter(
+    budgets({ max_input_events: 1 }),
+    clock,
+  );
+  const admitted = admitSessionEventPrefix([{
+    ...fakeSession(sourcePath),
+    session_id: "shared",
+    observed_cwds: ["/repo/prefix", "/repo/suffix"],
+    observed_branches: ["feature/prefix", "feature/suffix"],
+    events: [prefix, suffix],
+    warnings: [
+      {
+        code: "prefix_warning",
+        message: "prefix",
+        source_path: sourcePath,
+        line: 1,
+        session_ref: prefix.session_ref,
+      },
+      {
+        code: "suffix_warning",
+        message: "suffix",
+        source_path: sourcePath,
+        line: 2,
+        session_ref: suffix.session_ref,
+      },
+      {
+        code: "unscoped_warning",
+        message: "unscoped",
+        source_path: sourcePath,
+      },
+    ],
+  }], meter);
+
+  assert.deepEqual(admitted[0]?.observed_cwds, ["/repo/prefix"]);
+  assert.deepEqual(admitted[0]?.observed_branches, ["feature/prefix"]);
+  assert.deepEqual(
+    admitted[0]?.warnings.map(({ code }) => code),
+    ["prefix_warning"],
+  );
+});
+
+test("event admission uses deterministic identity ties for equal source indices", () => {
+  const tied = (sessionRef: string): Session => {
+    const [sessionId, entryUuid] = sessionRef.split("#") as [string, string];
+    return {
+      ...fakeSession("/repo/shared.jsonl"),
+      session_id: sessionId,
+      events: [{
+        kind: "assistant",
+        timestamp_ms: 1,
+        session_id: sessionId,
+        entry_uuid: entryUuid,
+        session_ref: sessionRef,
+        source_index: 0,
+        agent_id: sessionId,
+        is_sidechain: false,
+        confidence: "high",
+        text: sessionRef,
+      }],
+    };
+  };
+  const meter = new AnalysisBudgetMeter(
+    budgets({ max_input_events: 1 }),
+    clock,
+  );
+
+  const admitted = admitSessionEventPrefix(
+    [tied("z#entry"), tied("a#entry")],
+    meter,
+  );
+
+  assert.deepEqual(admitted.map(({ session_id }) => session_id), ["a"]);
+});
+
+test("tool-use identity breaks equal source-index ties independent of input order", () => {
+  const tiedTool = (toolUseId: string): Session["events"][number] => ({
+    kind: "tool_use",
+    timestamp_ms: 1,
+    session_id: "shared",
+    entry_uuid: "same-entry",
+    session_ref: "shared#same-entry",
+    source_index: 0,
+    agent_id: "shared",
+    is_sidechain: false,
+    confidence: "high",
+    tool_use_id: toolUseId,
+    tool_name: "Read",
+    input: {},
+    paths: [],
+    edit_fragments: [],
+  });
+  const admittedTool = (toolUseIds: readonly string[]): string | undefined => {
+    const meter = new AnalysisBudgetMeter(
+      budgets({ max_input_events: 1 }),
+      clock,
+    );
+    const [session] = admitSessionEventPrefix([{
+      ...fakeSession("/repo/shared.jsonl"),
+      session_id: "shared",
+      events: toolUseIds.map(tiedTool),
+    }], meter);
+    const event = session?.events[0];
+    return event?.kind === "tool_use" ? event.tool_use_id : undefined;
+  };
+
+  assert.equal(admittedTool(["z-call", "a-call"]), "a-call");
+  assert.equal(admittedTool(["a-call", "z-call"]), "a-call");
+});
+
+test("truncated session confidence comes only from admitted events", () => {
+  const event = (
+    entryUuid: string,
+    sourceIndex: number,
+    confidence: "high" | "low",
+  ): Session["events"][number] => ({
+    kind: "assistant",
+    timestamp_ms: sourceIndex + 1,
+    session_id: "confidence",
+    entry_uuid: entryUuid,
+    session_ref: `confidence#${entryUuid}`,
+    source_index: sourceIndex,
+    agent_id: "confidence",
+    is_sidechain: false,
+    confidence,
+    text: entryUuid,
+  });
+  const meter = new AnalysisBudgetMeter(
+    budgets({ max_input_events: 1 }),
+    clock,
+  );
+
+  const admitted = admitSessionEventPrefix([{
+    ...fakeSession("/repo/confidence.jsonl"),
+    session_id: "confidence",
+    confidence: "low",
+    events: [event("prefix", 0, "high"), event("suffix", 1, "low")],
+  }], meter);
+
+  assert.equal(admitted[0]?.confidence, "high");
+});
+
+test("truncated warning must match both an admitted reference and line", () => {
+  const event = (entryUuid: string, sourceIndex: number): Session["events"][number] => ({
+    kind: "assistant",
+    timestamp_ms: sourceIndex + 1,
+    session_id: "warnings",
+    entry_uuid: entryUuid,
+    session_ref: `warnings#${entryUuid}`,
+    source_index: sourceIndex,
+    agent_id: "warnings",
+    is_sidechain: false,
+    confidence: "high",
+    text: entryUuid,
+  });
+  const prefix = event("prefix", 0);
+  const meter = new AnalysisBudgetMeter(
+    budgets({ max_input_events: 1 }),
+    clock,
+  );
+
+  const admitted = admitSessionEventPrefix([{
+    ...fakeSession("/repo/warnings.jsonl"),
+    session_id: "warnings",
+    events: [prefix, event("suffix", 1)],
+    warnings: [{
+      code: "suffix_line_with_prefix_ref",
+      message: "suffix",
+      source_path: "/repo/warnings.jsonl",
+      line: 2,
+      session_ref: prefix.session_ref,
+    }],
+  }], meter);
+
+  assert.deepEqual(admitted[0]?.warnings, []);
+});
+
+test("event admission computes large-prefix bounds without variadic min/max", () => {
+  const eventCount = 200_000;
+  const events: Session["events"] = Array.from(
+    { length: eventCount },
+    (_, sourceIndex) => ({
+      kind: "assistant",
+      timestamp_ms: eventCount - sourceIndex,
+      session_id: "large",
+      entry_uuid: `entry-${sourceIndex.toString(10)}`,
+      session_ref: `large#${sourceIndex.toString(10)}`,
+      source_index: sourceIndex,
+      agent_id: "large",
+      is_sidechain: false,
+      confidence: "high",
+      text: "",
+    }),
+  );
+  const meter = new AnalysisBudgetMeter(
+    budgets({ max_input_events: eventCount }),
+    clock,
+  );
+
+  const admitted = admitSessionEventPrefix([{
+    ...fakeSession("large.jsonl"),
+    session_id: "large",
+    events,
+  }], meter);
+
+  assert.equal(admitted[0]?.events.length, eventCount);
+  assert.equal(admitted[0]?.started_at_ms, 1);
+  assert.equal(admitted[0]?.ended_at_ms, eventCount);
 });

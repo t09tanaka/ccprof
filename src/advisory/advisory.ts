@@ -58,9 +58,11 @@ export function buildAdvisoryEnvironment(
 /**
  * Judgment-level LLM commentary rendered alongside — never inside — the
  * deterministic report. It exists only behind the explicit `--advisory`
- * opt-in, is produced after the analysis (and its store write) completed,
- * and is never persisted: `ReportV2`, `AnalysisRecord`, and baselines are
- * structurally unable to carry it.
+ * opt-in, and is never persisted. Unbudgeted commands produce it after the
+ * analysis and Store write; budgeted commands may produce it before the write
+ * solely to finalize outbound bytes. In both paths it remains in the display
+ * closure and is never passed to `ReportV2`, `AnalysisRecord`, snapshots,
+ * baselines, or the Store.
  */
 export interface AdvisoryText {
   source: "llm";

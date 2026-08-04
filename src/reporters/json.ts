@@ -14,6 +14,42 @@ export interface JsonReportOptions {
  */
 type DisplayReport = ReportV2 & { advisory?: AdvisoryText };
 
+function budgetForDisplay(
+  budget: NonNullable<ReportV2["analysis_budget"]>,
+): NonNullable<ReportV2["analysis_budget"]> {
+  return {
+    configured: {
+      max_input_bytes: budget.configured.max_input_bytes,
+      max_input_events: budget.configured.max_input_events,
+      max_wall_ms: budget.configured.max_wall_ms,
+      max_cpu_ms: budget.configured.max_cpu_ms,
+      max_output_bytes: budget.configured.max_output_bytes,
+      max_source_items: budget.configured.max_source_items,
+    },
+    consumed: {
+      input_bytes: budget.consumed.input_bytes,
+      input_events: budget.consumed.input_events,
+      wall_ms: budget.consumed.wall_ms,
+      cpu_ms: budget.consumed.cpu_ms,
+      output_bytes: budget.consumed.output_bytes,
+      source_items: budget.consumed.source_items,
+    },
+    observed: {
+      input_bytes: budget.observed.input_bytes,
+      input_events: budget.observed.input_events,
+      wall_ms: budget.observed.wall_ms,
+      cpu_ms: budget.observed.cpu_ms,
+      output_bytes: budget.observed.output_bytes,
+      source_items: budget.observed.source_items,
+    },
+    completeness: budget.completeness,
+    ...(budget.truncation_reason === undefined
+      ? {}
+      : { truncation_reason: budget.truncation_reason }),
+    coverage: budget.coverage,
+  };
+}
+
 function reportForDisplay(
   report: ReportV2,
   advisory?: AdvisoryText,
@@ -25,6 +61,9 @@ function reportForDisplay(
       pr_ref: report.unit.pr_ref,
       sessions: [...report.unit.sessions],
     },
+    ...(report.analysis_budget === undefined
+      ? {}
+      : { analysis_budget: budgetForDisplay(report.analysis_budget) }),
     ...(report.sources === undefined
       ? {}
       : {

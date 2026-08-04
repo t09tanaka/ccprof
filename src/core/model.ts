@@ -8,6 +8,7 @@
 
 import type { EventIdentity } from "./event-identity.js";
 import type { SourceDescriptor } from "./source-descriptor.js";
+import type { AnalysisBudgetResult } from "../analysis/budgets.js";
 
 export type JsonPrimitive = boolean | number | string | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | JsonObject;
@@ -404,6 +405,8 @@ export interface RuleCoverage {
 export interface ReportV2 {
   version: 2;
   unit: AnalysisUnit;
+  /** Additive run-wide budget facts; absent when no budget was supplied. */
+  analysis_budget?: AnalysisBudgetResult;
   /**
    * Validated, privacy-safe descriptors for source instances used by this
    * analysis. Additive so older stored and constructed v2 reports remain

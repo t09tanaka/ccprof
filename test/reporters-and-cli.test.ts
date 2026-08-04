@@ -30,6 +30,7 @@ import {
   runDismissCommand,
   runExplainCommand,
 } from "../src/commands/dismiss.js";
+import type { AnalysisBudgetResult } from "../src/analysis/budgets.js";
 import type {
   AnalysisSummary,
   CommandIdentity,
@@ -134,6 +135,38 @@ function report(): ReportV2 {
       "Third caveat.",
       "Fourth caveat.",
     ],
+  };
+}
+
+function analysisBudgetResult(): AnalysisBudgetResult {
+  return {
+    configured: {
+      max_input_bytes: 1_000,
+      max_input_events: 100,
+      max_wall_ms: 5_000,
+      max_cpu_ms: 4_000,
+      max_output_bytes: 500,
+      max_source_items: 10,
+    },
+    consumed: {
+      input_bytes: 750,
+      input_events: 50,
+      wall_ms: 2_500,
+      cpu_ms: 2_000,
+      output_bytes: 100,
+      source_items: 5,
+    },
+    observed: {
+      input_bytes: 1_500,
+      input_events: 50,
+      wall_ms: 2_500,
+      cpu_ms: 2_000,
+      output_bytes: 600,
+      source_items: 5,
+    },
+    completeness: "partial",
+    truncation_reason: "max_output_bytes",
+    coverage: 0.5,
   };
 }
 
@@ -422,6 +455,63 @@ test("JSON reporter carries skipped_rules through and omits it when absent", () 
   assert.ok(
     !Object.prototype.hasOwnProperty.call(withoutSkips, "skipped_rules"),
   );
+});
+
+test("JSON renders budget facts in stable contract order and legacy reports omit them", () => {
+  const budgeted = report();
+  budgeted.analysis_budget = analysisBudgetResult();
+  const output = renderJsonReport(budgeted);
+  const parsed = JSON.parse(output) as ReportV2;
+
+  assert.deepEqual(parsed.analysis_budget, budgeted.analysis_budget);
+  assert.deepEqual(Object.keys(parsed), [
+    "version",
+    "unit",
+    "analysis_budget",
+    "summary",
+    "findings",
+    "caveats",
+  ]);
+  assert.deepEqual(Object.keys(parsed.analysis_budget ?? {}), [
+    "configured",
+    "consumed",
+    "observed",
+    "completeness",
+    "truncation_reason",
+    "coverage",
+  ]);
+  assert.deepEqual(Object.keys(parsed.analysis_budget?.configured ?? {}), [
+    "max_input_bytes",
+    "max_input_events",
+    "max_wall_ms",
+    "max_cpu_ms",
+    "max_output_bytes",
+    "max_source_items",
+  ]);
+  assert.deepEqual(Object.keys(parsed.analysis_budget?.consumed ?? {}), [
+    "input_bytes",
+    "input_events",
+    "wall_ms",
+    "cpu_ms",
+    "output_bytes",
+    "source_items",
+  ]);
+
+  const legacy = JSON.parse(renderJsonReport(report())) as ReportV2;
+  assert.equal(legacy.analysis_budget, undefined);
+  assert.ok(!Object.prototype.hasOwnProperty.call(legacy, "analysis_budget"));
+});
+
+test("TTY and Markdown render one content-free budget status line only when present", () => {
+  const budgeted = report();
+  budgeted.analysis_budget = analysisBudgetResult();
+  const expected =
+    "Analysis budget: partial — max_output_bytes (50% coverage).";
+
+  assert.equal(renderTtyReport(budgeted).split(expected).length - 1, 1);
+  assert.equal(renderMarkdownReport(budgeted).split(expected).length - 1, 1);
+  assert.doesNotMatch(renderTtyReport(report()), /Analysis budget:/u);
+  assert.doesNotMatch(renderMarkdownReport(report()), /Analysis budget:/u);
 });
 
 test("TTY and Markdown reporters show a skipped-rules line near caveats only when present", () => {
@@ -1315,6 +1405,29 @@ test("shared privacy uses stable finding references and redacts untrusted verifi
   assert.equal(balanced.findings[0]?.fix_recipe.verify, "[redacted-command]");
   assert.equal(projectReportPrivacy(raw, "raw"), raw);
   assert.match(renderMarkdownReport(strict), new RegExp(reference, "u"));
+});
+
+test("report privacy clones budget facts without changing their values", () => {
+  const raw = privacyReport();
+  raw.analysis_budget = analysisBudgetResult();
+
+  for (const profile of ["strict", "balanced"] as const) {
+    const projected = projectReportPrivacy(raw, profile);
+    assert.deepEqual(projected.analysis_budget, raw.analysis_budget);
+    assert.notEqual(projected.analysis_budget, raw.analysis_budget);
+    assert.notEqual(
+      projected.analysis_budget?.configured,
+      raw.analysis_budget.configured,
+    );
+    assert.notEqual(
+      projected.analysis_budget?.consumed,
+      raw.analysis_budget.consumed,
+    );
+    assert.notEqual(
+      projected.analysis_budget?.observed,
+      raw.analysis_budget.observed,
+    );
+  }
 });
 
 test("stats raw privacy returns the report and keeps JSON and TTY bytes unchanged", () => {

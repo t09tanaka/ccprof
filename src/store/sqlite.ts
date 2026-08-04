@@ -12,17 +12,19 @@ import { join } from "node:path";
 
 import type { StorePaths } from "./paths.js";
 
-export const STORE_SCHEMA_VERSION = 3;
+export const STORE_SCHEMA_VERSION = 4;
 export const SOURCE_CATALOG_MIGRATION = "schema-v3-source-catalog";
+export const ANALYSIS_BUDGETS_MIGRATION = "schema-v4-analysis-budgets";
 
 const BUSY_TIMEOUT_MS = 5_000;
 const STORE_SCHEMA_V2 = 2;
+const STORE_SCHEMA_V3 = 3;
 const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 
 export class UnsupportedStoreSchemaError extends Error {
   constructor(readonly schema_version: number) {
     super(
-      `Unsupported ccprof store schema version ${schema_version}; expected 0, ${STORE_SCHEMA_V2}, or ${STORE_SCHEMA_VERSION}`,
+      `Unsupported ccprof store schema version ${schema_version}; expected 0, ${STORE_SCHEMA_V2}, ${STORE_SCHEMA_V3}, or ${STORE_SCHEMA_VERSION}`,
     );
     this.name = "UnsupportedStoreSchemaError";
   }
@@ -37,7 +39,12 @@ function schemaVersion(database: Database.Database): number {
 }
 
 function assertSupportedSchema(version: number): void {
-  if (version !== 0 && version !== STORE_SCHEMA_V2 && version !== STORE_SCHEMA_VERSION) {
+  if (
+    version !== 0 &&
+    version !== STORE_SCHEMA_V2 &&
+    version !== STORE_SCHEMA_V3 &&
+    version !== STORE_SCHEMA_VERSION
+  ) {
     throw new UnsupportedStoreSchemaError(version);
   }
 }
@@ -87,6 +94,91 @@ const SOURCE_CATALOG_SCHEMA = `
     CHECK ((device IS NULL) = (inode IS NULL)),
     CHECK (last_parsed_offset <= size_bytes),
     CHECK (completeness <> 'complete' OR last_parsed_offset = size_bytes)
+  );
+`;
+
+const ANALYSIS_BUDGETS_SCHEMA = `
+  CREATE TABLE analysis_budget_runs (
+    execution_id TEXT NOT NULL PRIMARY KEY,
+    max_input_bytes INTEGER NOT NULL CHECK (typeof(max_input_bytes) = 'integer'
+      AND max_input_bytes BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    max_input_events INTEGER NOT NULL CHECK (typeof(max_input_events) = 'integer'
+      AND max_input_events BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    max_wall_ms INTEGER NOT NULL CHECK (typeof(max_wall_ms) = 'integer'
+      AND max_wall_ms BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    max_cpu_ms INTEGER NOT NULL CHECK (typeof(max_cpu_ms) = 'integer'
+      AND max_cpu_ms BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    max_output_bytes INTEGER NOT NULL CHECK (typeof(max_output_bytes) = 'integer'
+      AND max_output_bytes BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    max_source_items INTEGER NOT NULL CHECK (typeof(max_source_items) = 'integer'
+      AND max_source_items BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    consumed_input_bytes INTEGER NOT NULL
+      CHECK (typeof(consumed_input_bytes) = 'integer'
+        AND consumed_input_bytes BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    consumed_input_events INTEGER NOT NULL
+      CHECK (typeof(consumed_input_events) = 'integer'
+        AND consumed_input_events BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    consumed_wall_ms INTEGER NOT NULL CHECK (typeof(consumed_wall_ms) = 'integer'
+      AND consumed_wall_ms BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    consumed_cpu_ms INTEGER NOT NULL CHECK (typeof(consumed_cpu_ms) = 'integer'
+      AND consumed_cpu_ms BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    consumed_output_bytes INTEGER NOT NULL
+      CHECK (typeof(consumed_output_bytes) = 'integer'
+        AND consumed_output_bytes BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    consumed_source_items INTEGER NOT NULL
+      CHECK (typeof(consumed_source_items) = 'integer'
+        AND consumed_source_items BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    observed_input_bytes INTEGER NOT NULL
+      CHECK (typeof(observed_input_bytes) = 'integer'
+        AND observed_input_bytes BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    observed_input_events INTEGER NOT NULL
+      CHECK (typeof(observed_input_events) = 'integer'
+        AND observed_input_events BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    observed_wall_ms INTEGER NOT NULL CHECK (typeof(observed_wall_ms) = 'integer'
+      AND observed_wall_ms BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    observed_cpu_ms INTEGER NOT NULL CHECK (typeof(observed_cpu_ms) = 'integer'
+      AND observed_cpu_ms BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    observed_output_bytes INTEGER NOT NULL
+      CHECK (typeof(observed_output_bytes) = 'integer'
+        AND observed_output_bytes BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    observed_source_items INTEGER NOT NULL
+      CHECK (typeof(observed_source_items) = 'integer'
+        AND observed_source_items BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    completeness TEXT NOT NULL CHECK (completeness IN ('complete', 'partial')),
+    truncation_reason TEXT CHECK (truncation_reason IS NULL OR
+      truncation_reason IN ('max_input_bytes', 'max_input_events',
+        'max_wall_ms', 'max_cpu_ms', 'max_output_bytes', 'max_source_items',
+        'source_failure', 'meter_error')),
+    coverage REAL NOT NULL CHECK (typeof(coverage) IN ('integer', 'real')
+      AND coverage BETWEEN 0 AND 1),
+    FOREIGN KEY (execution_id) REFERENCES analysis_executions(execution_id)
+      ON DELETE CASCADE,
+    CHECK (consumed_input_bytes <= observed_input_bytes),
+    CHECK (consumed_input_events <= observed_input_events),
+    CHECK (consumed_wall_ms <= observed_wall_ms),
+    CHECK (consumed_cpu_ms <= observed_cpu_ms),
+    CHECK (consumed_output_bytes <= observed_output_bytes),
+    CHECK (consumed_source_items <= observed_source_items),
+    CHECK (consumed_input_bytes <= max_input_bytes),
+    CHECK (consumed_input_events <= max_input_events),
+    CHECK (consumed_output_bytes <= max_output_bytes),
+    CHECK (consumed_source_items <= max_source_items),
+    CHECK ((completeness = 'complete' AND truncation_reason IS NULL
+        AND coverage = 1
+        AND consumed_input_bytes = observed_input_bytes
+        AND consumed_input_events = observed_input_events
+        AND consumed_wall_ms = observed_wall_ms
+        AND consumed_cpu_ms = observed_cpu_ms
+        AND consumed_output_bytes = observed_output_bytes
+        AND consumed_source_items = observed_source_items
+        AND consumed_input_bytes <= max_input_bytes
+        AND consumed_input_events <= max_input_events
+        AND consumed_wall_ms <= max_wall_ms
+        AND consumed_cpu_ms <= max_cpu_ms
+        AND consumed_output_bytes <= max_output_bytes
+        AND consumed_source_items <= max_source_items)
+      OR (completeness = 'partial' AND truncation_reason IS NOT NULL
+        AND coverage < 1))
   );
 `;
 
@@ -225,10 +317,16 @@ function migrateSchema(database: Database.Database): void {
         ON adoptions(detected_at_ms);
     `);
 
-    database.exec(SOURCE_CATALOG_SCHEMA);
+    if (version === 0 || version === STORE_SCHEMA_V2) {
+      database.exec(SOURCE_CATALOG_SCHEMA);
+      database.prepare(
+        "INSERT INTO store_migrations(name, completed_at_ms) VALUES (?, ?)",
+      ).run(SOURCE_CATALOG_MIGRATION, Date.now());
+    }
+    database.exec(ANALYSIS_BUDGETS_SCHEMA);
     database.prepare(
       "INSERT INTO store_migrations(name, completed_at_ms) VALUES (?, ?)",
-    ).run(SOURCE_CATALOG_MIGRATION, Date.now());
+    ).run(ANALYSIS_BUDGETS_MIGRATION, Date.now());
     database.pragma(`user_version = ${STORE_SCHEMA_VERSION}`);
   });
 

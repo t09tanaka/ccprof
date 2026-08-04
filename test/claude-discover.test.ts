@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { unlinkSync } from "node:fs";
 import {
   mkdir,
   mkdtemp,
@@ -13,12 +14,36 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 
 import {
+  AnalysisBudgetMeter,
+  type AnalysisBudgetClock,
+  type AnalysisBudgets,
+} from "../src/analysis/budgets.js";
+import {
   ClaudeDiscoveryError,
   ClaudeSessionSource,
   discoverClaudeSessions,
 } from "../src/sources/claude/discover.js";
 
 const timestamp = "2026-07-31T03:00:00.000Z";
+
+function analysisBudgets(
+  overrides: Partial<AnalysisBudgets> = {},
+): AnalysisBudgets {
+  return {
+    max_input_bytes: 1_000_000,
+    max_input_events: 1_000,
+    max_wall_ms: 1_000_000,
+    max_cpu_ms: 1_000_000,
+    max_output_bytes: 1_000_000,
+    max_source_items: 1_000,
+    ...overrides,
+  };
+}
+
+const steadyBudgetClock: AnalysisBudgetClock = {
+  wall_ms: () => 0,
+  cpu_ms: () => 0,
+};
 
 function transcript(options: {
   sessionId: string;
@@ -434,6 +459,161 @@ test("skips JSONL symlinks escaping the projects directory and reports source wa
       (warning) => warning.code === "source_parse_error",
     ),
   );
+});
+
+test("budgeted Claude traversal preserves an earlier session and records a later traversal failure", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-budget-claude-traversal-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const projects = join(root, "projects");
+  const repo = join(root, "repo");
+  await Promise.all([
+    mkdir(projects, { recursive: true }),
+    mkdir(repo, { recursive: true }),
+  ]);
+  await writeFile(
+    join(projects, "a-valid.jsonl"),
+    transcript({
+      sessionId: "survivor",
+      cwd: repo,
+      branch: "feature/parser",
+    }),
+  );
+  await symlink(
+    join(root, "missing.jsonl"),
+    join(projects, "z-broken.jsonl"),
+  );
+  const meter = new AnalysisBudgetMeter(
+    analysisBudgets(),
+    steadyBudgetClock,
+  );
+
+  const sessions = await discoverClaudeSessions(projects, {
+    repoRoot: repo,
+    headBranch: "feature/parser",
+    startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+    analysisBudgetMeter: meter,
+  });
+
+  assert.deepEqual(sessions.map(({ session_id }) => session_id), ["survivor"]);
+  assert.equal(meter.result().truncation_reason, "source_failure");
+  assert.equal(meter.result().coverage, 0);
+});
+
+test("budgeted Claude discovery re-checks wall time after adapter startup", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-budget-claude-clock-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const projects = join(root, "projects");
+  const repo = join(root, "repo");
+  await Promise.all([
+    mkdir(projects, { recursive: true }),
+    mkdir(repo, { recursive: true }),
+  ]);
+  await writeFile(
+    join(projects, "must-not-open.jsonl"),
+    transcript({
+      sessionId: "must-not-open",
+      cwd: repo,
+      branch: "feature/parser",
+    }),
+  );
+  const wallReadings = [0, 0, 1];
+  let wallIndex = 0;
+  const meter = new AnalysisBudgetMeter(
+    analysisBudgets({ max_wall_ms: 0 }),
+    {
+      wall_ms: () =>
+        wallReadings[Math.min(wallIndex++, wallReadings.length - 1)]!,
+      cpu_ms: () => 0,
+    },
+  );
+
+  const sessions = await discoverClaudeSessions(projects, {
+    repoRoot: repo,
+    headBranch: "feature/parser",
+    startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+    analysisBudgetMeter: meter,
+  });
+
+  assert.deepEqual(sessions, []);
+  assert.equal(meter.result().truncation_reason, "max_wall_ms");
+  assert.equal(meter.result().observed.source_items, 0);
+});
+
+test("budgeted Claude discovery claims a zero source-item budget before lstat", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-budget-claude-item-first-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const projects = join(root, "projects");
+  const repo = join(root, "repo");
+  await Promise.all([
+    mkdir(projects, { recursive: true }),
+    mkdir(repo, { recursive: true }),
+  ]);
+  const sourcePath = join(projects, "vanishing.jsonl");
+  await writeFile(
+    sourcePath,
+    transcript({
+      sessionId: "vanishing",
+      cwd: repo,
+      branch: "feature/parser",
+    }),
+  );
+  let wallReads = 0;
+  const meter = new AnalysisBudgetMeter(
+    analysisBudgets({ max_source_items: 0 }),
+    {
+      wall_ms: () => {
+        wallReads += 1;
+        if (wallReads === 7) unlinkSync(sourcePath);
+        return 0;
+      },
+      cpu_ms: () => 0,
+    },
+  );
+
+  const sessions = await discoverClaudeSessions(projects, {
+    repoRoot: repo,
+    headBranch: "feature/parser",
+    startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+    analysisBudgetMeter: meter,
+  });
+
+  assert.deepEqual(sessions, []);
+  assert.equal(meter.result().truncation_reason, "max_source_items");
+  assert.equal(meter.result().observed.source_items, 1);
+});
+
+test("budgeted Claude discovery claims an item before resolving a transcript symlink", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-budget-claude-symlink-first-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const projects = join(root, "projects");
+  const repo = join(root, "repo");
+  await Promise.all([
+    mkdir(projects, { recursive: true }),
+    mkdir(repo, { recursive: true }),
+  ]);
+  await symlink(
+    join(root, "missing.jsonl"),
+    join(projects, "broken.jsonl"),
+  );
+  const meter = new AnalysisBudgetMeter(
+    analysisBudgets({ max_source_items: 0 }),
+    steadyBudgetClock,
+  );
+
+  const sessions = await discoverClaudeSessions(projects, {
+    repoRoot: repo,
+    headBranch: "feature/parser",
+    startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+    analysisBudgetMeter: meter,
+  });
+
+  assert.deepEqual(sessions, []);
+  assert.equal(meter.result().truncation_reason, "max_source_items");
+  assert.equal(meter.result().observed.source_items, 1);
 });
 
 test("throws a typed discovery error when malformed-only sources yield no sessions", async (t) => {
