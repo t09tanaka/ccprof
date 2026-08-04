@@ -304,10 +304,10 @@ export async function collectDiffEvidence(
       addedLines: content.addedLines,
       binary: content.binary,
       contentComplete:
-        patchPairingComplete && !truncated && !content.binary && section !== undefined,
+        patchPairingComplete && !patchTruncated && !content.binary && section !== undefined,
     };
   });
-  const changedLineCount = files.length > 0 && patchPairingComplete && !truncated &&
+  const changedLineCount = files.length > 0 && patchPairingComplete && !patchTruncated &&
     files.every(({ contentComplete }) => contentComplete)
       ? parsedChangedLineCount
       : undefined;
