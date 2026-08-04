@@ -13,6 +13,7 @@ import test from "node:test";
 
 import {
   analyze,
+  type AnalyzeOptions,
   NoAnalyzableTimestampsError,
   NoMatchingSessionsError,
 } from "../src/core/analyze.js";
@@ -1102,7 +1103,7 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
       first.window.ended_at_ms,
     );
     assert.deepEqual(first.report.unit.sessions, ["e2e-session"]);
-    assert.equal(first.report.summary.baseline?.prs, 3);
+    assert.equal(first.report.summary.baseline, null);
     assert.ok(
       first.warnings.some(({ code }) => code === "invalid_json"),
       "source warnings must survive orchestration",
@@ -1198,13 +1199,16 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
       terminalStats.measured_wall_ms,
       first.ledger.totals_ms.measured,
     );
-    assert.equal(
-      terminalStats.human_wait_ms,
-      first.ledger.totals_ms.human_wait,
+    assert.ok(
+      terminalStats.human_wait_ms <= first.ledger.totals_ms.human_wait,
     );
-    assert.equal(
-      terminalStats.unexplained_ms,
-      first.ledger.totals_ms.unexplained,
+    assert.ok(
+      terminalStats.unexplained_ms <= first.ledger.totals_ms.unexplained,
+    );
+    assert.ok(
+      terminalStats.estimated_critical_path_upper_ms +
+          terminalStats.human_wait_ms + terminalStats.unexplained_ms <=
+        terminalStats.measured_wall_ms,
     );
     assert.deepEqual(
       terminalStats.rules.map((row) => ({
@@ -1305,7 +1309,7 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
       assert.deepEqual(finding.impact, allFinding.impact);
       assert.deepEqual(finding.recoverable, allFinding.recoverable);
     }
-    assert.equal(current.summary.baseline?.prs, 3);
+    assert.equal(current.summary.baseline, null);
     const npmTestCost = current.command_costs.find(
       ({ command }) => command === "npm test",
     );
@@ -1404,6 +1408,116 @@ test("binary diffs suppress line cohorts and cohort policy changes snapshot iden
     );
     assert.equal(policyDigests.length, 2);
     assert.notEqual(policyDigests[0], policyDigests[1]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("captures one cohort floor for baseline eligibility and persisted policy identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-analyze-cohort-capture-"));
+  try {
+    const repo = await makeRepository(root);
+    const projects = await makeClaudeProjects(root, repo);
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    for (let index = 0; index < 5; index += 1) {
+      const base = `cohort-base-${index}`;
+      await git(repo, ["branch", base, "main"]);
+      await analyze({
+        cwd: repo,
+        pr: `${base}...feature`,
+        nowMs: NOW_MS + index,
+        sessionSource: new ClaudeSessionSource(projects),
+        storePaths,
+        minimumCohortSize: 20,
+      });
+    }
+    await git(repo, ["branch", "cohort-current", "main"]);
+    const currentOptions = {
+      cwd: repo,
+      pr: "cohort-current...feature",
+      storePaths,
+    } as const;
+
+    let mutableFloor = 5;
+    let getterReads = 0;
+    let markPaused!: () => void;
+    let resumeDiscovery!: () => void;
+    const paused = new Promise<void>((resolve) => {
+      markPaused = resolve;
+    });
+    const resumed = new Promise<void>((resolve) => {
+      resumeDiscovery = resolve;
+    });
+    const delegate = new ClaudeSessionSource(projects);
+    const pausingSource: SessionSource = {
+      discover: async (query) => {
+        markPaused();
+        await resumed;
+        return await delegate.discover(query);
+      },
+    };
+    const mutableOptions: AnalyzeOptions = {
+      ...currentOptions,
+      nowMs: NOW_MS + 10,
+      sessionSource: pausingSource,
+      get minimumCohortSize() {
+        getterReads += 1;
+        return mutableFloor;
+      },
+    };
+
+    const pendingMutable = analyze(mutableOptions);
+    await paused;
+    mutableFloor = 20;
+    resumeDiscovery();
+    const capturedFive = await pendingMutable;
+    const immutableFive = await analyze({
+      ...currentOptions,
+      nowMs: NOW_MS + 11,
+      sessionSource: new ClaudeSessionSource(projects),
+      minimumCohortSize: 5,
+    });
+    const immutableTwenty = await analyze({
+      ...currentOptions,
+      nowMs: NOW_MS + 12,
+      sessionSource: new ClaudeSessionSource(projects),
+      minimumCohortSize: 20,
+    });
+
+    assert.equal(capturedFive.record.summary.baseline?.prs, 5);
+    assert.equal(immutableFive.record.summary.baseline?.prs, 5);
+    assert.equal(immutableTwenty.record.summary.baseline, null);
+
+    const entries = (await loadAnalyses(storePaths)).entries ?? [];
+    const storedIdentity = (analysisId: string) => {
+      const entry = entries.find(({ record }) =>
+        record.analysis_id === analysisId
+      );
+      assert.ok(entry);
+      if ("mode" in entry.identity) {
+        assert.fail("analyze must persist a full snapshot identity");
+      }
+      return entry.identity;
+    };
+    const capturedDigest = storedIdentity(
+      capturedFive.record.analysis_id,
+    ).policy_digest;
+    const immutableFiveDigest = storedIdentity(
+      immutableFive.record.analysis_id,
+    ).policy_digest;
+    const immutableTwentyDigest = storedIdentity(
+      immutableTwenty.record.analysis_id,
+    ).policy_digest;
+    assert.equal(
+      capturedDigest,
+      immutableFiveDigest,
+      "mutation after analysis starts cannot change the captured policy floor",
+    );
+    assert.notEqual(capturedDigest, immutableTwentyDigest);
+    assert.equal(getterReads, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

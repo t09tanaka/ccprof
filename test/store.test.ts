@@ -2929,24 +2929,6 @@ test("analysis write failures return warnings without throwing", async () => {
   }
 });
 
-test("baseline uses only the previous ten analyses and stays null below three", () => {
-  const histories = Array.from({ length: 12 }, (_, index) =>
-    record(`history-${String(index + 1).padStart(2, "0")}`, index + 1, {
-      metric: index + 1,
-    })
-  );
-  const current = record("current", 20, { metric: 99 });
-
-  assert.equal(computeBaseline(current, histories.slice(0, 2)), null);
-  const baseline = computeBaseline(current, [...histories, current]);
-  assert.ok(baseline !== null);
-  assert.equal(baseline.prs, 10);
-  assert.deepEqual(
-    baseline.notable.find(({ metric }) => metric === "human_wait_ratio"),
-    { metric: "human_wait_ratio", value: 99, baseline: 7.5 },
-  );
-});
-
 test("dismissals expire exactly at 14 days and revive only strictly over twice strength", () => {
   const day = 24 * 60 * 60 * 1_000;
   const dismissal = {

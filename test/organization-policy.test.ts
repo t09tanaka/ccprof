@@ -53,7 +53,10 @@ import {
 } from "../src/policy/rule-safety.js";
 import { renderJsonReport } from "../src/reporters/json.js";
 import type { PrivacyProfile } from "../src/reporters/privacy.js";
-import type { StorePaths } from "../src/store/paths.js";
+import {
+  resolveStorePaths,
+  type StorePaths,
+} from "../src/store/paths.js";
 
 const ENVIRONMENT_KEYS = {
   organization: "CCPROF_ORGANIZATION",
@@ -2163,6 +2166,7 @@ test("analyze resolves canonical Store policy before core and passes its cohort 
 
 test("analyze applies effective privacy and denies advisory before spawning", async (t) => {
   const repoRoot = await temporaryRepository(t);
+  const paths = await resolveStorePaths(repoRoot);
   const rawReport = report(repoRoot);
   const privateWarning = "/private/policy/warning";
   let runnerCalls = 0;
@@ -2201,7 +2205,7 @@ test("analyze applies effective privacy and denies advisory before spawning", as
     },
   });
 
-  assert.equal(resolvedRepo, repoRoot);
+  assert.equal(resolvedRepo, paths.canonical_repo);
   assert.deepEqual(resolvedRequest, { privacy: "raw", advisory: true });
   assert.equal(runnerCalls, 0);
   assert.equal(output.stdout.includes(repoRoot), false);
