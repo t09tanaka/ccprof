@@ -301,7 +301,7 @@ export function detectSerialSlack(
           suggestion: decision.kind === "parallel_safe"
             ? `Batch the independent read or validation calls for ${target} into one parallel tool invocation.`
             : decision.kind === "parallel_unsafe"
-              ? `The signed resource-domain policy prohibits concurrent execution for ${target}; no parallel invocation is recommended.`
+              ? `The effective resource-domain policy prohibits concurrent execution for ${target}; no parallel invocation is recommended.`
               : `Review shared resources for the path-disjoint read or validation calls affecting ${target} before changing execution.`,
           verify: "ccprof --json",
         },
