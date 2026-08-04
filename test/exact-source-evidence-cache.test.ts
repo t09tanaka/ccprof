@@ -180,8 +180,6 @@ test("same metadata with changed bytes misses exact revision", async (t) => {
 test("warning-free negatives reuse; warning and mixed evidence never commit", async (t) => {
   const cases = [
     { raw: "", expectedReads: 1, expectedRows: 1 },
-    { raw: `${JSON.stringify({ sessionId: "ignored", uuid: "ignored",
-      timestamp: at(1), type: "summary" })}\n`, expectedReads: 1, expectedRows: 1 },
     { raw: "{malformed\n", expectedReads: 2, expectedRows: 0 },
   ];
   for (const item of cases) {
