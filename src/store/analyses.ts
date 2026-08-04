@@ -15,6 +15,10 @@ import {
   normalizeAnalysisBudgetResult,
   type AnalysisBudgetResult,
 } from "../analysis/budgets.js";
+import {
+  normalizeTerminalStatsSnapshot,
+  type TerminalStatsSnapshotV1,
+} from "../analysis/stats-aggregation.js";
 import { normalizeRepoPath } from "../analysis/test-map.js";
 import {
   findingCompatibilityMetadata,
@@ -70,6 +74,7 @@ export interface AnalysisRecordInput {
   command_costs?: readonly StoredCommandCost[];
   read_observations?: readonly StoredReadObservation[];
   analysis_budget?: AnalysisBudgetResult;
+  terminal_stats_snapshot?: TerminalStatsSnapshotV1;
 }
 
 export interface AnalysisRecord {
@@ -83,6 +88,7 @@ export interface AnalysisRecord {
   command_costs: StoredCommandCost[];
   read_observations?: StoredReadObservation[];
   analysis_budget?: AnalysisBudgetResult;
+  terminal_stats_snapshot?: TerminalStatsSnapshotV1;
 }
 
 export interface AnalysisSaveResult {
@@ -641,12 +647,33 @@ function optionalAnalysisBudget(
   return normalizeAnalysisBudgetResult(descriptor.value);
 }
 
+function optionalTerminalStatsSnapshot(
+  input: AnalysisRecordInput,
+): TerminalStatsSnapshotV1 | undefined {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(
+      input,
+      "terminal_stats_snapshot",
+    );
+  } catch {
+    throw new TypeError("Invalid terminal stats snapshot.");
+  }
+  if (descriptor === undefined) return undefined;
+  if (descriptor.enumerable !== true || !("value" in descriptor)) {
+    throw new TypeError("Invalid terminal stats snapshot.");
+  }
+  if (descriptor.value === undefined) return undefined;
+  return normalizeTerminalStatsSnapshot(descriptor.value);
+}
+
 export function makeAnalysisRecord(
   input: AnalysisRecordInput,
 ): AnalysisRecord {
   validateInput(input);
   const findings = snapshotStoredFindings(input.findings);
   const analysisBudget = optionalAnalysisBudget(input);
+  const terminalStatsSnapshot = optionalTerminalStatsSnapshot(input);
   const metrics = {
     ...summaryMetrics(input.summary),
     ...Object.fromEntries(
@@ -673,6 +700,9 @@ export function makeAnalysisRecord(
     ...(input.read_observations === undefined ? {} :
       { read_observations: normalizedReadObservations(input.read_observations) }),
     ...(analysisBudget === undefined ? {} : { analysis_budget: analysisBudget }),
+    ...(terminalStatsSnapshot === undefined ? {} : {
+      terminal_stats_snapshot: terminalStatsSnapshot,
+    }),
   };
   const generatedId = createHash("sha256")
     .update(canonicalJson(content))
@@ -713,6 +743,8 @@ function isRecord(value: unknown): value is AnalysisRecord {
     !Array.isArray(record.command_costs) ||
     (record.analysis_budget !== undefined &&
       !isAnalysisBudgetResult(record.analysis_budget)) ||
+    (record.terminal_stats_snapshot !== undefined &&
+      !isTerminalStatsSnapshot(record.terminal_stats_snapshot)) ||
     (record.read_observations !== undefined &&
       (!Array.isArray(record.read_observations) ||
         !record.read_observations.every(isStoredReadObservation)))
@@ -758,10 +790,26 @@ function isAnalysisBudgetResult(value: unknown): value is AnalysisBudgetResult {
   }
 }
 
+function isTerminalStatsSnapshot(
+  value: unknown,
+): value is TerminalStatsSnapshotV1 {
+  try {
+    const normalized = normalizeTerminalStatsSnapshot(value);
+    return canonicalJson(normalized) === canonicalJson(value);
+  } catch {
+    return false;
+  }
+}
+
 function normalizeRecordFindings(record: AnalysisRecord): AnalysisRecord {
   const normalized = {
     ...record,
     findings: snapshotStoredFindings(record.findings),
+    ...(record.terminal_stats_snapshot === undefined ? {} : {
+      terminal_stats_snapshot: normalizeTerminalStatsSnapshot(
+        record.terminal_stats_snapshot,
+      ),
+    }),
   };
   if (!isRecord(normalized)) {
     throw new TypeError("unsupported or invalid analysis record");
