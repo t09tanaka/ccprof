@@ -3448,6 +3448,134 @@ test("terminal snapshot IDs bound recurrence adoption and the history label", ()
   assert.match(renderStatsTty(stats), /^History: 5 terminal work units$/mu);
 });
 
+test("an incomplete terminal counts as history without entering KPI statistics", () => {
+  const incomplete = task6TerminalInput({
+    id: "incomplete-only-terminal",
+    createdAtMs: 1_000,
+  });
+  delete incomplete.terminal_metrics;
+
+  const aggregate = task6Aggregate([incomplete]);
+  assert.deepEqual(aggregate.selected_snapshot_ids, [incomplete.snapshot_id]);
+  assert.deepEqual(aggregate.metadata, {
+    stored_snapshot_count: 1,
+    distinct_work_unit_count: 1,
+    terminal_snapshot_count: 1,
+    superseded_snapshot_count: 0,
+    ineligible_snapshot_count: 1,
+    sample_count: 0,
+    minimum_cohort_size: 5,
+    status: "suppressed",
+    reason_codes: ["below_minimum"],
+  });
+  assert.equal("terminal_metrics" in aggregate, false);
+  assert.deepEqual(aggregate.rule_minutes, []);
+  assert.deepEqual(aggregate.cohorts, []);
+
+  const recordsBySnapshot = new Map<string, AnalysisRecord>([[
+    incomplete.snapshot_id,
+    adoptionAnalysisRecord(
+      "incomplete-only-record",
+      incomplete.created_at_ms,
+      [],
+      "incomplete-only-pr",
+    ),
+  ]]);
+  const terminalRecords = aggregate.selected_snapshot_ids.map((snapshotId) => {
+    const record = recordsBySnapshot.get(snapshotId);
+    assert.ok(record !== undefined);
+    return record;
+  });
+  const stats = summarizeTerminalStats(aggregate, terminalRecords);
+  assert.equal(stats.history_count, 1);
+  assert.match(renderStatsTty(stats), /^History: 1 terminal work units$/mu);
+});
+
+test("incomplete selected terminals remain in recurrence and adoption history", () => {
+  const incomplete = task6TerminalInput({
+    id: "observational-incomplete",
+    createdAtMs: 1_000,
+  });
+  delete incomplete.terminal_metrics;
+  const complete = task6TerminalInput({
+    id: "observational-complete",
+    createdAtMs: 2_000,
+  });
+  const aggregate = task6Aggregate([incomplete, complete]);
+  assert.deepEqual(
+    [...aggregate.selected_snapshot_ids].sort(),
+    [incomplete.snapshot_id, complete.snapshot_id].sort(),
+  );
+  assert.equal(aggregate.metadata.distinct_work_unit_count, 2);
+  assert.equal(aggregate.metadata.sample_count, 1);
+  assert.equal(aggregate.metadata.ineligible_snapshot_count, 1);
+  assert.equal(aggregate.cohorts.length, 1);
+  assert.equal(aggregate.cohorts[0]?.metadata.sample_count, 1);
+
+  const findingKey = "incomplete-observational-key";
+  const before = adoptionFinding(findingKey, {
+    rule_id: "R002",
+    title: "Observe every terminal work unit",
+    recoverable: { min: 6, bound: "point" },
+  });
+  const after = adoptionFinding(findingKey, {
+    rule_id: "R002",
+    title: "Observe every terminal work unit",
+    recoverable: { min: 2, bound: "point" },
+  });
+  const recordsBySnapshot = new Map<string, AnalysisRecord>([
+    [incomplete.snapshot_id, adoptionAnalysisRecord(
+      "incomplete-observational-record",
+      incomplete.created_at_ms,
+      [before],
+      "incomplete-origin-pr",
+    )],
+    [complete.snapshot_id, adoptionAnalysisRecord(
+      "complete-observational-record",
+      complete.created_at_ms,
+      [after],
+      "complete-followup-pr",
+    )],
+  ]);
+  const terminalRecords = aggregate.selected_snapshot_ids.map((snapshotId) => {
+    const record = recordsBySnapshot.get(snapshotId);
+    assert.ok(record !== undefined);
+    return record;
+  });
+  const stats = summarizeTerminalStats(aggregate, terminalRecords, [
+    adoptionRecordFixture({
+      finding_key: findingKey,
+      rule_id: "R002",
+      detected_at_ms: 1_500,
+    }),
+  ]);
+
+  assert.equal(stats.history_count, 2);
+  assert.deepEqual(stats.recurring_findings, [{
+    finding_key: findingKey,
+    rule_id: "R002",
+    title: "Observe every terminal work unit",
+    occurrence_count: 2,
+    first_min: 6,
+    first_bound: "point",
+    last_min: 2,
+    last_bound: "point",
+    trend: "improved",
+  }]);
+  assert.deepEqual(stats.adoptions, [{
+    finding_key: findingKey,
+    rule_id: "R002",
+    title: "Observe every terminal work unit",
+    method: "claude_md_edit",
+    detected_at_ms: 1_500,
+    analyses_after: 1,
+    recurrences_after: 1,
+    minutes_before: 6,
+    minutes_after: 2,
+    status: "recurred",
+  }]);
+});
+
 const ADOPTION_DAY0_MS = Date.UTC(2026, 7, 1, 12, 0, 0);
 
 function adoptionFixtureRecords(): AnalysisRecord[] {

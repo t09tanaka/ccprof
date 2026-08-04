@@ -4420,13 +4420,14 @@ test("terminal selection suppresses an incomplete terminal without historical fa
   assert.ok(projected[1]?.reason_codes.includes("missing_terminal_metrics"));
   const selected = selectTerminalSnapshots(projected);
   assert.deepEqual(
-    selected.terminals,
-    [],
-    "an older complete state must not replace the incomplete terminal state",
+    selected.terminals.map(({ snapshot_id }) => snapshot_id),
+    [incompleteTerminal.snapshot_id],
+    "the incomplete terminal state must remain selected instead of falling back",
   );
+  assert.equal(selected.terminals[0]?.terminal_metrics, undefined);
   assert.deepEqual(selected.metadata, {
     stored_snapshot_count: 3,
-    terminal_snapshot_count: 0,
+    terminal_snapshot_count: 1,
     superseded_snapshot_count: 2,
     ineligible_snapshot_count: 1,
   });
