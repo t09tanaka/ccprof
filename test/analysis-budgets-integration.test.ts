@@ -14,10 +14,20 @@ import test from "node:test";
 import {
   type AnalysisBudgetClock,
   type AnalysisBudgets,
+  AnalysisBudgetMeter,
 } from "../src/analysis/budgets.js";
 import { analyze } from "../src/core/analyze.js";
-import type { Session } from "../src/core/model.js";
+import type { ReportV2, Session } from "../src/core/model.js";
 import { runCommand, type CommandRunner } from "../src/git/client.js";
+import {
+  finalizeBudgetedOutput,
+  OUTPUT_BUDGET_ENVELOPES,
+} from "../src/reporters/budget.js";
+import { renderJsonReport } from "../src/reporters/json.js";
+import {
+  projectReportPrivacy,
+  type PrivacyProfile,
+} from "../src/reporters/privacy.js";
 import type {
   SessionQuery,
   SessionSource,
@@ -254,6 +264,35 @@ const steadyClock: AnalysisBudgetClock = {
   wall_ms: () => 0,
   cpu_ms: () => 0,
 };
+
+function outputReport(canary = "safe"): ReportV2 {
+  return {
+    version: 2,
+    unit: {
+      repo: `/private/${canary}`,
+      pr_ref: "main...feature",
+      sessions: [`session-${canary}`],
+    },
+    summary: {
+      measured_min: 0,
+      idle_excluded_min: 0,
+      estimated_floor_min: 0,
+      recoverable_min: 0,
+      human_wait_min: 0,
+      unexplained_min: 0,
+      baseline: null,
+    },
+    findings: [],
+    caveats: [`token ghp_${canary}_12345678`],
+  };
+}
+
+function outputMeter(maxOutputBytes: number): AnalysisBudgetMeter {
+  return new AnalysisBudgetMeter(
+    budgets({ max_output_bytes: maxOutputBytes }),
+    steadyClock,
+  );
+}
 
 test("custom sources are backstopped to an exact event prefix without empty-result errors", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-budget-events-"));
@@ -787,4 +826,196 @@ test("Claude byte truncation over a malformed huge row keeps admitted-byte cover
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("projected output uses inclusive exact UTF-8 byte limits", () => {
+  const output = "é";
+  const maxOutputBytes = Buffer.byteLength(output, "utf8");
+
+  const finalized = finalizeBudgetedOutput({
+    report: outputReport(),
+    meter: outputMeter(maxOutputBytes),
+    projection: {
+      format: "json",
+      render: () => ({ output }),
+    },
+  });
+
+  assert.equal(finalized.stdout, output);
+  assert.equal(finalized.analysisBudget.completeness, "complete");
+  assert.equal(
+    finalized.analysisBudget.consumed.output_bytes,
+    maxOutputBytes,
+  );
+  assert.equal(
+    finalized.analysisBudget.observed.output_bytes,
+    maxOutputBytes,
+  );
+});
+
+test("one UTF-8 byte over the output cap is never sliced", () => {
+  const output = "界";
+
+  const finalized = finalizeBudgetedOutput({
+    report: outputReport(),
+    meter: outputMeter(Buffer.byteLength(output, "utf8") - 1),
+    projection: {
+      format: "json",
+      render: () => ({ output }),
+    },
+  });
+
+  assert.equal(finalized.stdout, "");
+  assert.equal(
+    finalized.analysisBudget.truncation_reason,
+    "max_output_bytes",
+  );
+  assert.equal(finalized.analysisBudget.consumed.output_bytes, 0);
+  assert.equal(
+    finalized.analysisBudget.observed.output_bytes,
+    Buffer.byteLength(output, "utf8"),
+  );
+});
+
+test("overflow emits the fixed content-free envelope at its exact boundary", () => {
+  const envelope = OUTPUT_BUDGET_ENVELOPES.tty;
+  const maxOutputBytes = Buffer.byteLength(envelope, "utf8");
+  const secret = "ghp_FIXED_ENVELOPE_SECRET";
+  const output = secret.repeat(100);
+
+  const finalized = finalizeBudgetedOutput({
+    report: outputReport(secret),
+    meter: outputMeter(maxOutputBytes),
+    projection: {
+      format: "tty",
+      render: () => ({ output }),
+    },
+  });
+
+  assert.equal(finalized.stdout, envelope);
+  assert.ok(!finalized.stdout.includes(secret));
+  assert.equal(
+    finalized.analysisBudget.consumed.output_bytes,
+    maxOutputBytes,
+  );
+  assert.equal(
+    finalized.analysisBudget.observed.output_bytes,
+    Buffer.byteLength(output, "utf8"),
+  );
+});
+
+test("an envelope larger than the cap and a zero cap both emit zero bytes", () => {
+  const envelopeBytes = Buffer.byteLength(
+    OUTPUT_BUDGET_ENVELOPES.markdown,
+    "utf8",
+  );
+
+  for (const maxOutputBytes of [envelopeBytes - 1, 0]) {
+    const finalized = finalizeBudgetedOutput({
+      report: outputReport(),
+      meter: outputMeter(maxOutputBytes),
+      projection: {
+        format: "markdown",
+        render: () => ({ output: "x".repeat(envelopeBytes + 100) }),
+      },
+    });
+
+    assert.equal(finalized.stdout, "");
+    assert.equal(finalized.analysisBudget.consumed.output_bytes, 0);
+    assert.equal(
+      finalized.analysisBudget.truncation_reason,
+      "max_output_bytes",
+    );
+  }
+});
+
+test("an advisory that crosses the cap is omitted before the envelope", () => {
+  const deterministic = "safe report\n";
+  const advisory = "PRIVATE_ADVISORY_CANARY";
+  const full = `${deterministic}${advisory}`;
+
+  const finalized = finalizeBudgetedOutput({
+    report: outputReport(),
+    meter: outputMeter(Buffer.byteLength(deterministic, "utf8")),
+    projection: {
+      format: "tty",
+      render: () => ({
+        output: full,
+        withoutAdvisory: deterministic,
+      }),
+    },
+  });
+
+  assert.equal(finalized.stdout, deterministic);
+  assert.ok(!finalized.stdout.includes(advisory));
+  assert.equal(
+    finalized.analysisBudget.truncation_reason,
+    "max_output_bytes",
+  );
+  assert.equal(
+    finalized.analysisBudget.consumed.output_bytes,
+    Buffer.byteLength(deterministic, "utf8"),
+  );
+  assert.equal(
+    finalized.analysisBudget.observed.output_bytes,
+    Buffer.byteLength(full, "utf8"),
+  );
+});
+
+test("byte measurement receives only privacy-projected report values", () => {
+  const canary = "PRIVACY_MEASUREMENT_CANARY";
+  const profiles: readonly PrivacyProfile[] = ["strict", "balanced"];
+
+  for (const profile of profiles) {
+    const measured: string[] = [];
+    const finalized = finalizeBudgetedOutput({
+      report: outputReport(canary),
+      meter: outputMeter(1_000_000),
+      projection: {
+        format: "json",
+        render: (candidate) => ({
+          output: renderJsonReport(projectReportPrivacy(candidate, profile)),
+        }),
+      },
+      byteLength: (value) => {
+        measured.push(value);
+        return Buffer.byteLength(value, "utf8");
+      },
+    });
+
+    assert.ok(measured.length > 0);
+    assert.ok(measured.every((value) => !value.includes(canary)));
+    assert.ok(!finalized.stdout.includes(canary));
+    const parsed = JSON.parse(finalized.stdout) as ReportV2;
+    assert.deepEqual(parsed.analysis_budget, finalized.analysisBudget);
+    assert.equal(
+      Buffer.byteLength(finalized.stdout, "utf8"),
+      finalized.analysisBudget.consumed.output_bytes,
+    );
+  }
+});
+
+test("fallback bytes are identical for different raw secret inputs", () => {
+  const maxOutputBytes = Buffer.byteLength(
+    OUTPUT_BUDGET_ENVELOPES.json,
+    "utf8",
+  );
+  const run = (canary: string) =>
+    finalizeBudgetedOutput({
+      report: outputReport(canary),
+      meter: outputMeter(maxOutputBytes),
+      projection: {
+        format: "json",
+        render: (candidate) => ({
+          output: `${renderJsonReport(candidate)}${canary.repeat(100)}`,
+        }),
+      },
+    });
+
+  const first = run("ghp_FIRST_RAW_SECRET");
+  const second = run("ghp_SECOND_RAW_SECRET");
+
+  assert.equal(first.stdout, OUTPUT_BUDGET_ENVELOPES.json);
+  assert.equal(second.stdout, OUTPUT_BUDGET_ENVELOPES.json);
+  assert.equal(first.stdout, second.stdout);
 });
