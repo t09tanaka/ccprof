@@ -17,7 +17,7 @@ import {
   NoMatchingSessionsError,
 } from "../src/core/analyze.js";
 import { runAnalyzeCommand } from "../src/commands/analyze.js";
-import type { Interval, Session } from "../src/core/model.js";
+import type { Interval, ReportV2, Session } from "../src/core/model.js";
 import {
   discoverManifestTestMap,
   parseExplicitTestMap,
@@ -614,7 +614,21 @@ test("linked-worktree analyze uses one canonical effective policy for core ident
       advisory_enabled: false,
       rule_safety: ruleSafety,
     });
-    const linkedPathPolicy = commandPolicy();
+    const unauthorizedPatternCanary = "pnpm test --linked-policy-canary";
+    const unauthorizedDomainCanary = "linked-policy-canary";
+    const linkedPathPolicy = commandPolicy({
+      rule_safety: resolveRuleSafetyPolicy(
+        {
+          safe_patterns: [unauthorizedPatternCanary],
+          allow_rule_recommendation: true,
+        },
+        [{
+          match: [unauthorizedPatternCanary],
+          domain: unauthorizedDomainCanary,
+          parallel_safe: true,
+        }],
+      ),
+    });
     const source = {
       discover: async () => [
         policySensitiveSession("linked-policy-session", linkedRepo),
@@ -664,8 +678,21 @@ test("linked-worktree analyze uses one canonical effective policy for core ident
     assert.ok(output.warnings.some((warning) =>
       warning.includes("[policy_advisory_disabled]")
     ));
-    assert.equal(output.stdout.includes("npm test"), false);
-    assert.equal(output.stdout.includes("node-workspace"), false);
+    const strictReport = JSON.parse(output.stdout) as ReportV2;
+    const strictApproval = strictReport.findings.find(
+      ({ rule_id }) => rule_id === "R004",
+    );
+    assert.match(strictApproval?.fix_recipe.suggestion ?? "", /npm test/u);
+    for (const finding of strictReport.findings) {
+      assert.deepEqual(Object.keys(finding.evidence).sort(), [
+        "interval_ids",
+        "session_refs",
+      ]);
+      assert.equal(Object.hasOwn(finding.evidence, "canonical_commands"), false);
+      assert.equal(Object.hasOwn(finding.evidence, "resource_domain"), false);
+    }
+    assert.equal(output.stdout.includes(unauthorizedPatternCanary), false);
+    assert.equal(output.stdout.includes(unauthorizedDomainCanary), false);
 
     const commandHistory = await loadAnalyses(commandStorePaths);
     assert.equal(commandHistory.records.length, 1);
@@ -831,6 +858,133 @@ test("linked-worktree canonical policy failure precedes discovery and persistenc
     assert.deepEqual(resolvedRepos, [storePaths.canonical_repo]);
     assert.equal(discoveryCalls, 0);
     assert.deepEqual((await loadAnalyses(storePaths)).records, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("linked-worktree budget partial keeps canonical policy identity without Store paths", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-linked-budget-policy-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const linkedRepoPath = join(repo, ".test-worktrees", "policy-budget");
+    await mkdir(dirname(linkedRepoPath), { recursive: true });
+    await git(repo, ["worktree", "add", "--detach", linkedRepoPath, "feature"]);
+    const linkedRepo = await realpath(linkedRepoPath);
+    assert.notEqual(linkedRepo, repo);
+
+    const canonicalPolicy = commandPolicy({
+      governed: true,
+      organization: "canonical-policy",
+      privacy: "strict",
+      allow_raw: false,
+      allow_advisory: false,
+      advisory_enabled: false,
+      rule_safety: policySensitiveRuleSafety(),
+    });
+    const linkedPatternCanary = "npm test --linked-budget-policy-canary";
+    const linkedDomainCanary = "linked-budget-policy-canary";
+    const linkedPathPolicy = commandPolicy({
+      privacy: "raw",
+      allow_advisory: true,
+      advisory_enabled: true,
+      rule_safety: resolveRuleSafetyPolicy(
+        {
+          safe_patterns: [linkedPatternCanary],
+          allow_rule_recommendation: true,
+        },
+        [{
+          match: [linkedPatternCanary],
+          domain: linkedDomainCanary,
+          parallel_safe: true,
+        }],
+      ),
+    });
+    const advisoryCanary = "LINKED_BUDGET_ADVISORY_CANARY";
+    const resolvedRepos: string[] = [];
+    let discoveryCalls = 0;
+    let projectorCalls = 0;
+    let advisoryCalls = 0;
+    let wallReads = 0;
+    let partialReport: ReportV2 | undefined;
+    let preparedOutput: string | undefined;
+
+    const output = await runAnalyzeCommand({
+      cwd: linkedRepo,
+      pr: "main...feature",
+      format: "json",
+      color: false,
+      privacy: "raw",
+      advisory: true,
+      budgets: {
+        max_input_bytes: 1_000_000,
+        max_input_events: 1_000,
+        max_wall_ms: 0,
+        max_cpu_ms: 1_000_000,
+        max_output_bytes: 1_000_000,
+        max_source_items: 1_000,
+      },
+      budgetClock: {
+        wall_ms: () => wallReads++,
+        cpu_ms: () => 0,
+      },
+    }, {
+      analyze: async (options) => {
+        assert.equal(Object.hasOwn(options, "storePaths"), false);
+        const outputProjector = options.outputProjector;
+        assert.ok(outputProjector !== undefined);
+        const result = await analyze({
+          ...options,
+          nowMs: NOW_MS,
+          persist: false,
+          sessionSource: {
+            discover: async () => {
+              discoveryCalls += 1;
+              return [policySensitiveSession("must-not-discover", linkedRepo)];
+            },
+          },
+          outputProjector: async (report) => {
+            projectorCalls += 1;
+            return await outputProjector(report);
+          },
+        });
+        partialReport = result.report;
+        preparedOutput = result.preparedOutput;
+        return result;
+      },
+      resolvePolicy: async (resolvedRepo) => {
+        resolvedRepos.push(resolvedRepo);
+        return resolvedRepo === repo ? canonicalPolicy : linkedPathPolicy;
+      },
+      runCommand: async () => {
+        advisoryCalls += 1;
+        throw new Error(advisoryCanary);
+      },
+    });
+
+    assert.deepEqual(resolvedRepos, [repo]);
+    assert.equal(discoveryCalls, 0);
+    assert.equal(projectorCalls, 1);
+    assert.equal(advisoryCalls, 0);
+    assert.ok(partialReport !== undefined);
+    assert.equal(partialReport.unit.repo, repo);
+    assert.equal(
+      partialReport.analysis_budget?.truncation_reason,
+      "max_wall_ms",
+    );
+    assert.equal(preparedOutput, output.stdout);
+    assert.ok(output.warnings.some((warning) =>
+      warning.includes("[policy_advisory_disabled]")
+    ));
+    const strictReport = JSON.parse(output.stdout) as ReportV2;
+    assert.notEqual(strictReport.unit.repo, repo);
+    assert.notEqual(strictReport.unit.repo, linkedRepo);
+    const visibleOutput = `${output.stdout}\n${output.warnings.join("\n")}`;
+    assert.equal(visibleOutput.includes(repo), false);
+    assert.equal(visibleOutput.includes(linkedRepo), false);
+    assert.equal(visibleOutput.includes(linkedPatternCanary), false);
+    assert.equal(visibleOutput.includes(linkedDomainCanary), false);
+    assert.equal(visibleOutput.includes(advisoryCanary), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
