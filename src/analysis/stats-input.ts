@@ -6,6 +6,7 @@ import {
   exactCohortKey,
   normalizeTerminalStatsSnapshot,
   statsOpaqueDigest,
+  TERMINAL_STATS_COLLECTION_LIMIT,
   type BoundedBaselineMetric,
   type StatsAggregationInput as ProjectedStatsAggregationInput,
   type StatsInputReason,
@@ -14,6 +15,40 @@ import type { CommandIdentity } from "../core/model.js";
 import type { AnalysisSelectorIdentity } from "../store/analyses.js";
 
 export type { StatsAggregationInput } from "./stats-aggregation.js";
+
+export interface TerminalHistoryWindow {
+  entries: ProjectedStatsAggregationInput[];
+  metadata: {
+    total_snapshot_count: number;
+    window_snapshot_count: number;
+    truncated_snapshot_count: number;
+  };
+  truncated_work_unit_keys: ReadonlySet<string>;
+}
+
+export function boundTerminalHistory(
+  input: readonly ProjectedStatsAggregationInput[],
+): TerminalHistoryWindow {
+  const ordered = [...input].sort((left, right) =>
+    left.created_at_ms - right.created_at_ms ||
+    left.snapshot_id.localeCompare(right.snapshot_id));
+  const truncatedCount = Math.max(
+    0,
+    ordered.length - TERMINAL_STATS_COLLECTION_LIMIT,
+  );
+  const truncated = ordered.slice(0, truncatedCount);
+  const entries = ordered.slice(truncatedCount);
+  return {
+    entries,
+    metadata: {
+      total_snapshot_count: ordered.length,
+      window_snapshot_count: entries.length,
+      truncated_snapshot_count: truncatedCount,
+    },
+    truncated_work_unit_keys: new Set(truncated.flatMap(({ work_unit_key }) =>
+      work_unit_key === undefined ? [] : [work_unit_key])),
+  };
+}
 
 const HEX_64 = /^[0-9a-f]{64}$/u;
 const OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;

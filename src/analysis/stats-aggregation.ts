@@ -165,6 +165,9 @@ export interface TerminalAggregatePopulationMetadata {
 export interface TerminalStatsAggregateMetadata
   extends TerminalAggregatePopulationMetadata {
   stored_snapshot_count: number;
+  total_snapshot_count?: number;
+  window_snapshot_count?: number;
+  truncated_snapshot_count?: number;
   distinct_work_unit_count: number;
   terminal_snapshot_count: number;
   superseded_snapshot_count: number;

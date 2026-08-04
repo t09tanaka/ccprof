@@ -1,7 +1,10 @@
 import { resolve } from "node:path";
 
 import { aggregateTerminalStats } from "../analysis/stats-aggregation.js";
-import { projectStatsAggregationInput } from "../analysis/stats-input.js";
+import {
+  boundTerminalHistory,
+  projectStatsAggregationInput,
+} from "../analysis/stats-input.js";
 import { buildChronicCostMaterializationEntries } from "../core/analyze.js";
 import {
   runCommand,
@@ -103,13 +106,24 @@ export async function runStatsCommand(
   const adoptions = await (
     dependencies.loadAdoptions ?? loadAdoptions
   )(paths);
+  const terminalHistoryWarnings: Array<{
+    code: string;
+    message: string;
+  }> = [];
   const rawStats = history.entries === undefined
     ? summarizeStats(history.records, adoptions.records)
     : (() => {
       const mode = { mode: "stats_all_groups" } as const;
-      const projected = history.entries.map((entry) =>
-        projectStatsAggregationInput(entry)
-      );
+      const terminalWindow = boundTerminalHistory(history.entries.map(
+        (entry) => projectStatsAggregationInput(entry),
+      ));
+      const projected = terminalWindow.entries;
+      if (terminalWindow.metadata.truncated_snapshot_count > 0) {
+        terminalHistoryWarnings.push({
+          code: "terminal_history_truncated",
+          message: "Terminal statistics used a bounded recent history window.",
+        });
+      }
       const aggregate = aggregateTerminalStats(
         projected,
         mode,
@@ -117,6 +131,9 @@ export async function runStatsCommand(
       );
       const recordsBySnapshot = new Map(history.entries.map((entry) =>
         [entry.snapshot_id, entry.record] as const
+      ));
+      const entriesBySnapshot = new Map(history.entries.map((entry) =>
+        [entry.snapshot_id, entry] as const
       ));
       const terminalRecords = aggregate.selected_snapshot_ids.flatMap(
         (snapshotId) => {
@@ -131,11 +148,17 @@ export async function runStatsCommand(
       );
       const chronicEntries = buildChronicCostMaterializationEntries(
         projected,
-        history.entries,
+        projected.flatMap(({ snapshot_id }) => {
+          const entry = entriesBySnapshot.get(snapshot_id);
+          return entry === undefined ? [] : [entry];
+        }),
         mode,
       );
       return summarizeTerminalStats(
-        aggregate,
+        {
+          ...aggregate,
+          metadata: { ...aggregate.metadata, ...terminalWindow.metadata },
+        },
         terminalRecords,
         adoptions.records,
         chronicAggregates,
@@ -147,7 +170,11 @@ export async function runStatsCommand(
     privacy,
     repoRoot,
   );
-  const warnings = [...history.warnings, ...adoptions.warnings].map(
+  const warnings = [
+    ...history.warnings,
+    ...adoptions.warnings,
+    ...terminalHistoryWarnings,
+  ].map(
     (warning) => ({
       code: warning.code,
       message: warning.message,

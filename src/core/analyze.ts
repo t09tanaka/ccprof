@@ -72,8 +72,11 @@ import {
   mergeTestMaps,
   type TestMap,
 } from "../analysis/test-map.js";
-import { projectStatsAggregationInput, statsCommandKey } from
-  "../analysis/stats-input.js";
+import {
+  boundTerminalHistory,
+  projectStatsAggregationInput,
+  statsCommandKey,
+} from "../analysis/stats-input.js";
 import {
   buildTerminalStatsSnapshot,
   exactCohortKey,
@@ -1725,17 +1728,34 @@ export async function analyze(
     );
   }
   const history = priorRecords(historyResult.records, context);
-  const projectedHistory = (historyResult.entries ?? []).flatMap((entry) => {
-    try {
-      return [projectStatsAggregationInput(entry)];
-    } catch {
-      warnings.push(textWarning(
-        "stats_history_ineligible",
-        "One history snapshot was ineligible for comparable statistics.",
-      ));
-      return [];
-    }
+  const projectedHistoryWindow = boundTerminalHistory(
+    (historyResult.entries ?? []).flatMap((entry) => {
+      try {
+        return [projectStatsAggregationInput(entry)];
+      } catch {
+        warnings.push(textWarning(
+          "stats_history_ineligible",
+          "One history snapshot was ineligible for comparable statistics.",
+        ));
+        return [];
+      }
+    }),
+  );
+  const projectedHistory = projectedHistoryWindow.entries;
+  const historyEntryBySnapshot = new Map(
+    (historyResult.entries ?? []).map((entry) =>
+      [entry.snapshot_id, entry] as const),
+  );
+  const terminalHistoryEntries = projectedHistory.flatMap(({ snapshot_id }) => {
+    const entry = historyEntryBySnapshot.get(snapshot_id);
+    return entry === undefined ? [] : [entry];
   });
+  if (projectedHistoryWindow.metadata.truncated_snapshot_count > 0) {
+    warnings.push(textWarning(
+      "terminal_history_truncated",
+      "Terminal statistics used a bounded recent history window.",
+    ));
+  }
 
   // Adoption detection only exists to feed a save; when persist is false
   // (e.g. a hook-driven `--notify` analysis) skip it entirely rather than
@@ -1971,6 +1991,22 @@ export async function analyze(
   };
   let draftRecord = buildCurrentRecord(preliminaryLedger, candidates);
   let projectedCurrent = projectCurrentRecord(draftRecord);
+  const selectorHistoryTruncated = projectedCurrent.work_unit_key !== undefined &&
+    projectedHistoryWindow.truncated_work_unit_keys.has(
+      projectedCurrent.work_unit_key,
+    );
+  if (selectorHistoryTruncated) {
+    warnings.push(textWarning(
+      "terminal_history_selector_truncated",
+      "Terminal statistics were suppressed because current-selector history was truncated.",
+    ));
+  }
+  const comparableProjectedHistory = selectorHistoryTruncated
+    ? []
+    : projectedHistory;
+  const comparableHistoryEntries = selectorHistoryTruncated
+    ? []
+    : terminalHistoryEntries;
   if (
     projectedCurrent.work_unit_key !== undefined &&
     projectedCurrent.cohort_key !== undefined
@@ -1982,10 +2018,14 @@ export async function analyze(
     } as const;
     const chronicCoverage = coverage.find(({ rule_id }) => rule_id === "R006");
     const chronicCandidates = materializeChronicCostFindings(
-      buildChronicCostAggregates(projectedHistory, mode, minimumCohortSize),
+      buildChronicCostAggregates(
+        comparableProjectedHistory,
+        mode,
+        minimumCohortSize,
+      ),
       buildChronicCostMaterializationEntries(
-        projectedHistory,
-        historyResult.entries ?? [],
+        comparableProjectedHistory,
+        comparableHistoryEntries,
         mode,
       ),
       {
@@ -2007,7 +2047,7 @@ export async function analyze(
     ? null
     : computeBaseline(
         projectedCurrent.baseline_metrics,
-        projectedHistory,
+        comparableProjectedHistory,
         {
           mode: "analysis_current",
           current_work_unit_key: projectedCurrent.work_unit_key,
