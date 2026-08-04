@@ -3554,14 +3554,17 @@ test("terminal history window keeps deterministic recent ties and reports trunca
       createdAtMs: 1_000,
     })
   );
-  const expected = [...projected]
+  const ordered = [...projected]
     .sort((left, right) =>
       left.created_at_ms - right.created_at_ms ||
-      left.snapshot_id.localeCompare(right.snapshot_id))
-    .slice(-10_000);
-  const expectedIds = new Set(expected.map(({ snapshot_id }) => snapshot_id));
-  const dropped = projected.filter(({ snapshot_id }) =>
-    !expectedIds.has(snapshot_id));
+      left.snapshot_id.localeCompare(right.snapshot_id));
+  ordered.at(-2)!.work_unit_key = ordered[0]!.work_unit_key;
+  ordered.at(-1)!.work_unit_key = ordered[1]!.work_unit_key;
+  const dropped = ordered.slice(0, 2);
+  const droppedWorkUnitKeys = new Set(dropped.map(({ work_unit_key }) =>
+    work_unit_key!));
+  const expected = ordered.slice(2).filter(({ work_unit_key }) =>
+    !droppedWorkUnitKeys.has(work_unit_key!));
 
   for (const input of [projected, [...projected].reverse()]) {
     const window = boundTerminalHistory(input);
@@ -3571,8 +3574,8 @@ test("terminal history window keeps deterministic recent ties and reports trunca
     );
     assert.deepEqual(window.metadata, {
       total_snapshot_count: 10_002,
-      window_snapshot_count: 10_000,
-      truncated_snapshot_count: 2,
+      window_snapshot_count: 9_998,
+      truncated_snapshot_count: 4,
     });
     assert.deepEqual(
       [...window.truncated_work_unit_keys].sort(),
@@ -4034,6 +4037,9 @@ test("stats CLI aggregates opaque terminal history before privacy rendering", as
       privacy_profile: profile,
       projection: "numeric_bounded_opaque_v1",
       stored_snapshot_count: 7,
+      total_snapshot_count: 7,
+      window_snapshot_count: 7,
+      truncated_snapshot_count: 0,
       distinct_work_unit_count: 6,
       terminal_snapshot_count: 6,
       superseded_snapshot_count: 1,
