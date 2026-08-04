@@ -242,7 +242,23 @@ function projectedAnalysisBudget(
 export function projectReportPrivacy(report: ReportV2, profile: PrivacyProfile): ReportV2 {
   if (profile === "raw") return report;
   const findings = report.findings.map(findingForDisplay);
-  const scope = createHash("sha256").update(JSON.stringify(report)).digest("hex");
+  const normalizedReport: ReportV2 = {
+    version: 2,
+    unit: report.unit,
+    ...(report.sources === undefined ? {} : { sources: report.sources }),
+    summary: report.summary,
+    findings,
+    caveats: report.caveats,
+    ...(report.rule_coverage === undefined
+      ? {}
+      : { rule_coverage: report.rule_coverage }),
+    ...(report.skipped_rules === undefined
+      ? {}
+      : { skipped_rules: report.skipped_rules }),
+  };
+  const scope = createHash("sha256")
+    .update(JSON.stringify(normalizedReport))
+    .digest("hex");
   const repoRoot = report.unit.repo;
   const sessions = report.unit.sessions;
   return {
@@ -262,7 +278,7 @@ export function projectReportPrivacy(report: ReportV2, profile: PrivacyProfile):
     findings: findings.map((finding) => projectedFinding(
       finding, profile, scope, repoRoot, sessions,
     )),
-    caveats: reportCaveats(report, profile, repoRoot, sessions),
+    caveats: reportCaveats(normalizedReport, profile, repoRoot, sessions),
     ...(report.rule_coverage === undefined ? {} : {
       rule_coverage: report.rule_coverage.map((entry) => ({
         rule_id: entry.rule_id,

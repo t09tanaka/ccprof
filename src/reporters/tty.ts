@@ -2,6 +2,7 @@ import { types as utilTypes } from "node:util";
 
 import type { AdvisoryText } from "../advisory/advisory.js";
 import {
+  findingCompatibilityMetadata,
   findingScoringRationale,
   findingSeverity,
   projectFindingConfidence,
@@ -12,8 +13,10 @@ import {
 import type {
   Finding,
   FindingConfidence,
+  FindingEvidence,
   FindingScoringRationale,
   ImpactEstimate,
+  JsonValue,
   ReportV2,
 } from "../core/model.js";
 import { sanitizeHumanText } from "./sanitize.js";
@@ -64,6 +67,53 @@ const DISPLAY_CANONICAL_FIELDS = [
   "scoring_rationale",
 ] as const;
 
+const DISPLAY_REQUIRED_FIELDS = [
+  "finding_key",
+  "rule_id",
+  "title",
+  "classification",
+  "cause",
+  "scope",
+  "confidence",
+  "evidence",
+  "fix_recipe",
+  "caveats",
+  "recoverable",
+] as const;
+
+const DISPLAY_OPTIONAL_FIELDS = [
+  "target",
+  ...DISPLAY_CANONICAL_FIELDS,
+  "rule_version",
+  "compatibility_epoch",
+] as const;
+
+const DISPLAY_FINDING_FIELDS = new Set<string>([
+  ...DISPLAY_REQUIRED_FIELDS,
+  ...DISPLAY_OPTIONAL_FIELDS,
+]);
+const DISPLAY_RULE_IDS = new Set([
+  "R001",
+  "R002",
+  "R003",
+  "R004",
+  "R005",
+  "R006",
+  "R007",
+  "R008",
+]);
+const DISPLAY_CLASSIFICATIONS = new Set(["repo", "config", "behavior"]);
+const DISPLAY_SCOPES = new Set(["this_pr", "separate_issue", "claude_md"]);
+const DISPLAY_CONFIDENCES = new Set(["low", "medium", "high"]);
+const DISPLAY_CAUSES = new Set([
+  "ambiguous_task",
+  "requirements_changed",
+  "missing_context",
+  "scope_creep",
+  "tool_failure",
+  "unknown",
+]);
+
 function displayDataValue(
   descriptor: PropertyDescriptor | undefined,
 ): unknown {
@@ -73,6 +123,216 @@ function displayDataValue(
     !("value" in descriptor)
   ) throw new TypeError();
   return descriptor.value;
+}
+
+function displayObjectDescriptors(
+  value: unknown,
+): Record<string, PropertyDescriptor> {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    utilTypes.isProxy(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) throw new TypeError();
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (Reflect.ownKeys(descriptors).some((key) => typeof key !== "string")) {
+    throw new TypeError();
+  }
+  return descriptors;
+}
+
+function exactDisplayObject(
+  value: unknown,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): Record<string, unknown> {
+  const descriptors = displayObjectDescriptors(value);
+  const keys = Reflect.ownKeys(descriptors);
+  const allowed = new Set([...required, ...optional]);
+  if (
+    keys.some((key) => typeof key !== "string" || !allowed.has(key)) ||
+    required.some((key) => descriptors[key] === undefined)
+  ) throw new TypeError();
+  return Object.fromEntries(keys.map((key) => {
+    if (typeof key !== "string") throw new TypeError();
+    return [key, displayDataValue(descriptors[key])];
+  }));
+}
+
+function snapshotDisplayJson(
+  value: unknown,
+  active = new WeakSet<object>(),
+): JsonValue {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean"
+  ) return value;
+  if (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    !Object.is(value, -0)
+  ) return value;
+  if (typeof value !== "object" || utilTypes.isProxy(value)) {
+    throw new TypeError();
+  }
+  if (active.has(value)) throw new TypeError();
+  active.add(value);
+  try {
+    if (Array.isArray(value)) {
+      if (Object.getPrototypeOf(value) !== Array.prototype) {
+        throw new TypeError();
+      }
+      const ownKeys = Reflect.ownKeys(value);
+      const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+      if (
+        lengthDescriptor === undefined ||
+        !("value" in lengthDescriptor) ||
+        !Number.isSafeInteger(lengthDescriptor.value) ||
+        lengthDescriptor.value < 0 ||
+        ownKeys.length !== lengthDescriptor.value + 1
+      ) throw new TypeError();
+      const snapshot: JsonValue[] = [];
+      for (let index = 0; index < lengthDescriptor.value; index += 1) {
+        snapshot.push(snapshotDisplayJson(displayDataValue(
+          Object.getOwnPropertyDescriptor(value, String(index)),
+        ), active));
+      }
+      return snapshot;
+    }
+
+    if (Object.getPrototypeOf(value) !== Object.prototype) {
+      throw new TypeError();
+    }
+    const entries: Array<[string, JsonValue]> = [];
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== "string") throw new TypeError();
+      entries.push([
+        key,
+        snapshotDisplayJson(displayDataValue(
+          Object.getOwnPropertyDescriptor(value, key),
+        ), active),
+      ]);
+    }
+    return Object.fromEntries(entries);
+  } finally {
+    active.delete(value);
+  }
+}
+
+function snapshotDisplayStringArray(value: unknown): string[] {
+  const snapshot = snapshotDisplayJson(value);
+  if (
+    !Array.isArray(snapshot) ||
+    snapshot.some((entry) => typeof entry !== "string")
+  ) throw new TypeError();
+  return snapshot as string[];
+}
+
+function snapshotDisplayEvidence(value: unknown): FindingEvidence {
+  const snapshot = snapshotDisplayJson(value);
+  if (
+    snapshot === null ||
+    typeof snapshot !== "object" ||
+    Array.isArray(snapshot) ||
+    !Array.isArray(snapshot.session_refs) ||
+    snapshot.session_refs.some((entry) => typeof entry !== "string") ||
+    !Array.isArray(snapshot.interval_ids) ||
+    snapshot.interval_ids.some((entry) => typeof entry !== "string")
+  ) throw new TypeError();
+  return snapshot as FindingEvidence;
+}
+
+function snapshotDisplayBaseFinding(
+  descriptors: Record<string, PropertyDescriptor>,
+): Finding {
+  const read = (field: (typeof DISPLAY_REQUIRED_FIELDS)[number]): unknown =>
+    displayDataValue(descriptors[field]);
+  const findingKey = read("finding_key");
+  const ruleId = read("rule_id");
+  const title = read("title");
+  const classification = read("classification");
+  const cause = read("cause");
+  const scope = read("scope");
+  const confidence = read("confidence");
+  if (
+    typeof findingKey !== "string" ||
+    typeof ruleId !== "string" ||
+    !DISPLAY_RULE_IDS.has(ruleId) ||
+    typeof title !== "string" ||
+    typeof classification !== "string" ||
+    !DISPLAY_CLASSIFICATIONS.has(classification) ||
+    (cause !== null &&
+      (typeof cause !== "string" || !DISPLAY_CAUSES.has(cause))) ||
+    typeof scope !== "string" ||
+    !DISPLAY_SCOPES.has(scope) ||
+    typeof confidence !== "string" ||
+    !DISPLAY_CONFIDENCES.has(confidence)
+  ) throw new TypeError();
+
+  const recoverable = exactDisplayObject(read("recoverable"), ["min", "bound"]);
+  if (
+    typeof recoverable.min !== "number" ||
+    !Number.isFinite(recoverable.min) ||
+    recoverable.min < 0 ||
+    Object.is(recoverable.min, -0) ||
+    (recoverable.bound !== "point" && recoverable.bound !== "upper")
+  ) throw new TypeError();
+  const recipe = exactDisplayObject(read("fix_recipe"), ["suggestion", "verify"]);
+  if (
+    typeof recipe.suggestion !== "string" ||
+    typeof recipe.verify !== "string"
+  ) throw new TypeError();
+
+  const target = descriptors.target === undefined
+    ? undefined
+    : displayDataValue(descriptors.target);
+  if (target !== undefined && typeof target !== "string") {
+    throw new TypeError();
+  }
+
+  const compatibilitySource: Record<string, unknown> = {};
+  const versionDescriptor = descriptors.rule_version;
+  const epochDescriptor = descriptors.compatibility_epoch;
+  if (
+    versionDescriptor !== undefined &&
+    epochDescriptor !== undefined &&
+    versionDescriptor.enumerable === true &&
+    epochDescriptor.enumerable === true &&
+    "value" in versionDescriptor &&
+    "value" in epochDescriptor
+  ) {
+    Object.defineProperties(compatibilitySource, {
+      rule_version: { enumerable: true, value: versionDescriptor.value },
+      compatibility_epoch: { enumerable: true, value: epochDescriptor.value },
+    });
+  }
+  const compatibility = findingCompatibilityMetadata(compatibilitySource);
+
+  return {
+    finding_key: findingKey,
+    rule_id: ruleId as Finding["rule_id"],
+    ...(compatibility.valid && compatibility.metadata !== undefined
+      ? compatibility.metadata
+      : {}),
+    title,
+    ...(target === undefined ? {} : { target }),
+    classification: classification as Finding["classification"],
+    cause: cause as Finding["cause"],
+    scope: scope as Finding["scope"],
+    confidence: confidence as Finding["confidence"],
+    evidence: snapshotDisplayEvidence(read("evidence")),
+    recoverable: {
+      min: recoverable.min,
+      bound: recoverable.bound,
+    } as Finding["recoverable"],
+    fix_recipe: {
+      suggestion: recipe.suggestion,
+      verify: recipe.verify,
+    },
+    caveats: snapshotDisplayStringArray(read("caveats")),
+  };
 }
 
 function snapshotDisplayRationale(value: unknown): FindingScoringRationale[] {
@@ -109,11 +369,47 @@ function exactRationale(
     actual.every((entry, index) => entry === expected[index]);
 }
 
+function rebuildDisplayFinding(
+  descriptors: Record<string, PropertyDescriptor>,
+  base: Finding,
+  impact: ImpactEstimate,
+  confidence: FindingConfidence,
+  rationale: FindingScoringRationale[],
+): Finding {
+  const projected: Finding = {
+    ...base,
+    confidence: projectFindingConfidence(confidence),
+    impact,
+    finding_confidence: confidence,
+    severity: findingSeverity(impact, confidence),
+    scoring_rationale: rationale,
+    recoverable: projectFindingRecoverable(impact),
+  };
+  const entries: Array<[string, unknown]> = [];
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (typeof key !== "string") throw new TypeError();
+    if (Object.hasOwn(projected, key)) {
+      entries.push([key, projected[key as keyof Finding]]);
+    }
+  }
+  for (const field of DISPLAY_CANONICAL_FIELDS) {
+    if (descriptors[field] === undefined) {
+      entries.push([field, projected[field]]);
+    }
+  }
+  return Object.fromEntries(entries) as unknown as Finding;
+}
+
 function validLegacyProjection(
+  ruleId: Finding["rule_id"],
   impact: ImpactEstimate,
   confidence: FindingConfidence,
 ): boolean {
-  return impact.lower_ms === 0 &&
+  const expectedKind = ruleId === "R005" || ruleId === "R006"
+    ? "resource_cost"
+    : "critical_path_latency";
+  return impact.kind === expectedKind &&
+    impact.lower_ms === 0 &&
     !("expected_ms" in impact) &&
     ((confidence.evidence === "low" &&
       confidence.causal === "low" &&
@@ -133,6 +429,14 @@ export function findingForDisplay(finding: Finding): Finding {
       Object.getPrototypeOf(finding) !== Object.prototype
     ) throw new TypeError();
     const descriptors = Object.getOwnPropertyDescriptors(finding);
+    const keys = Reflect.ownKeys(descriptors);
+    if (
+      keys.some((key) =>
+        typeof key !== "string" || !DISPLAY_FINDING_FIELDS.has(key)
+      ) ||
+      DISPLAY_REQUIRED_FIELDS.some((field) => descriptors[field] === undefined)
+    ) throw new TypeError();
+    const base = snapshotDisplayBaseFinding(descriptors);
     const presentCanonicalFields = DISPLAY_CANONICAL_FIELDS.filter(
       (field) => descriptors[field] !== undefined,
     );
@@ -144,30 +448,28 @@ export function findingForDisplay(finding: Finding): Finding {
     if (presentCanonicalFields.length === 0) {
       const impact: ImpactEstimate = {
         lower_ms: 0,
-        upper_ms: finding.recoverable.min * 60_000,
-        kind: finding.rule_id === "R005" || finding.rule_id === "R006"
+        upper_ms: base.recoverable.min * 60_000,
+        kind: base.rule_id === "R005" || base.rule_id === "R006"
           ? "resource_cost"
           : "critical_path_latency",
       };
-      const confidence: FindingConfidence = finding.confidence === "low"
+      const confidence: FindingConfidence = base.confidence === "low"
         ? { evidence: "low", causal: "low", source_completeness: 0 }
         : {
-          evidence: finding.confidence,
+          evidence: base.confidence,
           causal: "medium",
           source_completeness: 0.5,
         };
-      return {
-        ...finding,
-        confidence: projectFindingConfidence(confidence),
+      return rebuildDisplayFinding(
+        descriptors,
+        base,
         impact,
-        finding_confidence: confidence,
-        severity: findingSeverity(impact, confidence),
-        scoring_rationale: findingScoringRationale(impact, confidence, {
-          ...(finding.rule_id === "R004" ? { policy_dependent: true } : {}),
+        confidence,
+        findingScoringRationale(impact, confidence, {
+          ...(base.rule_id === "R004" ? { policy_dependent: true } : {}),
           legacy_projection: true,
         }),
-        recoverable: projectFindingRecoverable(impact),
-      };
+      );
     }
 
     const impact = snapshotImpactEstimate(
@@ -185,29 +487,28 @@ export function findingForDisplay(finding: Finding): Finding {
     );
     const legacyProjection = rationale.includes("legacy_projection");
     const expectedRationale = findingScoringRationale(impact, confidence, {
-      ...(finding.rule_id === "R004" ? { policy_dependent: true } : {}),
+      ...(base.rule_id === "R004" ? { policy_dependent: true } : {}),
       ...(legacyProjection ? { legacy_projection: true } : {}),
     });
     if (
       !exactRationale(rationale, expectedRationale) ||
-      (legacyProjection && !validLegacyProjection(impact, confidence))
+      (legacyProjection &&
+        !validLegacyProjection(base.rule_id, impact, confidence))
     ) throw new TypeError();
-    return {
-      ...finding,
-      confidence: projectFindingConfidence(confidence),
+    return rebuildDisplayFinding(
+      descriptors,
+      base,
       impact,
-      finding_confidence: confidence,
-      severity,
-      scoring_rationale: rationale,
-      recoverable: projectFindingRecoverable(impact),
-    };
+      confidence,
+      rationale,
+    );
   } catch {
     throw new TypeError("invalid finding");
   }
 }
 
-export function formatFindingImpact(finding: Finding): string {
-  const impact = findingForDisplay(finding).impact as ImpactEstimate;
+function formatDisplayedFindingImpact(finding: Finding): string {
+  const impact = finding.impact as ImpactEstimate;
   const expected = impact.expected_ms === undefined
     ? ""
     : `expected ${formatMinutes(impact.expected_ms / 60_000)}; `;
@@ -219,16 +520,19 @@ export function formatFindingImpact(finding: Finding): string {
   } (${expected}${kind})`;
 }
 
+export function formatFindingImpact(finding: Finding): string {
+  return formatDisplayedFindingImpact(findingForDisplay(finding));
+}
+
 function findingLine(
   finding: Finding,
   index: number,
   color: boolean,
 ): string {
-  const displayed = findingForDisplay(finding);
-  const confidence = displayed.finding_confidence as FindingConfidence;
-  const rule = paint(`[${displayed.rule_id}]`, 36, color);
-  const rationale = displayed.scoring_rationale?.join(",") || "none";
-  return `${index + 1}. ${rule} Impact ${formatFindingImpact(displayed)}; severity ${displayed.severity}; confidence evidence=${confidence.evidence} causal=${confidence.causal} completeness=${confidence.source_completeness}; rationale ${rationale} — ${plainLine(displayed.title)}`;
+  const confidence = finding.finding_confidence as FindingConfidence;
+  const rule = paint(`[${finding.rule_id}]`, 36, color);
+  const rationale = finding.scoring_rationale?.join(",") || "none";
+  return `${index + 1}. ${rule} Impact ${formatDisplayedFindingImpact(finding)}; severity ${finding.severity}; confidence evidence=${confidence.evidence} causal=${confidence.causal} completeness=${confidence.source_completeness}; rationale ${rationale} — ${plainLine(finding.title)}`;
 }
 
 function recipeLine(finding: Finding): string {
@@ -285,10 +589,10 @@ export function analysisBudgetLine(report: ReportV2): string | null {
   return `Analysis budget: ${budget.completeness}${reason} (${coverage}% coverage).`;
 }
 
-function caveatLines(report: ReportV2): string[] {
+function caveatLines(report: ReportV2, findings: readonly Finding[]): string[] {
   const caveats = [
     ...report.caveats,
-    ...report.findings.slice(0, 3).flatMap((finding) => finding.caveats),
+    ...findings.flatMap((finding) => finding.caveats),
   ].map(plainLine).filter((value) => value !== "");
   const unique = [...new Set(caveats)];
   if (unique.length <= 3) return unique.map((value) => `- ${value}`);
@@ -315,7 +619,7 @@ export function renderTtyReport(
   if (budgetSummary !== null) lines.push(budgetSummary);
   const sourceSummary = sourcesLine(report);
   if (sourceSummary !== null) lines.push(sourceSummary);
-  const findings = report.findings.slice(0, 3);
+  const findings = report.findings.slice(0, 3).map(findingForDisplay);
   if (findings.length === 0) {
     lines.push("No actionable findings.");
   } else {
@@ -333,7 +637,7 @@ export function renderTtyReport(
   if (skippedLine !== null) {
     lines.push(skippedLine);
   }
-  const caveats = caveatLines(report);
+  const caveats = caveatLines(report, findings);
   if (caveats.length > 0) {
     lines.push("Caveats:", ...caveats);
   }

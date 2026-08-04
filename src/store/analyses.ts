@@ -249,13 +249,17 @@ function snapshotScoringRationale(value: unknown): FindingScoringRationale[] {
   return snapshot;
 }
 
+function legacyImpactKind(ruleId: Finding["rule_id"]): ImpactEstimate["kind"] {
+  return ruleId === "R005" || ruleId === "R006"
+    ? "resource_cost"
+    : "critical_path_latency";
+}
+
 function legacyImpact(finding: Finding): ImpactEstimate {
   return snapshotImpactEstimate({
     lower_ms: 0,
     upper_ms: finding.recoverable.min * 60_000,
-    kind: finding.rule_id === "R005" || finding.rule_id === "R006"
-      ? "resource_cost"
-      : "critical_path_latency",
+    kind: legacyImpactKind(finding.rule_id),
   });
 }
 
@@ -301,7 +305,8 @@ function isCanonicalLegacyProjection(
     ...(base.rule_id === "R004" ? { policy_dependent: true } : {}),
     legacy_projection: true,
   });
-  return impact.lower_ms === 0 &&
+  return impact.kind === legacyImpactKind(base.rule_id) &&
+    impact.lower_ms === 0 &&
     !("expected_ms" in impact) &&
     isLegacyProjectedConfidence(confidence) &&
     base.confidence === projectFindingConfidence(confidence) &&
