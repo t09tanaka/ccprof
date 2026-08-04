@@ -126,7 +126,20 @@ test("README documents the doctor command contract", async () => {
   for (const property of ["deterministically", "privacy-safe", "read-only"]) {
     assert.match(readme, new RegExp(property, "u"));
   }
-  assert.match(prose, /Doctor does not create the Store/u);
+  assert.match(
+    prose,
+    /Doctor does not create the Store, initialize it, migrate it, repair it, backfill it/u,
+  );
+  assert.match(prose, /A missing Store is reported as a warning/u);
+  assert.match(
+    prose,
+    /An unconfigured or unavailable operator parser budget profile is reported as a warning/u,
+  );
+  assert.match(
+    prose,
+    /Unavailable encryption support is reported as a warning/u,
+  );
+  assert.match(prose, /Warnings still use exit 0 when no check failed/u);
   assert.match(prose, /Exit 0 means no check failed/u);
   assert.match(prose, /exit 1 means at least one check failed/u);
   assert.match(prose, /exit 2 means invalid command usage/u);

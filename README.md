@@ -112,9 +112,11 @@ errors are never printed.
 
 Store inspection is read-only. Doctor does not create the Store, initialize it,
 migrate it, repair it, backfill it, vacuum it, chmod it, or otherwise modify it.
-A missing Store, operator-configurable parser budget profile, or encryption
-support is reported as a warning. Exit 0 means no check failed, exit 1 means at
-least one check failed, and exit 2 means invalid command usage.
+A missing Store is reported as a warning. An unconfigured or unavailable
+operator parser budget profile is reported as a warning. Unavailable encryption
+support is reported as a warning. Warnings still use exit 0 when no check failed.
+Exit 0 means no check failed, exit 1 means at least one check failed, and exit 2
+means invalid command usage.
 
 ### Published Report v3 schema
 
