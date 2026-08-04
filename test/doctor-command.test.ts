@@ -3,7 +3,8 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
-  mkdir, mkdtemp, open, readFile, readdir, rm, stat, truncate, writeFile,
+  appendFile, mkdir, mkdtemp, open, readFile, readdir, rm, stat, truncate,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,7 +14,7 @@ import Database from "better-sqlite3";
 import {
   CliUsageError, parseCliArgs, runCli, USAGE,
 } from "../src/cli.js";
-import { runDoctorCommand } from "../src/commands/doctor.js";
+import { copyStoreFile, runDoctorCommand } from "../src/commands/doctor.js";
 import { resolveStorePaths } from "../src/store/paths.js";
 import {
   INCREMENTAL_SOURCES_MIGRATION,
@@ -88,6 +89,18 @@ async function capture(
     }
   }
 }
+
+test("bounded Store copy rejects growth after validation", async (t) => {
+  const { root } = await fixture(t);
+  const source = join(root, "source.sqlite3");
+  const target = join(root, "snapshot.sqlite3");
+  await writeFile(source, "validated bytes");
+  const expected = await stat(source);
+  await appendFile(source, " raced growth");
+
+  await assert.rejects(copyStoreFile(source, target, expected));
+  assert.equal(existsSync(target), false);
+});
 
 test("doctor parses its exact public command shapes", () => {
   assert.deepEqual(parseCliArgs(["doctor"]), { kind: "doctor", json: false });

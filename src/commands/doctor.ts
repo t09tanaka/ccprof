@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
-import type { Stats } from "node:fs";
-import { copyFile, lstat, mkdtemp, rm } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
+import { lstat, mkdtemp, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadRepositoryConfig, loadRepositoryPolicyPreferences } from
@@ -19,42 +19,30 @@ export type DoctorCheckId = "configuration" | "organization_policy" |
   "store_migrations" | "store_open" | "encryption";
 export interface DoctorCheck { id: DoctorCheckId; status: DoctorStatus;
   code: string; message: string; }
-export interface DoctorReport {
-  schema_version: 1; command: "doctor"; status: DoctorStatus;
-  checks: DoctorCheck[]; }
-export interface DoctorOptions { cwd: string; json: boolean;
-  env?: NodeJS.ProcessEnv; }
-interface StoreChecks { schema: DoctorCheck; migrations: DoctorCheck;
-  open: DoctorCheck; }
+export interface DoctorReport { schema_version: 1; command: "doctor";
+  status: DoctorStatus; checks: DoctorCheck[]; }
+export interface DoctorOptions { cwd: string; json: boolean; env?: NodeJS.ProcessEnv; }
+interface StoreChecks { schema: DoctorCheck; migrations: DoctorCheck; open: DoctorCheck; }
 const SUPPORTED_OLD_SCHEMAS = new Set([0, 2, 3, 4]);
 const REQUIRED_MIGRATIONS = [SOURCE_CATALOG_MIGRATION,
   ANALYSIS_BUDGETS_MIGRATION, INCREMENTAL_SOURCES_MIGRATION] as const;
 const MAX_STORE_SNAPSHOT_BYTES = 256 * 1024 * 1024;
 function check(id: DoctorCheckId, status: DoctorStatus, code: string,
-  message: string): DoctorCheck {
-  return { id, status, code, message };
-}
+  message: string): DoctorCheck { return { id, status, code, message }; }
 function missingStore(): StoreChecks { return {
-    schema: check("store_schema", "warn", "store_not_initialized",
-      "Store is not initialized."),
-    migrations: check("store_migrations", "warn", "store_not_initialized",
-      "Store is not initialized."),
-    open: check("store_open", "pass", "store_open_not_required",
-      "No Store database is present to open."),
+    schema: check("store_schema", "warn", "store_not_initialized", "Store is not initialized."),
+    migrations: check("store_migrations", "warn", "store_not_initialized", "Store is not initialized."),
+    open: check("store_open", "pass", "store_open_not_required", "No Store database is present to open."),
   }; }
 function failedStore(): StoreChecks { return {
-    schema: check("store_schema", "fail", "store_unavailable",
-      "Store could not be inspected safely."),
-    migrations: check("store_migrations", "fail", "store_unavailable",
-      "Store could not be inspected safely."),
-    open: check("store_open", "fail", "store_unavailable",
-      "Store could not be inspected safely."),
+    schema: check("store_schema", "fail", "store_unavailable", "Store could not be inspected safely."),
+    migrations: check("store_migrations", "fail", "store_unavailable", "Store could not be inspected safely."),
+    open: check("store_open", "fail", "store_unavailable", "Store could not be inspected safely."),
   }; }
 async function pathStatus(path: string): Promise<Stats | undefined> {
   try { return await lstat(path); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw error;
-  }
+    throw error; }
 }
 function sameFile(left: Stats, right: Stats): boolean {
   return left.dev === right.dev && left.ino === right.ino &&
@@ -66,31 +54,43 @@ function validSnapshot(database: Stats, wal: Stats | undefined): boolean {
     database.size <= MAX_STORE_SNAPSHOT_BYTES &&
     (wal?.size ?? 0) <= MAX_STORE_SNAPSHOT_BYTES - database.size;
 }
-function sameStatus(left: Stats | undefined, right: Stats | undefined): boolean {
-  return left === undefined ? right === undefined :
-    right !== undefined && sameFile(left, right);
+function sameStatus(left: Stats | undefined, right: Stats | undefined): boolean { return left === undefined
+  ? right === undefined : right !== undefined && sameFile(left, right); }
+/** @internal */
+export async function copyStoreFile(source: string, target: string, expected: Stats): Promise<void> {
+  const sourceHandle = await open(source, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    if (!sameFile(expected, await sourceHandle.stat())) throw new Error();
+    const targetHandle = await open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+    try {
+      const buffer = Buffer.allocUnsafe(64 * 1024);
+      let offset = 0;
+      while (offset < expected.size) {
+        const length = Math.min(buffer.length, expected.size - offset);
+        const { bytesRead } = await sourceHandle.read(buffer, 0, length, offset);
+        if (bytesRead === 0) throw new Error();
+        await targetHandle.writeFile(buffer.subarray(0, bytesRead));
+        offset += bytesRead;
+      }
+      if ((await sourceHandle.read(buffer, 0, 1, offset)).bytesRead !== 0) throw new Error();
+    } finally { await targetHandle.close(); }
+  } finally { await sourceHandle.close(); }
 }
-async function copyStore(path: string):
-Promise<{ directory: string; databasePath: string }> {
+async function copyStore(path: string): Promise<{ directory: string; databasePath: string }> {
   const walPath = `${path}-wal`;
-  const [databaseBefore, walBefore] = await Promise.all([
-    lstat(path), pathStatus(walPath),
-  ]);
+  const [databaseBefore, walBefore] = await Promise.all([lstat(path), pathStatus(walPath)]);
   if (!validSnapshot(databaseBefore, walBefore)) throw new Error();
   const directory = await mkdtemp(join(tmpdir(), "ccprof-doctor-"));
   const databasePath = join(directory, "store.sqlite3");
   try {
-    await copyFile(path, databasePath);
-    const [databaseMiddle, walMiddle] = await Promise.all([
-      lstat(path), pathStatus(walPath),
-    ]);
+    await copyStoreFile(path, databasePath, databaseBefore);
+    const [databaseMiddle, walMiddle] = await Promise.all([lstat(path), pathStatus(walPath)]);
     if (!sameFile(databaseBefore, databaseMiddle) ||
       !sameStatus(walBefore, walMiddle) ||
       !validSnapshot(databaseMiddle, walMiddle)) throw new Error();
-    if (walBefore !== undefined) await copyFile(walPath, `${databasePath}-wal`);
-    const [databaseAfter, walAfter] = await Promise.all([
-      lstat(path), pathStatus(walPath),
-    ]);
+    if (walBefore !== undefined)
+      await copyStoreFile(walPath, `${databasePath}-wal`, walBefore);
+    const [databaseAfter, walAfter] = await Promise.all([lstat(path), pathStatus(walPath)]);
     if (!sameFile(databaseBefore, databaseAfter) ||
       !sameStatus(walBefore, walAfter) ||
       !validSnapshot(databaseAfter, walAfter)) throw new Error();
