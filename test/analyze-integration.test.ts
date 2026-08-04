@@ -3587,13 +3587,18 @@ test("linked worktrees keep exact evidence eligibility rows isolated in one Stor
     } as const;
     await analyze({ ...common, cwd: repo, storePaths: mainPaths });
     await analyze({ ...common, cwd: linkedRepo, storePaths: linkedPaths });
+    await analyze({ ...common, cwd: repo, storePaths: mainPaths });
 
     const database = openStoreDatabase(mainPaths);
     try {
       const counts = database.prepare(`SELECT count(*) AS rows,
-        count(DISTINCT eligibility_identity) AS roots
-        FROM source_evidence_cache`).get() as { rows: number; roots: number };
-      assert.deepEqual(counts, { rows: 2, roots: 2 });
+        count(DISTINCT eligibility_identity) AS roots,
+        sum(cache.updated_at_ms = catalog.observed_at_ms
+          AND cache.content_revision = catalog.content_revision
+          AND cache.last_parsed_offset = catalog.last_parsed_offset) AS valid
+        FROM source_evidence_cache cache JOIN source_catalog catalog
+          USING (source_identity)`).get() as { rows: number; roots: number; valid: number };
+      assert.deepEqual(counts, { rows: 2, roots: 2, valid: 2 });
     } finally {
       database.close();
     }

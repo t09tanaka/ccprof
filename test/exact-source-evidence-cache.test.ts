@@ -9,6 +9,7 @@ import test, { type TestContext } from "node:test";
 
 import type { Session } from "../src/core/model.js";
 import {
+  IncrementalParserStateCapacityError, parseClaudeTranscriptDetailed,
   projectClaudeParserState, readClaudeParserState,
 } from "../src/sources/claude/parser.js";
 import {
@@ -139,6 +140,24 @@ test("fresh cold/warm consumers read 1 -> 0 and reproject endedAt", async (t) =>
   assert.equal(rows(value.paths), 1);
 });
 
+test("parser-state capacity falls back cold without publishing", async (t) => {
+  const value = await fixture(t);
+  await writeFile(value.sourcePath, `${claude(value.repo, "fallback", 1)}\n`);
+  let fallbacks = 0;
+  const result = await consumer(value).consume({
+    adapterId: "claude", sourceRoot: value.sourceRoot, sourcePath: value.sourcePath,
+    readState: async () => { throw new IncrementalParserStateCapacityError(1); },
+    projectState: projectClaudeParserState,
+    ...{ coldFallback: async () => {
+      fallbacks += 1;
+      return await parseClaudeTranscriptDetailed(value.sourcePath);
+    } },
+  });
+  assert.equal(fallbacks, 1);
+  assert.equal(result.sessions[0]?.session_id, "fallback");
+  assert.equal(rows(value.paths), 0);
+});
+
 test("same metadata with changed bytes misses exact revision", async (t) => {
   const value = await fixture(t);
   const first = `${claude(value.repo, "replace-a", 1)}\n`;
@@ -161,6 +180,8 @@ test("same metadata with changed bytes misses exact revision", async (t) => {
 test("warning-free negatives reuse; warning and mixed evidence never commit", async (t) => {
   const cases = [
     { raw: "", expectedReads: 1, expectedRows: 1 },
+    { raw: `${JSON.stringify({ sessionId: "ignored", uuid: "ignored",
+      timestamp: at(1), type: "summary" })}\n`, expectedReads: 1, expectedRows: 1 },
     { raw: "{malformed\n", expectedReads: 2, expectedRows: 0 },
   ];
   for (const item of cases) {
