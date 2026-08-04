@@ -319,6 +319,29 @@ Fixed buckets are selected over relative tolerances because relative
 Exact counts are rejected as unnecessarily suppressive. A missing repository,
 workspace, or changed-line dimension suppresses the cohort with a stable reason.
 
+The exact cohort identity is the closed tuple `(repository_key, workspace_key,
+changed_files_bucket, changed_lines_bucket)`. Its internal `cohort_key` is a
+domain-separated opaque digest of the canonical tuple, including the bucket
+enum identities rather than their display labels. Cohort helpers require one
+explicit mode:
+
+```ts
+type CohortEvaluationMode =
+  | {
+      mode: "analysis_current";
+      current_work_unit_key: OpaqueDigest;
+      current_cohort_key: OpaqueDigest;
+    }
+  | { mode: "stats_all_groups" };
+```
+
+`analysis_current` evaluates only the group whose exact cohort key equals the
+current projected cohort, then excludes every terminal with the exact current
+work-unit key. `stats_all_groups` retains every terminal with a complete exact
+cohort identity and partitions them into independent exact-cohort groups; it
+does not exclude a current work unit or merge distributions across bucket
+identities. No helper infers one mode from missing arguments.
+
 The baseline compares each current numeric work-unit metric with prior terminal
 work units in the same cohort. It reports:
 
@@ -337,24 +360,26 @@ equals the median. MAD is the median absolute deviation from that median.
 Finite inputs are sorted before every sum or interpolation and results are
 rounded once to four decimal places.
 
-Analysis-time baseline and R006 comparisons receive the current opaque
-`work_unit_key` separately. After projection and terminal selection, every
-history entry with that exact key is excluded before cohort construction. The
-raw display `unit.pr_ref` is never used as a prefilter: an older state of the
-same work unit cannot become its own baseline, while a different selector with
-the same display label remains an independent comparable work unit. Stats-wide
-aggregation, which has no current work unit, keeps every selected terminal.
+In analysis mode, baseline and R006 comparisons apply exact-cohort selection and
+current-work-unit exclusion only after terminal selection. The raw display
+`unit.pr_ref` is never used as a prefilter: an older state of the same work unit
+cannot become its own baseline, while a different selector with the same
+display label remains an independent comparable work unit. In stats mode, each
+exact cohort is reported as its own group and keeps all of its selected
+terminals.
 
 ### R006 command cohorts
 
-R006 does not reuse a single command key attached to the whole snapshot. Its
-comparable population is all selected terminal snapshots with the same exact
-repository ID, workspace ID, changed-file bucket, and changed-line bucket as
-the current work unit. `history_count` is the size of that entire population,
+R006 does not reuse a single command key attached to the whole snapshot. In
+analysis mode its comparable population is the selected current exact-cohort
+group; in stats mode the same calculation runs independently for every selected
+exact-cohort group. `history_count` is the size of one such entire population,
 including snapshots on which the command/cache pair is absent.
 
-Within the population, the exact cohort key is a domain-separated opaque digest
-of canonical `CommandIdentity` plus the exact cache state `cold` or `warm`.
+Within one exact work-unit cohort, `command_key` is a domain-separated opaque
+digest of canonical `CommandIdentity`, and the lane identity is the exact tuple
+`(cohort_key, command_key, cache_state)`. Cache state is exactly `cold` or
+`warm`; neither the command key nor the work-unit cohort key subsumes it.
 `StoredCommandCost` gains an optional `cache_state: "cold" | "warm"`. A row
 with an absent or unknown cache state is ineligible and is never placed into an
 `unknown` cohort. Current sources do not reliably observe cache state, so this
@@ -375,6 +400,20 @@ sum(positive per-snapshot command/cache costs)
 sum(measured_wall_ms across all history_count population rows)
 ```
 
+The interval-less resource upper preserves the existing per-analysis estimate,
+but operates entirely in projected milliseconds:
+
+```text
+resource_upper_ms = round4(
+  sorted_sum(positive per-snapshot command/cache cost_ms) / history_count
+)
+```
+
+It divides by the full exact-cohort `history_count`, not `presence_count`, and
+does not apply a minutes-to-milliseconds conversion. The ratio is likewise
+computed from sorted millisecond sums and rounded once to four decimal places
+after division; distribution values follow the same single final-rounding rule.
+
 Missing, non-finite, or zero population wall time suppresses the result. A
 finding is emitted only when both `history_count` and
 `sample_count === presence_count` meet the effective policy minimum and the
@@ -387,25 +426,39 @@ smaller-than-policy sample.
 The R006 finding key includes the opaque command-identity digest and cache
 state. Its bounded evidence and stats output include `cache_state`,
 `history_count`, `presence_count`, distribution `sample_count`, median, p50,
-p75, MAD, and ratio. Cold and warm observations always produce distinct
-findings and rows. The finding remains interval-less `resource_cost` with the
-manifest's `max` aggregation policy.
+p75, MAD, ratio, and `resource_upper_ms`. Cold and warm observations always
+produce distinct findings and rows. The finding remains interval-less
+`resource_cost` with the manifest's `max` aggregation policy.
+
+These cohort, cache, evidence, and estimate semantics are incompatible with the
+existing R006 contract. The built-in R006 manifest alone therefore changes to
+`version: "2.0.0"`, `compatibility_epoch: 2`, and
+`evidence_schema: "ccprof://rules/R006/evidence/v2"`; every other manifest row
+stays at version 1/epoch 1/evidence v1. Epoch-2 finding keys isolate the new
+series. Stored R006 v1/epoch-1 findings remain readable as legacy records but
+fail exact-current manifest eligibility and cannot contribute to a new terminal
+resource row or be materialized as an R006 v2 finding.
 
 The projected `buildChronicCostAggregates` evaluator returns closed
-`ChronicCostAggregate` values containing only the opaque command key, cache
-enum, bounded counts, distribution, ratio, and resource estimate. It does not
-construct a `FindingCandidate` and never receives a raw command, command
-identity, session reference, or fix recipe. For analysis only, core code outside
-the evaluator builds a separate lookup from already-normalized selected terminal
-records, keyed by the same opaque command digest. It joins a qualifying
-aggregate back to its canonical command identity/display and deterministically
-unioned session references through `materializeChronicCostFindings`, then uses
-the existing candidate-construction boundary to retain an actionable target and
-fix recipe. A missing or invalid join suppresses the finding rather than
-fabricating session evidence. Stats consumes the bounded aggregate directly and
-performs its optional command-label join outside the aggregator before the
-existing display privacy projection. No raw lookup or joined object becomes
-reachable from `StatsAggregationInput` or `ChronicCostAggregate`.
+`ChronicCostAggregate` values containing only the internal opaque cohort and
+command keys, cache enum, bounded counts, distribution, ratio, and resource
+estimate. It does not construct a `FindingCandidate` and never receives a raw
+command, command identity, session reference, or fix recipe. For analysis only,
+core code outside the evaluator builds a separate lookup from already-normalized
+selected terminal records, keyed by the exact composite `(cohort_key,
+command_key, cache_state)`. While building that lookup, it recomputes the cohort
+digest from every normalized repository/workspace/bucket tuple and the command
+digest from every snapshotted canonical `CommandIdentity`. Rows with one exact
+composite are folded into one validated lookup entry with deterministic
+lane-local session refs; a digest mismatch or conflicting canonical identity
+invalidates that entry. `materializeChronicCostFindings` accepts only one such
+validated exact-composite entry, then uses the existing candidate-construction
+boundary to retain an actionable target and fix recipe. A missing or invalid
+join suppresses the finding rather than fabricating session evidence. Stats
+consumes the bounded aggregate directly and performs its optional
+exact-composite command-label join outside the aggregator before the existing
+display privacy projection. No raw lookup or joined object becomes reachable
+from `StatsAggregationInput` or `ChronicCostAggregate`.
 
 ## Minimum cohort policy
 
@@ -458,7 +511,7 @@ of every history entry without invoking accessors or proxy traps. It then calls
 `projectStatsAggregationInput`, whose return type contains only:
 
 - opaque canonical digests for snapshot, work-unit, Git-state, repository,
-  workspace, and command identity;
+  workspace, exact cohort, and command identity;
 - finite non-negative times and counts;
 - closed size-bucket and cache-state enums;
 - finalized numeric metric and canonical per-rule rows.
@@ -476,6 +529,7 @@ interface StatsAggregationInput {
   workspace_key?: OpaqueDigest;
   changed_files_bucket?: ChangedFilesBucket;
   changed_lines_bucket?: ChangedLinesBucket;
+  cohort_key?: OpaqueDigest;
   terminal_metrics?: {
     measured_wall_ms: number;
     confirmed_critical_path_ms: number;
@@ -517,8 +571,9 @@ raw Store history
   -> strict closed validation/snapshot
   -> project numeric/bounded/opaque StatsAggregationInput
   -> select terminals and aggregate metrics/cohorts in memory
-  -> optionally join selected opaque snapshot/command keys to normalized
-     records for legacy observational and privacy-governed command display
+  -> optionally join selected opaque snapshot keys and exact
+     cohort/command/cache composites to normalized records for legacy
+     observational and privacy-governed command display
   -> project the selected display privacy profile
   -> render JSON or TTY
 ```
@@ -558,6 +613,9 @@ does not add another rendering or privacy bypass.
 - Existing Report v2 fields and JSON rendering stay additive-compatible.
   Robust distribution fields are optional when reading older baseline objects;
   old mean-only baselines are not re-labeled as cohort medians.
+- Stored R006 v1/epoch-1 findings stay readable, but only exact R006
+  v2/epoch-2 findings with evidence v2 are eligible for new resource aggregation
+  or materialization.
 - Existing callers of `loadAnalyses().records` keep working. Snapshot-aware
   consumers use additive `entries`.
 - Existing stats JSON sections remain present. Their populations become
@@ -582,14 +640,16 @@ does not add another rendering or privacy bypass.
    non-finite or unsafe counts suppress instead of broadening a cohort.
 9. Size-bucket boundary values are inclusive exactly as listed.
 10. Missing or malformed command identities cannot form an R006 cohort; valid
-    identities are converted to opaque digests before aggregation.
+    identities are converted to opaque digests before aggregation and the
+    digest is recomputed before an exact cohort/command/cache materialization.
 11. Missing command cache state suppresses R006; `cold` and `warm` never mix or
     share finding keys.
 12. R006 history includes comparable terminal snapshots where the command is
     absent, presence and distribution include only positive per-snapshot cost,
     and the ratio denominator includes measured wall for the full population.
     Both population and positive command/cache sample count must meet the
-    effective policy floor.
+    effective policy floor. Its millisecond resource upper divides the sorted
+    positive-cost sum by full `history_count` and rounds only after division.
 13. A cohort one below the effective minimum is suppressed; one exactly at it
     is emitted.
 14. Default 5 and a resolved organization floor of 20 affect analysis-time
@@ -609,7 +669,8 @@ does not add another rendering or privacy bypass.
     closed; expected-only and interval-less critical impacts never become
     confirmed wall time.
 20. R006's interval-less historical upper can appear only on the separate
-    resource axis under manifest `max`.
+    resource axis under manifest `max`; v1/epoch-1 legacy findings remain
+    readable but are ineligible under the exact v2/epoch-2 manifest.
 21. Legacy scalar point estimates, partial canonical fields, non-high evidence
     or causality, incomplete source coverage, and invalid intervals all produce
     zero confirmed time.
@@ -633,9 +694,14 @@ does not add another rendering or privacy bypass.
   partition invariant.
 - Cohort tests prove bucket boundaries, terminal-only populations, robust
   distributions, separate R006 command/cache populations and denominators,
-  cache suppression, current-work-unit exclusion by opaque key, bounded
-  aggregate-to-finding materialization, and default-5/organization-20
+  explicit analysis-current versus stats-all-exact-group modes, cache
+  suppression, current-work-unit exclusion by opaque key, exact composite
+  aggregate-to-finding joins with digest revalidation, the millisecond resource
+  upper formula and rounding, and default-5/organization-20
   population-and-sample threshold boundaries.
+- Manifest/legacy tests prove R006 alone is v2/epoch 2/evidence v2, epoch-2
+  finding-key isolation, readable v1 records, and fail-closed exclusion of v1
+  findings from current resource aggregation/materialization.
 - Policy/config tests prove bounds, canonical signature compatibility, and
   organization-over-repository monotonicity, analysis-time resolution, and
   effective-floor inclusion in snapshot policy identity.
