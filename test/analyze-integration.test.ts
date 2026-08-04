@@ -682,7 +682,9 @@ test("linked-worktree analyze uses one canonical effective policy for core ident
     const strictApproval = strictReport.findings.find(
       ({ rule_id }) => rule_id === "R004",
     );
-    assert.match(strictApproval?.fix_recipe.suggestion ?? "", /npm test/u);
+    assert.ok(strictApproval !== undefined);
+    assert.equal(strictApproval.fix_recipe.suggestion, "[redacted-command]");
+    assert.equal(output.stdout.includes("npm test"), false);
     for (const finding of strictReport.findings) {
       assert.deepEqual(Object.keys(finding.evidence).sort(), [
         "interval_ids",
