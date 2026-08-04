@@ -962,6 +962,35 @@ test("an advisory that crosses the cap is omitted before the envelope", () => {
   );
 });
 
+test("envelope fallback retains the full advisory attempt as observed bytes", () => {
+  const deterministic = "d".repeat(1_000);
+  const advisory = "a".repeat(100);
+  const full = `${deterministic}${advisory}`;
+  const envelope = OUTPUT_BUDGET_ENVELOPES.tty;
+
+  const finalized = finalizeBudgetedOutput({
+    report: outputReport(),
+    meter: outputMeter(Buffer.byteLength(envelope, "utf8")),
+    projection: {
+      format: "tty",
+      render: () => ({
+        output: full,
+        withoutAdvisory: deterministic,
+      }),
+    },
+  });
+
+  assert.equal(finalized.stdout, envelope);
+  assert.equal(
+    finalized.analysisBudget.observed.output_bytes,
+    Buffer.byteLength(full, "utf8"),
+  );
+  assert.equal(
+    finalized.analysisBudget.coverage,
+    Buffer.byteLength(envelope, "utf8") / Buffer.byteLength(full, "utf8"),
+  );
+});
+
 test("byte measurement receives only privacy-projected report values", () => {
   const canary = "PRIVACY_MEASUREMENT_CANARY";
   const profiles: readonly PrivacyProfile[] = ["strict", "balanced"];
