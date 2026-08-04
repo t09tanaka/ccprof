@@ -513,6 +513,8 @@ test("rejects Windows expansion and composite syntax through every decision path
     "npm test -- !!",
     "npm test -- %0",
     "npm test -- %*",
+    "npm test -- %~dp0",
+    "npm test -- %~f1",
     "npm test -- %%A",
     "npm.cmd test 'x&calc'",
     "npm.cmd test x\\&calc",
@@ -531,6 +533,22 @@ test("rejects Windows expansion and composite syntax through every decision path
       kind: "investigation_candidate",
     }, raw);
   }
+});
+
+test("rejects Windows caret provenance through every decision path", () => {
+  const raw = "npm.cmd test ^\"x&calc^\"";
+  const wildcard = resolvedPolicy(
+    { safe_patterns: ["*"], allow_rule_recommendation: true },
+    [{ match: ["*"], domain: "validation", parallel_safe: true }],
+  );
+  assert.equal(safeCanonicalCommand(raw), undefined);
+  assert.deepEqual(approvalRecommendationDecision([raw], wildcard), {
+    kind: "evaluated",
+    commands: [{ allowed: false }],
+  });
+  assert.deepEqual(resourceDomainDecision([raw], wildcard), {
+    kind: "investigation_candidate",
+  });
 });
 
 test("rejects active ripgrep decompressor flags without consuming literals", () => {
