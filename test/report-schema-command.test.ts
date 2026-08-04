@@ -192,7 +192,7 @@ test("schema command is static and canonicalizes output before writing", async (
   const runtime = {
     readReportV3Schema: () => {
       reads += 1;
-      return ` { "z": 1, "schema_version": { "const": 3 } }\n\n`;
+      return ` { "z": 1, "properties": { "schema_version": { "const": 3 } } }\n\n`;
     },
     stdout: (value: string) => {
       stdout += value;
@@ -218,8 +218,10 @@ test("schema command is static and canonicalizes output before writing", async (
   assert.equal(await runCli(["schema", "report-v3"], runtime), 0);
   const once = `{
   "z": 1,
-  "schema_version": {
-    "const": 3
+  "properties": {
+    "schema_version": {
+      "const": 3
+    }
   }
 }\n`;
   assert.equal(stdout, `${once}${once}`);
@@ -236,6 +238,7 @@ test("schema read and parse failures return 5 without partial stdout", async () 
       },
     },
     { name: "malformed", read: () => `{ "PRIVATE_SCHEMA_VALUE":` },
+    { name: "wrong contract", read: () => "{}" },
   ];
 
   for (const scenario of scenarios) {
