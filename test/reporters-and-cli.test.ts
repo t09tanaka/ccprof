@@ -3146,7 +3146,7 @@ interface Task6AggregateMetadata {
   sample_count: number;
   minimum_cohort_size: number;
   status: "available" | "suppressed";
-  reason_codes: string[];
+  reason_codes: Array<"below_minimum">;
 }
 
 interface Task6AggregateResult {
