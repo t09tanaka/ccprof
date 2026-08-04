@@ -171,7 +171,9 @@ function canonicalRemote(remote: LogicalRepositoryRemote): RemoteTuple | undefin
     }
     path = urlParts[3] ?? "";
   } else {
-    if (raw.includes("://")) return undefined;
+    if (raw.includes("://") || /^(?:file|https?|ssh|git):/iu.test(raw)) {
+      return undefined;
+    }
     const scp = /^(?:[^@/:]+@)?([^@/:]+):([^?#]*)(?:[?#].*)?$/u.exec(raw);
     if (scp === null) return undefined;
     host = normalizeHost(scp[1]!);

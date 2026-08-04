@@ -135,6 +135,7 @@ test("logical repository remote canonicalizes equivalent fetch syntaxes", () => 
     "https://user:secret@GITHUB.com:443/Owner/Repo.git?token=secret#fragment",
     "ssh://git@github.com:22/owner/repo/",
     "git@github.com:owner/repo.git",
+    "github.com:owner/repo.git",
   ];
 
   for (const fetch_url of equivalent) {
@@ -362,6 +363,10 @@ test("logical repository remote rejects unsafe and non-fetch inputs", () => {
     "../repo",
     "C:\\repo",
     "C:/repo",
+    "file:/tmp/repo",
+    "https:github.com/owner/repo",
+    "ssh:host/path",
+    "git:host/repo",
     "https://example.com",
     "ssh://git@example.com/",
     "https://example.com/a%2Frepo",
