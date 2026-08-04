@@ -123,6 +123,8 @@ const UNSAFE_GIT_OPTIONS = [
   "--textconv",
   "--open-files-in-pager",
 ] as const;
+const GIT_GREP_PAGER_OPTION = "--open-files-in-pager";
+const GIT_GREP_PAGER_MINIMUM_PREFIX = "--op";
 
 export class RuleSafetyPolicyValidationError extends Error {
   constructor() {
@@ -538,10 +540,24 @@ function mappedCommandTokens(raw: string): string[] | undefined {
 }
 
 function unsafeGitOption(value: string, subcommand: string): boolean {
-  return UNSAFE_GIT_OPTIONS.some(
+  const fixedUnsafe = UNSAFE_GIT_OPTIONS.some(
     (option) => value === option || value.startsWith(`${option}=`),
-  ) ||
-    (subcommand === "grep" && value.startsWith("-O"));
+  );
+  if (fixedUnsafe || subcommand !== "grep") return fixedUnsafe;
+
+  // Git parse-options accepts bundled short options and unambiguous long
+  // abbreviations. In `git grep`, uppercase O takes an optional pager value,
+  // and `--op` is already a unique prefix of --open-files-in-pager.
+  if (
+    value.startsWith("-") && !value.startsWith("--") &&
+    value.slice(1).includes("O")
+  ) {
+    return true;
+  }
+  const equals = value.indexOf("=");
+  const name = equals < 0 ? value : value.slice(0, equals);
+  return name.length >= GIT_GREP_PAGER_MINIMUM_PREFIX.length &&
+    GIT_GREP_PAGER_OPTION.startsWith(name);
 }
 
 function unsafeInspectOption(executable: string, value: string): boolean {
