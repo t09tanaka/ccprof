@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 
 export type SourceCoverageCompleteness = "complete" | "partial";
+export interface SourceFileCoverageObservation {
+  rows_seen: number; rows_accepted: number; events_emitted: number;
+  completeness: SourceCoverageCompleteness;
+}
 
 export interface AvailableBuiltInSourceCoverage {
   status: "available";
