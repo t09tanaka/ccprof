@@ -1,7 +1,7 @@
 # Incremental Source Catalog Consumer Design
 
-**Status:** Revised after independent specification review; approved program
-scope, pending re-review before production implementation.
+**Status:** Revised after two independent focused specification reviews;
+approved program scope, pending third re-review before production implementation.
 
 ## Goal and completion boundary
 
@@ -27,7 +27,8 @@ No watcher, queue, cron, outbox, lease, or application lock is added.
    `endedAtMs`, resumes append parsing exactly, and safely discovers new files.
 2. **Persistent normalized `Session[]` only.** Rejected: current parser output
    depends on `endedAtMs`, and sessions omit branch, assistant-group, ancestry,
-   warning-budget, line, and retained-byte state needed for exact suffix work.
+   line, original-byte costs, and ordered warning facts needed to reapply query
+   budgets and perform exact suffix work.
 3. **Process-local state or metadata-only skipping.** Rejected: restarts force a
    full parse, or metadata can suppress evidence that cannot be restored.
 
@@ -42,9 +43,12 @@ split into three deterministic stages:
 
 1. `read*ParserState(handle, range, seed)` reads and validates physical JSONL
    rows into a query-independent, closed parser state. It never receives
-   `endedAtMs`.
-2. `project*ParserState(state, { endedAtMs })` selects rows at or before the
-   inclusive end, then applies the adapter's current normalization semantics.
+   `endedAtMs`, `maxRetainedBytes`, or `maxWarnings`; its caller supplies only
+   the query-independent file/line/node/depth read limits.
+2. `project*ParserState(state, { endedAtMs, budgets })` first selects rows and
+   warning facts applicable at or before the inclusive end, then applies the
+   adapter's current retained-byte and warning budgets and normalization
+   semantics in physical order.
 3. Existing public parser functions call stage 1 followed by stage 2. The
    incremental consumer stores stage 1 state and invokes the same stage 2 for a
    cache hit. There is no separate cache-only projector.
@@ -53,13 +57,19 @@ This order matters. Filtering already-normalized sessions is not equivalent:
 later Claude branch rows can backfill effective branch, later assistant rows can
 revise a message group, and later result rows can replace a prior tool result.
 The common projector first filters physical parser-stage rows, exactly as the
-current parser filters before normalization.
+current parser filters before normalization. Each state row therefore preserves
+its original `JsonlLine.bytes` retained cost (UTF-8 row content excluding the
+CR/LF terminator) plus its exact physical byte range. Each possible parser
+warning is stored as a closed ordered fact with its timestamp applicability.
+Post-window bytes or warnings cannot consume an earlier window's
+`maxRetainedBytes` or `maxWarnings`.
 
 Two fixtures lock this contract:
 
 - T1 appends a post-window Claude branch/message revision and proves a cold
   parse, freshly read state projection, and restored state projection are
-  canonical-byte identical for the earlier window.
+  canonical-byte identical for the earlier window, even when post-window row
+  bytes/warning facts would overflow its tight projection budgets.
 - T2 caches with an early end, restarts with a later end, and proves the later
   events appear without reparsing an unchanged file.
 
@@ -69,28 +79,30 @@ change the relevant value and force a cold read.
 
 ## Closed adapter continuation state
 
-The cache contains both the full unwindowed `Session[]` and the state from which
-it was projected. The full sessions must equal
-`project*ParserState(state, { endedAtMs: undefined })`; otherwise validation
-fails. This redundant invariant catches corrupt, partial, or incompatible state.
+An eligible-evidence cache entry contains both the full unwindowed `Session[]`
+and the state from which it was projected. The full sessions must equal
+`project*ParserState(state, { endedAtMs: undefined, budgets: defaults })`;
+otherwise validation fails. This redundant invariant catches corrupt, partial,
+or incompatible state.
 
 ### Claude state v1
 
 `ClaudeParserStateV1` contains only exact closed fields:
 
 - `kind: "claude-state-v1"`, canonical source path, physical line count,
-  parsed offset, whether the prefix ends in LF, retained valid-row bytes,
-  warning count, and warning-overflow state;
-- normalized physical rows with byte/line range, timestamp, session id, entry
-  uuid, cwd, explicit branch, parent uuid, agent id, sidechain flag, and one
+  parsed offset, and whether the prefix ends in LF;
+- normalized physical rows with original retained-byte cost, byte/line range,
+  timestamp, session id, entry uuid, cwd, explicit branch, parent uuid, agent
+  id, sidechain flag, and one
   closed payload variant: auxiliary, API error, compaction, genuine-user,
   assistant logical blocks/usage/message id, or ingested tool results;
 - branch/epoch continuation by agent lane and file lane;
 - sidechain ancestry entries needed to resolve a suffix parent;
 - assistant message-group and text/tool dedupe indexes;
-- latest tool-result positions and fixed parser warnings. Each retained warning
-  has a closed `source | session` scope and nullable target session id so the
-  repository gate can filter it without interpreting its message.
+- latest tool-result positions and ordered warning facts. Each fact records
+  unconditional or timestamp-gated applicability plus a closed `source |
+  session` scope and nullable target session id, so the projector and repository
+  gate can act without interpreting its message.
 
 Assistant logical blocks retain only the normalized text or tool name/input
 needed to construct current events. Tool results retain only normalized status,
@@ -101,20 +113,24 @@ unknown raw properties, and raw JSONL text are not stored.
 
 `CodexParserStateV1` contains:
 
-- `kind: "codex-state-v1"`, canonical source path, line/offset/newline facts,
-  retained-byte and warning-budget continuation;
-- validated timestamped row evidence with one closed variant: session metadata,
+- `kind: "codex-state-v1"`, canonical source path and line/offset/newline facts;
+- validated timestamped row evidence with its original retained-byte cost and
+  one closed variant: session metadata,
   normalized message, function call, function-call output, ignored known row, or
   warned unknown subtype;
 - selected session id/cwd/branch metadata, seen subtype set, call/result dedupe
   state, and the same scoped/targeted fixed-warning representation.
 
 Both validators snapshot own data descriptors without invoking accessors, reject
-unknown/missing/non-enumerable/symbol properties, bound payload JSON to 128 MiB,
-bound recursive tool-input nodes/depth, validate every integer/enum/optional
-field, require canonical row/index ordering, and return detached plain clones.
-An unknown state kind/version or an adapter case not representable by its closed
-variants is a cold fallback, never a lossy approximation.
+unknown/missing/non-enumerable/symbol properties, bound recursive tool-input
+nodes/depth, validate every integer/enum/optional field, require canonical
+row/fact/index ordering, and return detached plain clones. Independently of user
+parser budgets, `MAX_INCREMENTAL_PARSER_STATE_BYTES = 128 * 1024 * 1024` limits
+the canonical UTF-8 bytes of a reusable state, including structural overhead.
+The reader tracks that fixed capacity while building state. Exceeding it or
+encountering an unrepresentable adapter case discards incremental state and uses
+the existing bounded cold parser; it never truncates a reusable state or changes
+the user's `maxRetainedBytes`/`maxWarnings` result.
 
 ## Store v5 schema and migration
 
@@ -127,7 +143,10 @@ future versions are rejected before mutation. Reopening v5 is a no-op.
 ### `source_evidence_cache`
 
 ```text
-source_identity       primary key, foreign key to source_catalog on delete cascade
+source_identity       foreign key to source_catalog on delete cascade
+repository_identity   64 lowercase hex characters from StorePaths.repo_hash
+eligibility_identity  64 lowercase hex of the exact canonical query repo root
+primary key           (source_identity, eligibility_identity)
 adapter_id            claude | codex
 canonical_path        non-empty, NUL-free
 content_revision      sha256: plus 64 lowercase hex characters
@@ -144,40 +163,69 @@ retention_class       raw_evidence
 updated_at_ms         non-negative safe integer
 ```
 
-`SourceEvidenceEnvelopeV1` is:
+`SourceEvidenceEnvelopeV1` is a closed union:
 
 ```ts
-interface SourceEvidenceEnvelopeV1 {
+interface EligibleSourceEvidenceEnvelopeV1 {
   schema_version: 1;
+  kind: "eligible-evidence-v1";
   adapter_id: "claude" | "codex";
   canonical_path: string;
   full_sessions: Session[];
   parse_warnings: SourceWarning[];
   continuation: ClaudeParserStateV1 | CodexParserStateV1;
 }
+
+interface NoEvidenceMarkerV1 {
+  schema_version: 1;
+  kind: "no-evidence-v1";
+  adapter_id: "claude" | "codex";
+  canonical_path: string;
+  reason: "empty" | "other-repository-only";
+}
+
+type SourceEvidenceEnvelopeV1 =
+  | EligibleSourceEvidenceEnvelopeV1
+  | NoEvidenceMarkerV1;
 ```
 
-A row is valid only with a matching complete catalog row parsed through its
-size. Cache/catalog adapter, canonical path, revision, parser version, schema,
+A row is valid only for the active Store's exact `repository_identity` and exact
+canonical query-root `eligibility_identity`, and with a matching complete catalog
+row parsed through its size. This second identity is required because linked Git
+worktrees share one Store but have different cwd eligibility roots. Cache/catalog
+adapter, canonical path, revision, parser version, schema,
 offset, line count, newline boundary, and observation timestamp
 (`updated_at_ms === observed_at_ms`) must agree. All sessions must use the row
 adapter and exact canonical source path. Every session warning and parse warning
-must use that path. Claude cardinality is one or more repository-eligible
-sessions; Codex cardinality is exactly one. Empty or other-repository-only
-results are not persisted.
+must use that path. For `eligible-evidence-v1`, Claude cardinality is one or more
+repository-eligible sessions and Codex cardinality is exactly one.
+`no-evidence-v1` is a revision-bound negative marker with no continuation,
+session, warning, line content, descriptor, or other raw evidence. It is emitted
+only when the cold repository-visible result is exactly empty and warning-free;
+otherwise the source remains uncached. Its reason distinguishes a structurally
+empty source from an all-other-repository source.
+
+Persistent state is read or written only when the effective query-independent
+file/line/node/depth read budgets equal the checked-in defaults. An override of
+those limits uses the existing bounded cold parser and returns no commit
+candidate; this prevents read limits from becoming an unstated cache key.
+`maxRetainedBytes` and `maxWarnings` remain safe per-call projector inputs and do
+not disable reuse.
 
 The payload digest is domain-separated and binds this tuple, not merely JSON:
 
 ```text
-source identity, canonical path, adapter id, content revision,
+repository identity, eligibility identity, source identity, canonical path,
+adapter id, content revision,
 parser version, schema fingerprint, canonical payload JSON,
 sensitivity, retention class
 ```
 
 The descriptor digest binds the same foreign tuple plus the sorted descriptors
-recomputed from `full_sessions`. Copying a valid payload or digest to another
-source, path, adapter, or revision fails validation. Identities, errors, and
-warnings never interpolate rejected content.
+recomputed from `full_sessions`, or the canonical empty descriptor list for a
+negative marker. Copying a valid payload or digest to another Store repository,
+eligibility root/worktree, source, path, adapter, or revision fails validation.
+Identities, errors, and warnings never interpolate rejected content.
 
 ### `source_discovery_roots`
 
@@ -217,29 +265,49 @@ separate PRs and are disclosed in README.
 
 Parser/restore and persistence are intentionally two phases:
 
-1. `prepare*Source` returns a detached observation, parser state, projected
-   result, warning list, and an opaque commit candidate. It performs no Store
-   write.
+1. `prepare*Source` returns a detached observation, projected result, warning
+   list, and either `null` or a runtime-authenticated branded commit candidate.
+   The candidate closes over the exact source observation, unwindowed state,
+   query end, read/projection budgets, observation time, discovery cursor,
+   parser/schema versions, roots, repository identity, and Store target needed
+   for one later commit. It performs no Store write.
 2. The discoverer applies canonical cwd repository eligibility to the
-   **unwindowed** full sessions. It filters state, sessions, and warnings to the
-   eligible session ids. Only a non-empty repository-eligible candidate may call
-   `commitEligibleSource` against that repository's Store.
+   **unwindowed** full sessions. An all-eligible positive result may retain its
+   state. An exactly empty/warning-free or all-other-repository/warning-free
+   result may become a no-raw negative marker. A mixed result is never cached.
+3. After event admission for that source, the discoverer calls one final
+   wall/CPU checkpoint. Only if every projected event was admitted and the meter
+   remains unstopped may it redeem the still-branded candidate against that
+   repository's Store.
+
+Cache and negative-marker hits are always read-only and return `null` candidates,
+even when the meter remains unstopped; exact unchanged reuse never refreshes a
+timestamp or discovery cursor. Only new stable complete cold/suffix observations
+can mint a candidate.
 
 Thus a global Claude/Codex root cannot place another repository's raw normalized
 evidence in the current repository Store. Eligibility is independent of query
-time and head branch; time/branch projection remains per analysis. A mixed file
-stores only rows and session-scoped warnings belonging to eligible session ids;
-source-scoped warnings must be content-free with no `session_ref` and may be
-retained only because the file has eligible evidence. Other-repo-only files are
-parsed but not cached in this repository.
+time and head branch; time/branch projection remains per analysis. Positive
+reuse is deliberately all-or-nothing by file: if unwindowed sessions mix
+eligible and ineligible session ids, retaining only the current eligible subset
+could become unsound if future suffix rows expand eligibility. Such a file cold
+parses on every run and never publishes a positive or negative pair. Likewise,
+if a suffix introduces a session id absent from the cached all-eligible state,
+suffix reuse is abandoned and one full cold parse reclassifies the entire file.
 
 Catalog and cache writes share one `IMMEDIATE` transaction. Exact replay at the
 same observation time is unchanged. A different pair at the same time is a
-content-free `conflict` result. A newer observation replaces catalog and cache together;
-a stale observation changes neither. Readers on a second WAL connection see
+content-free `conflict` result. A newer observation replaces catalog and cache
+together; a stale observation changes neither. Readers on a second WAL connection see
 the old pair or new pair, never a mixed pair. Store/cache write failure rolls
 back both, returns already-produced analysis evidence, adds one sanitized
 optimization warning, and does not mark a valid source as failed.
+
+No Store mutation occurs before the event/final-checkpoint gate. A cache or
+negative-marker hit read before a later input/event/time stop may still supply
+the already-admitted prefix, but it never refreshes its catalog/cache row. A
+cold or suffix candidate that admits only an event prefix, or whose final
+checkpoint stops, is discarded and the old pair remains byte-for-byte unchanged.
 
 Two simultaneous v4 opens serialize inside the migration transaction: the
 winner creates v5; the waiter re-reads `user_version` after acquiring the write
@@ -254,39 +322,48 @@ their filename matches the adapter pattern. A root change cannot make old paths
 eligible. Root-escape, wrong-adapter, non-regular, and broken paths are ignored
 without opening and yield content-free warnings where current discovery does.
 
-Each admitted file is opened once through a no-follow regular-file helper. On
-POSIX it uses `O_RDONLY | O_NOFOLLOW`; on platforms without `O_NOFOLLOW`, an
-`lstat`/open/`fstat` identity check supplies the portable fail-closed path. The
-same `FileHandle` is passed to hashing, JSONL parsing, and before/after `fstat`.
-Parsers never reopen the pathname.
+After source-item admission, each candidate gets one primary no-follow regular-
+file handle. On POSIX the helper uses `O_RDONLY | O_NOFOLLOW`; on platforms
+without `O_NOFOLLOW`, an `lstat`/open/`fstat` identity check supplies the portable
+fail-closed path. The same primary `FileHandle` is passed to initial hashing,
+cache validation, suffix/cold JSONL parsing, final rehashing, and before/after
+`fstat`. Parsers never reopen the pathname.
 
 The JSONL reader produces a receipt containing exact start/end offsets, bytes
 read, and SHA-256 of the bytes the parser consumed. A full parse receipt must
 equal the admitted full-file digest; a suffix receipt must equal the separately
 observed suffix digest. The receipt is returned beside parser state rather than
 stored inside it, so a suffix receipt can never masquerade as a receipt for the
-merged full state. After parsing, the same handle is re-hashed and fstat'ed;
-the path is rebound with a final no-follow identity check. Metadata change,
-digest change, a mixed parser receipt, or pathname replacement abandons commit
-and cold-retries once. A second instability returns available evidence with a
-warning and no cache update.
+merged full state. Before **every** cache, suffix, cold, or bounded-cold return,
+the primary handle is rehashed over the exact admitted range and `fstat`ed. A
+separate final no-follow binding handle is then opened only for pathname
+validation, rehashed over that range, compared, and closed; no parser uses it.
+Metadata change, digest change, a mixed parser receipt, or pathname replacement
+abandons commit and cold-retries once. A second instability returns available
+evidence with a warning and no cache update.
 
 This catches truncate/rotation and ABA change-restore cases. If bytes change
 during parsing and are restored, the parser receipt differs from the stable
 post-parse digest unless it read exactly the restored content; in the latter
 case its evidence is correctly bound to that content.
 
-Windows and filesystems without a stable safe-integer device/inode pair record
-both as `null`. Exact unchanged reuse still requires the full content digest.
-Append optimization and stable directory cursor reuse are disabled; changed
-content takes the cold path.
+Within one operation, `fstat({ bigint: true })` device/inode/size/time values are
+kept as BigInt identity evidence even when they cannot be serialized as safe
+integers. Persisted device/inode remain paired safe integers or paired `null`.
+For Windows, null/unstable identity, or any final binding without comparable
+BigInt identity, the final no-follow handle digest and size must still equal the
+primary handle's final digest and size. Exact unchanged reuse therefore requires
+the full content digest; append and stable directory-cursor reuse remain
+disabled for persisted null identity.
 
 ## Observation, limits, and append classification
 
 The operation order is fixed:
 
-1. Open no-follow and `fstat` the handle.
-2. Admit the source item in final candidate order.
+1. In final candidate order, checkpoint wall/CPU and call
+   `meter.admitSourceItem()` **before** any no-follow open, stat, hash, or cache
+   lookup. A denied item is never opened.
+2. Open the admitted item no-follow and `fstat` its primary handle.
 3. Immediately apply the existing parser `maxFileBytes` and analysis
    `max_input_bytes` admission to the stat size.
 4. If the whole file is not admitted, do **not** full-hash it. Invoke the
@@ -295,7 +372,9 @@ The operation order is fixed:
 5. Only a whole-file admission may hash for cache classification.
 
 Exact limits are inclusive: size equal to either limit is fully admitted; one
-byte over uses the bounded cold path. Zero-byte files perform no content read.
+byte over uses the bounded cold path. For `max_source_items`, zero opens none,
+exactly N opens N, and candidate N+1 is observed by the meter but never opened.
+Zero-byte files perform no content read.
 
 For a fully admitted stable file, `content_revision` hashes every byte. Bounded
 prefix/suffix hashes remain catalog diagnostics only. `source_identity` binds
@@ -312,9 +391,10 @@ Append requires matching identity/path/adapter, stable non-null device/inode,
 parser/schema, complete validated cache, larger size, an empty prior file or LF
 record boundary, and SHA-256 of current `[0, old_size)` equal to the old full
 revision through `previous_prefix_revision`. The parser starts at `old_size` and
-global line `old_line_count + 1`,
-seeded by the closed continuation and cumulative retained/warning budgets. It
-then rebuilds full state and sessions through the common projector. An unknown
+global line `old_line_count + 1`, seeded by the closed query-independent rows,
+indexes, and warning facts. It then
+rebuilds full state and applies retained/warning budgets from zero through the
+common projector. An unknown
 variant, incompatible seed, partial final row, digest mismatch, budget overflow,
 or state invariant falls back cold.
 
@@ -326,13 +406,32 @@ for cases represented by the closed state; tests provide the equivalence proof.
 
 The cursor records a closed tree rooted at the configured canonical adapter
 directory. A stable directory token consists of device, inode, nanosecond mtime,
-and nanosecond ctime captured as canonical decimal strings. Cursor reuse is
-enabled only when the runtime/platform supplies stable nonzero identity and
-nanosecond timestamps for every cached directory **and** the capability layer
-positively identifies a filesystem contract in which every child-set mutation
-changes at least one token component before the operation completes. Timestamp
-shape alone is not proof. Windows/null identity, unrecognized or remote/network
-filesystems, invalid/coarse tokens, or any uncertainty selects a full scan.
+and nanosecond ctime captured as canonical decimal strings.
+
+The production allowlist has exactly one v1 entry: supported Node 22/24 on
+`darwin`, `statfs(root, { bigint: true }).type === 26n` (APFS), and a canonical
+root whose no-follow `lstat`/opened-`fstat` BigInt device+inode agree. The root
+evidence records `kind: "darwin-apfs-v1"`, platform, Node major, filesystem type
+`"26"`, and canonical root device/inode. Every recursively opened directory must
+remain on that device and expose nonzero BigInt identity plus nonnegative,
+nonzero `mtimeNs`/`ctimeNs`; otherwise the entire run switches to full scan.
+This allowlist is based on APFS nanosecond timestamps and BSD directory-stat
+semantics that entry creation/removal/rename changes directory metadata; merely
+having nanosecond-shaped fields is never sufficient.
+
+Capability references are the Node `fs.statfs`/BigInt-stat contract, Apple's
+APFS one-nanosecond timestamp-granularity table, and Apple's `stat(2)` contract
+that `link`, `rename`, and `unlink` change `ctime`:
+
+- <https://nodejs.org/api/fs.html#fspromisesstatfspath-options>
+- <https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/APFS_Guide/VolumeFormatComparison/VolumeFormatComparison.html>
+- <https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/lstat.2.html>
+
+All other platforms/filesystems—including Windows, Linux until a separately
+reviewed filesystem entry exists, network/remote mounts, null identity, unknown
+`statfs.type`, invalid/coarse timestamps, or injected detector uncertainty—use
+`full_scan_required`. Capability evidence is stored inside the closed tree and
+bound by `tree_digest`; a root/evidence mismatch cannot reuse the cursor.
 
 For a complete stable snapshot, discovery stats every known directory in
 code-unit relative-path order. An unchanged token reuses its canonical child
@@ -348,12 +447,13 @@ Each changed-directory `readdir` is bracketed by two stats of the same opened
 directory. A changed token, backward time, equal-token/listing conflict, or path
 rebinding discards incremental reconciliation and starts one full scan. If the
 full scan is unstable, the result is partial and no reusable cursor is written.
-Independently, cursor generations divisible by 32 force a deterministic full
-reconciliation as defense in depth, not as the basis of no-miss correctness.
-This cycle is cursor-based, not wall-clock based, and catches a filesystem
-capability that became unreliable without making an implicit current-time
-dependency. Until such a full reconciliation succeeds, its cursor cannot advance
-as complete.
+The initial generation is 1 and always full-scans. Before every later complete
+run, compute `next_cursor = previous.cursor + 1`; even an unchanged complete run
+publishes that next cursor. When `next_cursor % 32 === 0` (31→32, 63→64, ...),
+the full reconciliation happens **before** generation N may be declared
+complete. A partial/unstable run preserves the prior cursor exactly. This
+cursor-based cycle is defense in depth, not the basis of no-miss correctness,
+and has no wall-clock dependency.
 
 Known catalog paths and newly reconciled paths are unioned and deduplicated by
 adapter plus canonical path. The entire union is sorted by the same cold-source
@@ -391,21 +491,25 @@ completeness.
 Incremental state is an optimization, never a budget bypass:
 
 - source candidates use the cold comparator before all admission;
-- every candidate consumes the same source-item unit;
+- every candidate checkpoints and consumes the same source-item unit before any
+  open;
 - current stat size receives the same input-byte admission before hashing;
 - fresh/restored projected events pass through the same
   `admitSessionEventPrefix` in physical source order;
-- output projection/finalization is unchanged, so output-byte accounting is
-  identical.
+- output projection/finalization uses the unchanged `admitOutputBytes` limiter,
+  so cache reuse can neither bypass the limit nor leak an unadmitted byte.
 
-For identical files/configuration and a clock that does not stop the run,
-`max_input_bytes`, `max_input_events`, `max_output_bytes`, and
-`max_source_items`, including observed/consumed values and their truncation
-decisions, are cold/warm identical. Cache reuse intentionally reduces CPU and
-wall work, so observed/consumed wall and CPU values may differ; a tight wall/CPU
-limit may allow a warm run to progress farther. Those two counters are excluded
-from byte-for-byte cold equivalence and tested as monotonic optimization rather
-than fabricated equality.
+With a real clock, cold/warm equivalence is asserted only for input bytes, input
+events, and source items over the common candidate prefix reached before a
+wall/CPU stop. Cache reuse intentionally changes checkpoint timing and CPU/wall
+work, so it can change how far later output/finalization proceeds. Output still
+uses the same limiter and always satisfies observed/consumed/cap invariants, but
+real-clock output bytes and final canonical artifacts are not asserted equal.
+
+Byte-for-byte equality of reports, output, findings, descriptors, warnings, and
+source digest is asserted only with the same deterministic scripted clock whose
+checkpoint decisions allow the same logical work. Tests separately use real
+clocks to prove safety/no limit bypass, never fabricated cold/warm time equality.
 
 Cache-only failure adds a warning and abandons optimization but does not call
 `recordSourceFailure`. Actual source discovery/read/parse failure retains the
@@ -428,9 +532,9 @@ failure cannot discard the parser result.
 
 The CLI flags, Report v2 shape, analysis snapshot schema, source descriptor
 contract, findings, rules, privacy projection, and output formats do not change.
-For identical source bytes/query/Git/config/history without wall/CPU exhaustion,
-warm and cold canonical reports, descriptors, findings, warnings, and source
-digest are identical.
+For identical source bytes/query/Git/config/history and the same non-stopping
+scripted budget clock, warm and cold canonical reports, descriptors, findings,
+warnings, output, and source digest are identical.
 
 ## Required edge and race tests
 
@@ -441,8 +545,9 @@ digest are identical.
 - Same-time exact/conflicting pair, newer/stale pair, concurrent WAL reader, and
   proof that a mixed catalog/cache pair is never visible.
 - Hostile envelope/state/tree objects, corrupt/non-canonical JSON, unknown state,
-  payload copy across path/source/adapter/revision, descriptor mismatch, wrong
-  session/warning paths, wrong adapter, and Claude/Codex cardinality.
+  payload copy across repository/path/source/adapter/revision, descriptor
+  mismatch, wrong session/warning paths, wrong adapter, and Claude/Codex
+  cardinality.
 - Exact unchanged restart with parser count zero; changed one-of-many parses only
   that source; missing/corrupt/partial evidence cold parses.
 - Exact append equivalence for UTF-8, LF/CRLF, branch/epoch, sidechain ancestry,
@@ -453,14 +558,21 @@ digest are identical.
 - Same-handle path swap, truncate, ABA rotate-restore, mutation during hash,
   mutation during parse, restored metadata, parser receipt mismatch, and retry.
 - Exact maxFileBytes/analysis byte boundary and one-over proof that no full hash
-  ran; source/event/output/source-item budget cold/warm equality.
-- Repo A/B mixed source: only A rows in A Store and only B rows in B Store;
-  ineligible state never commits; configured-root change and root-escape known
-  rows are never opened.
-- Stable directory cursor unchanged reuse, changed parent/new file, new nested
-  directory, removal/rename, earlier-sorting new source, symlink cases, Windows
-  null capability/full scan, entry 100,000/100,001, depth 64/65, partial cursor,
-  and final cold comparator order before budget admission.
+  ran; max-source-items zero/exact/one-over pre-open spies; real-clock input-
+  byte/event/source-item equality; unchanged output limiter/no leak; scripted-
+  clock canonical/output equality.
+- Repo A/B mixed source always cold/no pair; warning-free empty/all-other-only
+  no-raw negative markers; a new suffix session id forces full cold
+  reclassification; configured-root change and root-escape known rows are never
+  opened.
+- Stable Darwin/APFS detector/root evidence, unchanged reuse with cursor
+  increment, forced pre-generation 32/64 full scans, changed parent/new file,
+  new nested directory, removal/rename, earlier-sorting new source, symlink
+  cases, non-allowlisted/Windows/null full scan, entry 100,000/100,001, depth
+  64/65, partial cursor, and final cold comparator order before admission.
+- Cache/suffix/cold mutation during validation/final binding, BigInt identity,
+  null-identity pathname swap, and exact/one-over/time/event-stop proof that no
+  new pair commits and the prior pair is unchanged.
 - Cache/tree write failure, unavailable/read-only Store, transaction trigger,
   caller mutation of detached results, and descriptor/payload secret canaries
   absent from identity/error/warning text.

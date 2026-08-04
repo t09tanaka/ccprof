@@ -28,6 +28,8 @@ Production:
   classification, receipts, and ABA checks.
 - Create `src/sources/incremental.ts`: prepare/project/eligibility-commit consumer
   and append merge.
+- Create `src/sources/directory-cursor.ts`: shared capability detector, bounded
+  tree reconciliation, and candidate union.
 - Modify `src/sources/claude/discover.ts`: cursor reconciliation and the unified
   cold-ordered candidate set.
 - Modify `src/sources/codex/discover.ts`: cursor reconciliation and the unified
@@ -45,7 +47,7 @@ Tests:
 - Create `test/incremental-source-catalog.test.ts`.
 - Modify `test/docs.test.ts` only for the new disclosure contract.
 
-Together with this plan/design, expect 20 changed files, 1,600–2,200 production
+Together with this plan/design, expect 21 changed files, 1,800–2,500 production
 lines, and 1,400–2,000 test lines. The user explicitly approved the larger
 schema/design scope. Do not add a watcher, queue, cron, outbox, lease, lock
 service, GC/repair command, Report v3 field, rule, or CLI option.
@@ -98,13 +100,32 @@ export interface SourceReadReceipt {
 export interface ParserStateReadResult<State> {
   state: State;
   receipt: SourceReadReceipt;
+  completeness: "complete" | "partial";
 }
 
 export interface ParserStateWarningV1 {
+  order: number;
+  applicability:
+    | { kind: "unconditional" }
+    | { kind: "timestamp"; timestamp_ms: number };
   scope: "source" | "session";
   target_session_id: string | null;
   warning: SourceWarning;
 }
+
+export interface ParserStateRowBaseV1 {
+  original_bytes: number;
+  byte_start: number;
+  byte_end: number;
+  line: number;
+  timestamp_ms: number;
+}
+
+export type ParserReadBudgets = Pick<JsonlParserBudgets,
+  "maxFileBytes" | "maxLineBytes" | "maxNodesPerLine" |
+  "maxNestingDepth">;
+export type ParserProjectionBudgets = Pick<JsonlParserBudgets,
+  "maxRetainedBytes" | "maxWarnings">;
 
 export interface JsonlReadWindow extends ParserReadRange {
   file_handle: FileHandle;
@@ -118,8 +139,13 @@ export function boundedJsonlLines(
 
 export const CLAUDE_PARSER_VERSION = "2.0.0";
 export const CODEX_PARSER_VERSION = "2.0.0";
+export const MAX_INCREMENTAL_PARSER_STATE_BYTES = 128 * 1024 * 1024;
 export const PARSER_STATE_SCHEMA_FINGERPRINT =
-  "sha256:fb8892dbe61732ba057b6c36f6212f8cc560f3d098560260937117d74c6df06f";
+  "sha256:bd3f8bd7da3819214a46fe96969bdc35b439803e30171218c0564e1f1d75f996";
+
+export class IncrementalParserStateCapacityError extends Error {
+  readonly code: "incremental_state_capacity";
+}
 
 export interface ClaudeParserStateV1 {
   kind: "claude-state-v1";
@@ -127,9 +153,6 @@ export interface ClaudeParserStateV1 {
   parsed_offset: number;
   line_count: number;
   ends_with_newline: boolean;
-  retained_bytes: number;
-  warning_count: number;
-  warning_overflowed: boolean;
   rows: ClaudeStateRowV1[];
   branch_lanes: ClaudeBranchLaneV1[];
   ancestry: ClaudeAncestryV1[];
@@ -144,9 +167,6 @@ export interface CodexParserStateV1 {
   parsed_offset: number;
   line_count: number;
   ends_with_newline: boolean;
-  retained_bytes: number;
-  warning_count: number;
-  warning_overflowed: boolean;
   rows: CodexStateRowV1[];
   session_metadata: CodexSessionMetadataV1 | null;
   seen_subtypes: string[];
@@ -158,13 +178,16 @@ export async function readClaudeParserState(options: {
   fileHandle: FileHandle;
   range?: ParserReadRange;
   seed?: ClaudeParserStateV1;
-  budgets?: Partial<JsonlParserBudgets>;
+  budgets?: Partial<ParserReadBudgets>;
   signal?: AbortSignal;
 }): Promise<ParserStateReadResult<ClaudeParserStateV1>>;
 
 export function projectClaudeParserState(
   state: ClaudeParserStateV1,
-  options?: { endedAtMs?: number },
+  options?: {
+    endedAtMs?: number;
+    budgets?: Partial<ParserProjectionBudgets>;
+  },
 ): ClaudeTranscriptParseResult;
 
 export function normalizeClaudeParserState(
@@ -176,13 +199,16 @@ export async function readCodexParserState(options: {
   fileHandle: FileHandle;
   range?: ParserReadRange;
   seed?: CodexParserStateV1;
-  budgets?: Partial<JsonlParserBudgets>;
+  budgets?: Partial<ParserReadBudgets>;
   signal?: AbortSignal;
 }): Promise<ParserStateReadResult<CodexParserStateV1>>;
 
 export function projectCodexParserState(
   state: CodexParserStateV1,
-  options?: { endedAtMs?: number },
+  options?: {
+    endedAtMs?: number;
+    budgets?: Partial<ParserProjectionBudgets>;
+  },
 ): Session | null;
 
 export function normalizeCodexParserState(
@@ -194,15 +220,21 @@ Receipt ranges are half-open `[start_offset, end_offset)`, and `bytes_read` must
 equal their difference. `ParserStateReadResult.receipt` describes only that call;
 it is never serialized into a seeded/merged parser state.
 
-`ClaudeStateRowV1`, `CodexStateRowV1`, and their index types are closed exported
-unions/interfaces in their adapter modules. They contain the exact variants in
-the design and no `Record<string, unknown>` escape hatch.
+Every `ClaudeStateRowV1` and `CodexStateRowV1` variant extends
+`ParserStateRowBaseV1`. Their payload/index types are closed exported unions and
+interfaces in their adapter modules, with no `Record<string, unknown>` escape
+hatch. `original_bytes` is exactly the existing `JsonlLine.bytes` retained cost
+(UTF-8 content excluding CR/LF), while the half-open byte range covers physical
+source bytes. Readers enforce only `ParserReadBudgets`; projectors apply
+`ParserProjectionBudgets` after window selection. The checked-in state-capacity
+error triggers the legacy bounded cold pipeline and never a partial cache row.
 
 ### Store contracts
 
 ```ts
-export interface SourceEvidenceEnvelopeV1 {
+export interface EligibleSourceEvidenceEnvelopeV1 {
   schema_version: 1;
+  kind: "eligible-evidence-v1";
   adapter_id: SourceAdapterId;
   canonical_path: string;
   full_sessions: Session[];
@@ -210,8 +242,22 @@ export interface SourceEvidenceEnvelopeV1 {
   continuation: ClaudeParserStateV1 | CodexParserStateV1;
 }
 
+export interface NoEvidenceMarkerV1 {
+  schema_version: 1;
+  kind: "no-evidence-v1";
+  adapter_id: SourceAdapterId;
+  canonical_path: string;
+  reason: "empty" | "other-repository-only";
+}
+
+export type SourceEvidenceEnvelopeV1 =
+  | EligibleSourceEvidenceEnvelopeV1
+  | NoEvidenceMarkerV1;
+
 export interface SourceEvidenceCacheEntry {
   source_identity: string;
+  repository_identity: string;
+  eligibility_identity: string;
   adapter_id: SourceAdapterId;
   canonical_path: string;
   content_revision: string;
@@ -262,10 +308,14 @@ export function validateSourceDiscoveryRoot(
 ): SourceDiscoveryRoot;
 export function getSourceEvidencePair(
   database: Database.Database,
+  repositoryIdentity: unknown,
+  eligibilityIdentity: unknown,
   sourceIdentity: unknown,
 ): { catalog: SourceCatalogEntry; cache: SourceEvidenceCacheEntry } | undefined;
 export function commitEligibleSourceEvidence(
   database: Database.Database,
+  repositoryIdentity: unknown,
+  eligibilityIdentity: unknown,
   pair: { catalog: SourceCatalogEntry; cache: SourceEvidenceCacheEntry },
 ): "inserted" | "updated" | "unchanged" | "stale" | "conflict";
 export function getSourceDiscoveryRoot(
@@ -299,11 +349,13 @@ export interface SourceFileObservation {
 
 export type SourceChangeKind = "unchanged" | "append" | "replace";
 
-export interface SourceHandleStat {
-  device: number | null;
-  inode: number | null;
-  mtime_ms: number;
-  size_bytes: number;
+export interface OperationFileStat {
+  device: bigint | null;
+  inode: bigint | null;
+  size_bytes: bigint;
+  mtime_ns: bigint | null;
+  ctime_ns: bigint | null;
+  kind: "file" | "directory" | "symlink" | "other";
 }
 
 export async function observeAdmittedSource(options: {
@@ -311,7 +363,7 @@ export async function observeAdmittedSource(options: {
   source_identity: string;
   canonical_path: string;
   file_handle: FileHandle;
-  stat: SourceHandleStat;
+  stat: OperationFileStat;
   previous_size_bytes?: number;
   meter?: AnalysisBudgetMeter;
 }): Promise<SourceFileObservation>;
@@ -333,11 +385,45 @@ export interface IncrementalWarning {
 
 export interface SourcePrepareContext {
   adapterRoot: string;
+  eligibilityRoot: string;
   endedAtMs: number;
   observedAtMs: number;
   discoveryCursor: number;
-  admittedFileBytes: number;
+  parserBudgets?: Partial<JsonlParserBudgets>;
   meter?: AnalysisBudgetMeter;
+}
+
+export function sourceEligibilityIdentity(canonicalRoot: string): string;
+
+declare const sourceCommitCandidateBrand: unique symbol;
+
+export interface PreparedUnwindowedEvidenceV1 {
+  adapter_id: SourceAdapterId;
+  canonical_path: string;
+  full_sessions: Session[];
+  parse_warnings: SourceWarning[];
+  continuation: ClaudeParserStateV1 | CodexParserStateV1;
+}
+
+export interface SourceCommitCandidate {
+  readonly [sourceCommitCandidateBrand]: true;
+  readonly adapter_id: SourceAdapterId;
+  readonly source_identity: string;
+  readonly canonical_path: string;
+  readonly adapter_root: string;
+  readonly canonical_repo: string;
+  readonly repository_identity: string;
+  readonly eligibility_root: string;
+  readonly eligibility_identity: string;
+  readonly ended_at_ms: number;
+  readonly observed_at_ms: number;
+  readonly discovery_cursor: number;
+  readonly parser_read_budgets: ParserReadBudgets;
+  readonly parser_projection_budgets: ParserProjectionBudgets;
+  readonly parser_version: string;
+  readonly schema_fingerprint: string;
+  readonly observation: SourceFileObservation;
+  readonly unwindowed_evidence: PreparedUnwindowedEvidenceV1;
 }
 
 export interface PreparedSourceEvidence {
@@ -348,11 +434,83 @@ export interface PreparedSourceEvidence {
   warnings: IncrementalWarning[];
   completeness: "complete" | "partial";
   parser_mode: "cache" | "suffix" | "cold" | "bounded_cold";
+  commit_candidate: SourceCommitCandidate | null;
 }
 
 export interface EligibleSourceEvidence {
-  prepared: PreparedSourceEvidence;
+  commit_candidate: SourceCommitCandidate;
   eligible_session_ids: string[];
+  all_projected_events_admitted: boolean;
+  meter?: AnalysisBudgetMeter;
+}
+
+export interface DirectoryTokenV1 {
+  device: string;
+  inode: string;
+  mtime_ns: string;
+  ctime_ns: string;
+}
+
+export interface DarwinApfsCapabilityEvidenceV1 {
+  kind: "darwin-apfs-v1";
+  platform: "darwin";
+  node_major: 22 | 24;
+  filesystem_type: "26";
+  canonical_root: string;
+  root_device: string;
+  root_inode: string;
+}
+
+export type DirectoryCursorCapability =
+  | { kind: "stable_directory_token";
+      evidence: DarwinApfsCapabilityEvidenceV1 }
+  | { kind: "full_scan_required"; reason:
+      | "platform" | "node" | "filesystem" | "root_identity"
+      | "directory_identity" | "timestamp" | "uncertain" };
+
+export const DARWIN_APFS_STATFS_TYPE = 26n;
+
+export function detectDirectoryCursorCapability(options: {
+  platform: NodeJS.Platform;
+  node_major: number;
+  canonical_root: string;
+  filesystem_type: bigint;
+  root_lstat: OperationFileStat;
+  root_fstat: OperationFileStat;
+}): DirectoryCursorCapability;
+
+export interface DirectoryEntryObservation {
+  name: string;
+  kind: "file" | "directory" | "symlink" | "other";
+}
+
+export interface DirectoryReadHandle {
+  readonly canonical_path: string;
+  stat(): Promise<OperationFileStat>;
+  readEntries(): Promise<readonly DirectoryEntryObservation[]>;
+  close(): Promise<void>;
+}
+
+export interface IncrementalSourceDependencies {
+  readonly platform: NodeJS.Platform;
+  readonly node_major: number;
+  openNoFollow(path: string): Promise<FileHandle>;
+  fstat(handle: FileHandle): Promise<OperationFileStat>;
+  lstatNoFollow(path: string): Promise<OperationFileStat>;
+  hashRange(options: {
+    handle: FileHandle;
+    start_offset: number;
+    end_offset: number;
+    meter?: AnalysisBudgetMeter;
+  }): Promise<SourceReadReceipt>;
+  readClaudeState: typeof readClaudeParserState;
+  projectClaudeState: typeof projectClaudeParserState;
+  readCodexState: typeof readCodexParserState;
+  projectCodexState: typeof projectCodexParserState;
+  openStore(paths: StorePaths): Database.Database;
+  statfsType(path: string): Promise<bigint>;
+  openDirectoryNoFollow(path: string): Promise<DirectoryReadHandle>;
+  detectDirectoryCapability: typeof detectDirectoryCursorCapability;
 }
 
 export interface IncrementalSourceCatalogConsumerOptions {
@@ -380,6 +538,7 @@ export interface SourceDiscoveryResult {
   candidates: SourceCandidate[];
   cursor: number;
   completeness: "complete" | "partial";
+  capability: DirectoryCursorCapability;
   warnings: SourceWarning[];
 }
 
@@ -389,10 +548,15 @@ export function compareSourceCandidates(
 ): number;
 ```
 
-`IncrementalSourceDependencies` provides injectable no-follow open/hash/stat,
-Claude/Codex state readers/projectors, database open, directory stat/readdir,
-and platform capability functions. It is an embedder seam, not a test-only
-method. Every default dependency uses production code.
+The consumer owns every `FileHandle`, `DirectoryReadHandle`, and database
+returned by dependencies: borrowed hash/stat/parser/projector calls never close
+them; the consumer closes primary and final-binding file handles and every
+directory handle exactly once in `finally`, and closes the database exactly once
+from `close()`. A runtime `WeakSet` authenticates/consumes each branded commit
+candidate once; every scalar/context/budget value and detached nested value is
+deep-frozen, and structural casting cannot mint one. The dependency object is an
+embedder seam, not a test-only method, and every default member uses production
+code with the ownership above.
 
 ### Task 1: RED query-independent parser state and read receipts
 
@@ -422,7 +586,9 @@ T1 parses a Claude prefix plus a later post-window branch/message revision.
 Compare current public cold output, fresh `readResult.state` projection,
 serialized/restored state projection, and a state read before append then
 suffix-seeded state. The earlier window must be canonical-byte identical across
-all four.
+all four. Put enough post-window row bytes and warning facts after the end to
+overflow tight `maxRetainedBytes`/`maxWarnings` if read-stage accounting leaks;
+the earlier projection must remain unchanged.
 
 T2 reads a complete unchanged source once, projects an early end, serializes and
 restores the full state, then projects a later end. Assert later events appear
@@ -432,17 +598,21 @@ and the state reader spy remains zero after restore.
 
 Cover Claude branch/epoch transitions, sidechain parent across the suffix,
 assistant message grouping/prefix dedupe, tool-result replacement, warning
-saturation, retained-byte continuation, and multi-session rows. Cover Codex
-session metadata, subtype warning dedupe, call/result pairing, and a suffix with
-no metadata. Unknown variants and inconsistent indexes must be rejected rather
-than projected.
+saturation after time selection, original-byte accounting, ordered conditional/
+unconditional warning facts, and multi-session rows. Cover Codex session
+metadata, subtype warning dedupe, call/result pairing, and a suffix with no
+metadata. Unknown variants and inconsistent indexes must be rejected rather than
+projected.
 
 - [ ] **Step 4: Define parser-resource boundary behavior**
 
 At exact `maxFileBytes`, state is complete. At one byte over, only the admitted
 prefix is read, no full-file receipt is claimed, and no reusable complete state
-is returned. Retained-byte/warning limits seeded from a prefix must match one
-cold full read.
+is returned. File/line/node/depth limits remain read-stage; retained-byte/warning
+limits are projector-stage and match one cold full read for fresh/restored/
+suffix state. Assert exact and one-over
+`MAX_INCREMENTAL_PARSER_STATE_BYTES`: one-over takes the legacy bounded cold
+pipeline and exposes no reusable state.
 
 - [ ] **Step 5: Delegate RED verification and commit tests**
 
@@ -473,7 +643,7 @@ git commit -m "test(parsers): define query-independent source state"
 Add the exact parser constants/state unions from the API vocabulary before any
 Store module imports them. Compute the checked-in schema fingerprint from the
 literal contract label
-`ccprof:parser-state:v1\\0claude-state-v1,codex-state-v1,source-read-receipt-v1`
+`ccprof:parser-state:v1\\0claude-state-v1,codex-state-v1,source-read-receipt-v1,warning-fact-v1`
 documented beside the constant; the displayed separator is the two literal
 ASCII bytes backslash plus `0`, not U+0000. Never hash TypeScript source at
 runtime.
@@ -487,17 +657,19 @@ every admitted buffer into the receipt digest before JSON decoding.
 
 - [ ] **Step 3: Refactor Claude into state-read then projection**
 
-Move physical validation/compaction into `readClaudeParserState`; move
-`endedAtMs` filtering to the first step of `projectClaudeParserState`. Rebuild
-the existing branch stamping, agent resolution, assistant grouping, result
-replacement, warnings, and sessions only from filtered state rows. The existing
-public parser calls these two functions and retains its signature/results.
+Move query-independent physical validation/compaction and original byte/warning
+facts into `readClaudeParserState`; it applies only file/line/node/depth limits
+and the fixed reusable-state capacity. Move `endedAtMs`, `maxRetainedBytes`, and
+`maxWarnings` to the first projector phases. Rebuild branch stamping, agent
+resolution, assistant grouping, result replacement, warnings, and sessions only
+from admitted filtered facts. The existing public parser keeps its API and uses
+the legacy bounded cold path if the reusable-state cap is exceeded.
 
 - [ ] **Step 4: Refactor Codex into state-read then projection**
 
 Apply the same split, keeping the current metadata selection, ignored subtype,
-status, warning, and session behavior. A seeded suffix accumulates retained and
-warning budgets and metadata deterministically.
+status, warning, and session behavior. A seeded suffix appends query-independent
+facts; every projector invocation reapplies retained/warning budgets from zero.
 
 - [ ] **Step 5: Delegate GREEN, regressions, and LanguageService checks**
 
@@ -552,10 +724,16 @@ unchanged. Repeat v5 opens and prove idempotence. Version 1, negative, and above
 Assert fresh state/envelope normalization and detached clones. Reject hostile
 descriptors, extra/raw fields, unknown states, non-canonical ordering, wrong
 path/adapter/cardinality, warning path, continuation path, payload copied across
-source/path/adapter/revision, payload/descriptor digest mismatch, wrong labels,
+Store repository/eligibility root/source/path/adapter/revision, payload/
+descriptor digest mismatch, wrong labels,
 offset/line/newline/timestamp disagreement with catalog, unsafe integers,
 >128 MiB payloads, and invalid recursive tool input. Errors must not include
-`SECRET_CANARY`.
+`SECRET_CANARY`. Cover the closed eligible-envelope and no-evidence-marker
+variants; reject a negative marker containing any continuation, session,
+warning, descriptor, or extra field, and require its descriptor digest to bind
+the canonical empty descriptor list plus active Store and eligibility
+identities. Use two linked-worktree eligibility roots sharing one Store and prove
+positive/negative rows cannot cross roots.
 
 ```ts
 assert.throws(
@@ -575,8 +753,10 @@ never a mixed revision.
 - [ ] **Step 5: Define directory-root cache validation**
 
 Cover exact tree shape/order/digest/root binding, complete/partial rows,
-capability enum, stable decimal directory tokens, stale/equal/newer cursors,
-detached reads, hostile/corrupt JSON, wrong root/adapter, and fixed labels.
+capability enum, exact `darwin-apfs-v1` evidence, stable decimal directory
+tokens, stale/equal/newer cursors, detached reads, hostile/corrupt JSON, wrong
+root/adapter/evidence, and fixed labels. Unchanged complete generation N must
+write N+1; partial must preserve N.
 
 - [ ] **Step 6: Delegate RED and commit tests**
 
@@ -613,13 +793,15 @@ permission/configuration behavior.
 
 Use property descriptors, closed field sets, bounded iterative JSON validation,
 canonical JSON, adapter state validators, and the full-session projector
-cross-check. Enforce adapter/path/warning/cardinality constraints and return
-detached plain values.
+cross-check. Enforce adapter/path/warning/cardinality constraints for positive
+entries, the no-raw shape for negative markers, exact capability evidence for
+directory roots, and detached plain values.
 
 - [ ] **Step 3: Implement foreign-bound digests and reads**
 
-Domain-separate payload and descriptor digests with source identity, canonical
-path, adapter, revision, parser version, schema fingerprint, and labels. Read
+Domain-separate payload and descriptor digests with Store repository identity,
+exact eligibility-root identity, source identity, path, adapter, revision,
+parser version, schema fingerprint, and labels. Read
 catalog/cache through one join and validate the pair together; a lone/mixed row
 is a miss, never a partial value.
 
@@ -661,23 +843,27 @@ repeat the affected review.
 Cover stable identity/revision, Windows/null identity capability, exact replay,
 verified append, same-size rewrite with restored mtime, middle rewrite, larger
 non-append rewrite, truncate, inode rotation, parser/schema mismatch, partial
-state, and non-newline prefix. Null identity permits exact digest reuse but never
-append.
+state, and non-newline prefix. Preserve operation-local BigInt identity even
+when persisted identity is null. Null identity permits exact digest reuse but
+never append.
 
 - [ ] **Step 2: Define same-handle and ABA failures**
 
-Inject path swap, rotate/restore, truncate/restore, byte mutation during hash,
-byte mutation during parse, restored metadata, and parser-receipt mismatch.
-Assert hash/parser/fstat use one handle, the first instability cold-retries once,
-the second returns evidence plus `source_changed_during_read`, and no pair is
-committed.
+For cache, suffix, cold, and bounded-cold modes, inject path swap, null-identity
+swap, rotate/restore, truncate/restore, mutation during cache validation/hash/
+parse, restored metadata, and parser-receipt mismatch. Assert the primary hash/
+parser/fstat/rehash use one handle; a separately owned no-follow final-binding
+handle rehashes the exact admitted range. The first instability cold-retries
+once, the second returns evidence plus `source_changed_during_read`, and no pair
+is committed.
 
 - [ ] **Step 3: Define admission-before-hash boundaries**
 
-Instrument hasher calls. At exact parser/analysis file-byte limits, the file is
-fully hashed and cacheable. At one byte over, assert full-hash count zero, only
-the admitted prefix reaches bounded cold parsing, checkpoints occur, and no
-complete cache replaces a prior pair.
+Instrument open and hasher calls. For `max_source_items`, assert zero opens none,
+exact N opens N, and N+1 is never opened. At exact parser/analysis file-byte
+limits, the file is fully hashed and cacheable. At one byte over, assert full-
+hash count zero, only the admitted prefix reaches bounded cold parsing,
+checkpoints occur, and no complete cache replaces a prior pair.
 
 - [ ] **Step 4: Define restart/cache/append canonical equivalence**
 
@@ -685,25 +871,44 @@ Cold prepare+eligible commit, close all handles/database, construct a fresh
 consumer, and assert unchanged parser count zero with detached canonical-equal
 sessions. Append UTF-8/LF/CRLF and every continuation fixture; compare full
 envelope and early/late projected windows byte-for-byte with a separate cold
-full parse. Unsupported state must cold fallback.
+full parse. A suffix row with a previously unseen session id and unsupported
+state both force one full cold reclassification. Any effective parser-budget
+override to file/line/node/depth also stays on the bounded cold path and yields
+no persistent candidate; retained/warning overrides still reuse the projector.
 
 - [ ] **Step 5: Define two-phase repository eligibility**
 
-Parse a source with Repo A, Repo B, and unrelated sessions. Assert prepare writes
-nothing. Commit A using unwindowed canonical cwd eligibility and inspect A Store:
-only A rows/warnings/state/descriptors exist. Repeat B. An unrelated-only source
-commits neither catalog nor cache. A known path outside the currently configured
-adapter root is never opened.
+Parse a mixed Repo A/Repo B source and assert prepare writes nothing and neither
+Store receives a pair; unchanged restarts cold parse again. For all-eligible
+input, positive state commits. For exactly empty/warning-free and all-other-
+repository/warning-free inputs, inspect a revision-bound no-raw negative marker
+and prove an unchanged restart skips parsing. Any warning-bearing empty result
+remains uncached. Two linked worktrees share the Store but use distinct
+eligibility identities and never reuse each other's marker/state. A known path
+outside the configured adapter root is never opened.
 
 - [ ] **Step 6: Define cold/warm budget accounting**
 
-Union fixture candidates in cold order. Assert exact equality for observed and
-consumed input bytes, input events, output bytes, source items, and associated
-truncation. Assert wall/CPU are allowed to decrease and a tight wall/CPU clock
-may admit more warm work; no test fabricates equality for those counters. Cache-
-only failures add warning but do not record a source failure.
+Union fixture candidates in cold order. With a real clock, assert exact equality
+only for observed/consumed input bytes, input events, and source items over the
+common prefix. Prove output uses the identical limiter and never exceeds or leaks
+past it, without asserting real-clock output equality. With one non-stopping
+scripted clock, assert canonical/output equality. Wall/CPU may decrease and a
+tight clock may admit more warm work; no test fabricates equality. Cache-only
+failures add warning but do not record a source failure.
 
-- [ ] **Step 7: Delegate RED and commit tests**
+- [ ] **Step 7: Define branded candidate and final commit gate**
+
+Assert `prepare*` itself checkpoints/claims source item before open, stats, and
+admits file bytes from the supplied meter/parser budgets. It returns a runtime-
+authenticated candidate only for stable complete cold/suffix work. Forged,
+replayed, cache-hit, bounded, unstable, and mixed candidates cannot write. After
+event admission, exact and one-over event limits plus a final wall/CPU stop must
+preserve the old pair; only all-events-admitted plus final `checkpoint() === true`
+may publish a new pair. Assert every dependency handle/database owner closes it
+exactly once on all exits.
+
+- [ ] **Step 8: Delegate RED and commit tests**
 
 Delegate:
 
@@ -728,43 +933,64 @@ git commit -m "test(sources): define safe incremental consumption"
 
 - [ ] **Step 1: Implement no-follow admitted handle**
 
-Canonicalize/contain the candidate before opening. Use POSIX `O_NOFOLLOW`; use
-portable lstat/open/fstat identity checks elsewhere. Stat, source-item admit, and
-file-byte admission occur before any full hash. Pass the same handle into hash
-and parser dependencies; close in `finally`.
+Canonicalize/contain the candidate, then use the context meter to checkpoint and
+claim the source item before calling `openNoFollow`. On denial, return partial
+without open/stat/cache access. Use POSIX `O_NOFOLLOW` and portable lstat/open/
+fstat checks elsewhere. After primary-handle stat, apply parser and analysis file-
+byte admission before any full hash. The consumer owns and closes every returned
+handle exactly once in `finally`.
 
 - [ ] **Step 2: Implement observation and receipt binding**
 
 Hash chunk-by-chunk with meter checkpoints. Bind full/suffix parser receipts to
 observed ranges. During the admitted full pass, compute the exact prior-size
-prefix revision when a prior complete row exists. Rehash and fstat after parse,
-then no-follow bind the current path to the same identity. Implement one cold
-retry and content-free instability warning.
+prefix revision when a prior complete row exists. Retain raw BigInt stat identity
+for this operation even if persistence normalizes it to null. Before every mode
+returns, rehash/fstat the primary handle and open a final no-follow binding handle
+to rehash the admitted range and compare path content/identity. Implement one
+cold retry and content-free instability warning.
 
 - [ ] **Step 3: Implement strict cache selection and append**
 
 Require the complete foreign-bound pair. Exact match projects stored state.
 Append verifies the entire old prefix digest, stable identity, newline boundary,
 and versions using `previous_prefix_revision`, then calls the state reader with
-exact offset/global line and seed. Normalize/project the merged state and apply
-cold equivalence invariants; every other state cold parses.
+exact offset/global line and query-independent seed. Reapply retained/warning
+budgets in the projector from zero. A new suffix session id, mixed eligibility,
+capacity overflow, or other unsupported state cold parses the whole file.
 
 - [ ] **Step 4: Implement prepare then eligible commit**
 
-`prepareClaude`/`prepareCodex` never write. `commitEligible` filters unwindowed
-sessions, state rows/indexes, and targeted warnings to canonical cwd-eligible
-session ids. It retains only content-free source-scoped warnings, reprojects full
-sessions, rebuilds bound digests, and atomically commits only a non-empty complete
-value. Cache write errors return one warning and preserve the prepared result.
+`prepareClaude`/`prepareCodex` never write. Stable complete cold/suffix work gets
+a one-shot branded candidate containing every frozen observation/context value;
+cache hits and all partial/unstable paths get `null`. `commitEligible` classifies
+the unwindowed result: all eligible creates positive evidence; all ineligible or
+empty creates a marker only when repository-visible warnings are empty; mixed or
+warning-bearing empty results consume/discard the candidate without writing.
+Runtime `WeakSet` membership rejects forged/replayed candidates. Cache write
+errors return one warning and preserve the prepared result. Compare effective
+file/line/node/depth budgets to the checked-in defaults before cache lookup; any
+read-budget override is cold-only and produces no commit candidate, while
+retained/warning overrides remain projector inputs.
 
-- [ ] **Step 5: Preserve exact four non-time budgets**
+- [ ] **Step 5: Gate commit after event admission and final checkpoint**
 
-Use the already-sorted caller order, existing meter admissions, and
-`admitSessionEventPrefix`. Do not debit cached bytes/events differently. Keep
-output finalization untouched. Place checkpoints in every hash/parser/validation
-batch so wall/CPU savings remain real and observable.
+Use the already-sorted caller order and existing `admitSessionEventPrefix`; do
+not debit cached bytes/events differently. `commitEligible` requires
+`all_projected_events_admitted`, calls the final `meter.checkpoint()`, checks
+`meter.stopped === false`, and only then performs the pair transaction. An event
+prefix or time stop discards the candidate and preserves any old pair. Keep the
+existing output limiter/finalization unchanged, and checkpoint every hash/parser/
+validation batch so wall/CPU savings remain observable.
 
-- [ ] **Step 6: Delegate GREEN and commit production**
+- [ ] **Step 6: Implement the exact dependency seam and ownership**
+
+Implement every `IncrementalSourceDependencies` signature above. Borrowed hash,
+stat, parser, and projector functions never close; the consumer closes primary/
+binding file handles in `finally`, owns the Store connection until `close()`, and
+rejects use after close. No production function relies on a test-only hook.
+
+- [ ] **Step 7: Delegate GREEN and commit production**
 
 Delegate Task 5 plus parser-state/source-catalog/cache tests and LanguageService
 diagnostics. After GREEN, commit production separately:
@@ -774,7 +1000,7 @@ git add src/sources/source-observation.ts src/sources/incremental.ts
 git commit -m "feat(sources): reuse repository-bound source evidence"
 ```
 
-- [ ] **Step 7: Run task spec then quality/security review**
+- [ ] **Step 8: Run task spec then quality/security review**
 
 With the worktree clean, run the two independent reviews in that order. Fix in
 new commits, never amend, and repeat the affected review.
@@ -790,20 +1016,22 @@ new commits, never amend, and repeat the affected review.
 
 Build a directory tree with known/new/nested sources. Assert unchanged stable
 tokens stat every known directory but readdir none, changed parent readdir only
-that branch, and new files/dirs are found. The positive capability fixture must
-guarantee that every child-set mutation changes its token; timestamp shape alone
-does not enable reuse. Null identity, Windows, unrecognized/remote filesystem,
-coarse or backward time, equal-token conflict, invalid token, and unsupported
-capability must full scan and cannot claim cursor reuse.
+that branch, and new files/dirs are found. Production detection returns stable
+only for Node 22/24 + Darwin + APFS `statfs.type === 26n` + matching canonical-
+root lstat/fstat BigInt identity, and persists exact root evidence. Every child
+directory must remain on that device with valid nanosecond tokens. Linux,
+Windows, other Node majors/types/devices, remote/unknown filesystem, null/coarse
+identity/time, and detector uncertainty full-scan and cannot claim cursor reuse.
 
 - [ ] **Step 2: Define cursor ABA and deterministic full reconciliation**
 
 Mutate a directory during readdir, restore its metadata, and assert second stat
 causes a full scan. Repeat instability: result is partial and cursor does not
-advance. Force a complete full reconciliation every 32 successful cursors;
-assert it discovers an injected token-anomaly file and resets the deterministic
-cycle without depending on wall time. This periodic check is defense in depth;
-no test treats it as permission to claim complete on an unproven filesystem.
+advance. Initial generation 1 full-scans. Every unchanged complete run increments
+the cursor. Assert generation 31→32 and 63→64 force a full reconciliation
+before publishing N, discover an injected token-anomaly file, and do not depend
+on wall time. This check is defense in depth; it cannot enable an unallowlisted
+filesystem.
 
 - [ ] **Step 3: Define exact ceilings/depth/symlink placement**
 
@@ -826,10 +1054,11 @@ must match for source/input/event limits.
 
 Run `analyze()` with persisted built-in sources, close all state, and run again
 with fresh dependencies. Assert unchanged parser counts and unchanged-directory
-readdir counts are zero, while canonical report/findings/descriptors/warnings/
-snapshot source digest match cold. Change one source and one directory; only
-those paths are re-read/reparsed. `persist:false` and injected `SessionSource`
-retain current behavior.
+readdir counts are zero in the stable Darwin/APFS fixture, while a shared non-
+stopping scripted clock yields canonical report/findings/descriptors/warnings/
+output/snapshot digest equal to cold. Non-allowlisted fixtures full-scan. Change
+one source and one directory; only those paths are re-read/reparsed.
+`persist:false` and injected `SessionSource` retain current behavior.
 
 - [ ] **Step 6: Define the README disclosure contract**
 
@@ -851,6 +1080,7 @@ git commit -m "test(core): define cursor-backed source discovery"
 
 **Files:**
 
+- Create: `src/sources/directory-cursor.ts`
 - Modify: `src/sources/claude/discover.ts`
 - Modify: `src/sources/codex/discover.ts`
 - Modify: `src/core/analyze.ts`
@@ -858,12 +1088,13 @@ git commit -m "test(core): define cursor-backed source discovery"
 
 - [ ] **Step 1: Implement stable directory tokens and cursor reconciliation**
 
-Use dev/inode/mtimeNs/ctimeNs decimal tokens and an explicit capability check
-that positively identifies the child-set mutation guarantee; do not infer it
-from field shape. Stat every cached directory. Reuse listings only for unchanged
+Implement `detectDirectoryCursorCapability` and its exact Node 22/24 Darwin/APFS
+type-26 allowlist/root evidence; field shape alone cannot enable it. Stat every
+cached directory and require same root device. Reuse listings only for unchanged
 proven tokens; readdir changed/new branches. Surround reconciliation with same-
-directory second stats, use full scan on uncertainty, and force full
-reconciliation on cursor multiples of 32. Never publish partial as complete.
+directory second stats and full-scan on uncertainty. Compute N from prior N-1,
+increment even unchanged complete runs, and force the full scan before publishing
+N divisible by 32. Never publish partial as complete.
 
 - [ ] **Step 2: Implement exact scan bounds and warnings**
 
@@ -875,8 +1106,10 @@ prefixes, and route partial warnings/errors exactly as Task 7 specifies.
 
 Load root-contained known paths, reconcile new paths, canonical-deduplicate the
 whole union, apply `compareSourceCandidates`, and only then visit/admit. Pass each
-candidate through prepare, unwindowed repo eligibility, and optional commit
-before existing time/branch/alignment logic.
+candidate through prepare and unwindowed repo eligibility. Apply existing time/
+branch/alignment and event-prefix admission, then redeem a candidate only after
+all projected events were admitted and the final wall/CPU checkpoint succeeds.
+Cache hits are read-only; stopped/partial work never refreshes a pair.
 
 - [ ] **Step 4: Wire analyzer lifecycle without custom-source drift**
 
@@ -902,13 +1135,14 @@ npm run build:test
 node --test .test-dist/test/incremental-source-catalog.test.js .test-dist/test/claude-discover.test.js .test-dist/test/codex-discover.test.js .test-dist/test/analyze-integration.test.js .test-dist/test/analysis-budgets-integration.test.js .test-dist/test/determinism-golden.test.js .test-dist/test/docs.test.js
 ```
 
-Delegate LanguageService refs/diagnostics for discover classes/functions and
-`AnalyzeOptions`; require zero diagnostics.
+Delegate LanguageService refs/diagnostics for the detector/reconciler, discover
+classes/functions, dependency seam, and `AnalyzeOptions`; require zero
+diagnostics.
 
 - [ ] **Step 7: Commit production/docs**
 
 ```sh
-git add src/sources/claude/discover.ts src/sources/codex/discover.ts src/core/analyze.ts README.md
+git add src/sources/directory-cursor.ts src/sources/claude/discover.ts src/sources/codex/discover.ts src/core/analyze.ts README.md
 git commit -m "feat(core): reconcile incremental source discovery"
 ```
 
@@ -925,9 +1159,11 @@ affected review.
 Give a fresh reviewer the audit, revised design/plan, merge base, commits, and
 diff. Require explicit verdicts for T1/T2, closed continuation, foreign binding,
 repo gate, no-follow receipts/ABA, admission-before-hash, append equivalence,
-directory no-miss capability/fallback, exact bounds, deterministic budgets,
-Store migrations/races, privacy disclosure, and no extra scope. Fix all P0–P2
-introduced issues in new commits and re-review.
+project-stage retained/warning budgets, mixed/negative eligibility behavior,
+branded final commit gate, exact Darwin/APFS detector/generations, directory no-
+miss fallback, exact bounds, real/scripted-clock budget claims, Store migrations/
+races, privacy disclosure, and no extra scope. Fix all P0–P2 introduced issues in
+new commits and re-review.
 
 - [ ] **Step 2: Run separate whole quality/security review**
 
@@ -981,7 +1217,8 @@ Under standing authorization merge through the PR, never locally. Read and run
 
 - Review item 1: query-independent state/common projector/T1/T2 — Tasks 1–2.
 - Item 2: closed adapter continuation and cold fallback — Tasks 1–2, 5–6.
-- Item 3: union comparator and four non-time budget equivalence — Tasks 5–8.
+- Item 3: union comparator and three real-clock input-budget equivalences, plus
+  output limiter safety/scripted-clock equality — Tasks 5–8.
 - Item 4: repo eligibility before commit/root containment — Tasks 5–6, 8.
 - Item 5: same no-follow handle/parser receipt/ABA — Tasks 1–2, 5–6.
 - Item 6: admission immediately after stat/no over-limit hash — Tasks 5–6.
@@ -990,6 +1227,21 @@ Under standing authorization merge through the PR, never locally. Read and run
   Tasks 3–4, 7–8.
 - Item 10: foreign-bound digest/path/adapter/cardinality — Tasks 3–4.
 - Item 11: Windows capability and migration/pair races — Tasks 3–7.
+- Second review item 1: original byte/warning facts, projector budgets, fixed
+  reusable-state cap — Tasks 1–2.
+- Item 2: real-clock claim narrowed and scripted output/canonical equality —
+  Tasks 5–9.
+- Item 3: mixed cold fallback, no-raw negative markers, unseen suffix id — Tasks
+  3–6.
+- Item 4: source-item claim/checkpoint before open — Tasks 5–6, 8.
+- Item 5: every-mode final primary/binding verification and BigInt identity —
+  Tasks 5–6.
+- Item 6: branded complete commit candidate, exact context/dependencies/ownership
+  — API vocabulary, Tasks 5–6.
+- Item 7: exact Darwin/APFS detector/evidence and pre-N cursor cycle — Tasks 3–4,
+  7–8.
+- Item 8: all-events/final-checkpoint commit gate and old-pair preservation —
+  Tasks 5–8.
 - Every production task follows an observed RED and receives spec review before
   quality review. RED and production commits remain separate; no amend or local
   merge is used.
