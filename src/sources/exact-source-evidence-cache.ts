@@ -10,6 +10,7 @@ import { IncrementalParserStateCapacityError, type ParserStateReadResult } from 
 import { commitEligibleSourceEvidence, createSourceEvidencePair, getSourceEvidencePair,
   normalizeSourceEvidenceEnvelope, sourceEvidenceIdentity } from "../store/source-evidence-cache.js";
 import type { StorePaths } from "../store/paths.js";
+import { getSourceCatalogEntry } from "../store/source-catalog.js";
 import { openStoreDatabase } from "../store/sqlite.js";
 
 const RANGE_BYTES = 4_096;
@@ -95,11 +96,13 @@ export class ExactSourceEvidenceCache {
       if (!sameFile(before, held)) throw new Error("Source identity changed.");
       const observation = await observe(handle, held);
       const eligibilityIdentity = createHash("sha256").update(root).digest("hex");
-      let pair;
+      const sourceIdentity = sourceEvidenceIdentity(options.adapterId, sourcePath);
+      let catalog: ReturnType<typeof getSourceCatalogEntry>, pair;
       try {
         database = openStoreDatabase(this.#paths);
+        catalog = getSourceCatalogEntry(database, sourceIdentity);
         pair = getSourceEvidencePair(database, this.#paths.repo_hash,
-          eligibilityIdentity, sourceEvidenceIdentity(options.adapterId, sourcePath));
+          eligibilityIdentity, sourceIdentity);
       } catch { warn(); }
       if (pair?.catalog.content_revision === observation.contentRevision) {
         const envelope = normalizeSourceEvidenceEnvelope(JSON.parse(pair.cache.payload_json));
@@ -138,7 +141,9 @@ export class ExactSourceEvidenceCache {
           const committed = commitEligibleSourceEvidence(database, this.#paths.repo_hash, eligibilityIdentity,
             createSourceEvidencePair({ adapterId: options.adapterId, canonicalPath: sourcePath,
               repositoryIdentity: this.#paths.repo_hash, eligibilityIdentity,
-              observedAtMs: this.#observedAtMs ?? observation.mtimeMs, observation,
+              observedAtMs: catalog?.content_revision === observation.contentRevision
+                ? catalog.observed_at_ms : Math.max(this.#observedAtMs ?? observation.mtimeMs,
+                    (catalog?.observed_at_ms ?? -1) + 1), observation,
               parserState: read.state as never, evidence: { ...found, ...publish } }));
           if (negativeReason !== undefined && committed !== "stale" && committed !== "conflict")
             return (options.adapterId === "claude" ? { sessions: [], warnings: [] } : null) as Result;
