@@ -911,7 +911,7 @@ test("linked-worktree canonical policy failure precedes discovery and persistenc
   }
 });
 
-test("linked-worktree budget partial keeps canonical policy identity without Store paths", async () => {
+test("linked-worktree budget partial keeps canonical policy and Store identity", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-linked-budget-policy-"));
   try {
     const repo = await realpath(await makeRepository(root));
@@ -920,6 +920,8 @@ test("linked-worktree budget partial keeps canonical policy identity without Sto
     await git(repo, ["worktree", "add", "--detach", linkedRepoPath, "feature"]);
     const linkedRepo = await realpath(linkedRepoPath);
     assert.notEqual(linkedRepo, repo);
+    const storePaths = await resolveStorePaths(linkedRepo);
+    assert.equal(storePaths.canonical_repo, repo);
 
     const canonicalPolicy = commandPolicy({
       governed: true,
@@ -978,7 +980,12 @@ test("linked-worktree budget partial keeps canonical policy identity without Sto
       },
     }, {
       analyze: async (options) => {
-        assert.equal(Object.hasOwn(options, "storePaths"), false);
+        assert.ok(options.storePaths !== undefined);
+        assert.equal(
+          options.storePaths.canonical_repo,
+          storePaths.canonical_repo,
+        );
+        assert.equal(options.storePaths.root_dir, storePaths.root_dir);
         const outputProjector = options.outputProjector;
         assert.ok(outputProjector !== undefined);
         const result = await analyze({

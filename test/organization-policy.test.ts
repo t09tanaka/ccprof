@@ -2041,6 +2041,17 @@ test("repository policy resolver composes signed and repository layers", async (
 test("analyze shares one cached effective rule policy with core and rendering", async (t) => {
   const repoRoot = await temporaryRepository(t);
   const canonicalRepo = join(repoRoot, "canonical-report-repository");
+  const storePaths: StorePaths = {
+    canonical_repo: canonicalRepo,
+    repo_hash: "1".repeat(64),
+    root_dir: join(repoRoot, "data"),
+    repo_dir: join(repoRoot, "data", "repo"),
+    analyses_dir: join(repoRoot, "data", "repo", "analyses"),
+    history_index_path: join(repoRoot, "data", "repo", "index.json"),
+    dismissals_path: join(repoRoot, "data", "repo", "dismissals.json"),
+    adoptions_path: join(repoRoot, "data", "repo", "adoptions.json"),
+    hook_events_path: join(repoRoot, "data", "repo", "hooks.jsonl"),
+  };
   const ruleSafety = resolveRuleSafetyPolicy(
     {
       safe_patterns: ["npm *"],
@@ -2066,6 +2077,10 @@ test("analyze shares one cached effective rule policy with core and rendering", 
     color: false,
     privacy: "raw",
   }, {
+    resolveStorePaths: async (cwd) => {
+      assert.equal(cwd, repoRoot);
+      return storePaths;
+    },
     analyze: async (options) => {
       capturedOptions = options;
       const callback = options.resolveRuleSafetyPolicy;
@@ -2081,6 +2096,7 @@ test("analyze shares one cached effective rule policy with core and rendering", 
   });
 
   assert.equal(capturedOptions?.cwd, repoRoot);
+  assert.equal(capturedOptions?.storePaths, storePaths);
   assert.equal(resolvedRepo, canonicalRepo);
   assert.equal(resolverCalls, 1);
 });
