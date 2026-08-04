@@ -16,6 +16,7 @@ import {
   NoAnalyzableTimestampsError,
   NoMatchingSessionsError,
 } from "../src/core/analyze.js";
+import { runAnalyzeCommand } from "../src/commands/analyze.js";
 import type { Interval, Session } from "../src/core/model.js";
 import {
   discoverManifestTestMap,
@@ -47,6 +48,7 @@ import {
   RuleSafetyPolicyValidationError,
   type EffectiveRuleSafetyPolicy,
 } from "../src/policy/rule-safety.js";
+import type { EffectivePolicy } from "../src/policy/organization-policy.js";
 
 const NOW_MS = Date.parse("2026-01-01T01:00:00.000Z");
 const FEATURE_COMMIT_DATE = "2026-01-01T00:00:00.000Z";
@@ -256,6 +258,34 @@ function policySensitiveRuleSafety(): EffectiveRuleSafetyPolicy {
       parallel_safe: true,
     }],
   );
+}
+
+function commandPolicy(
+  overrides: Partial<EffectivePolicy> = {},
+): EffectivePolicy {
+  return {
+    governed: false,
+    privacy: "raw",
+    allow_raw: true,
+    allow_advisory: true,
+    advisory_enabled: true,
+    allow_export: true,
+    required_source_coverage: 0,
+    ...overrides,
+  };
+}
+
+function storedPolicyDigest(
+  history: Awaited<ReturnType<typeof loadAnalyses>>,
+): string {
+  assert.deepEqual(history.warnings, []);
+  const entry = history.entries?.[0];
+  assert.ok(entry !== undefined);
+  assert.equal("mode" in entry.identity, false);
+  if ("mode" in entry.identity) {
+    assert.fail("expected a rich analysis snapshot identity");
+  }
+  return entry.identity.policy_digest;
 }
 
 function policySensitiveSession(sessionId: string, repo: string): Session {
@@ -550,6 +580,255 @@ test("core rejects an invalid rule policy before discovery or persistence", asyn
         return true;
       },
     );
+    assert.equal(discoveryCalls, 0);
+    assert.deepEqual((await loadAnalyses(storePaths)).records, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("linked-worktree analyze uses one canonical effective policy for core identity and rendering", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-linked-rule-policy-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const linkedRepoPath = join(repo, ".test-worktrees", "policy-linked");
+    await mkdir(dirname(linkedRepoPath), { recursive: true });
+    await git(repo, ["worktree", "add", "--detach", linkedRepoPath, "feature"]);
+    const linkedRepo = await realpath(linkedRepoPath);
+    const commandStorePaths = await resolveStorePaths(linkedRepo, {
+      env: { CCPROF_DATA_DIR: join(root, "command-data") },
+    });
+    const referenceStorePaths = await resolveStorePaths(linkedRepo, {
+      env: { CCPROF_DATA_DIR: join(root, "reference-data") },
+    });
+    assert.notEqual(linkedRepo, commandStorePaths.canonical_repo);
+    assert.equal(commandStorePaths.canonical_repo, repo);
+
+    const ruleSafety = policySensitiveRuleSafety();
+    const canonicalPolicy = commandPolicy({
+      governed: true,
+      organization: "example-corp",
+      privacy: "strict",
+      allow_raw: false,
+      allow_advisory: false,
+      advisory_enabled: false,
+      rule_safety: ruleSafety,
+    });
+    const linkedPathPolicy = commandPolicy();
+    const source = {
+      discover: async () => [
+        policySensitiveSession("linked-policy-session", linkedRepo),
+      ],
+    };
+
+    await analyze({
+      cwd: linkedRepo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths: referenceStorePaths,
+      sessionSource: source,
+      resolveRuleSafetyPolicy: async () => ruleSafety,
+    });
+    const referenceHistory = await loadAnalyses(referenceStorePaths);
+
+    const resolvedRepos: string[] = [];
+    let advisoryCalls = 0;
+    const output = await runAnalyzeCommand({
+      cwd: linkedRepo,
+      pr: "main...feature",
+      format: "json",
+      color: false,
+      privacy: "raw",
+      advisory: true,
+    }, {
+      analyze: async (options) => await analyze({
+        ...options,
+        nowMs: NOW_MS,
+        storePaths: commandStorePaths,
+        sessionSource: source,
+      }),
+      resolvePolicy: async (resolvedRepo) => {
+        resolvedRepos.push(resolvedRepo);
+        return resolvedRepo === commandStorePaths.canonical_repo
+          ? canonicalPolicy
+          : linkedPathPolicy;
+      },
+      runCommand: async () => {
+        advisoryCalls += 1;
+        throw new Error("advisory must remain disabled by canonical policy");
+      },
+    });
+
+    assert.deepEqual(resolvedRepos, [commandStorePaths.canonical_repo]);
+    assert.equal(advisoryCalls, 0);
+    assert.ok(output.warnings.some((warning) =>
+      warning.includes("[policy_advisory_disabled]")
+    ));
+    assert.equal(output.stdout.includes("npm test"), false);
+    assert.equal(output.stdout.includes("node-workspace"), false);
+
+    const commandHistory = await loadAnalyses(commandStorePaths);
+    assert.equal(commandHistory.records.length, 1);
+    const findings = commandHistory.records[0]?.findings ?? [];
+    const approval = findings.find(({ rule_id, evidence }) =>
+      rule_id === "R004" &&
+      evidence.latency_classification === "repeated_safe_approval_latency"
+    );
+    const serial = findings.find(({ rule_id }) => rule_id === "R005");
+    assert.deepEqual(approval?.evidence.canonical_commands, ["npm test"]);
+    assert.equal(
+      serial?.evidence.parallelization_classification,
+      "parallel_safe",
+    );
+    assert.equal(serial?.evidence.resource_domain, "node-workspace");
+    assert.equal(
+      storedPolicyDigest(commandHistory),
+      storedPolicyDigest(referenceHistory),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("linked-worktree canonical rule-safety denial persists no authorized recipe", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-linked-policy-denial-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const linkedRepoPath = join(repo, ".test-worktrees", "policy-denial");
+    await mkdir(dirname(linkedRepoPath), { recursive: true });
+    await git(repo, ["worktree", "add", "--detach", linkedRepoPath, "feature"]);
+    const linkedRepo = await realpath(linkedRepoPath);
+    const storePaths = await resolveStorePaths(linkedRepo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    assert.notEqual(linkedRepo, storePaths.canonical_repo);
+    assert.equal(storePaths.canonical_repo, repo);
+
+    const linkedPathPolicy = commandPolicy({
+      rule_safety: policySensitiveRuleSafety(),
+    });
+    const canonicalPolicy = commandPolicy({
+      governed: true,
+      organization: "example-corp",
+      privacy: "balanced",
+      rule_safety: resolveRuleSafetyPolicy(
+        {
+          safe_patterns: ["cargo *"],
+          allow_rule_recommendation: true,
+        },
+        [{
+          match: ["cargo *"],
+          domain: "rust-workspace",
+          parallel_safe: false,
+        }],
+      ),
+    });
+    const resolvedRepos: string[] = [];
+
+    await runAnalyzeCommand({
+      cwd: linkedRepo,
+      pr: "main...feature",
+      format: "json",
+      color: false,
+      privacy: "raw",
+    }, {
+      analyze: async (options) => await analyze({
+        ...options,
+        nowMs: NOW_MS,
+        storePaths,
+        sessionSource: {
+          discover: async () => [
+            policySensitiveSession("canonical-denial", linkedRepo),
+          ],
+        },
+      }),
+      resolvePolicy: async (resolvedRepo) => {
+        resolvedRepos.push(resolvedRepo);
+        return resolvedRepo === storePaths.canonical_repo
+          ? canonicalPolicy
+          : linkedPathPolicy;
+      },
+    });
+
+    assert.deepEqual(resolvedRepos, [storePaths.canonical_repo]);
+    const history = await loadAnalyses(storePaths);
+    assert.equal(history.records.length, 1);
+    const findings = history.records[0]?.findings ?? [];
+    const approval = findings.find(({ rule_id }) => rule_id === "R004");
+    const serial = findings.find(({ rule_id }) => rule_id === "R005");
+    assert.equal(
+      approval?.evidence.latency_classification,
+      "approval_policy_latency",
+    );
+    assert.equal(
+      Object.hasOwn(approval?.evidence ?? {}, "canonical_commands"),
+      false,
+    );
+    assert.equal(
+      serial?.evidence.parallelization_classification,
+      "investigation_candidate",
+    );
+    assert.equal(
+      Object.hasOwn(serial?.evidence ?? {}, "resource_domain"),
+      false,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("linked-worktree canonical policy failure precedes discovery and persistence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-linked-policy-failure-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const linkedRepoPath = join(repo, ".test-worktrees", "policy-failure");
+    await mkdir(dirname(linkedRepoPath), { recursive: true });
+    await git(repo, ["worktree", "add", "--detach", linkedRepoPath, "feature"]);
+    const linkedRepo = await realpath(linkedRepoPath);
+    const storePaths = await resolveStorePaths(linkedRepo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    assert.notEqual(linkedRepo, storePaths.canonical_repo);
+    assert.equal(storePaths.canonical_repo, repo);
+
+    const invalidCanonicalPolicy = new Error("canonical policy invalid");
+    const linkedPathPolicy = commandPolicy({
+      rule_safety: policySensitiveRuleSafety(),
+    });
+    const resolvedRepos: string[] = [];
+    let discoveryCalls = 0;
+
+    await assert.rejects(
+      runAnalyzeCommand({
+        cwd: linkedRepo,
+        pr: "main...feature",
+        format: "json",
+        color: false,
+        privacy: "raw",
+      }, {
+        analyze: async (options) => await analyze({
+          ...options,
+          nowMs: NOW_MS,
+          storePaths,
+          sessionSource: {
+            discover: async () => {
+              discoveryCalls += 1;
+              return [policySensitiveSession("must-not-persist", linkedRepo)];
+            },
+          },
+        }),
+        resolvePolicy: async (resolvedRepo) => {
+          resolvedRepos.push(resolvedRepo);
+          if (resolvedRepo === storePaths.canonical_repo) {
+            throw invalidCanonicalPolicy;
+          }
+          return linkedPathPolicy;
+        },
+      }),
+      (error: unknown) => error === invalidCanonicalPolicy,
+    );
+
+    assert.deepEqual(resolvedRepos, [storePaths.canonical_repo]);
     assert.equal(discoveryCalls, 0);
     assert.deepEqual((await loadAnalyses(storePaths)).records, []);
   } finally {
