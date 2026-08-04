@@ -2910,6 +2910,10 @@ test("terminal snapshot applies every built-in manifest aggregation policy", () 
       ]),
       terminalCandidate("R006", "r006-small", 0, 400, []),
       terminalCandidate("R006", "r006-large", 0, 700, []),
+      terminalCandidate("R006", "r006-legacy-v1", 0, 50_000, [], {
+        ruleVersion: "1.0.0",
+        compatibilityEpoch: 1,
+      }),
     ],
   );
   assert.equal(terminalRuleRow(resource, "R005").resource_cost_ms, 500);

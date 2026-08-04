@@ -1034,6 +1034,74 @@ test("stats TTY removes stored control strings while stats JSON preserves values
   assert.equal(json.baseline_metrics[0]?.metric, metric);
 });
 
+test("stats JSON, privacy, and TTY expose bounded R006 v2 command-cohort rows", () => {
+  const commandIdentity = {
+    repo_relative_cwd: "packages/api",
+    normalized_argv: ["npm", "test"],
+    executor: "shell",
+  } satisfies CommandIdentity;
+  const stats: StatsReport = {
+    history_count: 6,
+    baseline_metrics: [],
+    chronic_commands: [{
+      command: "npm test",
+      command_identity: commandIdentity,
+      cache_state: "cold",
+      history_count: 6,
+      presence_count: 5,
+      sample_count: 5,
+      ratio: 0.4167,
+      resource_upper_ms: 833.3333,
+      median: 1_000,
+      p50: 1_000,
+      p75: 1_000,
+      mad: 0,
+      cost_ratio: 0.4167,
+      estimated_min: 0.0139,
+    }],
+    rule_minutes: [],
+    recurring_findings: [],
+    adoptions: [],
+    adoption_coverage: { detectable: 0, undetectable: 0 },
+  };
+  const expectedRow = {
+    command: "npm test",
+    command_identity: commandIdentity,
+    cache_state: "cold",
+    history_count: 6,
+    presence_count: 5,
+    sample_count: 5,
+    ratio: 0.4167,
+    resource_upper_ms: 833.3333,
+    median: 1_000,
+    p50: 1_000,
+    p75: 1_000,
+    mad: 0,
+    cost_ratio: 0.4167,
+    estimated_min: 0.0139,
+  };
+
+  assert.deepEqual(
+    (JSON.parse(renderStatsJson(stats)) as StatsReport).chronic_commands,
+    [expectedRow],
+  );
+  const projected = projectStatsPrivacy(stats, "balanced", "/repo");
+  const { command_identity: ignoredIdentity, ...privacySafeRow } = expectedRow;
+  void ignoredIdentity;
+  assert.deepEqual(projected.chronic_commands[0], privacySafeRow);
+  const tty = renderStatsTty(stats);
+  assert.match(tty, /packages\/api :: npm test/u);
+  assert.match(tty, /cold/u);
+  assert.match(tty, /5\/6/u);
+  assert.match(tty, /41\.67%/u);
+  assert.match(tty, /833\.3333/u);
+  assert.match(tty, /median 1000/u);
+  assert.match(tty, /p50 1000/u);
+  assert.match(tty, /p75 1000/u);
+  assert.match(tty, /MAD 0/u);
+  assert.doesNotMatch(tty, /session_refs|command_key|cohort_key/u);
+});
+
 test("CLI parser accepts direct analyze, optional PR selectors, durations, stats, and dismiss", () => {
   assert.deepEqual(parseCliArgs([]), {
     kind: "analyze",
