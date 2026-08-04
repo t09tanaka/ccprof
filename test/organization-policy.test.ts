@@ -23,6 +23,7 @@ import {
   loadRepositoryPolicyPreferences,
   RepositoryConfigError,
 } from "../src/analysis/repository-config.js";
+import { runCli, type CliHandlers } from "../src/cli.js";
 import { runAnalyzeCommand } from "../src/commands/analyze.js";
 import { runStatsCommand } from "../src/commands/stats.js";
 import type { ReportV2 } from "../src/core/model.js";
@@ -38,6 +39,7 @@ import {
   type PolicyRequest,
 } from "../src/policy/organization-policy.js";
 import { renderJsonReport } from "../src/reporters/json.js";
+import type { PrivacyProfile } from "../src/reporters/privacy.js";
 
 const ENVIRONMENT_KEYS = {
   organization: "CCPROF_ORGANIZATION",
@@ -119,6 +121,7 @@ interface SignedPolicyFixture {
   policyPath: string;
   signaturePath: string;
   publicKeyPath: string;
+  privateKeyPem: string;
   environment: NodeJS.ProcessEnv;
   value: OrganizationPolicy;
 }
@@ -133,6 +136,10 @@ async function signedPolicyFixture(
   const signaturePath = join(root, "organization-policy.sig");
   const publicKeyPath = join(root, "organization-policy.pub.pem");
   const keys = generateKeyPairSync("ed25519");
+  const privateKeyPem = keys.privateKey.export({
+    type: "pkcs8",
+    format: "pem",
+  }).toString();
   await Promise.all([
     writeFile(policyPath, `${JSON.stringify(value, null, 2)}\n`, "utf8"),
     writeFile(
@@ -151,6 +158,7 @@ async function signedPolicyFixture(
     policyPath,
     signaturePath,
     publicKeyPath,
+    privateKeyPem,
     environment: {
       [ENVIRONMENT_KEYS.organization]: value.organization,
       [ENVIRONMENT_KEYS.policy]: policyPath,
@@ -158,6 +166,25 @@ async function signedPolicyFixture(
       [ENVIRONMENT_KEYS.publicKey]: publicKeyPath,
     },
     value,
+  };
+}
+
+function cliHandlers(
+  overrides: Partial<Pick<CliHandlers, "analyze" | "stats">> = {},
+): CliHandlers {
+  return {
+    analyze: overrides.analyze ?? (async () => ({
+      stdout: "analyzed\n",
+      warnings: [],
+    })),
+    stats: overrides.stats ?? (async () => ({
+      stdout: "stats\n",
+      warnings: [],
+    })),
+    dismiss: async () => ({ stdout: "dismissed\n", warnings: [] }),
+    explain: async () => ({ stdout: "explained\n", warnings: [] }),
+    hookEvent: async () => ({ stdout: "", warnings: [] }),
+    hooks: async () => ({ stdout: "hooks\n", warnings: [] }),
   };
 }
 
@@ -513,6 +540,20 @@ test("configured policy verifies a genuine detached Ed25519 signature", async (t
   );
 
   assert.equal(await loadConfiguredOrganizationPolicy({}), undefined);
+});
+
+test("trusted public key input rejects matching private key material", async (t) => {
+  const fixture = await signedPolicyFixture(t);
+  await writeFile(fixture.publicKeyPath, fixture.privateKeyPem, "utf8");
+
+  await assert.rejects(
+    loadConfiguredOrganizationPolicy(fixture.environment),
+    (error: unknown) => assertPolicyError(
+      error,
+      "untrusted_policy",
+      [fixture.privateKeyPem, fixture.publicKeyPath],
+    ),
+  );
 });
 
 test("partial governed configuration fails closed without echoing values", async () => {
@@ -1141,6 +1182,219 @@ test("stats applies the same effective privacy floor before warning projection",
   assert.deepEqual(resolvedRequest, { privacy: "raw", advisory: false });
   assert.deepEqual(output.warnings, ["[private_stats_warning] 1 warning"]);
   assert.doesNotMatch(output.warnings.join("\n"), /private\/stats/u);
+});
+
+test("CLI preloads the signed privacy floor before analyze parsing", async (t) => {
+  const repoRoot = await temporaryRepository(t);
+  const privatePath = "/private/parser/organization-policy-canary";
+  const scenarios = [
+    {
+      label: "minimum strict",
+      organization: policy({
+        minimum_privacy: "strict",
+        allow_raw: true,
+      }),
+      hidden: true,
+    },
+    {
+      label: "raw denied",
+      organization: policy({
+        minimum_privacy: "raw",
+        allow_raw: false,
+      }),
+      hidden: false,
+    },
+    {
+      label: "raw kill switch",
+      organization: policy({
+        minimum_privacy: "raw",
+        allow_raw: true,
+        kill_switches: { raw: true, advisory: false, export: false },
+      }),
+      hidden: false,
+    },
+  ] as const;
+
+  for (const scenario of scenarios) {
+    let stderr = "";
+    let loads = 0;
+    const runtime = {
+      cwd: repoRoot,
+      ci: false,
+      handlers: cliHandlers(),
+      loadOrganizationPolicy: async () => {
+        loads += 1;
+        return scenario.organization;
+      },
+      stdout: (_value: string): void => undefined,
+      stderr: (value: string): void => {
+        stderr += value;
+      },
+    };
+    const code = await runCli([
+      "--privacy=raw",
+      `--unknown=${privatePath}`,
+    ], runtime);
+
+    assert.equal(code, 2, scenario.label);
+    assert.equal(loads, 1, scenario.label);
+    assert.doesNotMatch(stderr, new RegExp(privatePath, "u"), scenario.label);
+    if (scenario.hidden) {
+      assert.match(
+        stderr,
+        /analysis failed \(details hidden by strict privacy\)/u,
+        scenario.label,
+      );
+    } else {
+      assert.match(stderr, /\[path\]/u, scenario.label);
+    }
+  }
+});
+
+test("CLI signed privacy floor covers analyze and stats operational errors", async (t) => {
+  const repoRoot = await temporaryRepository(t);
+  const quiet = (_value: string): void => undefined;
+  const scenarios = [
+    {
+      label: "analyze core",
+      args: ["--json", "--privacy=raw"],
+      handlers: cliHandlers({
+        analyze: async () => {
+          throw new Error("core failed at /private/core/policy-canary");
+        },
+      }),
+      canary: "/private/core/policy-canary",
+    },
+    {
+      label: "stats store",
+      args: ["stats", "--json", "--privacy=raw"],
+      handlers: cliHandlers({
+        stats: async () => {
+          throw new Error("store failed at /private/store/policy-canary");
+        },
+      }),
+      canary: "/private/store/policy-canary",
+    },
+  ] as const;
+
+  for (const scenario of scenarios) {
+    let stderr = "";
+    const runtime = {
+      cwd: repoRoot,
+      ci: false,
+      handlers: scenario.handlers,
+      loadOrganizationPolicy: async () => policy({
+        minimum_privacy: "strict",
+        allow_raw: true,
+      }),
+      stdout: quiet,
+      stderr: (value: string): void => {
+        stderr += value;
+      },
+    };
+    const code = await runCli(scenario.args, runtime);
+
+    assert.equal(code, 5, scenario.label);
+    assert.match(
+      stderr,
+      /analysis failed \(details hidden by strict privacy\)/u,
+      scenario.label,
+    );
+    assert.doesNotMatch(stderr, new RegExp(scenario.canary, "u"));
+  }
+});
+
+test("commands publish fully resolved privacy before downstream work", async (t) => {
+  const repoRoot = await temporaryRepository(t);
+  const canonicalRepo = join(repoRoot, "canonical-main");
+  const resolved: Array<["analyze" | "stats", PrivacyProfile]> = [];
+
+  const analyzeDependencies = {
+    analyze: async () => ({ report: report(repoRoot), warnings: [] }),
+    resolvePolicy: async () => effectivePolicy({ privacy: "strict" }),
+    onPrivacyResolved: (privacy: PrivacyProfile): void => {
+      resolved.push(["analyze", privacy]);
+    },
+  };
+  await runAnalyzeCommand({
+    cwd: repoRoot,
+    format: "json",
+    color: false,
+    privacy: "raw",
+  }, analyzeDependencies);
+
+  const statsDependencies = {
+    resolveRepoRoot: async () => repoRoot,
+    resolveStorePaths: async () => ({
+      canonical_repo: canonicalRepo,
+      repo_hash: "hash",
+      root_dir: repoRoot,
+      repo_dir: repoRoot,
+      analyses_dir: repoRoot,
+      history_index_path: join(repoRoot, "history"),
+      dismissals_path: join(repoRoot, "dismissals"),
+      adoptions_path: join(repoRoot, "adoptions"),
+      hook_events_path: join(repoRoot, "hooks"),
+    }),
+    resolvePolicy: async () => effectivePolicy({ privacy: "strict" }),
+    onPrivacyResolved: (privacy: PrivacyProfile): void => {
+      resolved.push(["stats", privacy]);
+    },
+    loadAnalyses: async () => {
+      throw new Error("store failed after policy resolution");
+    },
+    loadAdoptions: async () => ({ records: [], warnings: [] }),
+  };
+  await assert.rejects(
+    runStatsCommand({
+      cwd: repoRoot,
+      json: true,
+      privacy: "raw",
+    }, statsDependencies),
+    /store failed after policy resolution/u,
+  );
+
+  assert.deepEqual(resolved, [
+    ["analyze", "strict"],
+    ["stats", "strict"],
+  ]);
+});
+
+test("CLI policy preload preserves custom handler arity and skips other commands", async () => {
+  let loads = 0;
+  let analyzeArguments = -1;
+  const customAnalyze = async (
+    ...values: Parameters<CliHandlers["analyze"]>
+  ) => {
+    analyzeArguments = values.length;
+    return { stdout: "ok\n", warnings: [] };
+  };
+  const policyLoader = async (): Promise<OrganizationPolicy> => {
+    loads += 1;
+    return policy({ minimum_privacy: "raw", allow_raw: true });
+  };
+  const quiet = (_value: string): void => undefined;
+
+  const analyzeRuntime = {
+    handlers: cliHandlers({ analyze: customAnalyze }),
+    loadOrganizationPolicy: policyLoader,
+    stdout: quiet,
+    stderr: quiet,
+  };
+  assert.equal(await runCli(["--json"], analyzeRuntime), 0);
+  assert.equal(loads, 1);
+  assert.equal(analyzeArguments, 1);
+
+  const otherRuntime = {
+    handlers: cliHandlers(),
+    loadOrganizationPolicy: policyLoader,
+    stdout: quiet,
+    stderr: quiet,
+  };
+  assert.equal(await runCli(["dismiss", "finding-key"], otherRuntime), 0);
+  assert.equal(await runCli(["--help"], otherRuntime), 0);
+  assert.equal(await runCli(["--version"], otherRuntime), 0);
+  assert.equal(loads, 1);
 });
 
 test("ungoverned analyze output remains byte-identical", async (t) => {
