@@ -31,6 +31,7 @@ import {
   type HooksCommandOptions,
 } from "./commands/hooks.js";
 import { runSchemaCommand } from "./commands/schema.js";
+import { runDoctorCommand } from "./commands/doctor.js";
 import {
   runStatsCommand,
   type StatsCommandOptions,
@@ -68,6 +69,7 @@ export const USAGE = `Usage: ccprof [--pr [<number|url|base...head>]] [--json|--
        ccprof rules list
        ccprof rules explain <rule-id>
        ccprof schema report-v3
+       ccprof doctor [--json]
        ccprof --version
 `;
 
@@ -165,6 +167,11 @@ export interface ParsedSchemaCommand {
   target: "report-v3";
 }
 
+export interface ParsedDoctorCommand {
+  kind: "doctor";
+  json: boolean;
+}
+
 export interface ParsedHelpCommand {
   kind: "help";
 }
@@ -183,6 +190,7 @@ export type ParsedCliCommand =
   | ParsedDataCommand
   | ParsedRulesCommand
   | ParsedSchemaCommand
+  | ParsedDoctorCommand
   | ParsedHelpCommand
   | ParsedVersionCommand;
 
@@ -738,6 +746,14 @@ function parseSchemaArgs(args: readonly string[]): ParsedSchemaCommand {
   return { kind: "schema", target: "report-v3" };
 }
 
+function parseDoctorArgs(args: readonly string[]): ParsedDoctorCommand {
+  if (args.length === 0) return { kind: "doctor", json: false };
+  if (args.length === 1 && args[0] === "--json") {
+    return { kind: "doctor", json: true };
+  }
+  throw new CliUsageError("doctor accepts only --json");
+}
+
 export function parseCliArgs(
   args: readonly string[],
 ): ParsedCliCommand {
@@ -746,6 +762,7 @@ export function parseCliArgs(
     return { kind: "help" };
   }
   if (args[0] === "schema") return parseSchemaArgs(args.slice(1));
+  if (args[0] === "doctor") return parseDoctorArgs(args.slice(1));
   if (args.includes("--version") || args.includes("-v")) {
     return { kind: "version" };
   }
@@ -833,7 +850,10 @@ function usesOrganizationPolicy(args: readonly string[]): boolean {
     return false;
   }
   return args[0] === "stats" ||
-    !["dismiss", "explain", "hook-event", "hooks", "data", "rules", "schema"]
+    ![
+      "dismiss", "explain", "hook-event", "hooks", "data", "rules",
+      "schema", "doctor",
+    ]
       .includes(args[0] ?? "");
 }
 
@@ -859,6 +879,26 @@ export async function runCli(
   const stderr = runtime.stderr ?? ((value: string) => {
     process.stderr.write(value);
   });
+  if (args[0] === "doctor") {
+    try {
+      const command = parseCliArgs(args);
+      if (command.kind !== "doctor") {
+        throw new CliUsageError("doctor accepts only --json");
+      }
+      const result = await runDoctorCommand({
+        cwd: runtime.cwd ?? process.cwd(),
+        json: command.json,
+        env: process.env,
+      });
+      stdout(result.stdout);
+      return result.exitCode;
+    } catch (error) {
+      const code = exitCodeFor(error);
+      stderr(`ccprof: ${sanitizeHumanText(errorMessage(error))}\n`);
+      if (code === 2 && error instanceof CliUsageError) stderr(USAGE);
+      return code;
+    }
+  }
   if (args[0] === "schema") {
     try {
       const command = parseCliArgs(args);
@@ -923,7 +963,10 @@ export async function runCli(
     ? ci ? "strict" : explicitPrivacy ?? "balanced"
     : args[0] === "explain" && ci
       ? "strict"
-      : ["stats", "dismiss", "explain", "hooks", "data", "rules", "schema"]
+      : [
+          "stats", "dismiss", "explain", "hooks", "data", "rules",
+          "schema", "doctor",
+        ]
           .includes(args[0] ?? "")
         ? undefined
         : explicitPrivacy ??

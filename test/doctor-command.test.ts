@@ -1,13 +1,20 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
+import Database from "better-sqlite3";
 
 import {
   CliUsageError, parseCliArgs, runCli,
 } from "../src/cli.js";
+import { resolveStorePaths } from "../src/store/paths.js";
+import {
+  INCREMENTAL_SOURCES_MIGRATION,
+  openStoreDatabase,
+  storeDatabasePath,
+} from "../src/store/sqlite.js";
 
 const IDS = [
   "configuration",
@@ -26,9 +33,15 @@ const ORG_KEYS = [
   "CCPROF_ORGANIZATION_POLICY_PUBLIC_KEY_PATH",
 ] as const;
 interface DoctorJson {
+  schema_version: 1;
+  command: "doctor";
   status: "pass" | "warn" | "fail";
   checks: { id: string; status: "pass" | "warn" | "fail";
     code: string; message: string }[];
+}
+
+function storeChecks(report: DoctorJson): DoctorJson["checks"] {
+  return report.checks.filter((check) => check.id.startsWith("store_"));
 }
 
 async function fixture(t: TestContext): Promise<{
@@ -92,6 +105,11 @@ test("doctor is deterministic, ordered, warning-safe, and read-only", async (t) 
   assert.equal(first.stdout, second.stdout);
   assert.equal(first.stderr, "");
   const report = JSON.parse(first.stdout) as DoctorJson;
+  assert.deepEqual(Object.keys(report), [
+    "schema_version", "command", "status", "checks",
+  ]);
+  assert.equal(report.schema_version, 1);
+  assert.equal(report.command, "doctor");
   assert.equal(report.status, "warn");
   assert.deepEqual(
     report.checks.map((check) => check.id),
@@ -100,12 +118,130 @@ test("doctor is deterministic, ordered, warning-safe, and read-only", async (t) 
   for (const id of ["parser_budgets", "encryption"] as const) {
     assert.equal(report.checks.find((check) => check.id === id)?.status, "warn");
   }
+  assert.deepEqual(
+    storeChecks(report).map(({ id, status }) => ({ id, status })),
+    [
+      { id: "store_schema", status: "warn" },
+      { id: "store_migrations", status: "warn" },
+      { id: "store_open", status: "pass" },
+    ],
+  );
   const textFirst = await capture(["doctor"], repo, dataRoot);
   const textSecond = await capture(["doctor"], repo, dataRoot);
   assert.equal(textFirst.code, 0);
   assert.equal(textFirst.stdout, textSecond.stdout);
   for (const id of IDS) assert.match(textFirst.stdout, new RegExp(id, "u"));
   assert.equal(existsSync(dataRoot), false);
+});
+
+test("doctor reports a healthy current store without modifying it", async (t) => {
+  const { repo, dataRoot } = await fixture(t);
+  const paths = await resolveStorePaths(repo, {
+    env: { CCPROF_DATA_DIR: dataRoot },
+  });
+  openStoreDatabase(paths).close();
+  const path = storeDatabasePath(paths);
+  const before = await readFile(path);
+
+  const result = await capture(["doctor", "--json"], repo, dataRoot);
+
+  assert.equal(result.code, 0);
+  const report = JSON.parse(result.stdout) as DoctorJson;
+  assert.deepEqual(
+    storeChecks(report).map(({ id, status }) => ({ id, status })),
+    [
+      { id: "store_schema", status: "pass" },
+      { id: "store_migrations", status: "pass" },
+      { id: "store_open", status: "pass" },
+    ],
+  );
+  assert.deepEqual(await readFile(path), before);
+});
+
+test("doctor leaves a supported old store pending and unmodified", async (t) => {
+  const { repo, dataRoot } = await fixture(t);
+  const paths = await resolveStorePaths(repo, {
+    env: { CCPROF_DATA_DIR: dataRoot },
+  });
+  const database = openStoreDatabase(paths);
+  database.prepare("DELETE FROM store_migrations WHERE name = ?")
+    .run(INCREMENTAL_SOURCES_MIGRATION);
+  database.pragma("user_version = 4");
+  database.close();
+  const path = storeDatabasePath(paths);
+  const before = await readFile(path);
+
+  const result = await capture(["doctor", "--json"], repo, dataRoot);
+
+  assert.equal(result.code, 0);
+  const report = JSON.parse(result.stdout) as DoctorJson;
+  assert.deepEqual(
+    storeChecks(report).map(({ id, status }) => ({ id, status })),
+    [
+      { id: "store_schema", status: "warn" },
+      { id: "store_migrations", status: "warn" },
+      { id: "store_open", status: "pass" },
+    ],
+  );
+  assert.deepEqual(await readFile(path), before);
+  const readonly = new Database(path, { readonly: true, fileMustExist: true });
+  assert.equal(Number(readonly.pragma("user_version", { simple: true })), 4);
+  readonly.close();
+});
+
+test("doctor recognizes an empty v0 store without initializing it", async (t) => {
+  const { repo, dataRoot } = await fixture(t);
+  const paths = await resolveStorePaths(repo, {
+    env: { CCPROF_DATA_DIR: dataRoot },
+  });
+  await mkdir(paths.repo_dir, { recursive: true });
+  const path = storeDatabasePath(paths);
+  new Database(path).close();
+  const before = await readFile(path);
+
+  const result = await capture(["doctor", "--json"], repo, dataRoot);
+
+  assert.equal(result.code, 0);
+  const report = JSON.parse(result.stdout) as DoctorJson;
+  assert.deepEqual(
+    storeChecks(report).map(({ id, status }) => ({ id, status })),
+    [
+      { id: "store_schema", status: "warn" },
+      { id: "store_migrations", status: "warn" },
+      { id: "store_open", status: "pass" },
+    ],
+  );
+  assert.deepEqual(await readFile(path), before);
+});
+
+test("doctor contains a corrupt store failure without modifying it", async (t) => {
+  const { repo, dataRoot } = await fixture(t);
+  const paths = await resolveStorePaths(repo, {
+    env: { CCPROF_DATA_DIR: dataRoot },
+  });
+  await mkdir(paths.repo_dir, { recursive: true });
+  const path = storeDatabasePath(paths);
+  await writeFile(path, "DISTINCTIVE_CORRUPT_STORE_CANARY");
+  const before = await readFile(path);
+
+  const result = await capture(["doctor", "--json"], repo, dataRoot);
+
+  assert.equal(result.code, 1);
+  const report = JSON.parse(result.stdout) as DoctorJson;
+  assert.deepEqual(
+    storeChecks(report).map(({ id, status }) => ({ id, status })),
+    [
+      { id: "store_schema", status: "fail" },
+      { id: "store_migrations", status: "fail" },
+      { id: "store_open", status: "fail" },
+    ],
+  );
+  assert.deepEqual(await readFile(path), before);
+  assert.equal(result.stdout.includes("DISTINCTIVE_CORRUPT_STORE_CANARY"), false);
+  assert.equal(result.stdout.includes(repo), false);
+  assert.equal(result.stdout.includes(dataRoot), false);
+  assert.ok(result.stdout.length <= 4_096);
+  assert.equal(result.stderr, "");
 });
 
 test("doctor contains malformed configuration and organization paths", async (t) => {
