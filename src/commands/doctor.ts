@@ -3,7 +3,6 @@ import type { Stats } from "node:fs";
 import { copyFile, lstat, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import { loadRepositoryConfig, loadRepositoryPolicyPreferences } from
   "../analysis/repository-config.js";
 import { loadConfiguredOrganizationPolicy, resolveEffectivePolicy } from
@@ -14,12 +13,10 @@ import { resolveStorePaths } from "../store/paths.js";
 import { ANALYSIS_BUDGETS_MIGRATION, INCREMENTAL_SOURCES_MIGRATION,
   SOURCE_CATALOG_MIGRATION, STORE_SCHEMA_VERSION, storeDatabasePath } from
   "../store/sqlite.js";
-
 export type DoctorStatus = "pass" | "warn" | "fail";
 export type DoctorCheckId = "configuration" | "organization_policy" |
   "source_capabilities" | "parser_budgets" | "store_schema" |
   "store_migrations" | "store_open" | "encryption";
-
 export interface DoctorCheck { id: DoctorCheckId; status: DoctorStatus;
   code: string; message: string; }
 export interface DoctorReport {
@@ -29,16 +26,14 @@ export interface DoctorOptions { cwd: string; json: boolean;
   env?: NodeJS.ProcessEnv; }
 interface StoreChecks { schema: DoctorCheck; migrations: DoctorCheck;
   open: DoctorCheck; }
-
 const SUPPORTED_OLD_SCHEMAS = new Set([0, 2, 3, 4]);
 const REQUIRED_MIGRATIONS = [SOURCE_CATALOG_MIGRATION,
   ANALYSIS_BUDGETS_MIGRATION, INCREMENTAL_SOURCES_MIGRATION] as const;
-
+const MAX_STORE_SNAPSHOT_BYTES = 256 * 1024 * 1024;
 function check(id: DoctorCheckId, status: DoctorStatus, code: string,
   message: string): DoctorCheck {
   return { id, status, code, message };
 }
-
 function missingStore(): StoreChecks { return {
     schema: check("store_schema", "warn", "store_not_initialized",
       "Store is not initialized."),
@@ -47,7 +42,6 @@ function missingStore(): StoreChecks { return {
     open: check("store_open", "pass", "store_open_not_required",
       "No Store database is present to open."),
   }; }
-
 function failedStore(): StoreChecks { return {
     schema: check("store_schema", "fail", "store_unavailable",
       "Store could not be inspected safely."),
@@ -56,41 +50,56 @@ function failedStore(): StoreChecks { return {
     open: check("store_open", "fail", "store_unavailable",
       "Store could not be inspected safely."),
   }; }
-
 async function pathStatus(path: string): Promise<Stats | undefined> {
   try { return await lstat(path); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
   }
 }
-
 function sameFile(left: Stats, right: Stats): boolean {
   return left.dev === right.dev && left.ino === right.ino &&
     left.size === right.size && left.mtimeMs === right.mtimeMs;
 }
-
+function validSnapshot(database: Stats, wal: Stats | undefined): boolean {
+  return !database.isSymbolicLink() && database.isFile() &&
+    (wal === undefined || !wal.isSymbolicLink() && wal.isFile()) &&
+    database.size <= MAX_STORE_SNAPSHOT_BYTES &&
+    (wal?.size ?? 0) <= MAX_STORE_SNAPSHOT_BYTES - database.size;
+}
+function sameStatus(left: Stats | undefined, right: Stats | undefined): boolean {
+  return left === undefined ? right === undefined :
+    right !== undefined && sameFile(left, right);
+}
 async function copyStore(path: string):
 Promise<{ directory: string; databasePath: string }> {
+  const walPath = `${path}-wal`;
+  const [databaseBefore, walBefore] = await Promise.all([
+    lstat(path), pathStatus(walPath),
+  ]);
+  if (!validSnapshot(databaseBefore, walBefore)) throw new Error();
   const directory = await mkdtemp(join(tmpdir(), "ccprof-doctor-"));
   const databasePath = join(directory, "store.sqlite3");
   try {
     await copyFile(path, databasePath);
-    const walPath = `${path}-wal`;
-    const before = await pathStatus(walPath);
-    if (before !== undefined) {
-      if (before.isSymbolicLink() || !before.isFile()) throw new Error();
-      await copyFile(walPath, `${databasePath}-wal`);
-    }
-    const after = await pathStatus(walPath);
-    if (before === undefined ? after !== undefined :
-      after === undefined || !sameFile(before, after)) throw new Error();
+    const [databaseMiddle, walMiddle] = await Promise.all([
+      lstat(path), pathStatus(walPath),
+    ]);
+    if (!sameFile(databaseBefore, databaseMiddle) ||
+      !sameStatus(walBefore, walMiddle) ||
+      !validSnapshot(databaseMiddle, walMiddle)) throw new Error();
+    if (walBefore !== undefined) await copyFile(walPath, `${databasePath}-wal`);
+    const [databaseAfter, walAfter] = await Promise.all([
+      lstat(path), pathStatus(walPath),
+    ]);
+    if (!sameFile(databaseBefore, databaseAfter) ||
+      !sameStatus(walBefore, walAfter) ||
+      !validSnapshot(databaseAfter, walAfter)) throw new Error();
     return { directory, databasePath };
   } catch (error) {
     await rm(directory, { recursive: true, force: true });
     throw error;
   }
 }
-
 async function inspectStore(cwd: string, env: NodeJS.ProcessEnv):
 Promise<StoreChecks> {
   const paths = await resolveStorePaths(cwd, { env });
@@ -98,13 +107,11 @@ Promise<StoreChecks> {
   if (repositoryStatus === undefined) return missingStore();
   if (repositoryStatus.isSymbolicLink() || !repositoryStatus.isDirectory())
     return failedStore();
-
   const databasePath = storeDatabasePath(paths);
   const databaseStatus = await pathStatus(databasePath);
   if (databaseStatus === undefined) return missingStore();
   if (databaseStatus.isSymbolicLink() || !databaseStatus.isFile())
     return failedStore();
-
   let database: Database.Database | undefined;
   let version: number | undefined;
   let markers: Set<string> | undefined;
@@ -142,12 +149,10 @@ Promise<StoreChecks> {
       catch { closeFailed = true; }
     }
   }
-
   if (version === undefined || markers === undefined ||
     !Number.isSafeInteger(version) || version < 0 || !stablePath) {
     return failedStore();
   }
-
   const supportedOld = SUPPORTED_OLD_SCHEMAS.has(version);
   const schema = version === STORE_SCHEMA_VERSION
     ? check("store_schema", "pass", "store_schema_current",
@@ -173,7 +178,6 @@ Promise<StoreChecks> {
         "Store could not be inspected safely.");
   return { schema, migrations, open };
 }
-
 function sourceCapabilitiesCheck(): DoctorCheck {
   const contracts = [CLAUDE_SESSION_SOURCE_CONTRACT,
     CODEX_SESSION_SOURCE_CONTRACT].sort((left, right) =>
@@ -188,7 +192,6 @@ function sourceCapabilitiesCheck(): DoctorCheck {
     `Built-in source capabilities: ${summary}.`,
   );
 }
-
 export async function runDoctorCommand(options: DoctorOptions): Promise<{
   stdout: string; warnings: readonly string[]; exitCode: number;
 }> {
@@ -202,7 +205,6 @@ export async function runDoctorCommand(options: DoctorOptions): Promise<{
     configuration = check("configuration", "fail", "configuration_invalid",
       "Repository configuration is invalid.");
   }
-
   let organization: DoctorCheck;
   try {
     const repository = await loadRepositoryPolicyPreferences(options.cwd);
@@ -220,7 +222,6 @@ export async function runDoctorCommand(options: DoctorOptions): Promise<{
       "organization_policy_invalid",
       "Organization policy configuration is invalid.");
   }
-
   const store = await inspectStore(options.cwd, env).catch(failedStore);
   const checks: DoctorCheck[] = [
     configuration,

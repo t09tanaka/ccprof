@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
-  mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile,
+  mkdir, mkdtemp, open, readFile, readdir, rm, stat, truncate, writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -310,6 +310,65 @@ test("doctor reads WAL state without creating Store sidecars", async (t) => {
     ],
   );
   assert.deepEqual(await snapshot(), before);
+});
+
+test("doctor rejects an oversized Store snapshot without copying it", async (t) => {
+  const { repo, dataRoot } = await fixture(t);
+  const paths = await resolveStorePaths(repo, {
+    env: { CCPROF_DATA_DIR: dataRoot },
+  });
+  openStoreDatabase(paths).close();
+  const path = storeDatabasePath(paths);
+  const writer = `
+    import Database from "better-sqlite3";
+    const database = new Database(process.argv[1]);
+    database.pragma("wal_autocheckpoint = 0");
+    database.prepare("DELETE FROM store_migrations WHERE name = ?")
+      .run(process.argv[2]);
+    database.pragma("user_version = 4");
+    process.kill(process.pid, "SIGKILL");
+  `;
+  const child = spawnSync(process.execPath, [
+    "--input-type=module", "-e", writer, path,
+    INCREMENTAL_SOURCES_MIGRATION,
+  ], { cwd: process.cwd() });
+  assert.notEqual(child.status, 0);
+  await rm(`${path}-shm`, { force: true });
+  const walPath = `${path}-wal`;
+  const walPrefix = await readFile(walPath);
+  await truncate(walPath, 256 * 1024 * 1024);
+  const beforeEntries = (await readdir(paths.repo_dir)).sort();
+  const beforeDatabase = await readFile(path);
+  const beforeWal = await stat(walPath, { bigint: true });
+  const beforeTemps = (await readdir(tmpdir())).filter((name) =>
+    name.startsWith("ccprof-doctor-")).sort();
+
+  const result = await capture(["doctor", "--json"], repo, dataRoot);
+
+  assert.equal(result.code, 1);
+  assert.deepEqual(storeChecks(JSON.parse(result.stdout) as DoctorJson), [
+    { id: "store_schema", status: "fail", code: "store_unavailable",
+      message: "Store could not be inspected safely." },
+    { id: "store_migrations", status: "fail", code: "store_unavailable",
+      message: "Store could not be inspected safely." },
+    { id: "store_open", status: "fail", code: "store_unavailable",
+      message: "Store could not be inspected safely." },
+  ]);
+  assert.deepEqual(await readdir(paths.repo_dir).then((items) => items.sort()),
+    beforeEntries);
+  assert.deepEqual(await readFile(path), beforeDatabase);
+  const afterWal = await stat(walPath, { bigint: true });
+  assert.deepEqual({ dev: afterWal.dev, ino: afterWal.ino,
+    size: afterWal.size, mtimeNs: afterWal.mtimeNs },
+  { dev: beforeWal.dev, ino: beforeWal.ino,
+    size: beforeWal.size, mtimeNs: beforeWal.mtimeNs });
+  const handle = await open(walPath, "r");
+  const afterPrefix = Buffer.alloc(walPrefix.length);
+  try { await handle.read(afterPrefix, 0, afterPrefix.length, 0); }
+  finally { await handle.close(); }
+  assert.deepEqual(afterPrefix, walPrefix);
+  assert.deepEqual((await readdir(tmpdir())).filter((name) =>
+    name.startsWith("ccprof-doctor-")).sort(), beforeTemps);
 });
 
 test("doctor recognizes an empty v0 store without initializing it", async (t) => {
