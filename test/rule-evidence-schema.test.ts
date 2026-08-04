@@ -443,9 +443,19 @@ test("every rule evidence resource rejects missing, mistyped, extra, and crossed
 test("the npm artifact includes the built-in evidence schema bundle", async () => {
   const cache = await mkdtemp(join(tmpdir(), "ccprof-schema-npm-"));
   try {
+    const npmArgs = ["pack", "--dry-run", "--json", "--ignore-scripts"];
+    const npmExecPath = process.env.npm_execpath;
     const packed = spawnSync(
-      "npm",
-      ["pack", "--dry-run", "--json", "--ignore-scripts"],
+      npmExecPath !== undefined
+        ? process.execPath
+        : process.platform === "win32"
+        ? process.env.ComSpec ?? "cmd.exe"
+        : "npm",
+      npmExecPath !== undefined
+        ? [npmExecPath, ...npmArgs]
+        : process.platform === "win32"
+        ? ["/d", "/s", "/c", "npm.cmd", ...npmArgs]
+        : npmArgs,
       {
         cwd: process.cwd(),
         encoding: "utf8",
