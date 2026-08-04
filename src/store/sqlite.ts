@@ -12,19 +12,21 @@ import { join } from "node:path";
 
 import type { StorePaths } from "./paths.js";
 
-export const STORE_SCHEMA_VERSION = 4;
+export const STORE_SCHEMA_VERSION = 5;
 export const SOURCE_CATALOG_MIGRATION = "schema-v3-source-catalog";
 export const ANALYSIS_BUDGETS_MIGRATION = "schema-v4-analysis-budgets";
+export const INCREMENTAL_SOURCES_MIGRATION = "schema-v5-incremental-sources";
 
 const BUSY_TIMEOUT_MS = 5_000;
 const STORE_SCHEMA_V2 = 2;
 const STORE_SCHEMA_V3 = 3;
+const STORE_SCHEMA_V4 = 4;
 const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 
 export class UnsupportedStoreSchemaError extends Error {
   constructor(readonly schema_version: number) {
     super(
-      `Unsupported ccprof store schema version ${schema_version}; expected 0, ${STORE_SCHEMA_V2}, ${STORE_SCHEMA_V3}, or ${STORE_SCHEMA_VERSION}`,
+      `Unsupported ccprof store schema version ${schema_version}; expected 0, ${STORE_SCHEMA_V2}, ${STORE_SCHEMA_V3}, ${STORE_SCHEMA_V4}, or ${STORE_SCHEMA_VERSION}`,
     );
     this.name = "UnsupportedStoreSchemaError";
   }
@@ -43,6 +45,7 @@ function assertSupportedSchema(version: number): void {
     version !== 0 &&
     version !== STORE_SCHEMA_V2 &&
     version !== STORE_SCHEMA_V3 &&
+    version !== STORE_SCHEMA_V4 &&
     version !== STORE_SCHEMA_VERSION
   ) {
     throw new UnsupportedStoreSchemaError(version);
@@ -179,6 +182,81 @@ const ANALYSIS_BUDGETS_SCHEMA = `
         AND consumed_source_items <= max_source_items)
       OR (completeness = 'partial' AND truncation_reason IS NOT NULL
         AND coverage < 1))
+  );
+`;
+
+const SOURCE_EVIDENCE_CACHE_SCHEMA = `
+  CREATE TABLE source_evidence_cache (
+    source_identity TEXT NOT NULL
+      CHECK (length(source_identity) = 71
+        AND substr(source_identity, 1, 7) = 'source-'
+        AND substr(source_identity, 8) NOT GLOB '*[^0-9a-f]*'),
+    repository_identity TEXT NOT NULL
+      CHECK (length(repository_identity) = 64
+        AND repository_identity NOT GLOB '*[^0-9a-f]*'),
+    eligibility_identity TEXT NOT NULL
+      CHECK (length(eligibility_identity) = 64
+        AND eligibility_identity NOT GLOB '*[^0-9a-f]*'),
+    adapter_id TEXT NOT NULL CHECK (adapter_id IN ('claude', 'codex')),
+    canonical_path TEXT NOT NULL
+      CHECK (length(canonical_path) > 0 AND instr(canonical_path, char(0)) = 0),
+    content_revision TEXT NOT NULL CHECK (length(content_revision) = 71
+      AND substr(content_revision, 1, 7) = 'sha256:'
+      AND substr(content_revision, 8) NOT GLOB '*[^0-9a-f]*'),
+    parser_version TEXT NOT NULL
+      CHECK (length(parser_version) > 0 AND instr(parser_version, char(0)) = 0),
+    schema_fingerprint TEXT NOT NULL CHECK (length(schema_fingerprint) = 71
+      AND substr(schema_fingerprint, 1, 7) = 'sha256:'
+      AND substr(schema_fingerprint, 8) NOT GLOB '*[^0-9a-f]*'),
+    last_parsed_offset INTEGER NOT NULL
+      CHECK (typeof(last_parsed_offset) = 'integer'
+        AND last_parsed_offset BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    line_count INTEGER NOT NULL CHECK (typeof(line_count) = 'integer'
+      AND line_count BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    ends_with_newline INTEGER NOT NULL
+      CHECK (typeof(ends_with_newline) = 'integer'
+        AND ends_with_newline IN (0, 1)),
+    payload_json TEXT NOT NULL
+      CHECK (length(payload_json) > 0 AND instr(payload_json, char(0)) = 0),
+    payload_digest TEXT NOT NULL CHECK (length(payload_digest) = 71
+      AND substr(payload_digest, 1, 7) = 'sha256:'
+      AND substr(payload_digest, 8) NOT GLOB '*[^0-9a-f]*'),
+    descriptor_digest TEXT NOT NULL CHECK (length(descriptor_digest) = 71
+      AND substr(descriptor_digest, 1, 7) = 'sha256:'
+      AND substr(descriptor_digest, 8) NOT GLOB '*[^0-9a-f]*'),
+    sensitivity TEXT NOT NULL CHECK (sensitivity = 'sensitive'),
+    retention_class TEXT NOT NULL CHECK (retention_class = 'raw_evidence'),
+    updated_at_ms INTEGER NOT NULL CHECK (typeof(updated_at_ms) = 'integer'
+      AND updated_at_ms BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    PRIMARY KEY (source_identity, eligibility_identity),
+    FOREIGN KEY (source_identity) REFERENCES source_catalog(source_identity)
+      ON DELETE CASCADE
+  );
+`;
+
+const SOURCE_DISCOVERY_ROOTS_SCHEMA = `
+  CREATE TABLE source_discovery_roots (
+    root_identity TEXT NOT NULL PRIMARY KEY
+      CHECK (length(root_identity) = 69
+        AND substr(root_identity, 1, 5) = 'root-'
+        AND substr(root_identity, 6) NOT GLOB '*[^0-9a-f]*'),
+    adapter_id TEXT NOT NULL CHECK (adapter_id IN ('claude', 'codex')),
+    canonical_root TEXT NOT NULL
+      CHECK (length(canonical_root) > 0 AND instr(canonical_root, char(0)) = 0),
+    cursor INTEGER NOT NULL CHECK (typeof(cursor) = 'integer'
+      AND cursor BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    capability TEXT NOT NULL
+      CHECK (capability IN ('stable_directory_token', 'full_scan_required')),
+    tree_json TEXT NOT NULL
+      CHECK (length(tree_json) > 0 AND instr(tree_json, char(0)) = 0),
+    tree_digest TEXT NOT NULL CHECK (length(tree_digest) = 71
+      AND substr(tree_digest, 1, 7) = 'sha256:'
+      AND substr(tree_digest, 8) NOT GLOB '*[^0-9a-f]*'),
+    observed_at_ms INTEGER NOT NULL CHECK (typeof(observed_at_ms) = 'integer'
+      AND observed_at_ms BETWEEN 0 AND ${MAX_SAFE_INTEGER}),
+    completeness TEXT NOT NULL CHECK (completeness IN ('complete', 'partial')),
+    sensitivity TEXT NOT NULL CHECK (sensitivity = 'sensitive'),
+    retention_class TEXT NOT NULL CHECK (retention_class = 'source_metadata')
   );
 `;
 
@@ -323,10 +401,28 @@ function migrateSchema(database: Database.Database): void {
         "INSERT INTO store_migrations(name, completed_at_ms) VALUES (?, ?)",
       ).run(SOURCE_CATALOG_MIGRATION, Date.now());
     }
-    database.exec(ANALYSIS_BUDGETS_SCHEMA);
-    database.prepare(
-      "INSERT INTO store_migrations(name, completed_at_ms) VALUES (?, ?)",
-    ).run(ANALYSIS_BUDGETS_MIGRATION, Date.now());
+    if (
+      version === 0 ||
+      version === STORE_SCHEMA_V2 ||
+      version === STORE_SCHEMA_V3
+    ) {
+      database.exec(ANALYSIS_BUDGETS_SCHEMA);
+      database.prepare(
+        "INSERT INTO store_migrations(name, completed_at_ms) VALUES (?, ?)",
+      ).run(ANALYSIS_BUDGETS_MIGRATION, Date.now());
+    }
+    if (
+      version === 0 ||
+      version === STORE_SCHEMA_V2 ||
+      version === STORE_SCHEMA_V3 ||
+      version === STORE_SCHEMA_V4
+    ) {
+      database.exec(SOURCE_EVIDENCE_CACHE_SCHEMA);
+      database.exec(SOURCE_DISCOVERY_ROOTS_SCHEMA);
+      database.prepare(
+        "INSERT INTO store_migrations(name, completed_at_ms) VALUES (?, ?)",
+      ).run(INCREMENTAL_SOURCES_MIGRATION, Date.now());
+    }
     database.pragma(`user_version = ${STORE_SCHEMA_VERSION}`);
   });
 
