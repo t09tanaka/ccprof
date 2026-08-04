@@ -30,6 +30,7 @@ import type {
 } from "../src/core/model.js";
 import type { AnalysisBudgetResult } from "../src/analysis/budgets.js";
 import {
+  aggregateTerminalStats,
   cohortDistribution,
   selectTerminalSnapshots,
   type TerminalStatsSnapshotV1 as ExportedTerminalStatsSnapshotV1,
@@ -4625,6 +4626,234 @@ test("stats projection exposes only closed numeric bounded and opaque data", () 
     );
   }
   assert.equal(hostileReads, 0);
+});
+
+test("terminal selectors reject unclosed nested projected inputs content-free", () => {
+  const canary = "TASK6_DIRECT_AGGREGATION_RAW_CANARY";
+  let nextId = 0;
+  const fresh = (): StatsAggregationInput => projectStatsAggregationInput(
+    comparableHistoryEntry({
+      id: `direct-boundary-${(nextId += 1).toString(10)}`,
+      createdAtMs: 6_000 + nextId,
+      metric: 0.5,
+    }),
+  );
+
+  const unknownTerminalMetric = fresh();
+  unknownTerminalMetric.terminal_metrics = {
+    ...unknownTerminalMetric.terminal_metrics!,
+    [canary]: canary,
+  } as unknown as NonNullable<StatsAggregationInput["terminal_metrics"]>;
+
+  const unknownBaselineRow = fresh();
+  unknownBaselineRow.baseline_metrics = [{
+    metric: "human_wait_ratio",
+    value: 0.5,
+    [canary]: canary,
+  }] as unknown as StatsAggregationInput["baseline_metrics"];
+
+  const unknownRuleRow = fresh();
+  const unknownRuleMetrics = unknownRuleRow.terminal_metrics!;
+  unknownRuleMetrics.rules = unknownRuleMetrics.rules.map((row, index) =>
+    index === 0 ? { ...row, [canary]: canary } : { ...row }
+  ) as unknown as typeof unknownRuleMetrics.rules;
+
+  const rawCommandCosts = fresh();
+  rawCommandCosts.command_costs = [{
+    command: canary,
+    normalized_argv: [canary],
+  }] as unknown as StatsAggregationInput["command_costs"];
+
+  const unknownReasonCode = fresh();
+  unknownReasonCode.reason_codes = [canary] as unknown as
+    StatsAggregationInput["reason_codes"];
+
+  const unclosed = [
+    ["terminal metric", unknownTerminalMetric],
+    ["baseline row", unknownBaselineRow],
+    ["rule row", unknownRuleRow],
+    ["command costs", rawCommandCosts],
+    ["reason code", unknownReasonCode],
+  ] as const;
+  const actions = [
+    ["select", (input: StatsAggregationInput) =>
+      selectTerminalSnapshots([input])],
+    ["aggregate", (input: StatsAggregationInput) =>
+      aggregateTerminalStats([input], { mode: "stats_all_groups" })],
+  ] as const;
+
+  for (const [caseName, input] of unclosed) {
+    for (const [actionName, action] of actions) {
+      assert.throws(
+        () => action(input),
+        (error: unknown) => {
+          assert.ok(error instanceof TypeError);
+          assert.equal(error.message, "invalid stats aggregation input");
+          assert.doesNotMatch(String(error), new RegExp(canary, "u"));
+          return true;
+        },
+        `${actionName}: ${caseName}`,
+      );
+    }
+  }
+});
+
+test("terminal selectors reject nested accessors and proxies without invoking them", () => {
+  const canary = "TASK6_DIRECT_AGGREGATION_TRAP_CANARY";
+  let nextId = 0;
+  let hostileReads = 0;
+  const trap = (): never => {
+    hostileReads += 1;
+    throw new Error(canary);
+  };
+  const fresh = (): StatsAggregationInput => projectStatsAggregationInput(
+    comparableHistoryEntry({
+      id: `direct-hostile-${(nextId += 1).toString(10)}`,
+      createdAtMs: 7_000 + nextId,
+      metric: 0.5,
+    }),
+  );
+
+  const metricAccessor = fresh();
+  const accessorMetrics = { ...metricAccessor.terminal_metrics! };
+  Object.defineProperty(accessorMetrics, "measured_wall_ms", {
+    enumerable: true,
+    get: trap,
+  });
+  metricAccessor.terminal_metrics = accessorMetrics;
+
+  const metricProxy = fresh();
+  metricProxy.terminal_metrics = new Proxy(
+    { ...metricProxy.terminal_metrics! },
+    { ownKeys: trap },
+  );
+
+  const baselineAccessor = fresh();
+  const accessorBaseline = baselineAccessor.baseline_metrics.map((row) => ({
+    ...row,
+  }));
+  assert.ok(accessorBaseline[0] !== undefined);
+  Object.defineProperty(accessorBaseline[0]!, "value", {
+    enumerable: true,
+    get: trap,
+  });
+  baselineAccessor.baseline_metrics = accessorBaseline;
+
+  const baselineProxy = fresh();
+  const proxiedBaseline = baselineProxy.baseline_metrics.map((row, index) =>
+    index === 0
+      ? new Proxy({ ...row }, { ownKeys: trap })
+      : { ...row }
+  );
+  baselineProxy.baseline_metrics = proxiedBaseline;
+
+  const reasonAccessor = fresh();
+  const accessorReasons: Array<
+    StatsAggregationInput["reason_codes"][number]
+  > = ["missing_terminal_metrics"];
+  Object.defineProperty(accessorReasons, "0", {
+    enumerable: true,
+    get: trap,
+  });
+  reasonAccessor.reason_codes = accessorReasons;
+
+  const reasonProxy = fresh();
+  reasonProxy.reason_codes = new Proxy(
+    ["missing_terminal_metrics"] as Array<
+      StatsAggregationInput["reason_codes"][number]
+    >,
+    { ownKeys: trap },
+  );
+
+  const ruleAccessor = fresh();
+  const accessorRuleMetrics = ruleAccessor.terminal_metrics!;
+  const accessorRules = accessorRuleMetrics.rules.map((row) => ({ ...row }));
+  assert.ok(accessorRules[0] !== undefined);
+  Object.defineProperty(accessorRules[0]!, "rule_version", {
+    enumerable: true,
+    get: trap,
+  });
+  accessorRuleMetrics.rules = accessorRules;
+
+  const ruleProxy = fresh();
+  const proxiedRuleMetrics = ruleProxy.terminal_metrics!;
+  proxiedRuleMetrics.rules = proxiedRuleMetrics.rules.map((row, index) =>
+    index === 0
+      ? new Proxy({ ...row }, { ownKeys: trap })
+      : { ...row }
+  );
+
+  const hostile = [
+    ["terminal metric accessor", metricAccessor],
+    ["terminal metric proxy", metricProxy],
+    ["baseline accessor", baselineAccessor],
+    ["baseline proxy", baselineProxy],
+    ["reason accessor", reasonAccessor],
+    ["reason proxy", reasonProxy],
+    ["rule accessor", ruleAccessor],
+    ["rule proxy", ruleProxy],
+  ] as const;
+  const actions = [
+    ["select", (input: StatsAggregationInput) =>
+      selectTerminalSnapshots([input])],
+    ["aggregate", (input: StatsAggregationInput) =>
+      aggregateTerminalStats([input], { mode: "stats_all_groups" })],
+  ] as const;
+
+  for (const [caseName, input] of hostile) {
+    for (const [actionName, action] of actions) {
+      assert.throws(
+        () => action(input),
+        (error: unknown) => {
+          assert.ok(error instanceof TypeError);
+          assert.equal(error.message, "invalid stats aggregation input");
+          assert.doesNotMatch(String(error), new RegExp(canary, "u"));
+          return true;
+        },
+        `${actionName}: ${caseName}`,
+      );
+    }
+  }
+  assert.equal(hostileReads, 0);
+});
+
+test("terminal selectors detach valid projected inputs from later mutation", () => {
+  const input = projectStatsAggregationInput(comparableHistoryEntry({
+    id: "direct-detached-input",
+    createdAtMs: 8_000,
+    metric: 0.5,
+  }));
+  const expectedInput = structuredClone(input);
+  const selected = selectTerminalSnapshots([input]);
+  const aggregate = aggregateTerminalStats(
+    [input],
+    { mode: "stats_all_groups" },
+  );
+  const expectedAggregate = structuredClone(aggregate);
+  const selectedTerminal = selected.terminals[0];
+  assert.ok(selectedTerminal !== undefined);
+  assert.notEqual(selectedTerminal, input);
+  assert.notEqual(selectedTerminal.terminal_metrics, input.terminal_metrics);
+  assert.notEqual(
+    selectedTerminal.terminal_metrics?.rules,
+    input.terminal_metrics?.rules,
+  );
+  assert.notEqual(selectedTerminal.baseline_metrics, input.baseline_metrics);
+  assert.notEqual(selectedTerminal.reason_codes, input.reason_codes);
+
+  input.snapshot_id = "f".repeat(64);
+  input.terminal_metrics!.measured_wall_ms = 123_456;
+  input.terminal_metrics!.rules[0]!.confirmed_critical_path_ms = 123_456;
+  const baseline = input.baseline_metrics[0];
+  assert.ok(baseline !== undefined);
+  baseline.value = 0.75;
+  (input.reason_codes as Array<
+    StatsAggregationInput["reason_codes"][number]
+  >).push("missing_terminal_metrics");
+
+  assert.deepEqual(selected.terminals, [expectedInput]);
+  assert.deepEqual(selected.eligible_terminals, [expectedInput]);
+  assert.deepEqual(aggregate, expectedAggregate);
 });
 
 test("robust distributions are order invariant and exact cohort buckets are fixed", () => {

@@ -3243,6 +3243,75 @@ function task6Aggregate(
   ) as Task6AggregateResult;
 }
 
+function task6OverflowTerminal(
+  axis: Task6Axis,
+  index: number,
+): StatsAggregationInput {
+  const input = task6TerminalInput({
+    id: `overflow-${axis}-${index.toString(10)}`,
+    createdAtMs: index,
+  });
+  const metrics = input.terminal_metrics!;
+  metrics.measured_wall_ms = 1e308;
+  metrics.confirmed_critical_path_ms = 0;
+  metrics.estimated_critical_path_upper_ms = 0;
+  metrics.resource_cost_ms = 0;
+  metrics.human_wait_ms = 0;
+  metrics.unexplained_ms = 0;
+  metrics.rules = metrics.rules.map((row) => ({
+    ...row,
+    confirmed_critical_path_ms: 0,
+    estimated_critical_path_upper_ms: 0,
+    resource_cost_ms: 0,
+  }));
+  metrics[axis] = 1e308;
+
+  const r001 = metrics.rules.find(({ rule_id }) => rule_id === "R001");
+  const r005 = metrics.rules.find(({ rule_id }) => rule_id === "R005");
+  assert.ok(r001 !== undefined);
+  assert.ok(r005 !== undefined);
+  if (axis === "confirmed_critical_path_ms") {
+    metrics.estimated_critical_path_upper_ms = 1e308;
+    r001.confirmed_critical_path_ms = 1e308;
+    r001.estimated_critical_path_upper_ms = 1e308;
+  } else if (axis === "estimated_critical_path_upper_ms") {
+    r001.estimated_critical_path_upper_ms = 1e308;
+  } else if (axis === "resource_cost_ms") {
+    r005.resource_cost_ms = 1e308;
+  }
+  return input;
+}
+
+test("terminal stats reject finite aggregate overflow before JSON can encode null", () => {
+  const axes = Object.keys(TASK6_AXIS_VALUES) as Task6Axis[];
+  for (const axis of axes) {
+    assert.throws(
+      () => task6Aggregate(Array.from(
+        { length: 5 },
+        (_, index) => task6OverflowTerminal(axis, index + 1),
+      )),
+      (error: unknown) => {
+        assert.ok(error instanceof TypeError);
+        assert.equal(error.message, "invalid stats aggregation input");
+        return true;
+      },
+      axis,
+    );
+  }
+
+  const control = summarizeTerminalStats(
+    task6Aggregate(Array.from(
+      { length: 5 },
+      (_, index) => task6TerminalInput({
+        id: `finite-json-control-${index + 1}`,
+        createdAtMs: index + 1,
+      }),
+    )),
+    [],
+  );
+  assert.doesNotMatch(renderStatsJson(control), /:\s*null(?:,|\n)/u);
+});
+
 test("terminal stats gate five axes and confirmed-only rule minutes at the effective floor", () => {
   const input = Array.from({ length: 5 }, (_, index) =>
     task6TerminalInput({
