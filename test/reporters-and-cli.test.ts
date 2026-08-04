@@ -38,6 +38,7 @@ import type {
   FindingConfidence,
   ImpactEstimate,
   ReportV2,
+  RuleId,
 } from "../src/core/model.js";
 import {
   findingScoringRationale,
@@ -3153,7 +3154,7 @@ interface Task6AggregateResult {
   selected_snapshot_ids: string[];
   metadata: Task6AggregateMetadata;
   terminal_metrics?: Record<Task6Axis, number>;
-  rule_minutes: Array<{ rule_id: string; minutes: number }>;
+  rule_minutes: Array<{ rule_id: RuleId; minutes: number }>;
   cohorts: Array<{
     cohort_key: string;
     metadata: Pick<
