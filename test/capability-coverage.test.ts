@@ -24,6 +24,7 @@ import {
   RULE_REQUIRED_CAPABILITIES,
   ruleCoverage,
 } from "../src/rules/capabilities.js";
+import { ruleManifest } from "../src/rules/manifest.js";
 import { runCommand } from "../src/git/client.js";
 import { renderJsonReport } from "../src/reporters/json.js";
 import { renderMarkdownReport } from "../src/reporters/markdown.js";
@@ -180,6 +181,33 @@ test("ruleCoverage handles zero eligible and required-empty rules", () => {
     "token_usage",
   ]);
   assert.deepEqual(coverage(result, "R006"), {
+    rule_id: "R006",
+    eligible_sessions: 1,
+    total_sessions: 1,
+    status: "full",
+    missing_capabilities: [],
+    completeness: 1,
+    truncated: false,
+  });
+});
+
+test("R006 v2 remains a history-only rule with full capability coverage", () => {
+  assert.deepEqual(ruleManifest("R006"), {
+    id: "R006",
+    version: "2.0.0",
+    compatibility_epoch: 2,
+    required_capabilities: [],
+    supported_sources: ["claude", "codex"],
+    impact_kind: "resource_cost",
+    default_mode: "enabled",
+    aggregation_policy: "max",
+    evidence_schema: "ccprof://rules/R006/evidence/v2",
+    policy_risk: "medium",
+  });
+  assert.deepEqual(RULE_REQUIRED_CAPABILITIES.R006, []);
+  assert.deepEqual(coverage(ruleCoverage([
+    session({ id: "no-current-capabilities", capabilities: [] }),
+  ]), "R006"), {
     rule_id: "R006",
     eligible_sessions: 1,
     total_sessions: 1,
