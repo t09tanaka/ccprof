@@ -1652,6 +1652,17 @@ test("raw privacy preserves report and warning values without mutating input", a
 
 test("rule-safety classifications preserve permitted evidence across formats and privacy", () => {
   const approvedCanonicalPrefix = "npm test";
+  const readOnlyCanonicalCommands = [
+    "rg secret-canary",
+    "cat secret",
+    "grep secret-canary README.md",
+    "head README.md",
+    "ls src",
+    "pwd",
+    "stat README.md",
+    "tail README.md",
+    "wc README.md",
+  ];
   const canonicalCommandCanary =
     "npm test -- /Users/alice/PolicyCanary/private.test.ts";
   const domainCommandCanary =
@@ -1972,6 +1983,64 @@ test("rule-safety classifications preserve permitted evidence across formats and
     }
     assert.equal(projectReportPrivacy(rawReport, "raw"), rawReport);
   }
+
+  const readOnlySuggestion =
+    `Ask an administrator to review an allowlist change for these repeated safe approval commands: ${
+      readOnlyCanonicalCommands.map((command) => `\`${command}\``).join(", ")
+    }.`;
+  const readOnlyReport: ReportV2 = {
+    ...report(),
+    caveats: [],
+    findings: [policyFinding(
+      106,
+      "R004",
+      "Repeated safe read-only approval latency",
+      r004Evidence(
+        "repeated_safe_approval_latency",
+        readOnlyCanonicalCommands,
+      ),
+      readOnlySuggestion,
+    )],
+  };
+  const strictReadOnly = projectReportPrivacy(readOnlyReport, "strict");
+  const strictReadOnlyRecipe = strictReadOnly.findings[0]?.fix_recipe;
+  assert.ok(strictReadOnlyRecipe !== undefined);
+  assert.equal(strictReadOnlyRecipe.suggestion, "[redacted-command]");
+  const strictReadOnlyOutputs = [
+    renderJsonReport(strictReadOnly),
+    renderTtyReport(strictReadOnly, { color: false }),
+    renderMarkdownReport(strictReadOnly),
+  ];
+  for (const command of readOnlyCanonicalCommands) {
+    assert.equal(JSON.stringify(strictReadOnlyRecipe).includes(command), false);
+    for (const output of strictReadOnlyOutputs) {
+      assert.equal(output.includes(command), false);
+    }
+  }
+
+  for (const profile of ["balanced", "raw"] as const) {
+    const projected = projectReportPrivacy(readOnlyReport, profile);
+    assert.deepEqual(
+      projected.findings[0]?.evidence.canonical_commands,
+      readOnlyCanonicalCommands,
+      profile,
+    );
+    assert.equal(
+      projected.findings[0]?.fix_recipe.suggestion,
+      readOnlySuggestion,
+      profile,
+    );
+    for (const output of [
+      renderJsonReport(projected),
+      renderTtyReport(projected, { color: false }),
+      renderMarkdownReport(projected),
+    ]) {
+      for (const command of readOnlyCanonicalCommands) {
+        assert.equal(output.includes(command), true, profile);
+      }
+    }
+  }
+  assert.equal(projectReportPrivacy(readOnlyReport, "raw"), readOnlyReport);
 
   const repeated = fixtures.find(({ classification }) =>
     classification === "repeated_safe_approval_latency"

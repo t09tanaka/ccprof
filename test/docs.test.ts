@@ -235,6 +235,14 @@ test("README documents the complete rule-safety and compatibility boundary", asy
       /never persists?[\s\S]{0,180}policy patterns[\s\S]{0,220}effective (?:policy )?snapshot[\s\S]{0,220}inner (?:rule-safety digest|ruleSafetyDigest)/iu,
     ],
     [
+      "complete resource-domain contract entries are never persisted",
+      /never persists?[\s\S]{0,260}complete resource-domain contract entries/iu,
+    ],
+    [
+      "only the selected resource-domain identifier may remain in finding evidence",
+      /only[\s\S]{0,80}selected `?resource_domain`? identifier[\s\S]{0,120}(?:retained|persisted|stored|appear)[\s\S]{0,140}authorized Finding evidence/iu,
+    ],
+    [
       "authorized finding evidence remains available",
       /authorized Finding evidence[\s\S]{0,220}canonical commands[\s\S]{0,180}`?resource_domain`?/u,
     ],
