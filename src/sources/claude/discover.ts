@@ -15,11 +15,12 @@ import {
   canonicalizeSessionCwds,
   cwdMatchesRepository,
 } from "../cwd.js";
-import type {
-  SessionQuery,
-  SessionSource,
+import {
+  CLAUDE_SESSION_SOURCE_CONTRACT,
+  admitSessionEventPrefix,
+  type SessionQuery,
+  type SessionSource,
 } from "../session-source.js";
-import { admitSessionEventPrefix } from "../session-source.js";
 import {
   parseClaudeTranscriptDetailed,
   type ClaudeTranscriptParseResult,
@@ -567,6 +568,7 @@ export async function discoverClaudeSessions(
 }
 
 export class ClaudeSessionSource implements SessionSource {
+  readonly contract = CLAUDE_SESSION_SOURCE_CONTRACT;
   readonly #projectsDirectory: string;
 
   constructor(projectsDirectory: string) {
@@ -574,6 +576,7 @@ export class ClaudeSessionSource implements SessionSource {
   }
 
   async discover(query: SessionQuery): Promise<Session[]> {
-    return discoverClaudeSessions(this.#projectsDirectory, query);
+    return (await discoverClaudeSessions(this.#projectsDirectory, query))
+      .map((session) => ({ ...session, capabilities: this.contract.capabilities }));
   }
 }

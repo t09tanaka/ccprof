@@ -71,6 +71,7 @@ import {
   APPROVAL_PROMPT_PHRASES,
   detectHumanWait,
 } from "../src/rules/human-wait.js";
+import { CLAUDE_SESSION_SOURCE_CONTRACT } from "../src/sources/session-source.js";
 
 const READ_OID_A = "a".repeat(40);
 const READ_OID_B = "b".repeat(40);
@@ -1885,6 +1886,7 @@ test("analyze stores frozen-head reads, caps session confidence, and omits unver
         nowMs: ANALYZE_NOW_MS,
         storePaths: paths,
         sessionSource: {
+          contract: CLAUDE_SESSION_SOURCE_CONTRACT,
           discover: async () => [readSession(sessionId, repo, confidence)],
         },
         ...(runner === undefined ? {} : { runner }),
@@ -1932,6 +1934,7 @@ test("analyze stores frozen-head reads, caps session confidence, and omits unver
       nowMs: ANALYZE_NOW_MS,
       storePaths: paths,
       sessionSource: {
+        contract: CLAUDE_SESSION_SOURCE_CONTRACT,
         discover: async () => [readThenEditSession("edited", repo)],
       },
     });
@@ -1957,6 +1960,7 @@ test("analyze stores frozen-head reads, caps session confidence, and omits unver
       nowMs: ANALYZE_NOW_MS,
       storePaths: paths,
       sessionSource: {
+        contract: CLAUDE_SESSION_SOURCE_CONTRACT,
         discover: async () => [{
           ...readSession("failed", repo, "high"),
           events: readSession("failed", repo, "high").events.map((event) =>

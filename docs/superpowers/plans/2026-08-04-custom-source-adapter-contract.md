@@ -35,7 +35,7 @@ git commit -m "docs: design fail-closed session source contracts"
 **Files:**
 - Create: `test/session-source-contract.test.ts`
 
-- [ ] **Step 1: Write failing public-contract tests**
+- [x] **Step 1: Write failing public-contract tests**
 
 Import the wished-for API and assert exact contracts and stable errors:
 
@@ -65,7 +65,7 @@ adapter/version/capability, duplicate/non-canonical capabilities, invalid
 discover method, non-array result, adapter mismatch, subset enforcement,
 explicit normalization, non-mutation, and canary-free error messages.
 
-- [ ] **Step 2: Delegate RED verification**
+- [x] **Step 2: Delegate RED verification**
 
 Run:
 
@@ -76,7 +76,7 @@ npm run build:test
 Expected: TypeScript fails only because the new contract exports do not yet
 exist. Record the diagnostics and ensure no production code was changed.
 
-- [ ] **Step 3: Commit test-only RED**
+- [x] **Step 3: Commit test-only RED**
 
 ```bash
 git add test/session-source-contract.test.ts
@@ -91,7 +91,7 @@ git commit -m "test: require fail-closed session source contracts"
 - Modify: `src/sources/codex/discover.ts`
 - Test: `test/session-source-contract.test.ts`
 
-- [ ] **Step 1: Define immutable v2 declarations**
+- [x] **Step 1: Define immutable v2 declarations**
 
 Add the exact public types and constants:
 
@@ -111,7 +111,7 @@ export interface SessionSource {
 Claude receives a frozen canonical copy of all capabilities and Codex receives
 the frozen two-capability list.
 
-- [ ] **Step 2: Implement data-descriptor validation**
+- [x] **Step 2: Implement data-descriptor validation**
 
 Use `util.types.isProxy`, own property descriptors, an exact three-field set,
 plain dense capability arrays, and the existing adapter ID/version vocabulary.
@@ -158,7 +158,7 @@ items, then require known, unique, code-unit-sorted string values. The discover
 helper must walk only non-Proxy prototypes and accept only a data-valued
 function.
 
-- [ ] **Step 3: Wrap and normalize discovery**
+- [x] **Step 3: Wrap and normalize discovery**
 
 Return a frozen source wrapper whose `discover` calls the captured method with
 the original receiver, validates a plain result array, rejects adapter
@@ -184,13 +184,13 @@ requires `session.source === contract.adapter_id`, canonicalizes a validated
 capability subset, and returns `{ ...snapshot, capabilities }` without mutating
 the adapter-owned value.
 
-- [ ] **Step 4: Give both built-ins explicit contracts**
+- [x] **Step 4: Give both built-ins explicit contracts**
 
 Add `readonly contract = CLAUDE_SESSION_SOURCE_CONTRACT` and
 `readonly contract = CODEX_SESSION_SOURCE_CONTRACT` to their existing classes.
 Do not add constructors, registries, or new services.
 
-- [ ] **Step 5: Delegate focused GREEN verification**
+- [x] **Step 5: Delegate focused GREEN verification**
 
 Run:
 
@@ -214,7 +214,7 @@ a missing behavior, change production code rather than weakening assertions.
 - Modify: `test/capability-coverage.test.ts`
 - Modify: `test/rules-primary.test.ts`
 
-- [ ] **Step 1: Migrate test adapter fixtures to v2**
+- [x] **Step 1: Migrate test adapter fixtures to v2**
 
 Every injected leaf receives an immutable built-in declaration, for example:
 
@@ -228,7 +228,7 @@ const source: SessionSource = {
 Use Codex only where the returned session source is Codex. Do not create a
 test-only bypass or optional runtime fallback.
 
-- [ ] **Step 2: Validate Combined leaves once**
+- [x] **Step 2: Validate Combined leaves once**
 
 In the constructor, map each leaf through `validateSessionSource`. Keep the
 existing parallel unbudgeted loop, sequential budgeted loop, callback behavior,
@@ -244,7 +244,7 @@ constructor(
 }
 ```
 
-- [ ] **Step 3: Validate injected analyze sources before discovery**
+- [x] **Step 3: Validate injected analyze sources before discovery**
 
 For `AnalyzeOptions.sessionSource`, call `validateSessionSource` before the
 query is assembled or `discover()` is invoked. Default Combined sources are
@@ -258,13 +258,13 @@ const source = usingDefaultSource
   : validateSessionSource(options.sessionSource);
 ```
 
-- [ ] **Step 4: Add integration assertions to the RED test file**
+- [x] **Step 4: Add integration assertions to the RED test file**
 
 Prove that invalid injected sources never call `discover`, never invoke the
 command runner, and do not create Store files. Prove a valid custom Codex
 source reaches analysis with explicit capability coverage.
 
-- [ ] **Step 5: Delegate regression verification**
+- [x] **Step 5: Delegate regression verification**
 
 Run the focused contract, Combined, analysis integration, budget, window,
 coverage, and primary-rule compiled tests. Expected: all pass with unchanged
@@ -275,13 +275,13 @@ ordering and budget assertions.
 **Files:**
 - Modify: `README.md`
 
-- [ ] **Step 1: Document the closed source boundary**
+- [x] **Step 1: Document the closed source boundary**
 
 Replace the statement that omitted declarations mean all capabilities for new
 sources. Show the exact `contract` object, state that only registered adapter
 ID/version pairs are accepted, and explain stable pre-discovery rejection.
 
-- [ ] **Step 2: Review scope and production size**
+- [x] **Step 2: Review scope and production size**
 
 Run `git diff --stat origin/main...HEAD`, `git diff --check`, and count added
 production lines. No Store migration, Report version, policy, CLI, background

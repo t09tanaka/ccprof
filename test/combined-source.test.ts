@@ -9,6 +9,7 @@ import {
 } from "../src/analysis/budgets.js";
 import { CombinedSessionSource } from "../src/sources/combined.js";
 import {
+  CLAUDE_SESSION_SOURCE_CONTRACT,
   admitSessionEventPrefix,
   type SessionQuery,
   type SessionSource,
@@ -37,11 +38,15 @@ function fakeSession(sourcePath: string): Session {
 }
 
 function sourceOf(...sessions: Session[]): SessionSource {
-  return { discover: async () => sessions };
+  return {
+    contract: CLAUDE_SESSION_SOURCE_CONTRACT,
+    discover: async () => sessions,
+  };
 }
 
 function throwingSource(error: unknown): SessionSource {
   return {
+    contract: CLAUDE_SESSION_SOURCE_CONTRACT,
     discover: async () => {
       throw error;
     },
@@ -131,6 +136,7 @@ test("unbudgeted combined discovery starts independent sources in parallel", asy
     releaseFirst = resolve;
   });
   const first: SessionSource = {
+    contract: CLAUDE_SESSION_SOURCE_CONTRACT,
     discover: async () => {
       order.push("first:start");
       await firstGate;
@@ -139,6 +145,7 @@ test("unbudgeted combined discovery starts independent sources in parallel", asy
     },
   };
   const second: SessionSource = {
+    contract: CLAUDE_SESSION_SOURCE_CONTRACT,
     discover: async () => {
       order.push("second:start");
       return [fakeSession("second")];
@@ -158,6 +165,7 @@ test("budgeted combined discovery is sequential and stops at the shared source-i
   const budgetAware = (
     name: string,
   ): SessionSource => ({
+    contract: CLAUDE_SESSION_SOURCE_CONTRACT,
     discover: async (sourceQuery) => {
       order.push(`${name}:start`);
       await Promise.resolve();
@@ -195,12 +203,14 @@ test("budgeted source failure is content-free and prevents the next source from 
   const failure = new Error("token-canary");
   const combined = new CombinedSessionSource([
     {
+      contract: CLAUDE_SESSION_SOURCE_CONTRACT,
       discover: async () => {
         started.push("first");
         throw failure;
       },
     },
     {
+      contract: CLAUDE_SESSION_SOURCE_CONTRACT,
       discover: async () => {
         started.push("second");
         return [fakeSession("second")];
@@ -233,6 +243,7 @@ test("budgeted combined discovery checkpoints before starting an adapter", async
   );
   let sourceCalls = 0;
   const combined = new CombinedSessionSource([{
+    contract: CLAUDE_SESSION_SOURCE_CONTRACT,
     discover: async () => {
       sourceCalls += 1;
       return [fakeSession("must-not-start")];

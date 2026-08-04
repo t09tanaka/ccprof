@@ -1,5 +1,9 @@
 import type { Session } from "../core/model.js";
-import type { SessionQuery, SessionSource } from "./session-source.js";
+import {
+  validateSessionSource,
+  type SessionQuery,
+  type SessionSource,
+} from "./session-source.js";
 
 /**
  * Concatenates results from several session sources, in source order. A
@@ -15,7 +19,7 @@ import type { SessionQuery, SessionSource } from "./session-source.js";
  * how to surface it - propagate it when nothing else was found, or fold it
  * into a warning when other sources still produced sessions.
  */
-export class CombinedSessionSource implements SessionSource {
+export class CombinedSessionSource {
   readonly #sources: readonly SessionSource[];
   readonly #onSourceError: ((error: unknown) => void) | undefined;
 
@@ -23,7 +27,7 @@ export class CombinedSessionSource implements SessionSource {
     sources: readonly SessionSource[],
     onSourceError?: (error: unknown) => void,
   ) {
-    this.#sources = sources;
+    this.#sources = sources.map(validateSessionSource);
     this.#onSourceError = onSourceError;
   }
 

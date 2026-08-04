@@ -546,9 +546,20 @@ The built-in registry accepts only `claude@1.0.0` with source kind
 `adapter_version`, `source_instance_id`, `source_kind`, sorted
 `provided_capabilities`, sorted `required_capabilities`, `provenance`,
 `sensitivity`, `retention_class`, and `canonical_fingerprint`. Both built-ins
-currently declare no prerequisite capabilities; provided capabilities retain
-the existing session-source compatibility rule where an omitted declaration
-means all known capabilities.
+currently declare no prerequisite capabilities.
+
+The `SessionSource` adapter API v2 requires every built-in or injected leaf to
+expose an enumerable data-only `contract` before `discover()` can run. The
+contract has exactly `adapter_id`, `adapter_version`, and a sorted unique
+`capabilities` array. Claude declares all known capabilities; Codex declares
+`edit_fragments` and `tool_timestamps`. A custom source may declare a narrower
+subset for one of those registered adapters, but a missing declaration,
+unknown adapter/version/capability, extra field, accessor, or Proxy is rejected
+with a stable content-free error before discovery, rules, reports, or Store
+writes. Newly discovered sessions always receive an explicit canonical
+capability array from this validated boundary. Only legacy stored/session
+reader paths retain the old `capabilities === undefined` compatibility meaning
+of all capabilities.
 
 `source_instance_id` is a domain-separated SHA-256 alias of the adapter and
 NFC-normalized logical session ID, so linked-worktree copies remain stable while

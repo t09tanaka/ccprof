@@ -31,9 +31,16 @@ import {
   ClaudeDiscoveryError,
   ClaudeSessionSource,
 } from "../src/sources/claude/discover.js";
+import { CombinedSessionSource } from "../src/sources/combined.js";
 import { CodexSessionSource } from "../src/sources/codex/discover.js";
 import { alignSessionCwdsToRepository } from "../src/sources/cwd.js";
-import type { SessionQuery, SessionSource } from "../src/sources/session-source.js";
+import {
+  CLAUDE_SESSION_SOURCE_CONTRACT,
+  CODEX_SESSION_SOURCE_CONTRACT,
+  type SessionQuery,
+  type SessionSource,
+  type SessionSourceContract,
+} from "../src/sources/session-source.js";
 import {
   analysisDigest,
   loadAnalyses,
@@ -52,6 +59,34 @@ import type { EffectivePolicy } from "../src/policy/organization-policy.js";
 
 const NOW_MS = Date.parse("2026-01-01T01:00:00.000Z");
 const FEATURE_COMMIT_DATE = "2026-01-01T00:00:00.000Z";
+
+function sourceContract(
+  source: Session["source"],
+): SessionSourceContract {
+  return source === "claude"
+    ? CLAUDE_SESSION_SOURCE_CONTRACT
+    : CODEX_SESSION_SOURCE_CONTRACT;
+}
+
+function sourceForSessions(
+  sessions: readonly Session[],
+): SessionSource | CombinedSessionSource {
+  const sources = (["claude", "codex"] as const).flatMap((adapter) => {
+    const matching = sessions.filter(({ source }) => source === adapter);
+    return matching.length === 0
+      ? []
+      : [{
+          contract: sourceContract(adapter),
+          discover: async () => [...matching],
+        } satisfies SessionSource];
+  });
+  return sources.length < 2
+    ? sources[0] ?? {
+        contract: CLAUDE_SESSION_SOURCE_CONTRACT,
+        discover: async () => [],
+      }
+    : new CombinedSessionSource(sources);
+}
 
 async function git(
   cwd: string,
@@ -176,6 +211,7 @@ function queryCapturingClaudeSource(projects: string): {
   const queries: SessionQuery[] = [];
   return {
     source: {
+      contract: CLAUDE_SESSION_SOURCE_CONTRACT,
       discover: async (query) => {
         queries.push({ ...query });
         return await source.discover(query);
@@ -463,6 +499,7 @@ test("core snapshots one injected rule policy for both R004 and R005", async () 
         return mutablePolicy;
       },
       sessionSource: {
+        contract: CLAUDE_SESSION_SOURCE_CONTRACT,
         discover: async () => {
           approval.organization_safe_patterns[0] = "cargo *";
           domain.match[0] = "cargo *";
@@ -505,6 +542,7 @@ test("core snapshots one injected rule policy for both R004 and R005", async () 
       storePaths,
       persist: false,
       sessionSource: {
+        contract: CLAUDE_SESSION_SOURCE_CONTRACT,
         discover: async () => [policySensitiveSession("absent-policy", repo)],
       },
     });
@@ -567,6 +605,7 @@ test("core rejects an invalid rule policy before discovery or persistence", asyn
         storePaths,
         resolveRuleSafetyPolicy: async () => hostile,
         sessionSource: {
+          contract: CLAUDE_SESSION_SOURCE_CONTRACT,
           discover: async () => {
             discoveryCalls += 1;
             return [policySensitiveSession("must-not-run", repo)];
@@ -630,6 +669,7 @@ test("linked-worktree analyze uses one canonical effective policy for core ident
       ),
     });
     const source = {
+      contract: CLAUDE_SESSION_SOURCE_CONTRACT,
       discover: async () => [
         policySensitiveSession("linked-policy-session", linkedRepo),
       ],
@@ -766,6 +806,7 @@ test("linked-worktree canonical rule-safety denial persists no authorized recipe
         nowMs: NOW_MS,
         storePaths,
         sessionSource: {
+          contract: CLAUDE_SESSION_SOURCE_CONTRACT,
           discover: async () => [
             policySensitiveSession("canonical-denial", linkedRepo),
           ],
@@ -840,6 +881,7 @@ test("linked-worktree canonical policy failure precedes discovery and persistenc
           nowMs: NOW_MS,
           storePaths,
           sessionSource: {
+            contract: CLAUDE_SESSION_SOURCE_CONTRACT,
             discover: async () => {
               discoveryCalls += 1;
               return [policySensitiveSession("must-not-persist", linkedRepo)];
@@ -940,6 +982,7 @@ test("linked-worktree budget partial keeps canonical policy identity without Sto
           nowMs: NOW_MS,
           persist: false,
           sessionSource: {
+            contract: CLAUDE_SESSION_SOURCE_CONTRACT,
             discover: async () => {
               discoveryCalls += 1;
               return [policySensitiveSession("must-not-discover", linkedRepo)];
@@ -1268,6 +1311,7 @@ test("linked worktrees preserve existing and missing root-absolute reads in both
       };
     };
     const source = (origin: string): SessionSource => ({
+      contract: CLAUDE_SESSION_SOURCE_CONTRACT,
       discover: async ({ repoRoot }) => [
         await alignSessionCwdsToRepository(session(origin), repoRoot),
       ],
@@ -1443,7 +1487,10 @@ test("session branch transition recovers pre-commit work only on broad fallback 
       ],
     };
     const queries: SessionQuery[] = [];
-    const source: SessionSource = { discover: async (query) => (queries.push({ ...query }), [session]) };
+    const source: SessionSource = {
+      contract: CLAUDE_SESSION_SOURCE_CONTRACT,
+      discover: async (query) => (queries.push({ ...query }), [session]),
+    };
     const noReflogRunner: CommandRunner = async (command, args, options) =>
       command === "git" && args[0] === "reflog"
         ? { code: 1, stdout: "", stderr: "reflog unavailable" }
@@ -1777,6 +1824,7 @@ test("coordination tools (including unknown mcp__ tools) count as normal time wh
         nowMs: NOW_MS,
         storePaths,
         sessionSource: {
+          contract: CLAUDE_SESSION_SOURCE_CONTRACT,
           discover: async () => [
             coordinationSession(sessionId, repo, toolName),
           ],
@@ -1847,7 +1895,7 @@ test("command costs separate cwd identities, exclude missing identities, and sta
     ];
     const analyzeSessions = async (ordered: Session[]) => await analyze({
       cwd: repo, pr: "main...feature", nowMs: NOW_MS, storePaths,
-      sessionSource: { discover: async () => ordered }, persist: false,
+      sessionSource: sourceForSessions(ordered), persist: false,
     });
 
     const forward = await analyzeSessions(sessions);
@@ -1957,6 +2005,7 @@ test("turn waits and AskUserQuestion waits land in human_wait_min instead of une
       nowMs: NOW_MS,
       storePaths,
       sessionSource: {
+        contract: CLAUDE_SESSION_SOURCE_CONTRACT,
         discover: async () => [humanWaitSession("wait-session", repo)],
       },
     });
@@ -2667,7 +2716,7 @@ test("repository config digest is legacy-compatible and ignores $schema", async 
     nowMs,
     idleThresholdMs: 123_000,
     storePaths,
-    sessionSource: { discover: async () => [session] },
+    sessionSource: sourceForSessions([session]),
   });
 
   const absent = await run(NOW_MS);
@@ -2749,7 +2798,7 @@ test("a hook-events.jsonl file with a matching, in-window Stop row is read witho
       pr: "main...feature",
       nowMs: NOW_MS,
       storePaths: baselineStorePaths,
-      sessionSource: { discover: async () => [baselineSession] },
+      sessionSource: sourceForSessions([baselineSession]),
       persist: false,
     });
 
@@ -2771,7 +2820,7 @@ test("a hook-events.jsonl file with a matching, in-window Stop row is read witho
       pr: "main...feature",
       nowMs: NOW_MS,
       storePaths,
-      sessionSource: { discover: async () => [session] },
+      sessionSource: sourceForSessions([session]),
       persist: false,
     });
 
@@ -2824,7 +2873,7 @@ test("hook Stop rows respect both frozen boundaries and unique session attributi
         sinceMs: windowStartMs,
         nowMs: NOW_MS,
         storePaths,
-        sessionSource: { discover: async () => discovered ?? [session] },
+        sessionSource: sourceForSessions(discovered ?? [session]),
         persist: false,
       });
     };
@@ -2908,7 +2957,7 @@ test("a Stop row more than 30 minutes past ended_at_ms is read without a warning
       pr: "main...feature",
       nowMs: NOW_MS,
       storePaths,
-      sessionSource: { discover: async () => [session] },
+      sessionSource: sourceForSessions([session]),
     });
 
     assert.deepEqual(
@@ -2946,7 +2995,7 @@ test("a Stop row for an unrelated session_id is read without a warning", async (
       pr: "main...feature",
       nowMs: NOW_MS,
       storePaths,
-      sessionSource: { discover: async () => [session] },
+      sessionSource: sourceForSessions([session]),
     });
 
     assert.deepEqual(
@@ -2976,7 +3025,7 @@ test("analysis proceeds unchanged when hook-events.jsonl is absent", async () =>
       pr: "main...feature",
       nowMs: NOW_MS,
       storePaths,
-      sessionSource: { discover: async () => [session] },
+      sessionSource: sourceForSessions([session]),
     });
 
     assert.deepEqual(
@@ -3011,7 +3060,7 @@ test("a corrupt hook-events.jsonl line degrades to one aggregate warning instead
       pr: "main...feature",
       nowMs: NOW_MS,
       storePaths,
-      sessionSource: { discover: async () => [session] },
+      sessionSource: sourceForSessions([session]),
     });
 
     const hookWarnings = result.warnings.filter(
@@ -3037,9 +3086,9 @@ test("hook input completeness creates a new snapshot even when malformed rows do
       pr: "main...feature",
       nowMs,
       storePaths,
-      sessionSource: {
-        discover: async () => [hookEventSession("hook-session", repo)],
-      },
+      sessionSource: sourceForSessions([
+        hookEventSession("hook-session", repo),
+      ]),
     });
 
     const first = await run(NOW_MS);
@@ -3128,7 +3177,7 @@ test("fixed-window analysis is invariant to high-impact events outside the snaps
     events: [outside[0]!, outside[1]!, ...stable.events, ...outside.slice(2)] };
   const run = async (session: Session) => await analyze({
     cwd: repo, pr: "main...feature", sinceMs: startedAtMs, nowMs: NOW_MS,
-    storePaths, sessionSource: { discover: async () => [session] },
+    storePaths, sessionSource: sourceForSessions([session]),
     testMap: { mappings: [], caveats: [] }, persist: false,
   });
 

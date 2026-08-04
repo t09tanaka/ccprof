@@ -12,6 +12,7 @@ import type { CommandRunner } from "../src/git/client.js";
 import type { PrContext } from "../src/git/pr-context.js";
 import { sliceSessionsToAnalysisWindow } from "../src/analysis/window.js";
 import type { AnalysisWindow, GenuineUserEvent, Session } from "../src/core/model.js";
+import { CLAUDE_SESSION_SOURCE_CONTRACT } from "../src/sources/session-source.js";
 
 function context(overrides: Partial<PrContext> = {}): PrContext {
   return {
@@ -73,10 +74,13 @@ test("an explicit start disables branch reflog probing", async () => {
     sinceMs: 700,
     nowMs: 1_000,
     runner,
-    sessionSource: { discover: async (query) => {
+    sessionSource: {
+      contract: CLAUDE_SESSION_SOURCE_CONTRACT,
+      discover: async (query) => {
       discoveryStart = query.startedAtMs;
       throw stop;
-    } },
+      },
+    },
   }), (error) => error === stop);
   assert.equal(discoveryStart, 700);
   assert.equal(calls.some((args) => args.includes("refs/heads/feature^{commit}")), false);

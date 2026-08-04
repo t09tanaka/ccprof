@@ -30,6 +30,13 @@ import { renderMarkdownReport } from "../src/reporters/markdown.js";
 import { projectReportPrivacy } from "../src/reporters/privacy.js";
 import { renderTtyReport } from "../src/reporters/tty.js";
 import { parseClaudeTranscript } from "../src/sources/claude/parser.js";
+import { CombinedSessionSource } from "../src/sources/combined.js";
+import {
+  CLAUDE_SESSION_SOURCE_CONTRACT,
+  CODEX_SESSION_SOURCE_CONTRACT,
+  type SessionSource,
+  type SessionSourceContract,
+} from "../src/sources/session-source.js";
 import { loadAnalyses } from "../src/store/analyses.js";
 import { resolveStorePaths } from "../src/store/paths.js";
 import { openStoreDatabase } from "../src/store/sqlite.js";
@@ -40,6 +47,34 @@ import {
 import "./rule-manifest.cases.js";
 
 const NOW_MS = Date.parse("2026-01-01T01:00:00.000Z");
+
+function sourceContract(
+  source: Session["source"],
+): SessionSourceContract {
+  return source === "claude"
+    ? CLAUDE_SESSION_SOURCE_CONTRACT
+    : CODEX_SESSION_SOURCE_CONTRACT;
+}
+
+function sourceForSessions(
+  sessions: readonly Session[],
+): SessionSource | CombinedSessionSource {
+  const sources = (["claude", "codex"] as const).flatMap((adapter) => {
+    const matching = sessions.filter(({ source }) => source === adapter);
+    return matching.length === 0
+      ? []
+      : [{
+          contract: sourceContract(adapter),
+          discover: async () => [...matching],
+        } satisfies SessionSource];
+  });
+  return sources.length < 2
+    ? sources[0] ?? {
+        contract: CLAUDE_SESSION_SOURCE_CONTRACT,
+        discover: async () => [],
+      }
+    : new CombinedSessionSource(sources);
+}
 
 function session(options: {
   id: string;
@@ -344,7 +379,7 @@ async function analyzeSessions(
     pr: "main...feature",
     sinceMs: NOW_MS - 2 * 60 * 60_000,
     nowMs: NOW_MS,
-    sessionSource: { discover: async () => [...sessions] },
+    sessionSource: sourceForSessions(sessions),
     storePaths: await resolveStorePaths(repo, {
       env: { CCPROF_DATA_DIR: join(root, "data") },
     }),
@@ -719,6 +754,7 @@ async function persistedPolicyEnvelope(
     sinceMs: NOW_MS - 2 * 60 * 60_000,
     nowMs: NOW_MS,
     sessionSource: {
+      contract: sourceContract(sourceSession.source),
       discover: async () => {
         options.afterResolution?.();
         return [sourceSession];
@@ -932,6 +968,7 @@ test("rule policy resolution precedes the first active-budget return", async () 
         return resolveRuleSafetyPolicy(undefined, []);
       },
       sessionSource: {
+        contract: CLAUDE_SESSION_SOURCE_CONTRACT,
         discover: async () => {
           discoveryCalls += 1;
           return [];

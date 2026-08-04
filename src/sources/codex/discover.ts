@@ -15,11 +15,12 @@ import {
   canonicalizeSessionCwds,
   cwdMatchesRepository,
 } from "../cwd.js";
-import type {
-  SessionQuery,
-  SessionSource,
+import {
+  CODEX_SESSION_SOURCE_CONTRACT,
+  admitSessionEventPrefix,
+  type SessionQuery,
+  type SessionSource,
 } from "../session-source.js";
-import { admitSessionEventPrefix } from "../session-source.js";
 import { ParserBudgetExceededError } from "../jsonl-budget.js";
 import { parseCodexSession } from "./parser.js";
 
@@ -367,6 +368,7 @@ export async function discoverCodexSessions(
 }
 
 export class CodexSessionSource implements SessionSource {
+  readonly contract = CODEX_SESSION_SOURCE_CONTRACT;
   readonly #sessionsDirectory: string | undefined;
   readonly #env: NodeJS.ProcessEnv;
 

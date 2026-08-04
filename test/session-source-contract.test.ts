@@ -379,7 +379,7 @@ test("CombinedSessionSource rejects an invalid leaf before any discovery starts"
   assert.equal(calls, 0);
 });
 
-test("analyze rejects a legacy injected source before invoking discover", async () => {
+test("analyze rejects a legacy injected source before an exhausted budget can report", async () => {
   const runner: CommandRunner = async (_command, args) => {
     if (args[0] === "rev-parse" && args[1] === "--show-toplevel") {
       return { code: 0, stdout: "/repo\n", stderr: "" };
@@ -406,6 +406,21 @@ test("analyze rejects a legacy injected source before invoking discover", async 
     nowMs: 1_000,
     runner,
     persist: false,
+    budgets: {
+      max_input_bytes: 1_000,
+      max_input_events: 100,
+      max_wall_ms: 0,
+      max_cpu_ms: 1_000,
+      max_output_bytes: 1_000,
+      max_source_items: 100,
+    },
+    budgetClock: {
+      wall_ms: (() => {
+        let reads = 0;
+        return () => reads++;
+      })(),
+      cpu_ms: () => 0,
+    },
     sessionSource: {
       discover: async () => {
         discoverCalls += 1;
