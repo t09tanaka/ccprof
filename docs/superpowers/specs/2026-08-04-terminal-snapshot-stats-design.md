@@ -337,6 +337,14 @@ equals the median. MAD is the median absolute deviation from that median.
 Finite inputs are sorted before every sum or interpolation and results are
 rounded once to four decimal places.
 
+Analysis-time baseline and R006 comparisons receive the current opaque
+`work_unit_key` separately. After projection and terminal selection, every
+history entry with that exact key is excluded before cohort construction. The
+raw display `unit.pr_ref` is never used as a prefilter: an older state of the
+same work unit cannot become its own baseline, while a different selector with
+the same display label remains an independent comparable work unit. Stats-wide
+aggregation, which has no current work unit, keeps every selected terminal.
+
 ### R006 command cohorts
 
 R006 does not reuse a single command key attached to the whole snapshot. Its
@@ -368,10 +376,13 @@ sum(measured_wall_ms across all history_count population rows)
 ```
 
 Missing, non-finite, or zero population wall time suppresses the result. A
-finding is emitted only when `history_count` meets the effective policy minimum,
-`presence_count` meets the existing chronic-cost minimum of 3, and the ratio is
-at least 0.30. Thus absence affects the population denominator but not the
-positive-cost distribution.
+finding is emitted only when both `history_count` and
+`sample_count === presence_count` meet the effective policy minimum and the
+ratio is at least 0.30. This also subsumes the existing chronic-cost minimum of
+3 because the effective policy floor is never below 5. Thus absence affects the
+population denominator but not the positive-cost distribution, and a large
+work-unit population can never expose a command/cache distribution built from a
+smaller-than-policy sample.
 
 The R006 finding key includes the opaque command-identity digest and cache
 state. Its bounded evidence and stats output include `cache_state`,
@@ -379,6 +390,22 @@ state. Its bounded evidence and stats output include `cache_state`,
 p75, MAD, and ratio. Cold and warm observations always produce distinct
 findings and rows. The finding remains interval-less `resource_cost` with the
 manifest's `max` aggregation policy.
+
+The projected `buildChronicCostAggregates` evaluator returns closed
+`ChronicCostAggregate` values containing only the opaque command key, cache
+enum, bounded counts, distribution, ratio, and resource estimate. It does not
+construct a `FindingCandidate` and never receives a raw command, command
+identity, session reference, or fix recipe. For analysis only, core code outside
+the evaluator builds a separate lookup from already-normalized selected terminal
+records, keyed by the same opaque command digest. It joins a qualifying
+aggregate back to its canonical command identity/display and deterministically
+unioned session references through `materializeChronicCostFindings`, then uses
+the existing candidate-construction boundary to retain an actionable target and
+fix recipe. A missing or invalid join suppresses the finding rather than
+fabricating session evidence. Stats consumes the bounded aggregate directly and
+performs its optional command-label join outside the aggregator before the
+existing display privacy projection. No raw lookup or joined object becomes
+reachable from `StatsAggregationInput` or `ChronicCostAggregate`.
 
 ## Minimum cohort policy
 
@@ -411,8 +438,8 @@ snapshot identity as well as behavior, while remaining an analysis variant of
 the same Git state for terminal selection. Tests cover default 5 and an
 organization floor of 20: a five-snapshot cohort emits under the default but
 both baseline and R006 remain suppressed under the organization floor until 20
-comparable snapshots exist. A repository value below 20 cannot weaken that
-floor.
+comparable snapshots and at least 20 matching command/cache samples exist. A
+repository value below 20 cannot weaken that floor.
 
 The effective threshold gates terminal aggregate emission and every comparable
 cohort distribution in `stats`, and it gates analysis-time baseline and R006 at
@@ -561,6 +588,8 @@ does not add another rendering or privacy bypass.
 12. R006 history includes comparable terminal snapshots where the command is
     absent, presence and distribution include only positive per-snapshot cost,
     and the ratio denominator includes measured wall for the full population.
+    Both population and positive command/cache sample count must meet the
+    effective policy floor.
 13. A cohort one below the effective minimum is suppressed; one exactly at it
     is emitted.
 14. Default 5 and a resolved organization floor of 20 affect analysis-time
@@ -604,7 +633,9 @@ does not add another rendering or privacy bypass.
   partition invariant.
 - Cohort tests prove bucket boundaries, terminal-only populations, robust
   distributions, separate R006 command/cache populations and denominators,
-  cache suppression, and default-5/organization-20 threshold boundaries.
+  cache suppression, current-work-unit exclusion by opaque key, bounded
+  aggregate-to-finding materialization, and default-5/organization-20
+  population-and-sample threshold boundaries.
 - Policy/config tests prove bounds, canonical signature compatibility, and
   organization-over-repository monotonicity, analysis-time resolution, and
   effective-floor inclusion in snapshot policy identity.

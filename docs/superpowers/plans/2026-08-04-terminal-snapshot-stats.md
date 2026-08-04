@@ -449,13 +449,18 @@ but are not presented as robust distributions.
 Project history for baseline selection and cover the A-at-1,000/B-at-2,000/
 A-variant-at-3,000 sequence here: B must remain terminal because Git-state
 first-seen is the minimum across A variants. The baseline helper must accept
-only projected numeric/bounded/opaque inputs, not `AnalysisRecord`.
+only projected numeric/bounded/opaque inputs, not `AnalysisRecord`. Pass the
+current opaque work-unit key separately and prove every state of that exact work
+unit is excluded. Also give a different explicit/inferred selector the same
+display `unit.pr_ref` and prove it remains in the cohort; no raw `pr_ref`
+prefilter is permitted.
 
 - [ ] **Step 3: Delegate RED verification**
 
 ```bash
 npm run build:test && node --test \
   .test-dist/test/analyze-integration.test.js \
+  .test-dist/test/organization-policy.test.js \
   .test-dist/test/store.test.js
 ```
 
@@ -482,7 +487,9 @@ generation with terminal work-unit cohort selection and the configured/default
 minimum passed through `AnalyzeOptions`. Create the strict
 `projectStatsAggregationInput` boundary and terminal selector needed by this
 baseline now; neither `computeBaseline` nor the selector may accept raw records.
-Keep `baseline` equal to `median` for the existing scalar field.
+Replace the existing display-`pr_ref` history prefilter with exact projected
+`work_unit_key !== currentWorkUnitKey` filtering after terminal selection. Keep
+`baseline` equal to `median` for the existing scalar field.
 
 - [ ] **Step 5: Delegate GREEN verification, review, and commit**
 
@@ -588,7 +595,15 @@ git commit -m "feat: aggregate terminal work-unit snapshots"
 - Test: `test/rules-secondary.test.ts`
 - Test: `test/reporters-and-cli.test.ts`
 
-- [ ] **Step 1: Write R006 RED tests**
+- [ ] **Step 1: Inventory changed R006 contracts with LanguageService**
+
+Use semantic plans without applying edits for `detectChronicCost`,
+`StoredCommandCost`, `FindingCandidate`, and `StatsChronicCommand`. Record every
+production and test caller before replacing the detector with the planned new
+`ChronicCostAggregate`, `buildChronicCostAggregates`, and
+`materializeChronicCostFindings` boundaries.
+
+- [ ] **Step 2: Write R006 RED tests**
 
 Add optional `cache_state` fixtures to individual command costs. Prove:
 
@@ -601,17 +616,24 @@ Add optional `cache_state` fixtures to individual command costs. Prove:
 - any missing/unknown cache state makes that row ineligible rather than joining
   an `unknown` bucket;
 - `cold` and `warm` create different finding keys and bounded output rows;
-- the exact effective minimum emits median/p50/p75/MAD/sample count, while
-  `presence_count < 3` suppresses even when history meets the floor;
+- both `history_count` and positive `sample_count === presence_count` must meet
+  the exact effective minimum before median/p50/p75/MAD or a finding is emitted;
 - the ratio is `sum(pair cost) / sum(measured wall for all history rows)`, uses
   the existing `>= 0.30` threshold, and suppresses zero/missing wall time;
 - a default floor of 5 emits at history 5, but an organization floor of 20
-  remains suppressed until history 20 even when presence is already 3;
+  remains suppressed at history 20/presence 3 and emits only at history
+  20/presence 20;
+- the exact current `work_unit_key` is removed after terminal selection, while
+  a different selector with the same display `pr_ref` remains in the population;
+- the projected evaluator returns a bounded `ChronicCostAggregate` without raw
+  command/session/fix data; core materialization joins a valid aggregate to a
+  normalized opaque-key lookup and produces a valid actionable candidate with
+  real session refs, while a missing/invalid join emits no candidate;
 - a cohort below the minimum emits no R006 finding or chronic-command row;
 - the R006 finding remains interval-less `resource_cost`, and the snapshot
   reducer applies manifest `max` only on the separate resource axis.
 
-- [ ] **Step 2: Delegate RED verification**
+- [ ] **Step 3: Delegate RED verification**
 
 ```bash
 npm run build:test && node --test \
@@ -620,31 +642,45 @@ npm run build:test && node --test \
   .test-dist/test/reporters-and-cli.test.js
 ```
 
-- [ ] **Step 3: Implement per-command cache snapshots and cohort detection**
+- [ ] **Step 4: Implement projected cohort evaluation and candidate materialization**
 
 Normalize `StoredCommandCost.cache_state` as absent, `cold`, or `warm` without
 accessors. In `projectStatsAggregationInput`, replace every eligible canonical
 command identity with a domain-separated opaque digest and retain only that
-digest, exact cache enum, and finite non-negative cost. Change
-`detectChronicCost` to accept projected terminal history, a current work-unit
-cohort, and the already-resolved `AnalyzeOptions.minimumCohortSize`. The
-comparable population is every terminal with the same repository/workspace and
-file/line buckets; its size is `history_count` even when the pair is absent.
-Within it, group by exact opaque command digest plus exact cache state. Combine
-duplicate rows to one per-snapshot positive cost. Set
+digest, exact cache enum, and finite non-negative cost. Replace the current
+detector with `buildChronicCostAggregates`, accepting projected terminal
+history, a current opaque work-unit key/cohort, and the already-resolved
+`AnalyzeOptions.minimumCohortSize`. Remove that exact work-unit key only after
+terminal selection; never prefilter on display `pr_ref`. The comparable
+population is every remaining terminal with the same repository/workspace and
+file/line buckets; its size is
+`history_count` even when the pair is absent. Within it, group by exact opaque
+command digest plus exact cache state. Combine duplicate rows to one
+per-snapshot positive cost and return closed `ChronicCostAggregate` objects
+containing no raw history reference. Set
 `presence_count = sample_count` from positive rows only, but divide summed cost
 by measured wall summed across the full `history_count` population. Require
-history at the effective floor, presence at the existing minimum 3, ratio at
-least 0.30, and a positive finite denominator.
+both history and positive sample count at the effective floor, ratio at least
+0.30, and a positive finite denominator.
 
-Include opaque command digest and cache state in the finding key. Expose only
-bounded `cache_state`, `history_count`, `presence_count`, `sample_count`, ratio,
-median, p50, p75, and MAD in evidence/stats output. Ensure cold and warm never
-collide. Do not pass raw command values into the cohort detector.
+Outside the evaluator, build an internal normalized command lookup from the
+selected records, keyed by opaque command digest.
+`materializeChronicCostFindings` joins a qualifying aggregate to canonical
+command identity/display plus deterministic session refs, then calls the
+existing finding-candidate boundary so target and fix recipe remain actionable.
+Missing/invalid joins suppress rather than invent evidence. Stats consumes the
+bounded aggregate and joins a display label only outside aggregation before
+privacy projection.
+
+Include opaque command digest and cache state in the finding key. Expose bounded
+`cache_state`, `history_count`, `presence_count`, `sample_count`, ratio, median,
+p50, p75, and MAD in aggregate evidence/stats output. Ensure cold and warm never
+collide. Do not pass raw command values, identities, session refs, or lookup
+objects into the cohort evaluator or `ChronicCostAggregate`.
 
 Do not attach one command key to the snapshot cohort. Do not infer cache state.
 
-- [ ] **Step 4: Delegate GREEN verification, review, and commit**
+- [ ] **Step 5: Delegate GREEN verification, review, and commit**
 
 ```bash
 git add src/store/analyses.ts src/analysis/stats-input.ts \
@@ -726,9 +762,12 @@ Give the reviewer the complete design acceptance list and the branch base/head.
 Require explicit checks for selector collision, A/B/A rerun, manifest policies,
 per-metric `max`, full-upper/residual wall partition invariant, legacy confirmed
 zero, terminal-before-eligibility, separate work-unit/R006 populations and
-denominators, pre-analysis monotonic threshold resolution, and raw-to-opaque
-projection before terminal/cohort aggregation. Fix every P0-P2 issue through a
-test-first commit and re-review.
+denominators, exact current-work-unit exclusion by opaque key after terminal
+selection, effective-policy floors on both R006 history and positive sample
+counts, bounded R006 aggregate-to-finding materialization, pre-analysis
+monotonic threshold resolution, and raw-to-opaque projection before
+terminal/cohort aggregation. Fix every P0-P2 issue through a test-first commit
+and re-review.
 
 - [ ] **Step 2: Dispatch final code-quality/security review**
 
