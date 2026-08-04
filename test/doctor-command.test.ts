@@ -132,6 +132,19 @@ test("doctor contains malformed configuration and organization paths", async (t)
   for (const value of [secret, repo, dataRoot]) {
     assert.equal(malformedOutput.includes(value), false);
   }
+  const malformedText = await capture(["doctor"], repo, dataRoot);
+  const malformedTextAgain = await capture(["doctor"], repo, dataRoot);
+  assert.equal(malformedText.code, 1);
+  assert.deepEqual(malformedTextAgain, malformedText);
+  assert.ok(malformedText.stdout.includes(
+    "[FAIL] configuration: Repository configuration is invalid.",
+  ));
+  assert.ok(malformedText.stdout.length <= 4_096);
+  assert.ok(malformedText.stderr.length <= 1_024);
+  const malformedTextOutput = malformedText.stdout + malformedText.stderr;
+  for (const value of [secret, repo, dataRoot]) {
+    assert.equal(malformedTextOutput.includes(value), false);
+  }
 
   await writeFile(join(repo, ".ccprof", "config.json"),
     JSON.stringify({ schema_version: 1 }));
@@ -159,6 +172,25 @@ test("doctor contains malformed configuration and organization paths", async (t)
   const partialOutput = partial.stdout + partial.stderr;
   for (const value of [secret, policyPath]) {
     assert.equal(partialOutput.includes(value), false);
+  }
+  const partialText = await capture(["doctor"], repo, dataRoot, {
+    CCPROF_ORGANIZATION: "example-org",
+    CCPROF_ORGANIZATION_POLICY_PATH: policyPath,
+  });
+  const partialTextAgain = await capture(["doctor"], repo, dataRoot, {
+    CCPROF_ORGANIZATION: "example-org",
+    CCPROF_ORGANIZATION_POLICY_PATH: policyPath,
+  });
+  assert.equal(partialText.code, 1);
+  assert.deepEqual(partialTextAgain, partialText);
+  assert.ok(partialText.stdout.includes(
+    "[FAIL] organization_policy: Organization policy configuration is invalid.",
+  ));
+  assert.ok(partialText.stdout.length <= 4_096);
+  assert.ok(partialText.stderr.length <= 1_024);
+  const partialTextOutput = partialText.stdout + partialText.stderr;
+  for (const value of [secret, policyPath, repo, dataRoot]) {
+    assert.equal(partialTextOutput.includes(value), false);
   }
 });
 
