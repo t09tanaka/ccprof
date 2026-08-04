@@ -23,6 +23,7 @@ import {
   readCodexParserState,
 } from "../src/sources/codex/parser.js";
 import {
+  canonicalJsonBytes,
   MAX_INCREMENTAL_PARSER_STATE_BYTES,
   PARSER_STATE_SCHEMA_FINGERPRINT,
 } from "../src/sources/jsonl-budget.js";
@@ -84,6 +85,32 @@ function detachedContractValue<T>(value: T): T {
   return JSON.parse(canonicalJson(value)) as T;
 }
 
+function prettyCanonicalJsonBytes(value: unknown): number {
+  let bytes = canonicalJsonBytes(value) + 1;
+  const pending: Array<{ value: object; depth: number }> = [];
+  if (value !== null && typeof value === "object") {
+    pending.push({ value, depth: 0 });
+  }
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    const children = Array.isArray(current.value)
+      ? current.value
+      : Object.values(current.value);
+    if (children.length > 0) {
+      bytes += children.length + 1;
+      bytes += children.length * 2 * (current.depth + 1);
+      bytes += 2 * current.depth;
+      if (!Array.isArray(current.value)) bytes += children.length;
+    }
+    for (const child of children) {
+      if (child !== null && typeof child === "object") {
+        pending.push({ value: child, depth: current.depth + 1 });
+      }
+    }
+  }
+  return bytes;
+}
+
 function cacheBinding(
   cache: Omit<SourceEvidenceCacheEntry, "payload_digest" | "descriptor_digest">,
 ): Record<string, unknown> {
@@ -104,8 +131,17 @@ function cacheBinding(
 function payloadDigest(
   cache: Omit<SourceEvidenceCacheEntry, "payload_digest" | "descriptor_digest">,
 ): string {
+  const payload = JSON.parse(cache.payload_json) as unknown;
+  const negativeProgress = payload !== null && typeof payload === "object" &&
+      (payload as Record<string, unknown>).kind === "no-evidence-v1"
+    ? {
+      line_count: cache.line_count,
+      ends_with_newline: cache.ends_with_newline,
+    }
+    : {};
   return boundDigest("source-evidence-payload-v1", {
     ...cacheBinding(cache),
+    ...negativeProgress,
     payload_json: cache.payload_json,
   });
 }
@@ -397,13 +433,14 @@ async function codexEnvelopeFixture(
 function negativeEnvelope(
   path: string,
   adapter: "claude" | "codex" = "claude",
+  reason: "empty" | "other-repository-only" = "other-repository-only",
 ): SourceEvidenceEnvelopeV1 {
   return {
     schema_version: 1,
     kind: "no-evidence-v1",
     adapter_id: adapter,
     canonical_path: path,
-    reason: "other-repository-only",
+    reason,
   };
 }
 
@@ -686,6 +723,50 @@ test("envelopes reject recursive tool inputs and payloads above the fixed 128 Mi
   );
 });
 
+test("strict envelope capacity counts pretty canonical bytes before materialization", {
+  timeout: 120_000,
+}, async (t) => {
+  const store = await storeFixture(t);
+  const fixture = await claudeEvidenceFixture(t, store);
+  assertEligibleEnvelope(fixture.envelope);
+  const envelope = structuredClone(fixture.envelope);
+
+  let nested: unknown = Array.from({ length: 300_000 }, () => null);
+  for (let depth = 0; depth < 220; depth += 1) {
+    nested = { child: nested };
+  }
+  replaceFirstEventWithToolInput(envelope, { payload: nested });
+  const compactBytes = canonicalJsonBytes(envelope);
+  const prettyBytes = prettyCanonicalJsonBytes(envelope);
+  assert.ok(compactBytes < MAX_INCREMENTAL_PARSER_STATE_BYTES);
+  assert.ok(prettyBytes > MAX_INCREMENTAL_PARSER_STATE_BYTES);
+
+  const canary = "CAPACITY_MATERIALIZATION_CANARY";
+  const originalStringify = JSON.stringify;
+  let prettyStringifyCalls = 0;
+  JSON.stringify = ((...args: unknown[]): string | undefined => {
+    if (args[2] === 2) {
+      prettyStringifyCalls += 1;
+      throw new Error(canary);
+    }
+    return Reflect.apply(originalStringify, JSON, args) as string | undefined;
+  }) as unknown as typeof JSON.stringify;
+  try {
+    assertEvidenceError(
+      () => normalizeSourceEvidenceEnvelope(envelope),
+      "invalid_state",
+      canary,
+    );
+  } finally {
+    JSON.stringify = originalStringify;
+  }
+  assert.equal(
+    prettyStringifyCalls,
+    0,
+    "the iterative cap must reject before canonical pretty JSON is allocated",
+  );
+});
+
 test("cache rows validate canonical payloads, descriptor digests, and detached positive and negative values", async (t) => {
   const store = await storeFixture(t);
   const positive = await claudeEvidenceFixture(t, store);
@@ -731,6 +812,97 @@ test("cache rows validate canonical payloads, descriptor digests, and detached p
       >,
       [],
     ),
+  );
+});
+
+test("negative cache progress is digest-bound and empty markers require zero catalog progress", async (t) => {
+  const store = await storeFixture(t);
+  const path = join(store.repositoryRoot, "empty-negative.jsonl");
+  const catalog = {
+    ...catalogEntry({
+      adapter: "claude",
+      canonicalPath: path,
+      content: "",
+      parsedOffset: 0,
+      sourceIdentity: `source-${"d".repeat(64)}`,
+    }),
+    last_normalized_event_index: 0,
+  };
+  const envelope = negativeEnvelope(path, "claude", "empty");
+  const { cache } = cacheEntry({
+    catalog,
+    envelope,
+    repositoryIdentity: store.paths.repo_hash,
+    eligibilityIdentity: ROOT_A,
+    lineCount: 0,
+    endsWithNewline: false,
+  });
+  assert.deepEqual(validateSourceEvidenceCacheEntry(cache), cache);
+
+  for (const changed of [
+    { ...cache, line_count: 1 },
+    { ...cache, ends_with_newline: true },
+  ]) {
+    assertEvidenceError(
+      () => validateSourceEvidenceCacheEntry(changed),
+      "digest_mismatch",
+    );
+  }
+
+  assert.equal(commitEligibleSourceEvidence(
+    store.database,
+    store.paths.repo_hash,
+    ROOT_A,
+    { catalog, cache },
+  ), "inserted");
+  const load = (): ReturnType<typeof getSourceEvidencePair> =>
+    getSourceEvidencePair(
+      store.database,
+      store.paths.repo_hash,
+      ROOT_A,
+      catalog.source_identity,
+    );
+  assert.ok(load() !== undefined);
+
+  store.database.prepare(`UPDATE source_evidence_cache SET line_count = 1
+    WHERE source_identity = ? AND eligibility_identity = ?`).run(
+      catalog.source_identity,
+      ROOT_A,
+    );
+  assert.equal(load(), undefined);
+  store.database.prepare(`UPDATE source_evidence_cache SET line_count = 0
+    WHERE source_identity = ? AND eligibility_identity = ?`).run(
+      catalog.source_identity,
+      ROOT_A,
+    );
+  assert.ok(load() !== undefined);
+
+  store.database.prepare(`UPDATE source_evidence_cache SET ends_with_newline = 1
+    WHERE source_identity = ? AND eligibility_identity = ?`).run(
+      catalog.source_identity,
+      ROOT_A,
+    );
+  assert.equal(load(), undefined);
+  store.database.prepare(`UPDATE source_evidence_cache SET ends_with_newline = 0
+    WHERE source_identity = ? AND eligibility_identity = ?`).run(
+      catalog.source_identity,
+      ROOT_A,
+    );
+  assert.ok(load() !== undefined);
+
+  store.database.prepare(`UPDATE source_catalog
+    SET size_bytes = 1, last_parsed_offset = 1
+    WHERE source_identity = ?`).run(catalog.source_identity);
+  store.database.prepare(`UPDATE source_evidence_cache
+    SET last_parsed_offset = 1
+    WHERE source_identity = ? AND eligibility_identity = ?`).run(
+      catalog.source_identity,
+      ROOT_A,
+    );
+  assert.equal(
+    load(),
+    undefined,
+    "an empty marker cannot describe a non-empty complete catalog observation",
   );
 });
 
@@ -890,6 +1062,61 @@ test("cache validation rejects hostile rows, noncanonical JSON, bad bounds, dige
   assertEvidenceError(
     () => validateSourceEvidenceCacheEntry(rawPayload),
     "unknown_field",
+  );
+});
+
+test("pair validation rejects nested catalog proxies without evaluating traps or getters", async (t) => {
+  const store = await storeFixture(t);
+  const fixture = await claudeEvidenceFixture(t, store);
+  const canary = "PAIR_CATALOG_PROXY_CANARY";
+  let hostileReads = 0;
+  const hostile = (): never => {
+    hostileReads += 1;
+    throw new Error(canary);
+  };
+
+  const accessorCatalog = structuredClone(fixture.catalog);
+  Object.defineProperty(accessorCatalog, "canonical_path", {
+    enumerable: true,
+    get: hostile,
+  });
+  const proxiedCatalog = new Proxy(structuredClone(fixture.catalog), {
+    get: hostile,
+    getPrototypeOf: hostile,
+    ownKeys: hostile,
+    getOwnPropertyDescriptor: hostile,
+  });
+  const revokedCatalog = Proxy.revocable(
+    structuredClone(fixture.catalog),
+    {},
+  );
+  revokedCatalog.revoke();
+
+  for (const catalog of [
+    accessorCatalog,
+    proxiedCatalog,
+    revokedCatalog.proxy,
+  ]) {
+    assertEvidenceError(
+      () => commitEligibleSourceEvidence(
+        store.database,
+        store.paths.repo_hash,
+        ROOT_A,
+        { catalog, cache: fixture.cache },
+      ),
+      "invalid_state",
+      canary,
+    );
+  }
+  assert.equal(hostileReads, 0);
+  assert.equal(
+    store.database.prepare("SELECT count(*) FROM source_catalog").pluck().get(),
+    0,
+  );
+  assert.equal(
+    store.database.prepare("SELECT count(*) FROM source_evidence_cache").pluck()
+      .get(),
+    0,
   );
 });
 
