@@ -71,6 +71,12 @@ function analysisRunner(onCall: () => void = () => {}): CommandRunner {
   };
 }
 
+function revokedProxy<T extends object>(value: T): T {
+  const revocable = Proxy.revocable(value, {});
+  revocable.revoke();
+  return revocable.proxy;
+}
+
 function session(
   overrides: Partial<Session> = {},
 ): Session {
@@ -301,6 +307,21 @@ test("Proxy sources, contracts, and capability arrays fail without invoking trap
     })),
     "invalid_capability",
   );
+  assertSourceError(
+    () => validateSessionSource(revokedProxy(source([]))),
+    "invalid_shape",
+  );
+  assertSourceError(
+    () => validateSessionSource(source([], revokedProxy(declaration()))),
+    "invalid_shape",
+  );
+  assertSourceError(
+    () => validateSessionSource(source([], {
+      ...declaration(),
+      capabilities: revokedProxy([...ALL_CAPABILITIES]),
+    })),
+    "invalid_capability",
+  );
   assert.equal(traps, 0);
 });
 
@@ -361,7 +382,9 @@ test("discovery results fail closed before invalid sessions reach consumers", as
   const cases: readonly [unknown, SessionSourceValidationCode][] = [
     [{}, "invalid_result"],
     [new Proxy([session()], {}), "invalid_result"],
+    [revokedProxy([session()]), "invalid_result"],
     [[new Proxy(session(), {})], "invalid_result"],
+    [[revokedProxy(session())], "invalid_result"],
     [[session({ source: "codex" })], "adapter_mismatch"],
     [[session({ capabilities: ["other" as SessionCapability] })], "invalid_capability"],
   ];
@@ -450,6 +473,124 @@ test("CombinedSessionSource propagates invalid discovery output in every budget 
     }),
     "adapter_mismatch",
   );
+});
+
+test("ordinary hostile discovery errors remain isolated without trap evaluation", async () => {
+  let traps = 0;
+  const hostilePrototype = new Proxy({}, {
+    getPrototypeOf: () => {
+      traps += 1;
+      throw new Error("SECRET_CANARY thrown prototype");
+    },
+  });
+  const hostileError = new Proxy(new Error("SECRET_CANARY thrown error"), {
+    getPrototypeOf: () => {
+      traps += 1;
+      throw new Error("SECRET_CANARY thrown proxy");
+    },
+  });
+  const thrownValues: readonly unknown[] = [
+    hostileError,
+    Object.create(hostilePrototype),
+    revokedProxy(new Error("SECRET_CANARY revoked error")),
+    new SessionSourceValidationError("adapter_mismatch"),
+  ];
+  for (const thrown of thrownValues) {
+    const failures: unknown[] = [];
+    const throwing: SessionSource = {
+      contract: CLAUDE_SESSION_SOURCE_CONTRACT,
+      discover: async () => Promise.reject(thrown),
+    };
+    assert.deepEqual(
+      await new CombinedSessionSource(
+        [throwing],
+        (error) => failures.push(error),
+      ).discover(QUERY),
+      [],
+    );
+    assert.equal(failures[0], thrown);
+    assert.deepEqual(
+      await new CombinedSessionSource([throwing]).discover({
+        ...QUERY,
+        analysisBudgetMeter: new AnalysisBudgetMeter(BUDGETS, STEADY_CLOCK),
+      }),
+      [],
+    );
+  }
+  assert.equal(traps, 0);
+});
+
+test("budgeted analyze isolates hostile and forged discovery errors", async () => {
+  let traps = 0;
+  const hostileError = new Proxy(new Error("SECRET_CANARY analyze error"), {
+    getPrototypeOf: () => {
+      traps += 1;
+      throw new Error("SECRET_CANARY analyze trap");
+    },
+  });
+  for (const thrown of [
+    hostileError,
+    new SessionSourceValidationError("adapter_mismatch"),
+  ]) {
+    const throwing: SessionSource = {
+      contract: CLAUDE_SESSION_SOURCE_CONTRACT,
+      discover: async () => Promise.reject(thrown),
+    };
+    const result = await analyze({
+      cwd: "/repo",
+      pr: "main...feature",
+      sinceMs: 0,
+      nowMs: 1_000,
+      runner: analysisRunner(),
+      persist: false,
+      budgets: BUDGETS,
+      budgetClock: STEADY_CLOCK,
+      sessionSource: throwing,
+    });
+    assert.equal(
+      result.report.analysis_budget?.truncation_reason,
+      "source_failure",
+    );
+  }
+  assert.equal(traps, 0);
+});
+
+test("analyze uses a captured CombinedSessionSource discovery method", async () => {
+  const combined = new CombinedSessionSource([source([session({
+    events: [{
+      kind: "assistant",
+      timestamp_ms: 150,
+      session_id: "session-1",
+      entry_uuid: "assistant-1",
+      session_ref: "session-1#assistant-1",
+      source_index: 0,
+      agent_id: "main",
+      is_sidechain: false,
+      confidence: "high",
+      text: "Working.",
+    }],
+  })])]);
+  const original = CombinedSessionSource.prototype.discover;
+  let replacementCalls = 0;
+  try {
+    CombinedSessionSource.prototype.discover = async () => {
+      replacementCalls += 1;
+      throw new Error("SECRET_CANARY replaced Combined discover");
+    };
+    const result = await analyze({
+      cwd: "/repo",
+      pr: "main...feature",
+      sinceMs: 0,
+      nowMs: 1_000,
+      runner: analysisRunner(),
+      persist: false,
+      sessionSource: combined,
+    });
+    assert.deepEqual(result.report.unit.sessions, ["session-1"]);
+    assert.equal(replacementCalls, 0);
+  } finally {
+    CombinedSessionSource.prototype.discover = original;
+  }
 });
 
 test("analyze rejects hostile CombinedSessionSource injections before effects", async () => {
