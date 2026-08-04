@@ -42,7 +42,7 @@ const DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema";
 const SCHEMA_PATH = "schemas/builtin-rule-evidence.schema.json";
 const IDENTITY: CommandIdentity = {
   repo_relative_cwd: ".",
-  normalized_argv: ["npm", "test"],
+  normalized_argv: ["npm", "test", ""],
   executor: "shell",
 };
 
@@ -359,7 +359,11 @@ async function schemaBundle(): Promise<Record<string, unknown>> {
 function validators(
   bundle: Record<string, unknown>,
 ): Map<RuleId, ValidateFunction> {
-  const ajv = new Ajv2020({ allErrors: true, strict: true });
+  const ajv = new Ajv2020({
+    allErrors: true,
+    strict: true,
+    strictTuples: false,
+  });
   ajv.addSchema(bundle);
   return new Map(listRuleManifests().map((manifest) => {
     const validate = ajv.getSchema(manifest.evidence_schema);
