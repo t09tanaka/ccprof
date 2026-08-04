@@ -155,6 +155,9 @@ test("partitions wall-clock time with exclusive point precedence", () => {
   assert.deepEqual(attribution(result, "redundant").intervals, []);
   assert.equal(attribution(result, "serial-upper").attributed_ms, 0);
   assert.equal(attribution(result, "context-upper").attributed_ms, 0);
+  assert.equal(attribution(result, "flaky").reported_ms, 30_000);
+  assert.equal(attribution(result, "rework").reported_ms, 20_000);
+  assert.equal(attribution(result, "redundant").reported_ms, 0);
 
   assert.deepEqual(result.pointRecoverableIntervals, [
     { start_ms: 10_000, end_ms: 60_000 },
@@ -210,19 +213,19 @@ test("partitions wall-clock time with exclusive point precedence", () => {
     result.findings.map((finding) => [finding.finding_key, finding]),
   );
   assert.deepEqual(findingByKey.get("flaky")?.recoverable, {
-    min: 0.5,
+    min: 1.25,
     bound: "point",
   });
   assert.deepEqual(findingByKey.get("rework")?.recoverable, {
-    min: 0.33,
+    min: 16.66665,
     bound: "point",
   });
   assert.deepEqual(findingByKey.get("redundant")?.recoverable, {
-    min: 0,
+    min: 1 / 3,
     bound: "point",
   });
   assert.deepEqual(findingByKey.get("serial-upper")?.recoverable, {
-    min: 0.33,
+    min: 1 / 3,
     bound: "upper",
   });
   assert.deepEqual(findingByKey.get("context-upper")?.recoverable, {
@@ -300,7 +303,7 @@ test("rounds a partition once without a negative residual", () => {
     result.findings.find(
       (finding) => finding.finding_key === "small-upper",
     )?.recoverable.min,
-    0.83,
+    50_000 / 60_000,
   );
 });
 

@@ -2917,6 +2917,76 @@ test("normalizes legacy finding bounds, domains, and confidence conservatively",
   ]);
 });
 
+test("legacy finding normalization is idempotent across save, load, and migration", async () => {
+  const legacy = {
+    ...record("legacy-idempotent", 2),
+    findings: [legacyFinding("legacy-idempotent-finding", {
+      confidence: "high",
+      bound: "point",
+      recoverableMin: 2,
+    })],
+  };
+  const normalized = makeAnalysisRecord(legacy);
+  assert.deepEqual(makeAnalysisRecord(normalized), normalized);
+
+  const fabricated = finding("fabricated-legacy-flag", "npm test", 2);
+  fabricated.impact = {
+    lower_ms: 0,
+    upper_ms: 120_000,
+    kind: "critical_path_latency",
+  };
+  fabricated.finding_confidence = {
+    evidence: "high",
+    causal: "high",
+    source_completeness: 1,
+  };
+  fabricated.severity = "medium";
+  fabricated.scoring_rationale = [
+    "estimated_upper_only",
+    "legacy_projection",
+  ];
+  fabricated.recoverable = { min: 2, bound: "upper" };
+  assert.throws(
+    () => makeAnalysisRecord({ ...legacy, findings: [fabricated] }),
+    (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.equal(error.message, "invalid finding");
+      return true;
+    },
+  );
+
+  await temporaryStore(async (paths) => {
+    const saved = await saveAnalysis(paths, legacy);
+    assert.deepEqual(saved.warnings, []);
+    assert.deepEqual(saved.record, normalized);
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded, { records: [normalized], warnings: [] });
+    const savedAgain = await saveAnalysis(paths, loaded.records[0]!);
+    assert.deepEqual(savedAgain, { record: normalized, warnings: [] });
+    assert.deepEqual(await loadAnalyses(paths), {
+      records: [normalized],
+      warnings: [],
+    });
+  });
+
+  await temporaryStore(async (paths) => {
+    await mkdir(paths.analyses_dir, { recursive: true });
+    await writeFile(
+      join(paths.analyses_dir, "legacy-finding.json"),
+      `${JSON.stringify(legacy)}\n`,
+      "utf8",
+    );
+    assert.deepEqual(await loadAnalyses(paths), {
+      records: [normalized],
+      warnings: [],
+    });
+    assert.deepEqual(await loadAnalyses(paths), {
+      records: [normalized],
+      warnings: [],
+    });
+  });
+});
+
 test("canonical finding snapshots derive v2 projections and stabilize nested key order", async () => {
   const canonical = finding("canonical-range", "npm test", 2);
   canonical.confidence = "low";

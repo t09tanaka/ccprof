@@ -408,6 +408,24 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
       current.findings.map(({ finding_key }) => finding_key),
       first.allFindings.map(({ finding_key }) => finding_key),
     );
+    const allByKey = new Map(
+      first.allFindings.map((finding) => [finding.finding_key, finding]),
+    );
+    const storedByKey = new Map(
+      current.findings.map((finding) => [finding.finding_key, finding]),
+    );
+    for (const finding of first.allFindings) {
+      const storedFinding = storedByKey.get(finding.finding_key);
+      assert.ok(storedFinding);
+      assert.deepEqual(storedFinding.impact, finding.impact);
+      assert.deepEqual(storedFinding.recoverable, finding.recoverable);
+    }
+    for (const finding of first.report.findings) {
+      const allFinding = allByKey.get(finding.finding_key);
+      assert.ok(allFinding);
+      assert.deepEqual(finding.impact, allFinding.impact);
+      assert.deepEqual(finding.recoverable, allFinding.recoverable);
+    }
     assert.equal(current.summary.baseline?.prs, 3);
     const npmTestCost = current.command_costs.find(
       ({ command }) => command === "npm test",
