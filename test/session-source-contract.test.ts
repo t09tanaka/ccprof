@@ -568,6 +568,17 @@ test("analyze uses a captured CombinedSessionSource discovery method", async () 
       is_sidechain: false,
       confidence: "high",
       text: "Working.",
+    }, {
+      kind: "assistant",
+      timestamp_ms: 200,
+      session_id: "session-1",
+      entry_uuid: "assistant-2",
+      session_ref: "session-1#assistant-2",
+      source_index: 1,
+      agent_id: "main",
+      is_sidechain: false,
+      confidence: "high",
+      text: "Done.",
     }],
   })])]);
   const original = CombinedSessionSource.prototype.discover;
