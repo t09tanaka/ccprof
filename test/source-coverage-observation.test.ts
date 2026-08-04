@@ -269,11 +269,15 @@ test("cold parser coverage counts events before analysis-window filtering", asyn
       { type: "message", role: "user", content: "early" }),
     timed("2026-07-31T05:00:00.000Z", "response_item",
       { type: "message", role: "user", content: "late" }),
+    timed("2026-07-31T05:30:00.000Z", "response_item",
+      { type: "function_call", name: "shell", call_id: "", arguments: "{}" }),
   ].join("\n")}\n`);
   const codex = await parseCodexSessionObserved({ sourcePath: codexPath,
     endedAtMs: Date.parse("2026-07-31T04:00:00.000Z") });
   assert.equal(codex.result?.events.length, 1);
+  assert.equal(codex.result?.warnings.length, 0);
   assert.equal(codex.observation.events_emitted, 2);
+  assert.equal(codex.observation.completeness, "partial");
 });
 
 test("cold parser coverage reports bounded reads as partial", async (t) => {

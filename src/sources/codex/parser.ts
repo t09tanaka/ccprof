@@ -1703,7 +1703,7 @@ export async function parseCodexSessionObserved(
         rows_accepted: read.state.rows.length, events_emitted: emitted?.events.length ?? 0,
         completeness: read.completeness === "complete" &&
           read.state.warnings.length === 0 && read.state.seen_subtypes.length === 0 &&
-          (result?.warnings.length ?? 0) === 0
+          (result?.warnings.length ?? 0) === 0 && (emitted?.warnings.length ?? 0) === 0
           ? "complete" : "partial" } };
     } catch (error) {
       if (!(error instanceof IncrementalParserStateCapacityError)) throw error;

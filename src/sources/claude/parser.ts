@@ -2992,13 +2992,13 @@ export async function parseClaudeTranscriptObserved(
           ? {}
           : { onAssistantPrefixProbe: instrumentation.onAssistantPrefixProbe }),
       });
-      const warned = read.state.warnings.length > 0 || result.warnings.length > 0 ||
-        result.sessions.some((session) => session.warnings.length > 0);
       const emitted = instrumentation.endedAtMs === undefined ? result :
         projectClaudeParserState(read.state, {
           ...(instrumentation.budgets === undefined ? {} : { budgets: instrumentation.budgets }),
           ...(instrumentation.signal === undefined ? {} : { signal: instrumentation.signal }),
         });
+      const warned = read.state.warnings.length > 0 || emitted.warnings.length > 0 ||
+        emitted.sessions.some((session) => session.warnings.length > 0);
       return { result, observation: { rows_seen: read.state.line_count,
         rows_accepted: read.state.rows.length,
         events_emitted: emitted.sessions.reduce((count, session) =>
