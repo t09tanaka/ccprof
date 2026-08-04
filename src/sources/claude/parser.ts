@@ -1,4 +1,6 @@
+import { open as openFile, type FileHandle } from "node:fs/promises";
 import { basename } from "node:path";
+import { types as utilTypes } from "node:util";
 
 import {
   makeSessionRef,
@@ -19,10 +21,29 @@ import {
   boundedJsonlLines,
   boundedWarnings,
   budgetWarningCode,
+  canonicalJsonBytes,
+  canonicalJsonStringBytes,
+  IncrementalParserStateCapacityError,
+  IncrementalParserStateByteTracker,
+  jsonlLinePhysicalRange,
   JsonlBudgetTracker,
   ParserBudgetExceededError,
   type JsonlParserControls,
+  type ParserProjectionBudgets,
+  type ParserReadBudgets,
+  type ParserStateReadResult,
+  type ParserStateRowBaseV1,
+  type ParserStateWarningV1,
+  type SourceReadReceipt,
 } from "../jsonl-budget.js";
+
+export {
+  IncrementalParserStateCapacityError,
+  MAX_INCREMENTAL_PARSER_STATE_BYTES,
+  PARSER_STATE_SCHEMA_FINGERPRINT,
+} from "../jsonl-budget.js";
+
+export const CLAUDE_PARSER_VERSION = "2.0.0";
 
 export const MAX_TOOL_OUTPUT_BYTES = 16_384;
 /** Maximum UTF-8 bytes retained for any non-path/command tool-input string. */
@@ -89,6 +110,131 @@ interface ParsedRow {
   isSidechain: boolean;
 }
 
+export interface ClaudeStateToolResultV1 {
+  tool_use_id: string | null;
+  status_evidence: ResultStatusEvidence;
+  output: string;
+  output_bytes: number;
+  estimated_tokens: number;
+  has_unknown_schema: boolean;
+  exit_code: number | null;
+}
+
+export interface ClaudeStateTextBlockV1 {
+  type: "text";
+  text?: string;
+}
+
+export interface ClaudeStateToolUseBlockV1 {
+  type: "tool_use";
+  id?: JsonValue;
+  name?: JsonValue;
+  input: JsonObject;
+}
+
+export interface ClaudeStateUnknownBlockV1 {
+  type: string;
+}
+
+export type ClaudeStateAssistantBlockV1 =
+  | ClaudeStateTextBlockV1
+  | ClaudeStateToolUseBlockV1
+  | ClaudeStateUnknownBlockV1
+  | null;
+
+export interface ClaudeStateAssistantValueV1 {
+  type: "assistant";
+  message: {
+    id?: string;
+    content: string | null | ClaudeStateAssistantBlockV1[];
+    usage: { input_tokens?: number; output_tokens?: number };
+  };
+}
+
+export interface ClaudeStateUserValueV1 {
+  type: "user";
+  isMeta?: boolean;
+  isCompactSummary?: boolean;
+  message: { content: string | ClaudeStateTextBlockV1[] };
+}
+
+export interface ClaudeStateSystemValueV1 {
+  type: "system";
+  subtype?: string;
+  content?: string;
+  compactMetadata?: {
+    preTokens?: number;
+    estimatedTokens?: number;
+    tokens?: number;
+  };
+}
+
+export interface ClaudeStateAuxiliaryValueV1 {
+  type: "auxiliary";
+}
+
+export type ClaudeStateRowValueV1 =
+  | ClaudeStateAssistantValueV1
+  | ClaudeStateUserValueV1
+  | ClaudeStateSystemValueV1
+  | ClaudeStateAuxiliaryValueV1;
+
+export interface ClaudeStateRowV1 extends ParserStateRowBaseV1 {
+  kind: "claude-row-v1";
+  source_index: number;
+  session_id: string;
+  entry_uuid: string;
+  has_synthetic_uuid: boolean;
+  cwd: string | null;
+  branch: string | null;
+  parent_uuid: string | null;
+  agent_id: string | null;
+  is_sidechain: boolean;
+  value: ClaudeStateRowValueV1;
+  tool_results: ClaudeStateToolResultV1[];
+}
+
+export interface ClaudeBranchLaneV1 {
+  session_id: string;
+  lane_id: string;
+  source_index: number;
+  branch: string;
+}
+
+export interface ClaudeAncestryV1 {
+  session_id: string;
+  entry_uuid: string;
+  parent_uuid: string;
+  source_index: number;
+  agent_id: string | null;
+}
+
+export interface ClaudeAssistantGroupV1 {
+  session_id: string;
+  message_id: string;
+  source_indexes: number[];
+}
+
+export interface ClaudeResultPositionV1 {
+  session_id: string;
+  tool_use_id: string;
+  source_index: number;
+}
+
+export interface ClaudeParserStateV1 {
+  kind: "claude-state-v1";
+  canonical_path: string;
+  parsed_offset: number;
+  line_count: number;
+  ends_with_newline: boolean;
+  rows: ClaudeStateRowV1[];
+  branch_lanes: ClaudeBranchLaneV1[];
+  ancestry: ClaudeAncestryV1[];
+  assistant_groups: ClaudeAssistantGroupV1[];
+  result_positions: ClaudeResultPositionV1[];
+  warnings: ParserStateWarningV1[];
+}
+
 interface PendingWarning extends SourceWarning {
   targetSessionId?: string;
 }
@@ -151,7 +297,7 @@ function nonEmptyString(value: unknown): string | undefined {
 function finiteInteger(value: unknown): number | undefined {
   return typeof value === "number" &&
     Number.isFinite(value) &&
-    Number.isInteger(value) &&
+    Number.isSafeInteger(value) &&
     value >= 0
     ? value
     : undefined;
@@ -159,7 +305,8 @@ function finiteInteger(value: unknown): number | undefined {
 
 function parseTimestamp(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) {
-    return Math.trunc(value);
+    const timestampMs = Math.trunc(value);
+    return Number.isSafeInteger(timestampMs) ? timestampMs : undefined;
   }
   if (typeof value !== "string") {
     return undefined;
@@ -307,7 +454,7 @@ function observedExitCode(value: unknown): number | undefined {
     const candidate = value[key];
     if (
       typeof candidate === "number" &&
-      Number.isInteger(candidate) &&
+      Number.isSafeInteger(candidate) &&
       Number.isFinite(candidate)
     ) {
       return candidate;
@@ -557,13 +704,13 @@ function ingestToolResults(parsed: UnknownRecord): IngestedToolResult[] {
 }
 
 interface CompactedContent {
-  value: unknown;
+  value: JsonValue;
   discardedPayload: boolean;
   discardedPayloadBytes: number;
 }
 
 interface CompactedRowValue {
-  value: UnknownRecord;
+  value: ClaudeStateRowValueV1;
   discardedPayload: boolean;
   discardedPayloadBytes: number;
 }
@@ -650,14 +797,14 @@ function compactAssistantContent(value: unknown): CompactedContent {
   }
   if (!Array.isArray(value)) {
     return {
-      value: {},
+      value: null,
       discardedPayload: true,
       discardedPayloadBytes: stringPayloadBytes(value),
     };
   }
   let discardedPayload = false;
   let discardedPayloadBytes = 0;
-  const compacted: unknown[] = [];
+  const compacted: JsonValue[] = [];
   for (const block of value) {
     if (!isRecord(block)) {
       discardedPayload = true;
@@ -680,8 +827,8 @@ function compactAssistantContent(value: unknown): CompactedContent {
     if (block.type === "tool_use") {
       compacted.push({
         type: "tool_use",
-        ...(block.id !== undefined ? { id: block.id } : {}),
-        ...(block.name !== undefined ? { name: block.name } : {}),
+        ...(typeof block.id === "string" ? { id: block.id } : {}),
+        ...(typeof block.name === "string" ? { name: block.name } : {}),
         input: toJsonObject(block.input),
       });
       continue;
@@ -718,7 +865,7 @@ function compactUserContent(
     };
   }
 
-  const compacted: unknown[] = [];
+  const compacted: JsonValue[] = [];
   let discardedPayload = false;
   let discardedPayloadBytes = 0;
   for (const block of value) {
@@ -754,19 +901,18 @@ function compactRowValue(
     const message = isRecord(parsed.message) ? parsed.message : {};
     const usage = isRecord(message.usage) ? message.usage : {};
     const content = compactAssistantContent(message.content);
+    const inputTokens = finiteInteger(usage.input_tokens);
+    const outputTokens = finiteInteger(usage.output_tokens);
     return {
       value: {
         type,
         message: {
-          ...(message.id !== undefined ? { id: message.id } : {}),
-          content: content.value,
+          ...(typeof message.id === "string" ? { id: message.id } : {}),
+          content: content.value as
+            ClaudeStateAssistantValueV1["message"]["content"],
           usage: {
-            ...(usage.input_tokens !== undefined
-              ? { input_tokens: usage.input_tokens }
-              : {}),
-            ...(usage.output_tokens !== undefined
-              ? { output_tokens: usage.output_tokens }
-              : {}),
+            ...(inputTokens === undefined ? {} : { input_tokens: inputTokens }),
+            ...(outputTokens === undefined ? {} : { output_tokens: outputTokens }),
           },
         },
       },
@@ -783,12 +929,13 @@ function compactRowValue(
     return {
       value: {
         type,
-        ...(parsed.isMeta !== undefined ? { isMeta: parsed.isMeta } : {}),
-        ...(parsed.isCompactSummary !== undefined
+        ...(typeof parsed.isMeta === "boolean" ? { isMeta: parsed.isMeta } : {}),
+        ...(typeof parsed.isCompactSummary === "boolean"
           ? { isCompactSummary: parsed.isCompactSummary }
           : {}),
         message: {
-          content: content.value,
+          content: content.value as
+            ClaudeStateUserValueV1["message"]["content"],
         },
       },
       discardedPayload: content.discardedPayload,
@@ -796,13 +943,28 @@ function compactRowValue(
     };
   }
   if (type === "system") {
+    const rawMetadata = isRecord(parsed.compactMetadata)
+      ? parsed.compactMetadata
+      : {};
+    const preTokens = finiteInteger(rawMetadata.preTokens);
+    const estimatedTokens = finiteInteger(rawMetadata.estimatedTokens);
+    const tokens = finiteInteger(rawMetadata.tokens);
+    const compactMetadata = {
+      ...(preTokens === undefined ? {} : { preTokens }),
+      ...(estimatedTokens === undefined ? {} : { estimatedTokens }),
+      ...(tokens === undefined ? {} : { tokens }),
+    };
     return {
       value: {
         type,
-        ...(parsed.subtype !== undefined ? { subtype: parsed.subtype } : {}),
-        ...(parsed.content !== undefined ? { content: parsed.content } : {}),
-        ...(parsed.compactMetadata !== undefined
-          ? { compactMetadata: parsed.compactMetadata }
+        ...(typeof parsed.subtype === "string"
+          ? { subtype: parsed.subtype }
+          : {}),
+        ...(parsed.content !== undefined
+          ? { content: textContent(parsed.content) }
+          : {}),
+        ...(Object.keys(compactMetadata).length > 0
+          ? { compactMetadata }
           : {}),
       },
       discardedPayload: false,
@@ -810,7 +972,7 @@ function compactRowValue(
     };
   }
   return {
-    value: { ...(type !== undefined ? { type } : {}) },
+    value: { type: "auxiliary" },
     discardedPayload: false,
     discardedPayloadBytes: 0,
   };
@@ -846,9 +1008,931 @@ function parserBudgetWarning(
   return warning(sourcePath, budgetWarningCode(error), error.message,
     error.line === undefined ? {} : { line: error.line });
 }
+
+function snapshotJson(
+  value: unknown,
+  capacity: IncrementalParserStateByteTracker,
+  depth = 0,
+): JsonValue {
+  if (depth > 256) throw new TypeError("Parser state is too deeply nested.");
+  if (value === null) {
+    capacity.addBytes(4);
+    return value;
+  }
+  if (typeof value === "string") {
+    capacity.addBytes(canonicalJsonStringBytes(value));
+    return value;
+  }
+  if (typeof value === "boolean") {
+    capacity.addBytes(value ? 4 : 5);
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("Invalid parser-state number.");
+    capacity.addBytes(canonicalJsonBytes(value));
+    return value;
+  }
+  if (typeof value !== "object" || value === undefined) {
+    throw new TypeError("Invalid parser-state value.");
+  }
+  if (utilTypes.isProxy(value)) {
+    throw new TypeError("Parser-state proxies are forbidden.");
+  }
+  if (Array.isArray(value)) {
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const keys = Reflect.ownKeys(descriptors);
+    if (
+      keys.length !== value.length + 1 ||
+      keys.some((key) =>
+        key !== "length" && (
+          typeof key !== "string" ||
+          !Number.isSafeInteger(Number(key)) ||
+          Number(key) < 0 || Number(key) >= value.length ||
+          Number(key).toString(10) !== key
+        )
+      )
+    ) throw new TypeError("Parser-state arrays have invalid properties.");
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = descriptors[index.toString(10)];
+      if (
+        descriptor === undefined || !("value" in descriptor) ||
+        descriptor.enumerable !== true
+      ) {
+        throw new TypeError("Parser-state arrays must be dense data arrays.");
+      }
+    }
+    capacity.addBytes(1);
+    const result: JsonValue[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      if (index > 0) capacity.addBytes(1);
+      const descriptor = descriptors[index.toString(10)]!;
+      result.push(snapshotJson(descriptor.value, capacity, depth + 1));
+    }
+    capacity.addBytes(1);
+    return result;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError("Parser-state objects must be plain objects.");
+  }
+  const result = Object.create(null) as JsonObject;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const keys = Reflect.ownKeys(descriptors);
+  capacity.addBytes(1);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index]!;
+    if (typeof key !== "string") {
+      throw new TypeError("Parser-state symbol properties are forbidden.");
+    }
+    const descriptor = descriptors[key];
+    if (
+      descriptor === undefined || !("value" in descriptor) ||
+      descriptor.enumerable !== true
+    ) {
+      throw new TypeError("Parser-state properties must be enumerable data fields.");
+    }
+    if (index > 0) capacity.addBytes(1);
+    capacity.addBytes(canonicalJsonStringBytes(key) + 1);
+    Object.defineProperty(result, key, {
+      value: snapshotJson(descriptor.value, capacity, depth + 1),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  capacity.addBytes(1);
+  return result;
+}
+
+function exactKeys(
+  value: UnknownRecord,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): void {
+  const keys = Object.keys(value).sort();
+  const allowed = [...required, ...optional].sort();
+  if (
+    keys.some((key) => !allowed.includes(key)) ||
+    required.some((key) => !keys.includes(key))
+  ) {
+    throw new TypeError("Parser state has an invalid field set.");
+  }
+}
+
+function nonnegativeInteger(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new TypeError("Parser-state integer is invalid.");
+  }
+  return value as number;
+}
+
+function stateInteger(value: unknown): number {
+  if (!Number.isSafeInteger(value)) {
+    throw new TypeError("Parser-state integer is invalid.");
+  }
+  return value as number;
+}
+
+function stateString(value: unknown): string;
+function stateString(value: unknown, nullable: true): string | null;
+function stateString(value: unknown, nullable = false): string | null {
+  if (nullable && value === null) return null;
+  if (typeof value !== "string" || value.includes("\0")) {
+    throw new TypeError("Parser-state text is invalid.");
+  }
+  return value;
+}
+
+function statePayloadText(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new TypeError("Parser-state payload text is invalid.");
+  }
+  return value;
+}
+
+function validateWarningFact(value: unknown, expectedOrder: number): void {
+  if (!isRecord(value)) throw new TypeError("Invalid parser-state warning fact.");
+  exactKeys(value, [
+    "order", "applicability", "scope", "target_session_id", "warning",
+  ]);
+  if (nonnegativeInteger(value.order) !== expectedOrder) {
+    throw new TypeError("Parser-state warning order is invalid.");
+  }
+  if (!isRecord(value.applicability)) {
+    throw new TypeError("Invalid parser-state warning applicability.");
+  }
+  if (value.applicability.kind === "unconditional") {
+    exactKeys(value.applicability, ["kind"]);
+  } else if (value.applicability.kind === "timestamp") {
+    exactKeys(value.applicability, ["kind", "timestamp_ms"]);
+    stateInteger(value.applicability.timestamp_ms);
+  } else {
+    throw new TypeError("Unknown parser-state warning applicability.");
+  }
+  if (value.scope !== "source" && value.scope !== "session") {
+    throw new TypeError("Invalid parser-state warning scope.");
+  }
+  stateString(value.target_session_id, true);
+  if (!isRecord(value.warning)) throw new TypeError("Invalid source warning.");
+  exactKeys(
+    value.warning,
+    ["code", "message", "source_path"],
+    ["line", "session_ref"],
+  );
+  stateString(value.warning.code);
+  stateString(value.warning.message);
+  stateString(value.warning.source_path);
+  if (value.warning.line !== undefined) nonnegativeInteger(value.warning.line);
+  if (value.warning.session_ref !== undefined) stateString(value.warning.session_ref);
+}
+
+function validateClaudeAssistantBlock(value: unknown): void {
+  if (value === null) return;
+  if (!isRecord(value)) {
+    throw new TypeError("Invalid Claude assistant state block.");
+  }
+  const type = stateString(value.type);
+  if (type === "text") {
+    exactKeys(value, ["type"], ["text"]);
+    if (value.text !== undefined) statePayloadText(value.text);
+    return;
+  }
+  if (type === "tool_use") {
+    exactKeys(value, ["type", "input"], ["id", "name"]);
+    if (value.id !== undefined) stateString(value.id);
+    if (value.name !== undefined) stateString(value.name);
+    if (!isRecord(value.input)) {
+      throw new TypeError("Invalid Claude state tool input.");
+    }
+    return;
+  }
+  exactKeys(value, ["type"]);
+}
+
+function validateClaudeRowValue(value: unknown): void {
+  if (!isRecord(value)) throw new TypeError("Invalid Claude state row value.");
+  if (value.type === "assistant") {
+    exactKeys(value, ["type", "message"]);
+    if (!isRecord(value.message)) {
+      throw new TypeError("Invalid Claude assistant state message.");
+    }
+    exactKeys(value.message, ["content", "usage"], ["id"]);
+    if (value.message.id !== undefined) stateString(value.message.id);
+    const content = value.message.content;
+    if (
+      typeof content !== "string" && content !== null &&
+      !Array.isArray(content)
+    ) throw new TypeError("Invalid Claude assistant state content.");
+    if (Array.isArray(content)) {
+      for (const block of content) validateClaudeAssistantBlock(block);
+    }
+    if (!isRecord(value.message.usage)) {
+      throw new TypeError("Invalid Claude assistant state usage.");
+    }
+    exactKeys(value.message.usage, [], ["input_tokens", "output_tokens"]);
+    if (value.message.usage.input_tokens !== undefined) {
+      nonnegativeInteger(value.message.usage.input_tokens);
+    }
+    if (value.message.usage.output_tokens !== undefined) {
+      nonnegativeInteger(value.message.usage.output_tokens);
+    }
+    return;
+  }
+  if (value.type === "user") {
+    exactKeys(value, ["type", "message"], ["isMeta", "isCompactSummary"]);
+    if (value.isMeta !== undefined && typeof value.isMeta !== "boolean") {
+      throw new TypeError("Invalid Claude state user marker.");
+    }
+    if (
+      value.isCompactSummary !== undefined &&
+      typeof value.isCompactSummary !== "boolean"
+    ) throw new TypeError("Invalid Claude state compaction marker.");
+    if (!isRecord(value.message)) {
+      throw new TypeError("Invalid Claude user state message.");
+    }
+    exactKeys(value.message, ["content"]);
+    const content = value.message.content;
+    if (typeof content !== "string" && !Array.isArray(content)) {
+      throw new TypeError("Invalid Claude user state content.");
+    }
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        if (!isRecord(block)) {
+          throw new TypeError("Invalid Claude user state block.");
+        }
+        exactKeys(block, ["type", "text"]);
+        if (block.type !== "text") {
+          throw new TypeError("Unknown Claude user state block.");
+        }
+        statePayloadText(block.text);
+      }
+    }
+    return;
+  }
+  if (value.type === "system") {
+    exactKeys(value, ["type"], ["subtype", "content", "compactMetadata"]);
+    if (value.subtype !== undefined) stateString(value.subtype);
+    if (value.content !== undefined) statePayloadText(value.content);
+    if (value.compactMetadata !== undefined) {
+      if (!isRecord(value.compactMetadata)) {
+        throw new TypeError("Invalid Claude compact metadata.");
+      }
+      exactKeys(value.compactMetadata, [], [
+        "preTokens", "estimatedTokens", "tokens",
+      ]);
+      for (const key of ["preTokens", "estimatedTokens", "tokens"] as const) {
+        if (value.compactMetadata[key] !== undefined) {
+          nonnegativeInteger(value.compactMetadata[key]);
+        }
+      }
+    }
+    return;
+  }
+  if (value.type === "auxiliary") {
+    exactKeys(value, ["type"]);
+    return;
+  }
+  throw new TypeError("Unknown Claude state row value.");
+}
+
+function validateClaudeToolResult(value: unknown): void {
+  if (!isRecord(value)) throw new TypeError("Invalid Claude state tool result.");
+  exactKeys(value, [
+    "tool_use_id", "status_evidence", "output", "output_bytes",
+    "estimated_tokens", "has_unknown_schema", "exit_code",
+  ]);
+  stateString(value.tool_use_id, true);
+  statePayloadText(value.output);
+  nonnegativeInteger(value.output_bytes);
+  nonnegativeInteger(value.estimated_tokens);
+  if (typeof value.has_unknown_schema !== "boolean") {
+    throw new TypeError("Invalid Claude state tool-result marker.");
+  }
+  if (value.exit_code !== null) stateInteger(value.exit_code);
+  if (!isRecord(value.status_evidence)) {
+    throw new TypeError("Invalid Claude state result evidence.");
+  }
+  exactKeys(value.status_evidence, ["status", "source", "confidence"]);
+  if (!["success", "failure", "timeout", "cancelled", "unknown"].includes(
+    stateString(value.status_evidence.status),
+  )) throw new TypeError("Invalid Claude state result status.");
+  if (![
+    "explicit_status", "exit_code", "tool_adapter", "output_pattern", "none",
+  ].includes(stateString(value.status_evidence.source))) {
+    throw new TypeError("Invalid Claude state result source.");
+  }
+  if (!["low", "medium", "high"].includes(
+    stateString(value.status_evidence.confidence),
+  )) throw new TypeError("Invalid Claude state result confidence.");
+}
+
+function validateClaudeIndexes(
+  value: UnknownRecord,
+  rows: readonly ClaudeStateRowV1[],
+): void {
+  const branchLanes = value.branch_lanes;
+  const ancestry = value.ancestry;
+  const assistantGroups = value.assistant_groups;
+  const resultPositions = value.result_positions;
+  if (
+    !Array.isArray(branchLanes) || !Array.isArray(ancestry) ||
+    !Array.isArray(assistantGroups) || !Array.isArray(resultPositions)
+  ) throw new TypeError("Invalid Claude parser-state index.");
+  for (const item of branchLanes) {
+    if (!isRecord(item)) throw new TypeError("Invalid Claude branch index.");
+    exactKeys(item, ["session_id", "lane_id", "source_index", "branch"]);
+    stateString(item.session_id); stateString(item.lane_id);
+    nonnegativeInteger(item.source_index); stateString(item.branch);
+  }
+  for (const item of ancestry) {
+    if (!isRecord(item)) throw new TypeError("Invalid Claude ancestry index.");
+    exactKeys(item, [
+      "session_id", "entry_uuid", "parent_uuid", "source_index", "agent_id",
+    ]);
+    stateString(item.session_id); stateString(item.entry_uuid);
+    stateString(item.parent_uuid); nonnegativeInteger(item.source_index);
+    stateString(item.agent_id, true);
+  }
+  for (const item of assistantGroups) {
+    if (!isRecord(item)) {
+      throw new TypeError("Invalid Claude assistant-group index.");
+    }
+    exactKeys(item, ["session_id", "message_id", "source_indexes"]);
+    stateString(item.session_id); stateString(item.message_id);
+    if (!Array.isArray(item.source_indexes)) {
+      throw new TypeError("Invalid Claude assistant-group positions.");
+    }
+    for (const index of item.source_indexes) nonnegativeInteger(index);
+  }
+  for (const item of resultPositions) {
+    if (!isRecord(item)) {
+      throw new TypeError("Invalid Claude result-position index.");
+    }
+    exactKeys(item, ["session_id", "tool_use_id", "source_index"]);
+    stateString(item.session_id); stateString(item.tool_use_id);
+    nonnegativeInteger(item.source_index);
+  }
+  const expected = buildClaudeIndexes(rows);
+  const sameBranchLanes = branchLanes.length === expected.branch_lanes.length &&
+    branchLanes.every((item, index) => {
+      const expectedItem = expected.branch_lanes[index]!;
+      return item.session_id === expectedItem.session_id &&
+        item.lane_id === expectedItem.lane_id &&
+        item.source_index === expectedItem.source_index &&
+        item.branch === expectedItem.branch;
+    });
+  const sameAncestry = ancestry.length === expected.ancestry.length &&
+    ancestry.every((item, index) => {
+      const expectedItem = expected.ancestry[index]!;
+      return item.session_id === expectedItem.session_id &&
+        item.entry_uuid === expectedItem.entry_uuid &&
+        item.parent_uuid === expectedItem.parent_uuid &&
+        item.source_index === expectedItem.source_index &&
+        item.agent_id === expectedItem.agent_id;
+    });
+  const sameGroups = assistantGroups.length === expected.assistant_groups.length &&
+    assistantGroups.every((item, index) => {
+      const expectedItem = expected.assistant_groups[index]!;
+      return item.session_id === expectedItem.session_id &&
+        item.message_id === expectedItem.message_id &&
+        Array.isArray(item.source_indexes) &&
+        item.source_indexes.length === expectedItem.source_indexes.length &&
+        item.source_indexes.every((
+          sourceIndex: number,
+          sourceOffset: number,
+        ) =>
+          sourceIndex === expectedItem.source_indexes[sourceOffset]
+        );
+    });
+  const sameResults = resultPositions.length === expected.result_positions.length &&
+    resultPositions.every((item, index) => {
+      const expectedItem = expected.result_positions[index]!;
+      return item.session_id === expectedItem.session_id &&
+        item.tool_use_id === expectedItem.tool_use_id &&
+        item.source_index === expectedItem.source_index;
+    });
+  if (!sameBranchLanes || !sameAncestry || !sameGroups || !sameResults) {
+    throw new TypeError("Claude parser-state indexes are not canonical.");
+  }
+}
+
+export function normalizeClaudeParserState(value: unknown): ClaudeParserStateV1 {
+  const capacity = new IncrementalParserStateByteTracker();
+  const cloned = snapshotJson(value, capacity);
+  if (!isRecord(cloned)) throw new TypeError("Claude parser state must be an object.");
+  exactKeys(cloned, [
+    "kind", "canonical_path", "parsed_offset", "line_count",
+    "ends_with_newline", "rows", "branch_lanes", "ancestry",
+    "assistant_groups", "result_positions", "warnings",
+  ]);
+  if (cloned.kind !== "claude-state-v1") {
+    throw new TypeError("Unknown Claude parser-state kind.");
+  }
+  stateString(cloned.canonical_path);
+  const parsedOffset = nonnegativeInteger(cloned.parsed_offset);
+  const lineCount = nonnegativeInteger(cloned.line_count);
+  if (typeof cloned.ends_with_newline !== "boolean") {
+    throw new TypeError("Invalid Claude newline state.");
+  }
+  if (
+    !Array.isArray(cloned.rows) || !Array.isArray(cloned.branch_lanes) ||
+    !Array.isArray(cloned.ancestry) ||
+    !Array.isArray(cloned.assistant_groups) ||
+    !Array.isArray(cloned.result_positions) ||
+    !Array.isArray(cloned.warnings)
+  ) throw new TypeError("Invalid Claude parser-state collection.");
+
+  let previousLine = 0;
+  let previousEnd = 0;
+  for (const row of cloned.rows) {
+    if (!isRecord(row)) throw new TypeError("Invalid Claude state row.");
+    exactKeys(row, [
+      "kind", "original_bytes", "byte_start", "byte_end", "line",
+      "timestamp_ms", "source_index", "session_id", "entry_uuid",
+      "has_synthetic_uuid", "cwd", "branch", "parent_uuid", "agent_id",
+      "is_sidechain", "value", "tool_results",
+    ]);
+    if (row.kind !== "claude-row-v1") throw new TypeError("Unknown Claude row kind.");
+    const originalBytes = nonnegativeInteger(row.original_bytes);
+    const byteStart = nonnegativeInteger(row.byte_start);
+    const byteEnd = nonnegativeInteger(row.byte_end);
+    const line = nonnegativeInteger(row.line);
+    const sourceIndex = nonnegativeInteger(row.source_index);
+    stateInteger(row.timestamp_ms);
+    const terminatorBytes = byteEnd - byteStart - originalBytes;
+    const reachesProgress = byteEnd === parsedOffset;
+    if (
+      line < 1 || line <= previousLine || sourceIndex !== line - 1 ||
+      originalBytes === 0 || byteStart < previousEnd || byteEnd < byteStart ||
+      terminatorBytes < 0 || terminatorBytes > 2 ||
+      (terminatorBytes === 0 && !reachesProgress) ||
+      (reachesProgress &&
+        cloned.ends_with_newline !== (terminatorBytes > 0)) ||
+      byteEnd > parsedOffset
+    ) throw new TypeError("Inconsistent Claude physical row indexes.");
+    stateString(row.session_id);
+    stateString(row.entry_uuid);
+    stateString(row.cwd, true);
+    stateString(row.branch, true);
+    stateString(row.parent_uuid, true);
+    stateString(row.agent_id, true);
+    if (
+      typeof row.has_synthetic_uuid !== "boolean" ||
+      typeof row.is_sidechain !== "boolean" || !Array.isArray(row.tool_results)
+    ) throw new TypeError("Invalid Claude state row payload.");
+    validateClaudeRowValue(row.value);
+    for (const result of row.tool_results) validateClaudeToolResult(result);
+    previousLine = line;
+    previousEnd = byteEnd;
+  }
+  if (previousLine > lineCount || previousEnd > parsedOffset) {
+    throw new TypeError("Claude parser-state progress is inconsistent.");
+  }
+  validateClaudeIndexes(
+    cloned,
+    cloned.rows as unknown as ClaudeStateRowV1[],
+  );
+  cloned.warnings.forEach((fact, index) => validateWarningFact(fact, index));
+  return cloned as unknown as ClaudeParserStateV1;
+}
+
+function stateToolResult(result: IngestedToolResult): ClaudeStateToolResultV1 {
+  return {
+    tool_use_id: result.toolUseId ?? null,
+    status_evidence: { ...result.statusEvidence },
+    output: result.output,
+    output_bytes: result.outputBytes,
+    estimated_tokens: result.estimatedTokens,
+    has_unknown_schema: result.hasUnknownSchema,
+    exit_code: result.exitCode ?? null,
+  };
+}
+
+function parsedToolResult(result: ClaudeStateToolResultV1): IngestedToolResult {
+  return {
+    statusEvidence: { ...result.status_evidence },
+    output: result.output,
+    outputBytes: result.output_bytes,
+    estimatedTokens: result.estimated_tokens,
+    hasUnknownSchema: result.has_unknown_schema,
+    ...(result.tool_use_id === null ? {} : { toolUseId: result.tool_use_id }),
+    ...(result.exit_code === null ? {} : { exitCode: result.exit_code }),
+  };
+}
+
+function warningFact(
+  pending: PendingWarning,
+  order: number,
+  timestampMs?: number,
+): ParserStateWarningV1 {
+  const { targetSessionId, ...sourceWarning } = pending;
+  return {
+    order,
+    applicability: timestampMs === undefined
+      ? { kind: "unconditional" }
+      : { kind: "timestamp", timestamp_ms: timestampMs },
+    scope: targetSessionId === undefined ? "source" : "session",
+    target_session_id: targetSessionId ?? null,
+    warning: sourceWarning,
+  };
+}
+
+function buildClaudeIndexes(
+  rows: readonly ClaudeStateRowV1[],
+  capacity?: IncrementalParserStateByteTracker,
+): Pick<
+  ClaudeParserStateV1,
+  "branch_lanes" | "ancestry" | "assistant_groups" | "result_positions"
+> {
+  const branchLanes: ClaudeBranchLaneV1[] = [];
+  const ancestry: ClaudeAncestryV1[] = [];
+  const assistantGroups = new Map<string, ClaudeAssistantGroupV1>();
+  const resultPositions = new Map<string, ClaudeResultPositionV1>();
+  for (const row of rows) {
+    if (row.branch !== null) {
+      const item = {
+        session_id: row.session_id,
+        lane_id: row.agent_id ?? row.session_id,
+        source_index: row.source_index,
+        branch: row.branch,
+      };
+      capacity?.addArrayItem(item, branchLanes.length);
+      branchLanes.push(item);
+    }
+    if (row.parent_uuid !== null) {
+      const item = {
+        session_id: row.session_id,
+        entry_uuid: row.entry_uuid,
+        parent_uuid: row.parent_uuid,
+        source_index: row.source_index,
+        agent_id: row.agent_id,
+      };
+      capacity?.addArrayItem(item, ancestry.length);
+      ancestry.push(item);
+    }
+    const messageId = row.value.type === "assistant"
+      ? nonEmptyString(row.value.message.id)
+      : undefined;
+    if (messageId !== undefined) {
+      const key = `${row.session_id}\0${messageId}`;
+      const group = assistantGroups.get(key);
+      if (group === undefined) {
+        assistantGroups.set(key, {
+          session_id: row.session_id,
+          message_id: messageId,
+          source_indexes: [row.source_index],
+        });
+      } else {
+        group.source_indexes.push(row.source_index);
+      }
+    }
+    for (const result of row.tool_results) {
+      if (result.tool_use_id !== null) {
+        resultPositions.set(`${row.session_id}\0${result.tool_use_id}`, {
+          session_id: row.session_id,
+          tool_use_id: result.tool_use_id,
+          source_index: row.source_index,
+        });
+      }
+    }
+  }
+  const assistantGroupsArray: ClaudeAssistantGroupV1[] = [];
+  for (const item of assistantGroups.values()) {
+    capacity?.addArrayItem(item, assistantGroupsArray.length);
+    assistantGroupsArray.push(item);
+  }
+  const resultPositionsArray: ClaudeResultPositionV1[] = [];
+  for (const item of resultPositions.values()) {
+    capacity?.addArrayItem(item, resultPositionsArray.length);
+    resultPositionsArray.push(item);
+  }
+  return {
+    branch_lanes: branchLanes,
+    ancestry,
+    assistant_groups: assistantGroupsArray,
+    result_positions: resultPositionsArray,
+  };
+}
+
+function claudeStateSkeleton(
+  canonicalPath: string,
+  parsedOffset: number,
+  lineCount: number,
+  endsWithNewline: boolean,
+): ClaudeParserStateV1 {
+  return {
+    kind: "claude-state-v1",
+    canonical_path: canonicalPath,
+    parsed_offset: parsedOffset,
+    line_count: lineCount,
+    ends_with_newline: endsWithNewline,
+    rows: [],
+    branch_lanes: [],
+    ancestry: [],
+    assistant_groups: [],
+    result_positions: [],
+    warnings: [],
+  };
+}
+
+async function rangeEndsWithNewline(
+  handle: FileHandle,
+  endOffset: number,
+  emptyFallback: boolean,
+): Promise<boolean> {
+  if (endOffset === 0) return false;
+  const byte = Buffer.allocUnsafe(1);
+  const { bytesRead } = await handle.read(byte, 0, 1, endOffset - 1);
+  return bytesRead === 0 ? emptyFallback : byte[0] === 0x0a;
+}
+
+export async function readClaudeParserState(options: {
+  sourcePath: string;
+  fileHandle: FileHandle;
+  range?: { start_offset: number; starting_line: number };
+  seed?: ClaudeParserStateV1;
+  budgets?: Partial<ParserReadBudgets>;
+  signal?: AbortSignal;
+}): Promise<ParserStateReadResult<ClaudeParserStateV1>> {
+  const seed = options.seed === undefined
+    ? undefined
+    : normalizeClaudeParserState(options.seed);
+  const startOffset = options.range?.start_offset ?? 0;
+  const startingLine = options.range?.starting_line ?? 1;
+  if (
+    (seed === undefined && (startOffset !== 0 || startingLine !== 1)) ||
+    (seed !== undefined && (
+      seed.canonical_path !== options.sourcePath ||
+      seed.parsed_offset !== startOffset ||
+      seed.line_count + 1 !== startingLine
+    ))
+  ) throw new TypeError("Claude parser seed/range is inconsistent.");
+  const configured = new JsonlBudgetTracker({
+    ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  });
+  const remainingFileBytes = Math.max(
+    0,
+    configured.budgets.maxFileBytes - startOffset,
+  );
+  const tracker = new JsonlBudgetTracker({
+    budgets: { ...options.budgets, maxFileBytes: remainingFileBytes },
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  });
+  const stat = await options.fileHandle.stat();
+  const rows = seed?.rows ?? [];
+  const warnings = seed?.warnings ?? [];
+  const initialSkeletonBytes = canonicalJsonBytes(claudeStateSkeleton(
+    options.sourcePath,
+    startOffset,
+    seed?.line_count ?? 0,
+    seed?.ends_with_newline ?? false,
+  ));
+  const stateCapacity = new IncrementalParserStateByteTracker(
+    initialSkeletonBytes,
+  );
+  for (let index = 0; index < rows.length; index += 1) {
+    stateCapacity.addArrayItem(rows[index], index);
+  }
+  for (let index = 0; index < warnings.length; index += 1) {
+    stateCapacity.addArrayItem(warnings[index], index);
+  }
+  const pushStateWarning = (fact: ParserStateWarningV1): void => {
+    stateCapacity.addArrayItem(fact, warnings.length);
+    warnings.push(fact);
+  };
+  let warningOrder = warnings.length;
+  let readStopIndex = 0;
+  const pushReadStops = (): void => {
+    while (readStopIndex < tracker.readStops.length) {
+      const error = tracker.readStops[readStopIndex]!;
+      pushStateWarning(warningFact(
+        parserBudgetWarning(options.sourcePath, error),
+        warningOrder,
+      ));
+      warningOrder += 1;
+      readStopIndex += 1;
+    }
+  };
+  let lastLine = seed?.line_count ?? 0;
+  const iterator = boundedJsonlLines(options.sourcePath, tracker, {
+    file_handle: options.fileHandle,
+    start_offset: startOffset,
+    starting_line: startingLine,
+  });
+  let receipt: SourceReadReceipt | undefined;
+  let iterationFailed = false;
+  try {
+    while (true) {
+      const next = await iterator.next();
+      pushReadStops();
+      if (next.done) {
+        receipt = next.value;
+        break;
+      }
+      const inputLine = next.value;
+      const { text: rawLine, bytes: rawBytes, line } = inputLine;
+      lastLine = line;
+      const pushWarning = (
+        pending: PendingWarning,
+        timestampMs?: number,
+      ): void => {
+        pushStateWarning(warningFact(pending, warningOrder, timestampMs));
+        warningOrder += 1;
+      };
+      if (rawLine.trim().length === 0) {
+        pushWarning(warning(
+          options.sourcePath,
+          "empty_line",
+          "Ignored an empty JSONL row.",
+          { line },
+        ));
+        continue;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(rawLine) as unknown;
+      } catch {
+        pushWarning(warning(
+          options.sourcePath,
+          "invalid_json",
+          "Ignored malformed JSON.",
+          { line },
+        ));
+        continue;
+      }
+      if (!isRecord(parsed)) {
+        pushWarning(warning(
+          options.sourcePath,
+          "invalid_row",
+          "JSONL row is not an object.",
+          { line },
+        ));
+        continue;
+      }
+      const timestampMs = parseTimestamp(parsed.timestamp);
+      try {
+        tracker.assertNodes(parsed, line);
+      } catch (error) {
+        tracker.throwIfAborted();
+        if (!(error instanceof ParserBudgetExceededError)) throw error;
+        pushWarning(parserBudgetWarning(options.sourcePath, error), timestampMs);
+        continue;
+      }
+      if (timestampMs === undefined) {
+        const sessionId = nonEmptyString(parsed.sessionId);
+        const rowType = nonEmptyString(parsed.type);
+        const isKnownAuxiliaryRow =
+          rowType !== undefined && KNOWN_AUXILIARY_ROW_TYPES.has(rowType);
+        if (sessionId === undefined) {
+          pushWarning(warning(
+            options.sourcePath,
+            "missing_session_id",
+            "Ignored a row without a sessionId.",
+            { line },
+          ));
+        } else if (!isKnownAuxiliaryRow) {
+          pushWarning(warning(
+            options.sourcePath,
+            "invalid_timestamp",
+            "Ignored a row with an invalid timestamp.",
+            { line, sessionId },
+          ));
+        }
+        continue;
+      }
+      const sessionId = nonEmptyString(parsed.sessionId);
+      if (sessionId === undefined) {
+        pushWarning(warning(
+          options.sourcePath,
+          "missing_session_id",
+          "Ignored a row without a sessionId.",
+          { line },
+        ), timestampMs);
+        continue;
+      }
+      const rowType = nonEmptyString(parsed.type);
+      const isKnownAuxiliaryRow =
+        rowType !== undefined && KNOWN_AUXILIARY_ROW_TYPES.has(rowType);
+      const sourceIndex = line - 1;
+      const observedUuid = nonEmptyString(parsed.uuid);
+      const entryUuid = observedUuid ??
+        `${sessionId}:source-${sourceIndex.toString(10)}`;
+      const cwd = nonEmptyString(parsed.cwd);
+      const branch = nonEmptyString(parsed.gitBranch);
+      const parentUuid = nonEmptyString(parsed.parentUuid);
+      const agentId = nonEmptyString(parsed.agentId);
+      const toolResults = ingestToolResults(parsed);
+      const compacted = compactRowValue(parsed, toolResults);
+      const range = jsonlLinePhysicalRange(inputLine);
+      const stateRow: ClaudeStateRowV1 = {
+        kind: "claude-row-v1",
+        original_bytes: rawBytes,
+        byte_start: range.byte_start,
+        byte_end: range.byte_end,
+        line,
+        timestamp_ms: timestampMs,
+        source_index: sourceIndex,
+        session_id: sessionId,
+        entry_uuid: entryUuid,
+        has_synthetic_uuid: observedUuid === undefined,
+        cwd: cwd ?? null,
+        branch: branch ?? null,
+        parent_uuid: parentUuid ?? null,
+        agent_id: agentId ?? null,
+        is_sidechain: parsed.isSidechain === true,
+        value: compacted.value,
+        tool_results: toolResults.map(stateToolResult),
+      };
+      stateCapacity.addArrayItem(stateRow, rows.length);
+      rows.push(stateRow);
+      const parsedRow: ParsedRow = {
+        value: compacted.value as unknown as UnknownRecord,
+        toolResults,
+        sessionId,
+        timestampMs,
+        entryUuid,
+        hasSyntheticUuid: observedUuid === undefined,
+        sourceIndex,
+        line,
+        isSidechain: parsed.isSidechain === true,
+        ...(cwd === undefined ? {} : { cwd }),
+        ...(branch === undefined ? {} : { branch }),
+        ...(parentUuid === undefined ? {} : { parentUuid }),
+        ...(agentId === undefined ? {} : { agentId }),
+      };
+      if (compacted.discardedPayload) {
+        pushWarning(warning(
+          options.sourcePath,
+          "content_payload_compacted",
+          `Discarded ${compacted.discardedPayloadBytes.toString(10)} UTF-8 bytes from an unrecognized message content payload.`,
+          { line, row: parsedRow },
+        ), timestampMs);
+      }
+      if (observedUuid === undefined && !isKnownAuxiliaryRow) {
+        pushWarning(warning(
+          options.sourcePath,
+          "missing_entry_uuid",
+          "Used a deterministic entry UUID fallback.",
+          { row: parsedRow },
+        ), timestampMs);
+      }
+    }
+  } catch (error) {
+    iterationFailed = true;
+    throw error;
+  } finally {
+    if (receipt === undefined) {
+      try {
+        await iterator.return(undefined as never);
+      } catch (error) {
+        if (!iterationFailed) throw error;
+      }
+    }
+  }
+  if (receipt === undefined) throw new TypeError("Missing Claude read receipt.");
+  lastLine = Math.max(lastLine, tracker.lastPhysicalLine);
+  const completeness = receipt.end_offset === stat.size ? "complete" : "partial";
+  if (
+    completeness === "partial" &&
+    !tracker.readStops.some((error) => error.budget === "file")
+  ) {
+    const error = new ParserBudgetExceededError("file", lastLine + 1);
+    pushStateWarning(warningFact(
+      parserBudgetWarning(options.sourcePath, error),
+      warningOrder,
+    ));
+  }
+  const endsWithNewline = await rangeEndsWithNewline(
+    options.fileHandle,
+    receipt.end_offset,
+    seed?.ends_with_newline ?? false,
+  );
+  const finalSkeletonBytes = canonicalJsonBytes(claudeStateSkeleton(
+    options.sourcePath,
+    receipt.end_offset,
+    lastLine,
+    endsWithNewline,
+  ));
+  stateCapacity.replaceBytes(initialSkeletonBytes, finalSkeletonBytes);
+  const indexes = buildClaudeIndexes(rows, stateCapacity);
+  const state: ClaudeParserStateV1 = {
+    kind: "claude-state-v1",
+    canonical_path: options.sourcePath,
+    parsed_offset: receipt.end_offset,
+    line_count: lastLine,
+    ends_with_newline: endsWithNewline,
+    rows,
+    ...indexes,
+    warnings,
+  };
+  return { state, receipt, completeness };
+}
+
 async function readRows(
   sourcePath: string,
   options: ClaudeTranscriptParseOptions,
+  fileHandle: FileHandle,
 ): Promise<{ rows: ParsedRow[]; warnings: PendingWarning[];
   tracker: JsonlBudgetTracker }> {
   const tracker = new JsonlBudgetTracker(options);
@@ -861,9 +1945,24 @@ async function readRows(
       "Suppressed further parser warnings after reaching maxWarnings.",
     ),
   );
+  let readStopIndex = 0;
+  const pushReadStops = (): void => {
+    while (readStopIndex < tracker.readStops.length) {
+      warnings.push(parserBudgetWarning(
+        sourcePath,
+        tracker.readStops[readStopIndex]!,
+      ));
+      readStopIndex += 1;
+    }
+  };
 
   try {
-    for await (const inputLine of boundedJsonlLines(sourcePath, tracker)) {
+    for await (const inputLine of boundedJsonlLines(sourcePath, tracker, {
+      file_handle: fileHandle,
+      start_offset: 0,
+      starting_line: 1,
+    })) {
+      pushReadStops();
       const { text: rawLine, bytes: rawBytes, line } = inputLine;
     if (rawLine.trim().length === 0) {
       warnings.push(
@@ -956,7 +2055,7 @@ async function readRows(
     const toolResults = ingestToolResults(parsed);
     const compacted = compactRowValue(parsed, toolResults);
     const row: ParsedRow = {
-      value: compacted.value,
+      value: compacted.value as unknown as UnknownRecord,
       toolResults,
       sessionId,
       timestampMs,
@@ -992,6 +2091,7 @@ async function readRows(
       );
     }
     }
+    pushReadStops();
   } catch (error) {
     tracker.throwIfAborted();
     if (!(error instanceof ParserBudgetExceededError)) throw error;
@@ -1712,11 +2812,113 @@ function normalizeSession(
   };
 }
 
-export async function parseClaudeTranscriptDetailed(
+export function projectClaudeParserState(
+  value: ClaudeParserStateV1,
+  options: {
+    endedAtMs?: number;
+    budgets?: Partial<ParserProjectionBudgets>;
+    signal?: AbortSignal;
+    onAgentAncestryStep?(): void;
+    onAssistantPrefixProbe?(): void;
+  } = {},
+): ClaudeTranscriptParseResult {
+  const state = normalizeClaudeParserState(value);
+  const tracker = new JsonlBudgetTracker({
+    ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  });
+  const admittedRows: ParsedRow[] = [];
+  let retainedFailure: ParserBudgetExceededError | undefined;
+  for (const row of state.rows) {
+    tracker.throwIfAborted();
+    if (options.endedAtMs !== undefined && row.timestamp_ms > options.endedAtMs) {
+      continue;
+    }
+    try {
+      tracker.retain(row.original_bytes, row.line);
+    } catch (error) {
+      tracker.throwIfAborted();
+      if (!(error instanceof ParserBudgetExceededError)) throw error;
+      retainedFailure = error;
+      break;
+    }
+    admittedRows.push({
+      value: structuredClone(row.value) as unknown as UnknownRecord,
+      toolResults: row.tool_results.map(parsedToolResult),
+      sessionId: row.session_id,
+      timestampMs: row.timestamp_ms,
+      entryUuid: row.entry_uuid,
+      hasSyntheticUuid: row.has_synthetic_uuid,
+      sourceIndex: row.source_index,
+      line: row.line,
+      isSidechain: row.is_sidechain,
+      ...(row.cwd === null ? {} : { cwd: row.cwd }),
+      ...(row.branch === null ? {} : { branch: row.branch }),
+      ...(row.parent_uuid === null ? {} : { parentUuid: row.parent_uuid }),
+      ...(row.agent_id === null ? {} : { agentId: row.agent_id }),
+    });
+  }
+  const warnings = boundedWarnings<PendingWarning>(
+    tracker.budgets.maxWarnings,
+    () => warning(
+      state.canonical_path,
+      "parser_warning_budget_exceeded",
+      "Suppressed further parser warnings after reaching maxWarnings.",
+    ),
+  );
+  for (const fact of state.warnings) {
+    const applicable = fact.applicability.kind === "unconditional" ||
+      options.endedAtMs === undefined ||
+      fact.applicability.timestamp_ms <= options.endedAtMs;
+    const beforeRetainedStop = retainedFailure === undefined ||
+      fact.warning.line === undefined ||
+      fact.warning.line < (retainedFailure.line ?? Number.MAX_SAFE_INTEGER);
+    if (!applicable || !beforeRetainedStop) continue;
+    warnings.push({
+      ...structuredClone(fact.warning),
+      ...(fact.target_session_id === null
+        ? {}
+        : { targetSessionId: fact.target_session_id }),
+    });
+  }
+  if (retainedFailure !== undefined) {
+    warnings.push(parserBudgetWarning(state.canonical_path, retainedFailure));
+  }
+  const grouped = new Map<string, ParsedRow[]>();
+  for (const row of admittedRows) {
+    const group = grouped.get(row.sessionId);
+    if (group === undefined) grouped.set(row.sessionId, [row]);
+    else group.push(row);
+  }
+  const sessions: Session[] = [];
+  for (const sessionRows of grouped.values()) {
+    tracker.throwIfAborted();
+    const session = normalizeSession(
+      state.canonical_path,
+      sessionRows,
+      warnings,
+      options,
+    );
+    if (session !== undefined) sessions.push(session);
+  }
+  return {
+    sessions,
+    warnings: warnings.map(
+      ({ targetSessionId: _targetSessionId, ...sourceWarning }) => sourceWarning,
+    ),
+  };
+}
+
+async function parseClaudeTranscriptDetailedLegacy(
   sourcePath: string,
-  instrumentation: ClaudeTranscriptParseOptions = {},
+  instrumentation: ClaudeTranscriptParseOptions,
+  fileHandle: FileHandle,
 ): Promise<ClaudeTranscriptParseResult> {
-  const { rows, warnings, tracker } = await readRows(sourcePath, instrumentation);
+  const { rows, warnings, tracker } = await readRows(
+    sourcePath,
+    instrumentation,
+    fileHandle,
+  );
   const grouped = new Map<string, ParsedRow[]>();
   for (const row of rows) {
     tracker.throwIfAborted();
@@ -1746,6 +2948,53 @@ export async function parseClaudeTranscriptDetailed(
         sourceWarning,
     ),
   };
+}
+
+export async function parseClaudeTranscriptDetailed(
+  sourcePath: string,
+  instrumentation: ClaudeTranscriptParseOptions = {},
+): Promise<ClaudeTranscriptParseResult> {
+  const fileHandle = await openFile(sourcePath, "r");
+  try {
+    try {
+      const read = await readClaudeParserState({
+        sourcePath,
+        fileHandle,
+        ...(instrumentation.budgets === undefined
+          ? {}
+          : { budgets: instrumentation.budgets }),
+        ...(instrumentation.signal === undefined
+          ? {}
+          : { signal: instrumentation.signal }),
+      });
+      return projectClaudeParserState(read.state, {
+        ...(instrumentation.endedAtMs === undefined
+          ? {}
+          : { endedAtMs: instrumentation.endedAtMs }),
+        ...(instrumentation.budgets === undefined
+          ? {}
+          : { budgets: instrumentation.budgets }),
+        ...(instrumentation.signal === undefined
+          ? {}
+          : { signal: instrumentation.signal }),
+        ...(instrumentation.onAgentAncestryStep === undefined
+          ? {}
+          : { onAgentAncestryStep: instrumentation.onAgentAncestryStep }),
+        ...(instrumentation.onAssistantPrefixProbe === undefined
+          ? {}
+          : { onAssistantPrefixProbe: instrumentation.onAssistantPrefixProbe }),
+      });
+    } catch (error) {
+      if (!(error instanceof IncrementalParserStateCapacityError)) throw error;
+      return await parseClaudeTranscriptDetailedLegacy(
+        sourcePath,
+        instrumentation,
+        fileHandle,
+      );
+    }
+  } finally {
+    await fileHandle.close();
+  }
 }
 
 export async function parseClaudeTranscript(

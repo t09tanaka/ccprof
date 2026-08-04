@@ -1,4 +1,6 @@
+import { open as openFile, type FileHandle } from "node:fs/promises";
 import { basename } from "node:path";
+import { types as utilTypes } from "node:util";
 
 import {
   makeSessionRef,
@@ -6,6 +8,7 @@ import {
   type Confidence,
   type GenuineUserEvent,
   type JsonObject,
+  type JsonValue,
   type NormalizedEvent,
   type ResultStatusEvidence,
   type Session,
@@ -18,10 +21,26 @@ import {
   boundedJsonlLines,
   boundedWarnings,
   budgetWarningCode,
+  canonicalJsonBytes,
+  canonicalJsonStringBytes,
+  IncrementalParserStateCapacityError,
+  IncrementalParserStateByteTracker,
+  jsonlLinePhysicalRange,
   JsonlBudgetTracker,
   ParserBudgetExceededError,
   type JsonlParserControls,
+  type ParserBudget,
+  type ParserProjectionBudgets,
+  type ParserReadBudgets,
+  type ParserStateReadResult,
+  type ParserStateRowBaseV1,
+  type ParserStateWarningV1,
+  type SourceReadReceipt,
 } from "../jsonl-budget.js";
+
+export { PARSER_STATE_SCHEMA_FINGERPRINT } from "../jsonl-budget.js";
+
+export const CODEX_PARSER_VERSION = "2.0.0";
 
 /**
  * Codex rollout logs are one JSON object per line:
@@ -64,6 +83,82 @@ interface ParsedRow {
   line: number;
 }
 
+interface CodexStateRowCommonV1 extends ParserStateRowBaseV1 {
+  kind: "codex-row-v1";
+  argument_budget: Extract<ParserBudget, "node" | "depth"> | null;
+}
+
+export type CodexStateTextFieldV1 =
+  | { kind: "missing" }
+  | { kind: "invalid" }
+  | { kind: "text"; value: string };
+
+export interface CodexStateSessionMetaPayloadV1 {
+  kind: "session_meta";
+  session_id: string | null;
+  cwd: string | null;
+  branch: string | null;
+}
+
+export interface CodexStateMessagePayloadV1 {
+  kind: "message";
+  role: string | null;
+  content: string;
+}
+
+export interface CodexStateFunctionCallPayloadV1 {
+  kind: "function_call";
+  name: string | null;
+  call_id: string | null;
+  arguments: CodexStateTextFieldV1;
+}
+
+export interface CodexStateFunctionOutputPayloadV1 {
+  kind: "function_call_output";
+  call_id: string | null;
+  output: CodexStateTextFieldV1;
+}
+
+export interface CodexStateUnknownPayloadV1 {
+  kind: "unknown";
+  subtype: string | null;
+}
+
+export interface CodexStateAuxiliaryPayloadV1 {
+  kind: "auxiliary";
+}
+
+export type CodexStateResponsePayloadV1 =
+  | CodexStateMessagePayloadV1
+  | CodexStateFunctionCallPayloadV1
+  | CodexStateFunctionOutputPayloadV1
+  | CodexStateUnknownPayloadV1;
+
+export type CodexStateRowV1 = CodexStateRowCommonV1 & (
+  | { type: "session_meta"; payload: CodexStateSessionMetaPayloadV1 }
+  | { type: "response_item"; payload: CodexStateResponsePayloadV1 }
+  | { type: "auxiliary"; payload: CodexStateAuxiliaryPayloadV1 }
+);
+
+export interface CodexSessionMetadataV1 {
+  session_id: string;
+  cwd: string | null;
+  branch: string | null;
+  line: number;
+}
+
+export interface CodexParserStateV1 {
+  kind: "codex-state-v1";
+  canonical_path: string;
+  parsed_offset: number;
+  line_count: number;
+  ends_with_newline: boolean;
+  rows: CodexStateRowV1[];
+  session_metadata: CodexSessionMetadataV1 | null;
+  seen_subtypes: string[];
+  warnings: ParserStateWarningV1[];
+}
+
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -104,8 +199,790 @@ function fileNameStem(sourcePath: string): string {
   return dot > 0 ? base.slice(0, dot) : base;
 }
 
+function snapshotCodexJson(
+  value: unknown,
+  capacity: IncrementalParserStateByteTracker,
+  depth = 0,
+): JsonValue {
+  if (depth > 256) throw new TypeError("Parser state is too deeply nested.");
+  if (value === null) {
+    capacity.addBytes(4);
+    return value;
+  }
+  if (typeof value === "string") {
+    capacity.addBytes(canonicalJsonStringBytes(value));
+    return value;
+  }
+  if (typeof value === "boolean") {
+    capacity.addBytes(value ? 4 : 5);
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("Invalid parser-state number.");
+    capacity.addBytes(canonicalJsonBytes(value));
+    return value;
+  }
+  if (typeof value !== "object" || value === undefined) {
+    throw new TypeError("Invalid parser-state value.");
+  }
+  if (utilTypes.isProxy(value)) {
+    throw new TypeError("Parser-state proxies are forbidden.");
+  }
+  if (Array.isArray(value)) {
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const keys = Reflect.ownKeys(descriptors);
+    if (
+      keys.length !== value.length + 1 ||
+      keys.some((key) =>
+        key !== "length" && (
+          typeof key !== "string" ||
+          !Number.isSafeInteger(Number(key)) ||
+          Number(key) < 0 || Number(key) >= value.length ||
+          Number(key).toString(10) !== key
+        )
+      )
+    ) throw new TypeError("Parser-state arrays have invalid properties.");
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = descriptors[index.toString(10)];
+      if (
+        descriptor === undefined || !("value" in descriptor) ||
+        descriptor.enumerable !== true
+      ) {
+        throw new TypeError("Parser-state arrays must be dense data arrays.");
+      }
+    }
+    capacity.addBytes(1);
+    const result: JsonValue[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      if (index > 0) capacity.addBytes(1);
+      const descriptor = descriptors[index.toString(10)]!;
+      result.push(snapshotCodexJson(
+        descriptor.value,
+        capacity,
+        depth + 1,
+      ));
+    }
+    capacity.addBytes(1);
+    return result;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError("Parser-state objects must be plain objects.");
+  }
+  const result = Object.create(null) as JsonObject;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const keys = Reflect.ownKeys(descriptors);
+  capacity.addBytes(1);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index]!;
+    if (typeof key !== "string") {
+      throw new TypeError("Parser-state symbol properties are forbidden.");
+    }
+    const descriptor = descriptors[key];
+    if (
+      descriptor === undefined || !("value" in descriptor) ||
+      descriptor.enumerable !== true
+    ) {
+      throw new TypeError("Parser-state properties must be enumerable data fields.");
+    }
+    if (index > 0) capacity.addBytes(1);
+    capacity.addBytes(canonicalJsonStringBytes(key) + 1);
+    Object.defineProperty(result, key, {
+      value: snapshotCodexJson(descriptor.value, capacity, depth + 1),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  capacity.addBytes(1);
+  return result;
+}
+
+function codexExactKeys(
+  value: UnknownRecord,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): void {
+  const keys = Object.keys(value).sort();
+  const allowed = [...required, ...optional].sort();
+  if (
+    keys.some((key) => !allowed.includes(key)) ||
+    required.some((key) => !keys.includes(key))
+  ) throw new TypeError("Parser state has an invalid field set.");
+}
+
+function codexNonnegativeInteger(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new TypeError("Parser-state integer is invalid.");
+  }
+  return value as number;
+}
+
+function codexSafeInteger(value: unknown): number {
+  if (!Number.isSafeInteger(value)) {
+    throw new TypeError("Parser-state integer is invalid.");
+  }
+  return value as number;
+}
+
+function codexStateString(value: unknown): string;
+function codexStateString(value: unknown, nullable: true): string | null;
+function codexStateString(value: unknown, nullable = false): string | null {
+  if (nullable && value === null) return null;
+  if (typeof value !== "string" || value.includes("\0")) {
+    throw new TypeError("Parser-state text is invalid.");
+  }
+  return value;
+}
+
+function codexStatePayloadText(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new TypeError("Parser-state payload text is invalid.");
+  }
+  return value;
+}
+
+function validateCodexWarningFact(value: unknown, expectedOrder: number): void {
+  if (!isRecord(value)) throw new TypeError("Invalid parser-state warning fact.");
+  codexExactKeys(value, [
+    "order", "applicability", "scope", "target_session_id", "warning",
+  ]);
+  if (codexNonnegativeInteger(value.order) !== expectedOrder) {
+    throw new TypeError("Parser-state warning order is invalid.");
+  }
+  if (!isRecord(value.applicability)) {
+    throw new TypeError("Invalid parser-state warning applicability.");
+  }
+  if (value.applicability.kind === "unconditional") {
+    codexExactKeys(value.applicability, ["kind"]);
+  } else if (value.applicability.kind === "timestamp") {
+    codexExactKeys(value.applicability, ["kind", "timestamp_ms"]);
+    codexSafeInteger(value.applicability.timestamp_ms);
+  } else {
+    throw new TypeError("Unknown parser-state warning applicability.");
+  }
+  if (value.scope !== "source" && value.scope !== "session") {
+    throw new TypeError("Invalid parser-state warning scope.");
+  }
+  codexStateString(value.target_session_id, true);
+  if (!isRecord(value.warning)) throw new TypeError("Invalid source warning.");
+  codexExactKeys(
+    value.warning,
+    ["code", "message", "source_path"],
+    ["line", "session_ref"],
+  );
+  codexStateString(value.warning.code);
+  codexStateString(value.warning.message);
+  codexStateString(value.warning.source_path);
+  if (value.warning.line !== undefined) {
+    codexNonnegativeInteger(value.warning.line);
+  }
+  if (value.warning.session_ref !== undefined) {
+    codexStateString(value.warning.session_ref);
+  }
+}
+
+function validateCodexTextField(value: unknown): void {
+  if (!isRecord(value)) throw new TypeError("Invalid Codex state text field.");
+  if (value.kind === "text") {
+    codexExactKeys(value, ["kind", "value"]);
+    codexStatePayloadText(value.value);
+    return;
+  }
+  if (value.kind === "missing" || value.kind === "invalid") {
+    codexExactKeys(value, ["kind"]);
+    return;
+  }
+  throw new TypeError("Unknown Codex state text field.");
+}
+
+function validateCodexStatePayload(type: unknown, value: unknown): void {
+  if (!isRecord(value)) throw new TypeError("Invalid Codex state payload.");
+  if (type === "session_meta") {
+    codexExactKeys(value, ["kind", "session_id", "cwd", "branch"]);
+    if (value.kind !== "session_meta") {
+      throw new TypeError("Invalid Codex session metadata payload.");
+    }
+    codexStateString(value.session_id, true);
+    codexStateString(value.cwd, true);
+    codexStateString(value.branch, true);
+    return;
+  }
+  if (type === "auxiliary") {
+    codexExactKeys(value, ["kind"]);
+    if (value.kind !== "auxiliary") {
+      throw new TypeError("Invalid Codex auxiliary payload.");
+    }
+    return;
+  }
+  if (type !== "response_item") {
+    throw new TypeError("Unknown Codex state row type.");
+  }
+  if (value.kind === "message") {
+    codexExactKeys(value, ["kind", "role", "content"]);
+    codexStateString(value.role, true);
+    codexStatePayloadText(value.content);
+    return;
+  }
+  if (value.kind === "function_call") {
+    codexExactKeys(value, ["kind", "name", "call_id", "arguments"]);
+    codexStateString(value.name, true);
+    codexStateString(value.call_id, true);
+    validateCodexTextField(value.arguments);
+    return;
+  }
+  if (value.kind === "function_call_output") {
+    codexExactKeys(value, ["kind", "call_id", "output"]);
+    codexStateString(value.call_id, true);
+    validateCodexTextField(value.output);
+    return;
+  }
+  if (value.kind === "unknown") {
+    codexExactKeys(value, ["kind", "subtype"]);
+    codexStateString(value.subtype, true);
+    return;
+  }
+  throw new TypeError("Unknown Codex response payload.");
+}
+
+function validateCodexDerivedState(
+  value: UnknownRecord,
+  rows: readonly CodexStateRowV1[],
+): void {
+  const metadata = value.session_metadata;
+  if (metadata !== null) {
+    if (!isRecord(metadata)) {
+      throw new TypeError("Invalid Codex session metadata.");
+    }
+    codexExactKeys(metadata, ["session_id", "cwd", "branch", "line"]);
+    codexStateString(metadata.session_id);
+    codexStateString(metadata.cwd, true);
+    codexStateString(metadata.branch, true);
+    codexNonnegativeInteger(metadata.line);
+  }
+  if (!Array.isArray(value.seen_subtypes)) {
+    throw new TypeError("Invalid Codex subtype index.");
+  }
+  for (const subtype of value.seen_subtypes) codexStateString(subtype);
+  if (new Set(value.seen_subtypes).size !== value.seen_subtypes.length) {
+    throw new TypeError("Codex subtype index is not canonical.");
+  }
+  const expectedMetadata = codexMetadata(rows);
+  const sameMetadata = metadata === null
+    ? expectedMetadata === null
+    : expectedMetadata !== null &&
+      metadata.session_id === expectedMetadata.session_id &&
+      metadata.cwd === expectedMetadata.cwd &&
+      metadata.branch === expectedMetadata.branch &&
+      metadata.line === expectedMetadata.line;
+  const expectedSubtypes = codexSeenSubtypes(rows);
+  const sameSubtypes = value.seen_subtypes.length === expectedSubtypes.length &&
+    value.seen_subtypes.every((subtype, index) =>
+      subtype === expectedSubtypes[index]
+    );
+  if (!sameMetadata || !sameSubtypes) {
+    throw new TypeError("Codex derived parser state is not canonical.");
+  }
+}
+
+export function normalizeCodexParserState(value: unknown): CodexParserStateV1 {
+  const capacity = new IncrementalParserStateByteTracker();
+  const cloned = snapshotCodexJson(value, capacity);
+  if (!isRecord(cloned)) throw new TypeError("Codex parser state must be an object.");
+  codexExactKeys(cloned, [
+    "kind", "canonical_path", "parsed_offset", "line_count",
+    "ends_with_newline", "rows", "session_metadata", "seen_subtypes",
+    "warnings",
+  ]);
+  if (cloned.kind !== "codex-state-v1") {
+    throw new TypeError("Unknown Codex parser-state kind.");
+  }
+  codexStateString(cloned.canonical_path);
+  const parsedOffset = codexNonnegativeInteger(cloned.parsed_offset);
+  const lineCount = codexNonnegativeInteger(cloned.line_count);
+  if (typeof cloned.ends_with_newline !== "boolean") {
+    throw new TypeError("Invalid Codex newline state.");
+  }
+  if (
+    !Array.isArray(cloned.rows) || !Array.isArray(cloned.seen_subtypes) ||
+    !Array.isArray(cloned.warnings)
+  ) throw new TypeError("Invalid Codex parser-state collection.");
+  let previousLine = 0;
+  let previousEnd = 0;
+  for (const row of cloned.rows) {
+    if (!isRecord(row)) throw new TypeError("Invalid Codex state row.");
+    codexExactKeys(row, [
+      "kind", "original_bytes", "byte_start", "byte_end", "line",
+      "timestamp_ms", "type", "payload", "argument_budget",
+    ]);
+    if (row.kind !== "codex-row-v1") throw new TypeError("Unknown Codex row kind.");
+    const originalBytes = codexNonnegativeInteger(row.original_bytes);
+    const byteStart = codexNonnegativeInteger(row.byte_start);
+    const byteEnd = codexNonnegativeInteger(row.byte_end);
+    const line = codexNonnegativeInteger(row.line);
+    codexSafeInteger(row.timestamp_ms);
+    const terminatorBytes = byteEnd - byteStart - originalBytes;
+    const reachesProgress = byteEnd === parsedOffset;
+    if (
+      line < 1 || line <= previousLine || originalBytes === 0 ||
+      byteStart < previousEnd || byteEnd < byteStart ||
+      terminatorBytes < 0 || terminatorBytes > 2 ||
+      (terminatorBytes === 0 && !reachesProgress) ||
+      (reachesProgress &&
+        cloned.ends_with_newline !== (terminatorBytes > 0)) ||
+      byteEnd > parsedOffset
+    ) throw new TypeError("Inconsistent Codex physical row indexes.");
+    validateCodexStatePayload(row.type, row.payload);
+    if (
+      row.argument_budget !== null && row.argument_budget !== "node" &&
+      row.argument_budget !== "depth"
+    ) throw new TypeError("Invalid Codex argument budget marker.");
+    previousLine = line;
+    previousEnd = byteEnd;
+  }
+  if (previousLine > lineCount || previousEnd > parsedOffset) {
+    throw new TypeError("Codex parser-state progress is inconsistent.");
+  }
+  validateCodexDerivedState(
+    cloned,
+    cloned.rows as unknown as CodexStateRowV1[],
+  );
+  cloned.warnings.forEach((fact, index) =>
+    validateCodexWarningFact(fact, index)
+  );
+  return cloned as unknown as CodexParserStateV1;
+}
+
+function codexWarningFact(
+  warning: SourceWarning,
+  order: number,
+  timestampMs?: number,
+): ParserStateWarningV1 {
+  return {
+    order,
+    applicability: timestampMs === undefined
+      ? { kind: "unconditional" }
+      : { kind: "timestamp", timestamp_ms: timestampMs },
+    scope: "source",
+    target_session_id: null,
+    warning,
+  };
+}
+
+function codexStateTextField(value: unknown): CodexStateTextFieldV1 {
+  if (value === undefined) return { kind: "missing" };
+  if (typeof value === "string") return { kind: "text", value };
+  return { kind: "invalid" };
+}
+
+function compactCodexStatePayload(
+  type: string,
+  payload: UnknownRecord,
+): CodexStateRowV1["payload"] {
+  if (type === "session_meta") {
+    const git = isRecord(payload.git) ? payload.git : {};
+    return {
+      kind: "session_meta",
+      session_id: nonEmptyString(payload.id) ??
+        nonEmptyString(payload.session_id) ?? null,
+      cwd: nonEmptyString(payload.cwd) ?? null,
+      branch: nonEmptyString(git.branch) ?? null,
+    };
+  }
+  if (type !== "response_item") return { kind: "auxiliary" };
+  const subtype = nonEmptyString(payload.type);
+  if (subtype === "message") {
+    return {
+      kind: "message",
+      role: nonEmptyString(payload.role) ?? null,
+      content: extractMessageText(payload.content),
+    };
+  }
+  if (subtype === "function_call") {
+    return {
+      kind: "function_call",
+      name: nonEmptyString(payload.name) ?? null,
+      call_id: nonEmptyString(payload.call_id) ?? null,
+      arguments: codexStateTextField(payload.arguments),
+    };
+  }
+  if (subtype === "function_call_output") {
+    return {
+      kind: "function_call_output",
+      call_id: nonEmptyString(payload.call_id) ?? null,
+      output: codexStateTextField(payload.output),
+    };
+  }
+  return { kind: "unknown", subtype: subtype ?? null };
+}
+
+function codexParsedTextField(value: CodexStateTextFieldV1): unknown {
+  if (value.kind === "missing") return undefined;
+  if (value.kind === "invalid") return null;
+  return value.value;
+}
+
+function parsedCodexStatePayload(row: CodexStateRowV1): UnknownRecord {
+  if (row.type === "session_meta") {
+    return {
+      ...(row.payload.session_id === null
+        ? {}
+        : { id: row.payload.session_id }),
+      ...(row.payload.cwd === null ? {} : { cwd: row.payload.cwd }),
+      ...(row.payload.branch === null
+        ? {}
+        : { git: { branch: row.payload.branch } }),
+    };
+  }
+  if (row.type === "auxiliary") return {};
+  const payload = row.payload;
+  if (payload.kind === "message") {
+    return {
+      type: "message",
+      ...(payload.role === null ? {} : { role: payload.role }),
+      content: payload.content,
+    };
+  }
+  if (payload.kind === "function_call") {
+    const args = codexParsedTextField(payload.arguments);
+    return {
+      type: "function_call",
+      ...(payload.name === null ? {} : { name: payload.name }),
+      ...(payload.call_id === null ? {} : { call_id: payload.call_id }),
+      ...(args === undefined ? {} : { arguments: args }),
+    };
+  }
+  if (payload.kind === "function_call_output") {
+    const output = codexParsedTextField(payload.output);
+    return {
+      type: "function_call_output",
+      ...(payload.call_id === null ? {} : { call_id: payload.call_id }),
+      ...(output === undefined ? {} : { output }),
+    };
+  }
+  return payload.subtype === null ? {} : { type: payload.subtype };
+}
+
+function codexMetadata(rows: readonly CodexStateRowV1[]): CodexSessionMetadataV1 | null {
+  const row = rows.find((candidate): candidate is Extract<
+    CodexStateRowV1,
+    { type: "session_meta" }
+  > => candidate.type === "session_meta");
+  if (row === undefined) return null;
+  if (row.payload.session_id === null) return null;
+  return {
+    session_id: row.payload.session_id,
+    cwd: row.payload.cwd,
+    branch: row.payload.branch,
+    line: row.line,
+  };
+}
+
+function codexSeenSubtypes(rows: readonly CodexStateRowV1[]): string[] {
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (row.type !== "response_item" || row.payload.kind !== "unknown") continue;
+    const subtype = row.payload.subtype ?? undefined;
+    if (
+      subtype !== undefined && subtype !== "message" &&
+      subtype !== "function_call" && subtype !== "function_call_output" &&
+      !IGNORED_RESPONSE_ITEM_SUBTYPES.has(subtype)
+    ) seen.add(subtype);
+  }
+  return [...seen];
+}
+
+function codexStateSkeleton(
+  canonicalPath: string,
+  parsedOffset: number,
+  lineCount: number,
+  endsWithNewline: boolean,
+): CodexParserStateV1 {
+  return {
+    kind: "codex-state-v1",
+    canonical_path: canonicalPath,
+    parsed_offset: parsedOffset,
+    line_count: lineCount,
+    ends_with_newline: endsWithNewline,
+    rows: [],
+    session_metadata: null,
+    seen_subtypes: [],
+    warnings: [],
+  };
+}
+
+async function codexRangeEndsWithNewline(
+  handle: FileHandle,
+  endOffset: number,
+  emptyFallback: boolean,
+): Promise<boolean> {
+  if (endOffset === 0) return false;
+  const byte = Buffer.allocUnsafe(1);
+  const { bytesRead } = await handle.read(byte, 0, 1, endOffset - 1);
+  return bytesRead === 0 ? emptyFallback : byte[0] === 0x0a;
+}
+
+export async function readCodexParserState(options: {
+  sourcePath: string;
+  fileHandle: FileHandle;
+  range?: { start_offset: number; starting_line: number };
+  seed?: CodexParserStateV1;
+  budgets?: Partial<ParserReadBudgets>;
+  signal?: AbortSignal;
+}): Promise<ParserStateReadResult<CodexParserStateV1>> {
+  const seed = options.seed === undefined
+    ? undefined
+    : normalizeCodexParserState(options.seed);
+  const startOffset = options.range?.start_offset ?? 0;
+  const startingLine = options.range?.starting_line ?? 1;
+  if (
+    (seed === undefined && (startOffset !== 0 || startingLine !== 1)) ||
+    (seed !== undefined && (
+      seed.canonical_path !== options.sourcePath ||
+      seed.parsed_offset !== startOffset ||
+      seed.line_count + 1 !== startingLine
+    ))
+  ) throw new TypeError("Codex parser seed/range is inconsistent.");
+  const configured = new JsonlBudgetTracker({
+    ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  });
+  const tracker = new JsonlBudgetTracker({
+    budgets: {
+      ...options.budgets,
+      maxFileBytes: Math.max(0, configured.budgets.maxFileBytes - startOffset),
+    },
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  });
+  const stat = await options.fileHandle.stat();
+  const rows = seed?.rows ?? [];
+  const warnings = seed?.warnings ?? [];
+  const initialSkeletonBytes = canonicalJsonBytes(codexStateSkeleton(
+    options.sourcePath,
+    startOffset,
+    seed?.line_count ?? 0,
+    seed?.ends_with_newline ?? false,
+  ));
+  const stateCapacity = new IncrementalParserStateByteTracker(
+    initialSkeletonBytes,
+  );
+  for (let index = 0; index < rows.length; index += 1) {
+    stateCapacity.addArrayItem(rows[index], index);
+  }
+  for (let index = 0; index < warnings.length; index += 1) {
+    stateCapacity.addArrayItem(warnings[index], index);
+  }
+  const pushStateWarning = (fact: ParserStateWarningV1): void => {
+    stateCapacity.addArrayItem(fact, warnings.length);
+    warnings.push(fact);
+  };
+  let warningOrder = warnings.length;
+  let readStopIndex = 0;
+  const pushReadStops = (): void => {
+    while (readStopIndex < tracker.readStops.length) {
+      const error = tracker.readStops[readStopIndex]!;
+      pushStateWarning(codexWarningFact(warn(
+        options.sourcePath,
+        error.line,
+        budgetWarningCode(error),
+        error.message,
+      ), warningOrder));
+      warningOrder += 1;
+      readStopIndex += 1;
+    }
+  };
+  let lastLine = seed?.line_count ?? 0;
+  const iterator = boundedJsonlLines(options.sourcePath, tracker, {
+    file_handle: options.fileHandle,
+    start_offset: startOffset,
+    starting_line: startingLine,
+  });
+  let receipt: SourceReadReceipt | undefined;
+  let iterationFailed = false;
+  try {
+    while (true) {
+      const next = await iterator.next();
+      pushReadStops();
+      if (next.done) {
+        receipt = next.value;
+        break;
+      }
+      const inputLine = next.value;
+      const { text: rawLine, bytes: rawBytes, line } = inputLine;
+      lastLine = line;
+      const pushWarning = (value: SourceWarning, timestampMs?: number): void => {
+        pushStateWarning(codexWarningFact(value, warningOrder, timestampMs));
+        warningOrder += 1;
+      };
+      if (rawLine.trim().length === 0) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(rawLine) as unknown;
+      } catch {
+        pushWarning(warn(
+          options.sourcePath,
+          line,
+          "codex_row_invalid",
+          "Ignored malformed JSON row.",
+        ));
+        continue;
+      }
+      if (!isRecord(parsed)) {
+        pushWarning(warn(
+          options.sourcePath,
+          line,
+          "codex_row_invalid",
+          "Ignored a non-object JSON row.",
+        ));
+        continue;
+      }
+      const timestampMs = parseTimestamp(parsed.timestamp);
+      try {
+        tracker.assertNodes(parsed, line);
+      } catch (error) {
+        tracker.throwIfAborted();
+        if (!(error instanceof ParserBudgetExceededError)) throw error;
+        pushWarning(warn(
+          options.sourcePath,
+          error.line,
+          budgetWarningCode(error),
+          error.message,
+        ), timestampMs);
+        continue;
+      }
+      if (timestampMs === undefined) {
+        pushWarning(warn(
+          options.sourcePath,
+          line,
+          "codex_row_invalid",
+          "Ignored a row with an invalid or missing timestamp.",
+        ));
+        continue;
+      }
+      const type = nonEmptyString(parsed.type);
+      if (type === undefined) {
+        pushWarning(warn(
+          options.sourcePath,
+          line,
+          "codex_row_invalid",
+          "Ignored a row without a type.",
+        ), timestampMs);
+        continue;
+      }
+      if (!isRecord(parsed.payload)) {
+        pushWarning(warn(
+          options.sourcePath,
+          line,
+          "codex_row_invalid",
+          "Ignored a row without a payload object.",
+        ), timestampMs);
+        continue;
+      }
+      let argumentBudget: Extract<ParserBudget, "node" | "depth"> | null = null;
+      if (
+        type === "response_item" &&
+        parsed.payload.type === "function_call" &&
+        typeof parsed.payload.arguments === "string"
+      ) {
+        try {
+          const args: unknown = JSON.parse(parsed.payload.arguments);
+          tracker.assertNodes(args, line);
+        } catch (error) {
+          tracker.throwIfAborted();
+          if (error instanceof ParserBudgetExceededError) {
+            if (error.budget === "node" || error.budget === "depth") {
+              argumentBudget = error.budget;
+            }
+            pushWarning(warn(
+              options.sourcePath,
+              error.line,
+              budgetWarningCode(error),
+              error.message,
+            ), timestampMs);
+          }
+        }
+      }
+      const range = jsonlLinePhysicalRange(inputLine);
+      const stateRow = {
+        kind: "codex-row-v1",
+        original_bytes: rawBytes,
+        byte_start: range.byte_start,
+        byte_end: range.byte_end,
+        line,
+        timestamp_ms: timestampMs,
+        type: type === "session_meta" || type === "response_item"
+          ? type
+          : "auxiliary",
+        payload: compactCodexStatePayload(type, parsed.payload),
+        argument_budget: argumentBudget,
+      } as CodexStateRowV1;
+      stateCapacity.addArrayItem(stateRow, rows.length);
+      rows.push(stateRow);
+    }
+  } catch (error) {
+    iterationFailed = true;
+    throw error;
+  } finally {
+    if (receipt === undefined) {
+      try {
+        await iterator.return(undefined as never);
+      } catch (error) {
+        if (!iterationFailed) throw error;
+      }
+    }
+  }
+  if (receipt === undefined) throw new TypeError("Missing Codex read receipt.");
+  lastLine = Math.max(lastLine, tracker.lastPhysicalLine);
+  const completeness = receipt.end_offset === stat.size ? "complete" : "partial";
+  if (
+    completeness === "partial" &&
+    !tracker.readStops.some((error) => error.budget === "file")
+  ) {
+    const error = new ParserBudgetExceededError("file", lastLine + 1);
+    pushStateWarning(codexWarningFact(warn(
+      options.sourcePath,
+      error.line,
+      budgetWarningCode(error),
+      error.message,
+    ), warningOrder));
+  }
+  const endsWithNewline = await codexRangeEndsWithNewline(
+    options.fileHandle,
+    receipt.end_offset,
+    seed?.ends_with_newline ?? false,
+  );
+  const finalSkeletonBytes = canonicalJsonBytes(codexStateSkeleton(
+    options.sourcePath,
+    receipt.end_offset,
+    lastLine,
+    endsWithNewline,
+  ));
+  stateCapacity.replaceBytes(initialSkeletonBytes, finalSkeletonBytes);
+  const sessionMetadata = codexMetadata(rows);
+  if (sessionMetadata !== null) {
+    stateCapacity.replaceBytes(4, canonicalJsonBytes(sessionMetadata));
+  }
+  const seenSubtypes = codexSeenSubtypes(rows);
+  for (let index = 0; index < seenSubtypes.length; index += 1) {
+    stateCapacity.addArrayItem(seenSubtypes[index], index);
+  }
+  const state: CodexParserStateV1 = {
+    kind: "codex-state-v1",
+    canonical_path: options.sourcePath,
+    parsed_offset: receipt.end_offset,
+    line_count: lastLine,
+    ends_with_newline: endsWithNewline,
+    rows,
+    session_metadata: sessionMetadata,
+    seen_subtypes: seenSubtypes,
+    warnings,
+  };
+  return { state, receipt, completeness };
+}
+
 async function parseRows(
   options: ParseCodexSessionOptions,
+  fileHandle: FileHandle,
 ): Promise<{ rows: ParsedRow[]; warnings: SourceWarning[];
   tracker: JsonlBudgetTracker;
   firstBudgetError: ParserBudgetExceededError | undefined }> {
@@ -122,9 +999,25 @@ async function parseRows(
   );
   const rows: ParsedRow[] = [];
   let firstBudgetError: ParserBudgetExceededError | undefined;
+  let readStopIndex = 0;
+  const pushReadStops = (): void => {
+    while (readStopIndex < tracker.readStops.length) {
+      const error = tracker.readStops[readStopIndex]!;
+      firstBudgetError ??= error;
+      warnings.push(
+        warn(sourcePath, error.line, budgetWarningCode(error), error.message),
+      );
+      readStopIndex += 1;
+    }
+  };
 
   try {
-    for await (const inputLine of boundedJsonlLines(sourcePath, tracker)) {
+    for await (const inputLine of boundedJsonlLines(sourcePath, tracker, {
+      file_handle: fileHandle,
+      start_offset: 0,
+      starting_line: 1,
+    })) {
+      pushReadStops();
       const { text: rawLine, bytes: rawBytes, line } = inputLine;
     if (rawLine.trim().length === 0) {
       continue;
@@ -201,6 +1094,7 @@ async function parseRows(
     }
     rows.push({ type, payload: parsed.payload, timestampMs, line });
     }
+    pushReadStops();
   } catch (error) {
     tracker.throwIfAborted();
     if (!(error instanceof ParserBudgetExceededError)) throw error;
@@ -525,12 +1419,14 @@ function buildFunctionCallOutputEvent(
   };
 }
 
-export async function parseCodexSession(
-  options: ParseCodexSessionOptions,
-): Promise<Session | null> {
-  const { sourcePath } = options;
-  let { rows, warnings, tracker, firstBudgetError } = await parseRows(options);
-
+function projectCodexRows(
+  sourcePath: string,
+  rows: ParsedRow[],
+  warnings: SourceWarning[],
+  tracker: JsonlBudgetTracker,
+  initialBudgetError?: ParserBudgetExceededError,
+): Session | null {
+  let firstBudgetError = initialBudgetError;
   const sessionMetaRow = rows.find((row) => row.type === "session_meta");
   let sessionMetaId: string | undefined;
   let sessionMetaCwd: string | undefined;
@@ -660,4 +1556,144 @@ export async function parseCodexSession(
     warnings,
     capabilities: ["tool_timestamps", "edit_fragments"],
   };
+}
+
+function budgetErrorFromWarning(
+  warning: SourceWarning,
+): ParserBudgetExceededError | undefined {
+  const match = /^parser_(file|line|node|depth)_budget_exceeded$/u.exec(
+    warning.code,
+  );
+  if (match?.[1] === undefined) return undefined;
+  return new ParserBudgetExceededError(
+    match[1] as Extract<ParserBudget, "file" | "line" | "node" | "depth">,
+    warning.line,
+  );
+}
+
+export function projectCodexParserState(
+  value: CodexParserStateV1,
+  options: {
+    endedAtMs?: number;
+    budgets?: Partial<ParserProjectionBudgets>;
+    signal?: AbortSignal;
+  } = {},
+): Session | null {
+  const state = normalizeCodexParserState(value);
+  const tracker = new JsonlBudgetTracker({
+    ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  });
+  const rows: ParsedRow[] = [];
+  let retainedFailure: ParserBudgetExceededError | undefined;
+  let firstBudgetError: ParserBudgetExceededError | undefined;
+  for (const row of state.rows) {
+    tracker.throwIfAborted();
+    if (options.endedAtMs !== undefined && row.timestamp_ms > options.endedAtMs) {
+      continue;
+    }
+    try {
+      tracker.retain(row.original_bytes, row.line);
+    } catch (error) {
+      tracker.throwIfAborted();
+      if (!(error instanceof ParserBudgetExceededError)) throw error;
+      retainedFailure = error;
+      firstBudgetError ??= error;
+      break;
+    }
+    if (row.argument_budget !== null) {
+      firstBudgetError ??= new ParserBudgetExceededError(
+        row.argument_budget,
+        row.line,
+      );
+      continue;
+    }
+    rows.push({
+      type: row.type,
+      payload: parsedCodexStatePayload(row),
+      timestampMs: row.timestamp_ms,
+      line: row.line,
+    });
+  }
+  const warnings = boundedWarnings<SourceWarning>(
+    tracker.budgets.maxWarnings,
+    () => warn(
+      state.canonical_path,
+      undefined,
+      "parser_warning_budget_exceeded",
+      "Suppressed further parser warnings after reaching maxWarnings.",
+    ),
+  );
+  for (const fact of state.warnings) {
+    const applicable = fact.applicability.kind === "unconditional" ||
+      options.endedAtMs === undefined ||
+      fact.applicability.timestamp_ms <= options.endedAtMs;
+    const beforeRetainedStop = retainedFailure === undefined ||
+      fact.warning.line === undefined ||
+      fact.warning.line < (retainedFailure.line ?? Number.MAX_SAFE_INTEGER);
+    if (!applicable || !beforeRetainedStop) continue;
+    const sourceWarning = structuredClone(fact.warning);
+    warnings.push(sourceWarning);
+    firstBudgetError ??= budgetErrorFromWarning(sourceWarning);
+  }
+  if (retainedFailure !== undefined) {
+    warnings.push(warn(
+      state.canonical_path,
+      retainedFailure.line,
+      budgetWarningCode(retainedFailure),
+      retainedFailure.message,
+    ));
+  }
+  return projectCodexRows(
+    state.canonical_path,
+    rows,
+    warnings,
+    tracker,
+    firstBudgetError,
+  );
+}
+
+async function parseCodexSessionLegacy(
+  options: ParseCodexSessionOptions,
+  fileHandle: FileHandle,
+): Promise<Session | null> {
+  const { rows, warnings, tracker, firstBudgetError } = await parseRows(
+    options,
+    fileHandle,
+  );
+  return projectCodexRows(
+    options.sourcePath,
+    rows,
+    warnings,
+    tracker,
+    firstBudgetError,
+  );
+}
+
+export async function parseCodexSession(
+  options: ParseCodexSessionOptions,
+): Promise<Session | null> {
+  const fileHandle = await openFile(options.sourcePath, "r");
+  try {
+    try {
+      const read = await readCodexParserState({
+        sourcePath: options.sourcePath,
+        fileHandle,
+        ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      });
+      return projectCodexParserState(read.state, {
+        ...(options.endedAtMs === undefined
+          ? {}
+          : { endedAtMs: options.endedAtMs }),
+        ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      });
+    } catch (error) {
+      if (!(error instanceof IncrementalParserStateCapacityError)) throw error;
+      return await parseCodexSessionLegacy(options, fileHandle);
+    }
+  } finally {
+    await fileHandle.close();
+  }
 }
