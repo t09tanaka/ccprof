@@ -28,9 +28,10 @@ import {
   projectReportPrivacy,
   type PrivacyProfile,
 } from "../src/reporters/privacy.js";
-import type {
-  SessionQuery,
-  SessionSource,
+import {
+  CLAUDE_SESSION_SOURCE_CONTRACT,
+  type SessionQuery,
+  type SessionSource,
 } from "../src/sources/session-source.js";
 import { resolveStorePaths } from "../src/store/paths.js";
 import {
@@ -301,7 +302,10 @@ test("custom sources are backstopped to an exact event prefix without empty-resu
     const storePaths = await resolveStorePaths(repo, {
       env: { CCPROF_DATA_DIR: join(root, "data") },
     });
-    const source: SessionSource = { discover: async () => [session(repo)] };
+    const source: SessionSource = {
+      contract: CLAUDE_SESSION_SOURCE_CONTRACT,
+      discover: async () => [session(repo)],
+    };
     const options = {
       cwd: repo,
       pr: "main...feature",
@@ -351,6 +355,7 @@ test("custom sources cannot opt out of deterministic source and event admission"
     const later = identifiedSession(repo, "later", join(repo, "z.jsonl"));
     const sourceWithLegacyBypassFlag = {
       budgetCooperative: true,
+      contract: CLAUDE_SESSION_SOURCE_CONTRACT,
       discover: async () => [later, first],
     };
 
@@ -393,7 +398,10 @@ test("custom source budget order uses locale-independent code units", async () =
       pr: "main...feature",
       sinceMs: NOW_MS - 20 * 60_000,
       nowMs: NOW_MS,
-      sessionSource: { discover: async () => [lower, upper] },
+      sessionSource: {
+        contract: CLAUDE_SESSION_SOURCE_CONTRACT,
+        discover: async () => [lower, upper],
+      },
       storePaths,
       persist: false,
       budgets: budgets({ max_source_items: 1 }),
@@ -424,7 +432,10 @@ test("custom source evidence is not admitted after its discovery clock expires",
       pr: "main...feature",
       sinceMs: NOW_MS - 20 * 60_000,
       nowMs: NOW_MS,
-      sessionSource: { discover: async () => [session(repo)] },
+      sessionSource: {
+        contract: CLAUDE_SESSION_SOURCE_CONTRACT,
+        discover: async () => [session(repo)],
+      },
       storePaths,
       persist: false,
       budgets: budgets({ max_wall_ms: 0 }),
@@ -457,7 +468,10 @@ test("timeline-time exhaustion returns a partial result before the no-interval e
       pr: "main...feature",
       sinceMs: NOW_MS - 20 * 60_000,
       nowMs: NOW_MS,
-      sessionSource: { discover: async () => [session(repo, 1)] },
+      sessionSource: {
+        contract: CLAUDE_SESSION_SOURCE_CONTRACT,
+        discover: async () => [session(repo, 1)],
+      },
       storePaths,
       persist: false,
       budgets: budgets({ max_wall_ms: 0 }),
@@ -498,7 +512,10 @@ test("a complete budgeted persist:false run never creates or migrates the Store"
       pr: "main...feature",
       sinceMs: NOW_MS - 20 * 60_000,
       nowMs: NOW_MS,
-      sessionSource: { discover: async () => [session(repo)] },
+      sessionSource: {
+        contract: CLAUDE_SESSION_SOURCE_CONTRACT,
+        discover: async () => [session(repo)],
+      },
       storePaths,
       persist: false,
       budgets: budgets(),
@@ -533,7 +550,10 @@ test("legacy unbudgeted persist:false analysis retains Store-backed reads", asyn
       pr: "main...feature",
       sinceMs: NOW_MS - 20 * 60_000,
       nowMs: NOW_MS,
-      sessionSource: { discover: async () => [session(repo)] },
+      sessionSource: {
+        contract: CLAUDE_SESSION_SOURCE_CONTRACT,
+        discover: async () => [session(repo)],
+      },
       storePaths,
       persist: false,
     });
@@ -578,6 +598,7 @@ test("simultaneous wall and CPU exhaustion returns a stable empty partial result
       nowMs: NOW_MS,
       runner,
       sessionSource: {
+        contract: CLAUDE_SESSION_SOURCE_CONTRACT,
         discover: async () => {
           sourceCalls += 1;
           return [session(repo)];
@@ -613,6 +634,7 @@ test("a budgeted custom source failure returns content-free partial output", asy
       env: { CCPROF_DATA_DIR: join(root, "data") },
     });
     const source: SessionSource = {
+      contract: CLAUDE_SESSION_SOURCE_CONTRACT,
       discover: async () => {
         throw new Error("token-canary");
       },
@@ -651,7 +673,10 @@ test("persisted and non-persisted partial runs differ only in Store budget rows"
       cwd: repo,
       pr: "main...feature",
       sinceMs: NOW_MS - 20 * 60_000,
-      sessionSource: { discover: async () => [session(repo)] },
+      sessionSource: {
+        contract: CLAUDE_SESSION_SOURCE_CONTRACT,
+        discover: async () => [session(repo)],
+      },
       storePaths,
       budgets: budgets({ max_input_events: 1 }),
       budgetClock: steadyClock,

@@ -122,6 +122,8 @@ import { CodexSessionSource } from "../sources/codex/discover.js";
 import { CombinedSessionSource } from "../sources/combined.js";
 import {
   admitSessionEventPrefix,
+  isSessionSourceValidationError,
+  validateSessionSource,
   type SessionSource,
 } from "../sources/session-source.js";
 import {
@@ -164,7 +166,7 @@ export interface AnalyzeOptions {
   idleThresholdMs?: number;
   testMapPath?: string;
   testMap?: TestMap;
-  sessionSource?: SessionSource;
+  sessionSource?: SessionSource | CombinedSessionSource;
   claudeProjectsDirectory?: string;
   codexSessionsDirectory?: string;
   storePaths?: StorePaths;
@@ -790,7 +792,7 @@ async function resolveTestMap(
 function defaultSessionSource(
   options: AnalyzeOptions,
   onSourceError?: (error: unknown) => void,
-): SessionSource {
+): CombinedSessionSource {
   const projectsDirectory =
     options.claudeProjectsDirectory ??
     process.env.CCPROF_CLAUDE_PROJECTS_DIR ??
@@ -1301,6 +1303,12 @@ async function finishBudgetedPartialAnalysis(
 export async function analyze(
   options: AnalyzeOptions,
 ): Promise<AnalyzeResult> {
+  const injectedSource = options.sessionSource;
+  const combinedSnapshot = CombinedSessionSource.snapshotDirectInstance(
+    injectedSource,
+  );
+  const validatedSource = injectedSource === undefined
+    ? undefined : combinedSnapshot ?? validateSessionSource(injectedSource);
   const persist = options.persist ?? true;
   const budgetMeter = options.budgets === undefined
     ? undefined
@@ -1352,8 +1360,8 @@ export async function analyze(
   // future custom integration) keeps its original throw-propagates
   // behavior untouched.
   const sourceErrors: unknown[] = [];
-  const usingDefaultSource = options.sessionSource === undefined;
-  const source = options.sessionSource ??
+  const usingDefaultSource = validatedSource === undefined;
+  const source = validatedSource ??
     defaultSessionSource(options, (error) => sourceErrors.push(error));
   let discoveredSessions: Session[];
   try {
@@ -1369,7 +1377,9 @@ export async function analyze(
         : { analysisBudgetMeter: budgetMeter }),
     });
   } catch (error) {
-    if (budgetMeter === undefined) throw error;
+    if (
+      budgetMeter === undefined || isSessionSourceValidationError(error)
+    ) throw error;
     budgetMeter.recordSourceFailure();
     discoveredSessions = [];
   }

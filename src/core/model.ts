@@ -68,12 +68,10 @@ export type R001Cause =
   | "unknown";
 
 /**
- * Optional data a session source can supply. `undefined` on `Session.capabilities`
- * means "all of them" (full capabilities), matching existing single-source
- * (Claude) behavior exactly. A source that cannot provide a capability (for
- * example, Codex rollout logs lacking per-message token usage) declares a
- * narrower list so rules that structurally depend on it can be skipped
- * instead of misfiring.
+ * Data a session source can supply. New SessionSource adapters are normalized
+ * to an explicit list before analysis. `undefined` remains accepted only for
+ * legacy sessions and means all capabilities. A narrower list keeps rules
+ * that structurally depend on unavailable evidence from misfiring.
  */
 export type SessionCapability =
   | "tool_timestamps"
@@ -208,8 +206,8 @@ export interface Session {
   events: NormalizedEvent[];
   warnings: SourceWarning[];
   /**
-   * Data capabilities this session's source can supply. `undefined` means
-   * full capabilities (every existing constructor and test is unaffected).
+   * Data capabilities this session's source can supply. New analyses always
+   * set this explicitly; legacy `undefined` means full capabilities.
    */
   capabilities?: readonly SessionCapability[];
   /**
