@@ -3595,6 +3595,10 @@ test("complete analyses expose canonical audit identity without altering report 
       persisted.audit_identity.deterministic_digest,
       transient.audit_identity.deterministic_digest,
     );
+    assert.deepEqual(
+      transient.audit_identity.snapshot_identity,
+      persisted.audit_identity.snapshot_identity,
+    );
     for (const result of [persisted, transient]) {
       assert.equal(result.audit_identity.analysis_id, result.record.analysis_id);
       assert.equal(
