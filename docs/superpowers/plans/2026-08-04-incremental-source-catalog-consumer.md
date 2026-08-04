@@ -2,55 +2,57 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Reuse complete normalized Claude/Codex evidence from Store v5 for unchanged sources across CLI processes, and safely parse verified append-only suffixes without changing cold-analysis results.
+**Goal:** Persist query-independent Claude/Codex parser state and a safe directory cursor so unchanged sources survive CLI restarts without reparse or full recursive discovery, while every warm result remains canonically equivalent to a cold run.
 
-**Architecture:** Keep the existing exact-key `source_catalog` metadata contract unchanged and add a separately validated `source_evidence_cache` table. A catalog-first consumer probes known paths, reconciles bounded new files, validates revision-bound evidence, and falls back to a cold parse for every uncertain case. Parser range support and conservative adapter merges enable suffix-only work when canonical cold/full equivalence is provable.
+**Architecture:** Store v5 adds separate evidence and discovery-root tables without changing the exact `source_catalog` contract. Parsers first create closed, versioned, query-independent state from one no-follow file handle, then a shared projector applies `endedAtMs`. Discovery unions known and new candidates under one cold comparator before budgets; source evidence is committed atomically only after repository eligibility.
 
-**Tech Stack:** TypeScript ESM, Node.js streams/test runner, `better-sqlite3`, SQLite WAL, SHA-256, existing `AnalysisBudgetMeter`.
+**Tech Stack:** TypeScript ESM, Node.js `FileHandle`/streams/test runner, `better-sqlite3`, SQLite WAL, SHA-256, existing `AnalysisBudgetMeter`.
 
 ---
 
-## File map and scope budget
+## File map and approved scope
 
-Production files:
+Production:
 
-- Modify `src/store/sqlite.ts`: Store v5 table, migration, compatibility, and
-  existing permission boundary.
-- Create `src/store/source-evidence-cache.ts`: exact envelope/cache validation,
-  canonical digests, detached reads, and atomic catalog+cache writes.
-- Create `src/sources/incremental.ts`: source observation, cache decisions,
-  parser invocation, append merge, failure isolation, and runtime dependencies.
-- Modify `src/sources/jsonl-budget.ts`: bounded byte-start/global-line reader.
-- Modify `src/sources/claude/parser.ts`: parser-version constants and safe suffix
-  seed/result support.
-- Modify `src/sources/codex/parser.ts`: parser-version constants and safe suffix
-  seed/result support.
-- Modify `src/sources/claude/discover.ts`: catalog-first known paths and bounded
-  unknown-file reconciliation.
-- Modify `src/sources/codex/discover.ts`: catalog-first known paths and bounded
-  unknown-file reconciliation.
-- Modify `src/core/analyze.ts`: Store-path/runtime wiring, lifecycle, and budget
-  preserving default-source integration.
-- Modify `README.md`: persistent normalized-evidence sensitivity and current
-  Store protection boundary.
+- Modify `src/sources/jsonl-budget.ts`: same-handle range reads and byte digest
+  receipts.
+- Modify `src/sources/claude/parser.ts`: versioned query-independent state and
+  shared end-window projector.
+- Modify `src/sources/codex/parser.ts`: versioned query-independent state and
+  shared end-window projector.
+- Modify `src/store/sqlite.ts`: additive Store v5 migration for two tables.
+- Create `src/store/source-evidence-cache.ts`: strict foreign-bound evidence
+  envelope and atomic catalog/cache API.
+- Create `src/store/source-discovery.ts`: strict directory-root cursor API.
+- Create `src/sources/source-observation.ts`: no-follow handle, observation,
+  classification, receipts, and ABA checks.
+- Create `src/sources/incremental.ts`: prepare/project/eligibility-commit consumer
+  and append merge.
+- Modify `src/sources/claude/discover.ts`: cursor reconciliation and the unified
+  cold-ordered candidate set.
+- Modify `src/sources/codex/discover.ts`: cursor reconciliation and the unified
+  cold-ordered candidate set.
+- Modify `src/core/analyze.ts`: default-source lifecycle and dependency wiring.
+- Modify `README.md`: sensitive normalized-evidence boundary and missing future
+  controls.
 
-Test files:
+Tests:
 
-- Modify `test/store.test.ts`: v5 schema/migration/rollback/permissions.
-- Create `test/source-evidence-cache.test.ts`: strict cache API and hostile data.
-- Create `test/incremental-source-catalog.test.ts`: change matrix, restart reuse,
-  append equivalence, discovery, budgets, and failures.
+- Create `test/parser-state.test.ts`.
+- Modify `test/store.test.ts`.
+- Create `test/source-evidence-cache.test.ts`.
+- Create `test/source-discovery-cache.test.ts`.
+- Create `test/incremental-source-catalog.test.ts`.
+- Modify `test/docs.test.ts` only for the new disclosure contract.
 
-Documentation files are the matching design and this plan. Expected production
-change is 850–1,200 lines across ten files; expected test change is 700–1,000
-lines across three files. The user explicitly approved this scope. No queue,
-cron, outbox, lease, lock service, watcher, cache GC, or unrelated rule/report
-change is included.
+Together with this plan/design, expect 20 changed files, 1,600–2,200 production
+lines, and 1,400–2,000 test lines. The user explicitly approved the larger
+schema/design scope. Do not add a watcher, queue, cron, outbox, lease, lock
+service, GC/repair command, Report v3 field, rule, or CLI option.
 
-## Semantic impact inventory
+## Pre-change semantic inventory
 
-Before this plan was written, the TypeScript LanguageService reported zero
-semantic diagnostics and these reference counts:
+The TypeScript LanguageService reported zero semantic diagnostics and:
 
 ```text
 STORE_SCHEMA_VERSION             9 refs / 2 files
@@ -68,156 +70,150 @@ CodexSessionSource              14 refs / 4 files
 AnalyzeOptions                  13 refs / 3 files
 ```
 
-Keep existing call forms source-compatible by adding only optional parameters
-or new functions. Re-run LanguageService references and semantic diagnostics
-after every shared-signature task.
+Keep every current call form source-compatible. Before each shared signature
+change, delegate a fresh LanguageService reference/definition inventory; after
+it, delegate semantic diagnostics and require zero.
 
-### Task 1: Define Store v5 and cache API with failing tests
+## Complete API vocabulary
 
-**Files:**
+Tasks use only the following names and signatures. Tests may define local
+literal parser/schema strings before the production constants exist, so RED
+must fail for behavior rather than an unrelated missing test import.
 
-- Modify: `test/store.test.ts`
-- Create: `test/source-evidence-cache.test.ts`
-
-- [ ] **Step 1: Add populated v2/v3/v4 and fresh v0 migration assertions**
-
-Assert exact `source_evidence_cache` columns, `user_version = 5`, the
-`schema-v5-source-evidence-cache` marker, its foreign key, no unexpected index,
-and preservation of every pre-v5 row. The v4 fixture must contain a real
-`source_catalog` row so the migration proves no rewrite:
+### Parser/read contracts
 
 ```ts
-assert.equal(database.pragma("user_version", { simple: true }), 5);
-assert.deepEqual(tableColumns(database, "source_evidence_cache"), [
-  ["source_identity", "TEXT", 1],
-  ["adapter_id", "TEXT", 1],
-  ["content_revision", "TEXT", 1],
-  ["parser_version", "TEXT", 1],
-  ["schema_fingerprint", "TEXT", 1],
-  ["last_parsed_offset", "INTEGER", 1],
-  ["line_count", "INTEGER", 1],
-  ["ends_with_newline", "INTEGER", 1],
-  ["payload_json", "TEXT", 1],
-  ["payload_digest", "TEXT", 1],
-  ["descriptor_digest", "TEXT", 1],
-  ["sensitivity", "TEXT", 1],
-  ["retention_class", "TEXT", 1],
-  ["updated_at_ms", "INTEGER", 1],
-]);
-assert.equal(migrationNames(database).includes(
-  "schema-v5-source-evidence-cache",
-), true);
-```
-
-- [ ] **Step 2: Add rollback and idempotence assertions**
-
-Inject a failure after table creation but before marker/version update, then
-verify the v4 catalog row, schema version, and marker set are byte-for-byte
-unchanged. Open v5 twice and prove the second open adds no marker and mutates no
-row. Confirm versions 1, negative, and above 5 fail before mutation.
-
-- [ ] **Step 3: Define the exact evidence-cache contract**
-
-Use one valid Claude envelope and one valid Codex envelope. Assert strict
-rejection of null/arrays/exotic prototypes/accessors, unknown/symbol/non-
-enumerable fields, invalid event unions, unsafe integers, unknown capabilities,
-non-canonical ordering, raw-row fields, malformed digests, wrong sensitivity or
-retention labels, and payload/catalog mismatches. Assert errors contain a stable
-code but not `SECRET_CANARY`.
-
-```ts
-const envelope: SourceEvidenceEnvelopeV1 = {
-  schema_version: 1,
-  adapter_id: "codex",
-  sessions: [codexSession()],
-  parse_warnings: [],
-};
-const entry = makeSourceEvidenceCacheEntry({
-  source_identity: SOURCE_ID,
-  content_revision: HASH_A,
-  parser_version: CODEX_PARSER_VERSION,
-  schema_fingerprint: NORMALIZED_EVIDENCE_SCHEMA_FINGERPRINT,
-  last_parsed_offset: 128,
-  line_count: 3,
-  ends_with_newline: true,
-  envelope,
-  updated_at_ms: 1_000,
-});
-assert.deepEqual(validateSourceEvidenceCacheEntry(entry), entry);
-```
-
-- [ ] **Step 4: Define detached CRUD and atomic pair semantics**
-
-Cover insert/read/re-read cloning, exact replay, replacement, descriptor and
-payload digest recomputation, stale/equal-time conflict, corrupt direct SQL,
-foreign-key failure, and a trigger that aborts the cache insert after catalog
-upsert. After the trigger fires, assert both old catalog and old cache rows
-remain exactly unchanged.
-
-- [ ] **Step 5: Delegate RED verification**
-
-Delegate, do not run in the owner context:
-
-```sh
-npm run build:test
-node --test .test-dist/test/store.test.js .test-dist/test/source-evidence-cache.test.js
-```
-
-Expected RED: missing Store v5 schema/module/API assertions fail for only the
-new feature. Record exact test totals and failure reasons.
-
-- [ ] **Step 6: Commit RED tests separately**
-
-```sh
-git add test/store.test.ts test/source-evidence-cache.test.ts
-git commit -m "test(store): define normalized source evidence cache"
-```
-
-### Task 2: Implement Store v5 and strict normalized evidence persistence
-
-**Files:**
-
-- Modify: `src/store/sqlite.ts`
-- Create: `src/store/source-evidence-cache.ts`
-
-- [ ] **Step 1: Add the additive Store v5 migration**
-
-Set `STORE_SCHEMA_VERSION = 5`, retain explicit constants for versions 2–4,
-and apply missing migrations in order inside the current immediate transaction.
-Create the evidence table only after `source_catalog` exists. Use the fixed
-labels and cross-table foreign key described in the design.
-
-```ts
-export const SOURCE_EVIDENCE_CACHE_MIGRATION =
-  "schema-v5-source-evidence-cache";
-
-if (version < STORE_SCHEMA_V5) {
-  database.exec(SOURCE_EVIDENCE_CACHE_SCHEMA);
-  database.prepare(
-    "INSERT INTO store_migrations(name, completed_at_ms) VALUES (?, ?)",
-  ).run(SOURCE_EVIDENCE_CACHE_MIGRATION, Date.now());
+export interface ParserReadRange {
+  start_offset: number;
+  starting_line: number;
 }
-database.pragma(`user_version = ${STORE_SCHEMA_VERSION}`);
+
+export interface SourceReadReceipt {
+  start_offset: number;
+  end_offset: number;
+  bytes_read: number;
+  digest: string;
+}
+
+export interface ParserStateReadResult<State> {
+  state: State;
+  receipt: SourceReadReceipt;
+}
+
+export interface ParserStateWarningV1 {
+  scope: "source" | "session";
+  target_session_id: string | null;
+  warning: SourceWarning;
+}
+
+export interface JsonlReadWindow extends ParserReadRange {
+  file_handle: FileHandle;
+}
+
+export function boundedJsonlLines(
+  sourcePath: string,
+  tracker: JsonlBudgetTracker,
+  window?: JsonlReadWindow,
+): AsyncGenerator<JsonlLine, SourceReadReceipt>;
+
+export const CLAUDE_PARSER_VERSION = "2.0.0";
+export const CODEX_PARSER_VERSION = "2.0.0";
+export const PARSER_STATE_SCHEMA_FINGERPRINT =
+  "sha256:fb8892dbe61732ba057b6c36f6212f8cc560f3d098560260937117d74c6df06f";
+
+export interface ClaudeParserStateV1 {
+  kind: "claude-state-v1";
+  canonical_path: string;
+  parsed_offset: number;
+  line_count: number;
+  ends_with_newline: boolean;
+  retained_bytes: number;
+  warning_count: number;
+  warning_overflowed: boolean;
+  rows: ClaudeStateRowV1[];
+  branch_lanes: ClaudeBranchLaneV1[];
+  ancestry: ClaudeAncestryV1[];
+  assistant_groups: ClaudeAssistantGroupV1[];
+  result_positions: ClaudeResultPositionV1[];
+  warnings: ParserStateWarningV1[];
+}
+
+export interface CodexParserStateV1 {
+  kind: "codex-state-v1";
+  canonical_path: string;
+  parsed_offset: number;
+  line_count: number;
+  ends_with_newline: boolean;
+  retained_bytes: number;
+  warning_count: number;
+  warning_overflowed: boolean;
+  rows: CodexStateRowV1[];
+  session_metadata: CodexSessionMetadataV1 | null;
+  seen_subtypes: string[];
+  warnings: ParserStateWarningV1[];
+}
+
+export async function readClaudeParserState(options: {
+  sourcePath: string;
+  fileHandle: FileHandle;
+  range?: ParserReadRange;
+  seed?: ClaudeParserStateV1;
+  budgets?: Partial<JsonlParserBudgets>;
+  signal?: AbortSignal;
+}): Promise<ParserStateReadResult<ClaudeParserStateV1>>;
+
+export function projectClaudeParserState(
+  state: ClaudeParserStateV1,
+  options?: { endedAtMs?: number },
+): ClaudeTranscriptParseResult;
+
+export function normalizeClaudeParserState(
+  value: unknown,
+): ClaudeParserStateV1;
+
+export async function readCodexParserState(options: {
+  sourcePath: string;
+  fileHandle: FileHandle;
+  range?: ParserReadRange;
+  seed?: CodexParserStateV1;
+  budgets?: Partial<JsonlParserBudgets>;
+  signal?: AbortSignal;
+}): Promise<ParserStateReadResult<CodexParserStateV1>>;
+
+export function projectCodexParserState(
+  state: CodexParserStateV1,
+  options?: { endedAtMs?: number },
+): Session | null;
+
+export function normalizeCodexParserState(
+  value: unknown,
+): CodexParserStateV1;
 ```
 
-The actual branch conditions must explicitly support 0, 2, 3, 4, and 5 rather
-than numerically accepting version 1.
+Receipt ranges are half-open `[start_offset, end_offset)`, and `bytes_read` must
+equal their difference. `ParserStateReadResult.receipt` describes only that call;
+it is never serialized into a seeded/merged parser state.
 
-- [ ] **Step 2: Implement one hostile-input-safe evidence normalizer**
+`ClaudeStateRowV1`, `CodexStateRowV1`, and their index types are closed exported
+unions/interfaces in their adapter modules. They contain the exact variants in
+the design and no `Record<string, unknown>` escape hatch.
 
-Export these contracts from `src/store/source-evidence-cache.ts`:
+### Store contracts
 
 ```ts
 export interface SourceEvidenceEnvelopeV1 {
   schema_version: 1;
   adapter_id: SourceAdapterId;
-  sessions: Session[];
+  canonical_path: string;
+  full_sessions: Session[];
   parse_warnings: SourceWarning[];
+  continuation: ClaudeParserStateV1 | CodexParserStateV1;
 }
 
 export interface SourceEvidenceCacheEntry {
   source_identity: string;
   adapter_id: SourceAdapterId;
+  canonical_path: string;
   content_revision: string;
   parser_version: string;
   schema_fingerprint: string;
@@ -232,138 +228,482 @@ export interface SourceEvidenceCacheEntry {
   updated_at_ms: number;
 }
 
+export interface SourceDiscoveryRoot {
+  root_identity: string;
+  adapter_id: SourceAdapterId;
+  canonical_root: string;
+  cursor: number;
+  capability: "stable_directory_token" | "full_scan_required";
+  tree_json: string;
+  tree_digest: string;
+  observed_at_ms: number;
+  completeness: "complete" | "partial";
+  sensitivity: "sensitive";
+  retention_class: "source_metadata";
+}
+
+export type SourceEvidenceCacheErrorCode =
+  | "invalid_shape" | "unknown_field" | "invalid_text" | "invalid_hash"
+  | "invalid_integer" | "invalid_state" | "foreign_binding"
+  | "digest_mismatch" | "observation_conflict" | "progress_regression";
+
+export class SourceEvidenceCacheError extends Error {
+  constructor(readonly code: SourceEvidenceCacheErrorCode);
+}
+
 export function normalizeSourceEvidenceEnvelope(
   value: unknown,
 ): SourceEvidenceEnvelopeV1;
-```
-
-Snapshot property descriptors before reading values. Validate every current
-`Session` and `NormalizedEvent` field, the recursive JSON object with explicit
-node/depth bounds, warnings, capabilities, optional fields, finite safe integer
-rules, and parser ordering. Return newly allocated arrays and objects.
-
-- [ ] **Step 3: Implement canonical digests and detached cache reads**
-
-Use `canonicalJson`, a domain-separated SHA-256 helper, and
-`deriveSourceDescriptor` for sorted descriptor snapshots:
-
-```ts
-export const NORMALIZED_EVIDENCE_SCHEMA_FINGERPRINT =
-  "sha256:1ca662ce526fd999b1d38947375045d8c80977a6d33d07be7d445fda327b74e1";
-
-export function evidencePayloadDigest(
-  envelope: SourceEvidenceEnvelopeV1,
-): string;
-
-export function evidenceDescriptorDigest(
-  sessions: readonly Session[],
-): string;
-
-export function getSourceEvidenceCacheEntry(
+export function validateSourceEvidenceCacheEntry(
+  value: unknown,
+): SourceEvidenceCacheEntry;
+export function validateSourceDiscoveryRoot(
+  value: unknown,
+): SourceDiscoveryRoot;
+export function getSourceEvidencePair(
   database: Database.Database,
   sourceIdentity: unknown,
-): SourceEvidenceCacheEntry | undefined;
+): { catalog: SourceCatalogEntry; cache: SourceEvidenceCacheEntry } | undefined;
+export function commitEligibleSourceEvidence(
+  database: Database.Database,
+  pair: { catalog: SourceCatalogEntry; cache: SourceEvidenceCacheEntry },
+): "inserted" | "updated" | "unchanged" | "stale" | "conflict";
+export function getSourceDiscoveryRoot(
+  database: Database.Database,
+  rootIdentity: unknown,
+): SourceDiscoveryRoot | undefined;
+export function commitSourceDiscoveryRoot(
+  database: Database.Database,
+  root: SourceDiscoveryRoot,
+): "inserted" | "updated" | "unchanged" | "stale" | "conflict";
 ```
 
-The checked-in fingerprint is the SHA-256 of
-`ccprof:normalized-source-evidence:v1\\0schema_version,adapter_id,sessions,parse_warnings`;
-it is a literal runtime compatibility marker, not a hash of TypeScript source at
-startup.
-
-- [ ] **Step 4: Implement atomic catalog plus cache update**
-
-Expose one transaction boundary:
+### Observation/consumer/discovery contracts
 
 ```ts
-export function commitSourceEvidence(
-  database: Database.Database,
-  catalog: SourceCatalogEntry,
-  evidence: SourceEvidenceCacheEntry,
-): "inserted" | "updated" | "unchanged" | "stale";
+export interface SourceFileObservation {
+  adapter_id: SourceAdapterId;
+  source_identity: string;
+  canonical_path: string;
+  device: number | null;
+  inode: number | null;
+  mtime_ms: number;
+  size_bytes: number;
+  prefix_hash: string;
+  suffix_hash: string;
+  content_revision: string;
+  previous_prefix_revision: string | null;
+  line_count: number;
+  ends_with_newline: boolean;
+}
+
+export type SourceChangeKind = "unchanged" | "append" | "replace";
+
+export interface SourceHandleStat {
+  device: number | null;
+  inode: number | null;
+  mtime_ms: number;
+  size_bytes: number;
+}
+
+export async function observeAdmittedSource(options: {
+  adapter_id: SourceAdapterId;
+  source_identity: string;
+  canonical_path: string;
+  file_handle: FileHandle;
+  stat: SourceHandleStat;
+  previous_size_bytes?: number;
+  meter?: AnalysisBudgetMeter;
+}): Promise<SourceFileObservation>;
+
+export function classifySourceChange(options: {
+  previous?: SourceCatalogEntry;
+  cache?: SourceEvidenceCacheEntry;
+  observation: SourceFileObservation;
+  parser_version: string;
+  schema_fingerprint: string;
+}): SourceChangeKind;
+
+export interface IncrementalWarning {
+  code: "source_cache_unavailable" | "source_cache_invalid" |
+    "source_cache_write_failed" | "source_changed_during_read" |
+    "source_discovery_partial";
+  message: string;
+}
+
+export interface SourcePrepareContext {
+  adapterRoot: string;
+  endedAtMs: number;
+  observedAtMs: number;
+  discoveryCursor: number;
+  admittedFileBytes: number;
+  meter?: AnalysisBudgetMeter;
+}
+
+export interface PreparedSourceEvidence {
+  observation: SourceFileObservation | null;
+  envelope: SourceEvidenceEnvelopeV1 | null;
+  projected_sessions: Session[];
+  projected_warnings: SourceWarning[];
+  warnings: IncrementalWarning[];
+  completeness: "complete" | "partial";
+  parser_mode: "cache" | "suffix" | "cold" | "bounded_cold";
+}
+
+export interface EligibleSourceEvidence {
+  prepared: PreparedSourceEvidence;
+  eligible_session_ids: string[];
+}
+
+export interface IncrementalSourceCatalogConsumerOptions {
+  paths: StorePaths;
+  roots: { claude: string; codex: string };
+  dependencies?: IncrementalSourceDependencies;
+}
+
+export class IncrementalSourceCatalogConsumer {
+  constructor(options: IncrementalSourceCatalogConsumerOptions);
+  knownPaths(adapter: SourceAdapterId): string[];
+  prepareClaude(path: string, context: SourcePrepareContext): Promise<PreparedSourceEvidence>;
+  prepareCodex(path: string, context: SourcePrepareContext): Promise<PreparedSourceEvidence>;
+  commitEligible(value: EligibleSourceEvidence): IncrementalWarning[];
+  close(): void;
+}
+
+export interface SourceCandidate {
+  adapter_id: SourceAdapterId;
+  canonical_path: string;
+  origin: "catalog" | "scan";
+}
+
+export interface SourceDiscoveryResult {
+  candidates: SourceCandidate[];
+  cursor: number;
+  completeness: "complete" | "partial";
+  warnings: SourceWarning[];
+}
+
+export function compareSourceCandidates(
+  left: SourceCandidate,
+  right: SourceCandidate,
+): number;
 ```
 
-Validate and cross-check both inputs before SQL. Inside one immediate
-transaction, call the catalog upsert, re-read the authoritative catalog row,
-reject a mismatch, then insert/update only the matching cache. A stale catalog
-result must not attach new evidence to an older row.
+`IncrementalSourceDependencies` provides injectable no-follow open/hash/stat,
+Claude/Codex state readers/projectors, database open, directory stat/readdir,
+and platform capability functions. It is an embedder seam, not a test-only
+method. Every default dependency uses production code.
 
-- [ ] **Step 5: Delegate GREEN and semantic verification**
+### Task 1: RED query-independent parser state and read receipts
+
+**Files:**
+
+- Create: `test/parser-state.test.ts`
+
+- [ ] **Step 1: Define no-reopen same-handle JSONL receipt behavior**
+
+Open a fixture once, rename/replace its pathname after open, and pass the handle
+to the reader. Assert exact half-open offsets, global starting line, digest of
+only bytes yielded to the parser, LF/CRLF handling, UTF-8 boundaries, and that
+the parser never invokes a path-based open spy.
+
+```ts
+assert.deepEqual(readResult.receipt, {
+  start_offset: 0,
+  end_offset: Buffer.byteLength(raw),
+  bytes_read: Buffer.byteLength(raw),
+  digest: sha256(raw),
+});
+```
+
+- [ ] **Step 2: Define T1/T2 projector fixtures**
+
+T1 parses a Claude prefix plus a later post-window branch/message revision.
+Compare current public cold output, fresh `readResult.state` projection,
+serialized/restored state projection, and a state read before append then
+suffix-seeded state. The earlier window must be canonical-byte identical across
+all four.
+
+T2 reads a complete unchanged source once, projects an early end, serializes and
+restores the full state, then projects a later end. Assert later events appear
+and the state reader spy remains zero after restore.
+
+- [ ] **Step 3: Define closed continuation invariants**
+
+Cover Claude branch/epoch transitions, sidechain parent across the suffix,
+assistant message grouping/prefix dedupe, tool-result replacement, warning
+saturation, retained-byte continuation, and multi-session rows. Cover Codex
+session metadata, subtype warning dedupe, call/result pairing, and a suffix with
+no metadata. Unknown variants and inconsistent indexes must be rejected rather
+than projected.
+
+- [ ] **Step 4: Define parser-resource boundary behavior**
+
+At exact `maxFileBytes`, state is complete. At one byte over, only the admitted
+prefix is read, no full-file receipt is claimed, and no reusable complete state
+is returned. Retained-byte/warning limits seeded from a prefix must match one
+cold full read.
+
+- [ ] **Step 5: Delegate RED verification and commit tests**
+
+Delegate only:
+
+```sh
+npm run build:test
+node --test .test-dist/test/parser-state.test.js .test-dist/test/claude-parser.test.js .test-dist/test/codex-parser.test.js
+```
+
+Expected RED is missing state/read/projector APIs. Commit tests separately:
+
+```sh
+git add test/parser-state.test.ts
+git commit -m "test(parsers): define query-independent source state"
+```
+
+### Task 2: Implement parser state, common projectors, and same-handle reads
+
+**Files:**
+
+- Modify: `src/sources/jsonl-budget.ts`
+- Modify: `src/sources/claude/parser.ts`
+- Modify: `src/sources/codex/parser.ts`
+
+- [ ] **Step 1: Add constants and closed state types first**
+
+Add the exact parser constants/state unions from the API vocabulary before any
+Store module imports them. Compute the checked-in schema fingerprint from the
+literal contract label
+`ccprof:parser-state:v1\\0claude-state-v1,codex-state-v1,source-read-receipt-v1`
+documented beside the constant; the displayed separator is the two literal
+ASCII bytes backslash plus `0`, not U+0000. Never hash TypeScript source at
+runtime.
+
+- [ ] **Step 2: Add `FileHandle` range reader and receipt**
+
+Extend `boundedJsonlLines` with an optional `JsonlReadWindow` while preserving
+the current path call form through a wrapper. Use `createReadStream` with the
+provided fd, `autoClose: false`, explicit start, and no pathname reopen. Feed
+every admitted buffer into the receipt digest before JSON decoding.
+
+- [ ] **Step 3: Refactor Claude into state-read then projection**
+
+Move physical validation/compaction into `readClaudeParserState`; move
+`endedAtMs` filtering to the first step of `projectClaudeParserState`. Rebuild
+the existing branch stamping, agent resolution, assistant grouping, result
+replacement, warnings, and sessions only from filtered state rows. The existing
+public parser calls these two functions and retains its signature/results.
+
+- [ ] **Step 4: Refactor Codex into state-read then projection**
+
+Apply the same split, keeping the current metadata selection, ignored subtype,
+status, warning, and session behavior. A seeded suffix accumulates retained and
+warning budgets and metadata deterministically.
+
+- [ ] **Step 5: Delegate GREEN, regressions, and LanguageService checks**
 
 Delegate:
 
 ```sh
 npm run build:test
-node --test .test-dist/test/store.test.js .test-dist/test/source-catalog.test.js .test-dist/test/source-evidence-cache.test.js
+node --test .test-dist/test/parser-state.test.js .test-dist/test/claude-parser.test.js .test-dist/test/codex-parser.test.js
 ```
 
-Also delegate TypeScript LanguageService references for
-`STORE_SCHEMA_VERSION`, `openStoreDatabase`, and every new exported cache API;
-expected semantic diagnostics are zero.
+Delegate references for every modified parser/read symbol and require zero
+semantic diagnostics.
 
 - [ ] **Step 6: Commit production separately**
 
 ```sh
-git add src/store/sqlite.ts src/store/source-evidence-cache.ts
-git commit -m "feat(store): persist normalized source evidence"
+git add src/sources/jsonl-budget.ts src/sources/claude/parser.ts src/sources/codex/parser.ts
+git commit -m "feat(parsers): expose query-independent source state"
 ```
 
-### Task 3: Define incremental observation and suffix behavior with RED tests
+- [ ] **Step 7: Run independent task spec then quality review**
+
+With the worktree clean, the spec reviewer compares Task 1/2 with the design.
+After approval, a separate quality reviewer checks descriptor-safe state
+validation, resource bounds, same-handle lifecycle, and unchanged public APIs.
+Fix in new commits and repeat the relevant review; never amend.
+
+### Task 3: RED Store v5 evidence and directory-root contracts
+
+**Files:**
+
+- Modify: `test/store.test.ts`
+- Create: `test/source-evidence-cache.test.ts`
+- Create: `test/source-discovery-cache.test.ts`
+
+- [ ] **Step 1: Define exact v5 bootstrap/migrations**
+
+Assert both exact table schemas, constraints, foreign key, one migration marker,
+and `user_version = 5` for v0. Build populated v2/v3/v4 fixtures and prove every
+preexisting row is unchanged. Inject failures after each table, marker, and
+version statement and prove total rollback.
+
+- [ ] **Step 2: Define simultaneous migration behavior**
+
+Open the same v4 database from two workers at one barrier. Assert both opens
+succeed, one marker exists, schema is exact v5, and the populated catalog row is
+unchanged. Repeat v5 opens and prove idempotence. Version 1, negative, and above
+5 must fail before mutation.
+
+- [ ] **Step 3: Define strict evidence foreign binding**
+
+Assert fresh state/envelope normalization and detached clones. Reject hostile
+descriptors, extra/raw fields, unknown states, non-canonical ordering, wrong
+path/adapter/cardinality, warning path, continuation path, payload copied across
+source/path/adapter/revision, payload/descriptor digest mismatch, wrong labels,
+offset/line/newline/timestamp disagreement with catalog, unsafe integers,
+>128 MiB payloads, and invalid recursive tool input. Errors must not include
+`SECRET_CANARY`.
+
+```ts
+assert.throws(
+  () => normalizeSourceEvidenceEnvelope(foreignPathEnvelope),
+  (error: SourceEvidenceCacheError) =>
+    error.code === "foreign_binding" && !error.message.includes("SECRET_CANARY"),
+);
+```
+
+- [ ] **Step 4: Define atomic pair race matrix**
+
+Cover insert, exact same-time replay, different same-time conflict, newer pair,
+stale pair, and a trigger between catalog/cache writes. Observe from a second
+WAL connection during a blocked transaction and prove it sees old or new pair,
+never a mixed revision.
+
+- [ ] **Step 5: Define directory-root cache validation**
+
+Cover exact tree shape/order/digest/root binding, complete/partial rows,
+capability enum, stable decimal directory tokens, stale/equal/newer cursors,
+detached reads, hostile/corrupt JSON, wrong root/adapter, and fixed labels.
+
+- [ ] **Step 6: Delegate RED and commit tests**
+
+Delegate:
+
+```sh
+npm run build:test
+node --test .test-dist/test/store.test.js .test-dist/test/source-catalog.test.js .test-dist/test/source-evidence-cache.test.js .test-dist/test/source-discovery-cache.test.js
+```
+
+Commit only tests:
+
+```sh
+git add test/store.test.ts test/source-evidence-cache.test.ts test/source-discovery-cache.test.ts
+git commit -m "test(store): define Store v5 incremental source state"
+```
+
+### Task 4: Implement Store v5 strict APIs and atomic persistence
+
+**Files:**
+
+- Modify: `src/store/sqlite.ts`
+- Create: `src/store/source-evidence-cache.ts`
+- Create: `src/store/source-discovery.ts`
+
+- [ ] **Step 1: Add ordered v5 migration**
+
+Recognize exactly versions 0, 2, 3, 4, and 5. Re-read the version inside the
+immediate migration transaction, apply missing v3/v4 schemas, create both v5
+tables, insert one marker, and set version 5 in that transaction. Retain current
+permission/configuration behavior.
+
+- [ ] **Step 2: Implement strict parser-state/envelope validation**
+
+Use property descriptors, closed field sets, bounded iterative JSON validation,
+canonical JSON, adapter state validators, and the full-session projector
+cross-check. Enforce adapter/path/warning/cardinality constraints and return
+detached plain values.
+
+- [ ] **Step 3: Implement foreign-bound digests and reads**
+
+Domain-separate payload and descriptor digests with source identity, canonical
+path, adapter, revision, parser version, schema fingerprint, and labels. Read
+catalog/cache through one join and validate the pair together; a lone/mixed row
+is a miss, never a partial value.
+
+- [ ] **Step 4: Implement atomic pair and directory-root updates**
+
+Prevalidate outside transactions. For evidence, perform catalog upsert, re-read
+the authoritative row, cross-check, then cache upsert inside one immediate
+transaction. Implement exact same-time/newer/stale semantics: evidence pairs
+return content-free `conflict` for the same observation time with different
+content. Directory roots return it for the same cursor with different content,
+use equivalent cursor ordering, and never let partial replace newer complete.
+
+- [ ] **Step 5: Delegate GREEN and semantic verification**
+
+Delegate the Task 3 suite plus LanguageService references for Store schema/open
+and all new exports. Require zero diagnostics.
+
+- [ ] **Step 6: Commit production only**
+
+```sh
+git add src/store/sqlite.ts src/store/source-evidence-cache.ts src/store/source-discovery.ts
+git commit -m "feat(store): persist incremental source state"
+```
+
+- [ ] **Step 7: Run task spec then quality review**
+
+With the worktree clean, run independent specification review followed by a
+separate quality/security review. Fix findings in new commits, never amend, and
+repeat the affected review.
+
+### Task 5: RED no-follow observation, append, budgets, and repo gate
 
 **Files:**
 
 - Create: `test/incremental-source-catalog.test.ts`
 
-- [ ] **Step 1: Add canonical observation/change-matrix tests**
+- [ ] **Step 1: Define observation/classifier matrix**
 
-Create real temporary files and assert stable source identity, full revision,
-prefix/suffix hashes, line count, newline flag, null portable identity override,
-and deterministic cursor behavior. Mutate each source by exact replay, simple
-append, multibyte append, CRLF append, same-size rewrite with restored mtime,
-middle rewrite, larger non-append rewrite, truncation, and inode replacement.
+Cover stable identity/revision, Windows/null identity capability, exact replay,
+verified append, same-size rewrite with restored mtime, middle rewrite, larger
+non-append rewrite, truncate, inode rotation, parser/schema mismatch, partial
+state, and non-newline prefix. Null identity permits exact digest reuse but never
+append.
 
-```ts
-assert.equal(classifySourceChange(previous, exact), "unchanged");
-assert.equal(classifySourceChange(previous, append), "append");
-assert.equal(classifySourceChange(previous, middleRewrite), "replace");
-assert.equal(classifySourceChange(previous, truncated), "replace");
-assert.equal(classifySourceChange(previous, rotated), "replace");
-```
+- [ ] **Step 2: Define same-handle and ABA failures**
 
-- [ ] **Step 2: Add cold/cache/restart parser-spy tests**
+Inject path swap, rotate/restore, truncate/restore, byte mutation during hash,
+byte mutation during parse, restored metadata, and parser-receipt mismatch.
+Assert hash/parser/fstat use one handle, the first instability cold-retries once,
+the second returns evidence plus `source_changed_during_read`, and no pair is
+committed.
 
-Run a consumer, close the database, construct a new consumer with a new parser
-spy, and process the unchanged file. Assert the second parser count is zero and
-the returned sessions are deeply equal but non-aliased. Repeat for empty and
-warning-only evidence. Directly corrupt each digest/JSON/label/version and assert
-one cold parser call restores evidence.
+- [ ] **Step 3: Define admission-before-hash boundaries**
 
-- [ ] **Step 3: Add append-only equivalence property cases**
+Instrument hasher calls. At exact parser/analysis file-byte limits, the file is
+fully hashed and cacheable. At one byte over, assert full-hash count zero, only
+the admitted prefix reaches bounded cold parsing, checkpoints occur, and no
+complete cache replaces a prior pair.
 
-For Claude and Codex fixture arrays, first cache the prefix, append suffix bytes,
-then compare the warm result with a separate cold full parse:
+- [ ] **Step 4: Define restart/cache/append canonical equivalence**
 
-```ts
-assert.equal(
-  canonicalJson(normalizeSourceEvidenceEnvelope(warm.envelope)),
-  canonicalJson(normalizeSourceEvidenceEnvelope(cold.envelope)),
-);
-assert.deepEqual(parserRanges, [{ start: prefixBytes, line: prefixLines + 1 }]);
-```
+Cold prepare+eligible commit, close all handles/database, construct a fresh
+consumer, and assert unchanged parser count zero with detached canonical-equal
+sessions. Append UTF-8/LF/CRLF and every continuation fixture; compare full
+envelope and early/late projected windows byte-for-byte with a separate cold
+full parse. Unsupported state must cold fallback.
 
-Include LF/CRLF, UTF-8, multiple Claude sessions, new Codex response items,
-warnings, branch continuity, sidechain parent context, and tool use/result.
-Assistant-message revision, duplicate tool id, metadata conflict, first suffix
-branch, and non-newline prefix must assert a cold start offset of zero.
+- [ ] **Step 5: Define two-phase repository eligibility**
 
-- [ ] **Step 4: Add budgets and failure tests**
+Parse a source with Repo A, Repo B, and unrelated sessions. Assert prepare writes
+nothing. Commit A using unwindowed canonical cwd eligibility and inspect A Store:
+only A rows/warnings/state/descriptors exist. Repeat B. An unrelated-only source
+commits neither catalog nor cache. A known path outside the currently configured
+adapter root is never opened.
 
-Prove a cache hit still admits one source item, full current bytes, and every
-returned event; max-input byte/event/source limits return the same prefix and
-partial reason as a cold run. Parser/budget partial outcomes cannot replace a
-complete cache. Store read/write/trigger failure and two consecutive TOCTOU
-changes return parser evidence, a content-free warning, and no partial pair.
+- [ ] **Step 6: Define cold/warm budget accounting**
 
-- [ ] **Step 5: Delegate RED verification and commit**
+Union fixture candidates in cold order. Assert exact equality for observed and
+consumed input bytes, input events, output bytes, source items, and associated
+truncation. Assert wall/CPU are allowed to decrease and a tight wall/CPU clock
+may admit more warm work; no test fabricates equality for those counters. Cache-
+only failures add warning but do not record a source failure.
+
+- [ ] **Step 7: Delegate RED and commit tests**
 
 Delegate:
 
@@ -372,287 +712,232 @@ npm run build:test
 node --test .test-dist/test/incremental-source-catalog.test.js
 ```
 
-Expected RED is the missing observation/consumer/range API. Commit only tests:
+Commit only tests:
 
 ```sh
 git add test/incremental-source-catalog.test.ts
-git commit -m "test(sources): define persistent incremental consumption"
+git commit -m "test(sources): define safe incremental consumption"
 ```
 
-### Task 4: Implement bounded JSONL ranges and conservative adapter merges
+### Task 6: Implement observation and two-phase incremental consumer
 
 **Files:**
 
-- Modify: `src/sources/jsonl-budget.ts`
-- Modify: `src/sources/claude/parser.ts`
-- Modify: `src/sources/codex/parser.ts`
+- Create: `src/sources/source-observation.ts`
 - Create: `src/sources/incremental.ts`
 
-- [ ] **Step 1: Add byte-start and global-line support without breaking callers**
+- [ ] **Step 1: Implement no-follow admitted handle**
 
-Add a separate optional read window so current calls remain unchanged:
+Canonicalize/contain the candidate before opening. Use POSIX `O_NOFOLLOW`; use
+portable lstat/open/fstat identity checks elsewhere. Stat, source-item admit, and
+file-byte admission occur before any full hash. Pass the same handle into hash
+and parser dependencies; close in `finally`.
 
-```ts
-export interface JsonlReadWindow {
-  start_offset: number;
-  starting_line: number;
-}
+- [ ] **Step 2: Implement observation and receipt binding**
 
-export async function* boundedJsonlLines(
-  sourcePath: string,
-  tracker: JsonlBudgetTracker,
-  window: JsonlReadWindow = { start_offset: 0, starting_line: 1 },
-): AsyncGenerator<JsonlLine>;
-```
+Hash chunk-by-chunk with meter checkpoints. Bind full/suffix parser receipts to
+observed ranges. During the admitted full pass, compute the exact prior-size
+prefix revision when a prior complete row exists. Rehash and fstat after parse,
+then no-follow bind the current path to the same identity. Implement one cold
+retry and content-free instability warning.
 
-Validate safe integers, create the stream with `start`, and initialize line
-number from the window. The caller proves record-boundary alignment; the reader
-must not silently discard a partial first line.
+- [ ] **Step 3: Implement strict cache selection and append**
 
-- [ ] **Step 2: Add explicit parser compatibility constants and seeds**
+Require the complete foreign-bound pair. Exact match projects stored state.
+Append verifies the entire old prefix digest, stable identity, newline boundary,
+and versions using `previous_prefix_revision`, then calls the state reader with
+exact offset/global line and seed. Normalize/project the merged state and apply
+cold equivalence invariants; every other state cold parses.
 
-Export adapter constants and optional incremental state:
+- [ ] **Step 4: Implement prepare then eligible commit**
 
-```ts
-export const CLAUDE_PARSER_VERSION = "1.0.0";
-export const CODEX_PARSER_VERSION = "1.0.0";
+`prepareClaude`/`prepareCodex` never write. `commitEligible` filters unwindowed
+sessions, state rows/indexes, and targeted warnings to canonical cwd-eligible
+session ids. It retains only content-free source-scoped warnings, reprojects full
+sessions, rebuilds bound digests, and atomically commits only a non-empty complete
+value. Cache write errors return one warning and preserve the prepared result.
 
-export interface ParserReadRange {
-  start_offset: number;
-  starting_line: number;
-}
-```
+- [ ] **Step 5: Preserve exact four non-time budgets**
 
-Claude accepts prior normalized sessions only to seed branch/agent context;
-Codex accepts the validated prior session to seed session id/cwd/branch when the
-suffix has no `session_meta`. Existing zero-offset functions retain identical
-results and errors.
+Use the already-sorted caller order, existing meter admissions, and
+`admitSessionEventPrefix`. Do not debit cached bytes/events differently. Keep
+output finalization untouched. Place checkpoints in every hash/parser/validation
+batch so wall/CPU savings remain real and observable.
 
-- [ ] **Step 3: Implement observation and strict cache decisions**
+- [ ] **Step 6: Delegate GREEN and commit production**
 
-In `src/sources/incremental.ts`, export:
-
-```ts
-export type SourceChangeKind = "unchanged" | "append" | "replace";
-
-export interface IncrementalSourceDependencies {
-  openDatabase?: (paths: StorePaths) => Database.Database;
-  parseClaude?: typeof parseClaudeTranscriptDetailed;
-  parseCodex?: typeof parseCodexSession;
-}
-
-export class IncrementalSourceCatalogConsumer {
-  constructor(paths: StorePaths, dependencies?: IncrementalSourceDependencies);
-  knownPaths(adapter: SourceAdapterId): string[];
-  consumeClaude(path: string, context: SourceConsumeContext): Promise<ClaudeTranscriptParseResult>;
-  consumeCodex(path: string, context: SourceConsumeContext): Promise<Session | null>;
-  close(): void;
-}
-```
-
-Observation hashes the full bytes, records bounded hashes/line facts, and checks
-post-parse stability. Cache matching requires every design invariant and returns
-only validator-created detached output.
-
-- [ ] **Step 4: Implement conservative append merge**
-
-Parse only the suffix after full-prefix digest verification. Merge by session
-id and deterministic source order, recompute session summary fields, and reject
-cross-boundary conflicts. Validate the merged envelope through the same strict
-normalizer before commit or return. The runtime must never claim equivalence by
-silently sorting away duplicate/conflicting identities.
-
-- [ ] **Step 5: Preserve analysis-budget accounting**
-
-`SourceConsumeContext` carries the existing meter and admitted file-byte count.
-Always admit the full current size before cache selection, checkpoint hashing
-and merge work, and run the returned sessions through the existing event-prefix
-admission. A partial admission invokes the existing bounded cold parser and
-does not commit a reusable cache.
-
-- [ ] **Step 6: Delegate GREEN, parser regressions, and LanguageService checks**
-
-Delegate:
+Delegate Task 5 plus parser-state/source-catalog/cache tests and LanguageService
+diagnostics. After GREEN, commit production separately:
 
 ```sh
-npm run build:test
-node --test .test-dist/test/incremental-source-catalog.test.js .test-dist/test/claude-parser.test.js .test-dist/test/codex-parser.test.js .test-dist/test/analysis-budgets.test.js
+git add src/sources/source-observation.ts src/sources/incremental.ts
+git commit -m "feat(sources): reuse repository-bound source evidence"
 ```
 
-Delegate semantic references/diagnostics for every modified parser/read symbol;
-expected diagnostics are zero.
+- [ ] **Step 7: Run task spec then quality/security review**
 
-- [ ] **Step 7: Commit production separately**
+With the worktree clean, run the two independent reviews in that order. Fix in
+new commits, never amend, and repeat the affected review.
 
-```sh
-git add src/sources/jsonl-budget.ts src/sources/claude/parser.ts src/sources/codex/parser.ts src/sources/incremental.ts
-git commit -m "feat(sources): reuse revision-bound normalized evidence"
-```
-
-### Task 5: Define catalog-first discovery and analyze integration with RED tests
+### Task 7: RED safe directory cursor, cold ordering, and analyzer restart
 
 **Files:**
 
 - Modify: `test/incremental-source-catalog.test.ts`
+- Modify: `test/docs.test.ts`
 
-- [ ] **Step 1: Add known-path versus new-scan assertions**
+- [ ] **Step 1: Define stable cursor and full-scan fallback**
 
-Populate catalog rows, restart the consumer, and instrument directory reads.
-Assert known canonical paths are directly probed in source-identity order and
-are not parsed or admitted again by the reconciliation scan. Add one new path
-that sorts before known paths and prove the final result remains deterministic.
-Hit the hard scan ceiling and an AnalysisBudget checkpoint; assert partial
-warning/coverage rather than a complete claim.
+Build a directory tree with known/new/nested sources. Assert unchanged stable
+tokens stat every known directory but readdir none, changed parent readdir only
+that branch, and new files/dirs are found. The positive capability fixture must
+guarantee that every child-set mutation changes its token; timestamp shape alone
+does not enable reuse. Null identity, Windows, unrecognized/remote filesystem,
+coarse or backward time, equal-token conflict, invalid token, and unsupported
+capability must full scan and cannot claim cursor reuse.
 
-- [ ] **Step 2: Add end-to-end default analyze restart equivalence**
+- [ ] **Step 2: Define cursor ABA and deterministic full reconciliation**
 
-Run `analyze()` twice with the same temporary Store and source directories but
-fresh runtime dependencies. Assert the second Claude/Codex parser counts are
-zero and canonical report, all findings, Store record source digest, source
-descriptors, and warnings equal the cold first run. Mutate one source and assert
-only its parser runs.
+Mutate a directory during readdir, restore its metadata, and assert second stat
+causes a full scan. Repeat instability: result is partial and cursor does not
+advance. Force a complete full reconciliation every 32 successful cursors;
+assert it discovers an injected token-anomaly file and resets the deterministic
+cycle without depending on wall time. This periodic check is defense in depth;
+no test treats it as permission to claim complete on an unproven filesystem.
 
-- [ ] **Step 3: Add persist/store failure boundaries**
+- [ ] **Step 3: Define exact ceilings/depth/symlink placement**
 
-Assert `persist: false` neither opens nor writes the persistent cache. Make the
-cache Store unavailable while source files remain readable; assert analysis
-succeeds with fresh evidence and one sanitized optimization warning. Assert
-custom injected `SessionSource` behavior and call signatures are unchanged.
+Assert root is not counted; entry 100,000 is processed and 100,001 is not. A
+depth-64 directory is read, file children are processed, and a depth-65 child is
+counted but not descended. Assert Claude symlink count/within-root regular target
+dedupe/escape warnings and Codex no-symlink behavior. A stop creates partial tree
+state, no reusable cursor, `source_discovery_partial` on sessions and Report v2
+caveats; an empty result uses the typed source error. Budget stops also retain
+their existing `analysis_budget` truncation.
 
-- [ ] **Step 4: Delegate RED verification and commit**
+- [ ] **Step 4: Define union-before-admission order**
 
-Delegate:
+Create a newly scanned path that sorts before a known catalog path. Assert the
+complete known+new union is deduplicated and sorted Claude-before-Codex then by
+code units before source/input/event admission. Warm and cold admitted prefixes
+must match for source/input/event limits.
+
+- [ ] **Step 5: Define CLI-process restart integration**
+
+Run `analyze()` with persisted built-in sources, close all state, and run again
+with fresh dependencies. Assert unchanged parser counts and unchanged-directory
+readdir counts are zero, while canonical report/findings/descriptors/warnings/
+snapshot source digest match cold. Change one source and one directory; only
+those paths are re-read/reparsed. `persist:false` and injected `SessionSource`
+retain current behavior.
+
+- [ ] **Step 6: Define the README disclosure contract**
+
+Add an exact docs assertion for the sensitive normalized-state boundary, the
+fact that raw JSONL is not copied, current local file protections, content-free
+identities/errors, and explicitly deferred encryption, retention/quota, and
+GC/repair controls.
+
+- [ ] **Step 7: Delegate RED and commit tests**
+
+Delegate focused build/tests, then commit only the additional RED:
 
 ```sh
-npm run build:test
-node --test .test-dist/test/incremental-source-catalog.test.js .test-dist/test/analyze-integration.test.js
+git add test/incremental-source-catalog.test.ts test/docs.test.ts
+git commit -m "test(core): define cursor-backed source discovery"
 ```
 
-Commit only the new integration RED:
-
-```sh
-git add test/incremental-source-catalog.test.ts
-git commit -m "test(core): define catalog-first source integration"
-```
-
-### Task 6: Wire catalog-first discovery into the default analyzer
+### Task 8: Implement directory reconciliation and default-source integration
 
 **Files:**
 
 - Modify: `src/sources/claude/discover.ts`
 - Modify: `src/sources/codex/discover.ts`
 - Modify: `src/core/analyze.ts`
+- Modify: `README.md`
 
-- [ ] **Step 1: Split known-source probing from bounded reconciliation**
+- [ ] **Step 1: Implement stable directory tokens and cursor reconciliation**
 
-Each discoverer accepts an optional consumer while preserving all existing call
-forms. Process `consumer.knownPaths(adapter)` first, then run a separately
-instrumented recursive scan whose known canonical targets are skipped. Sort all
-directory entries with direct code-unit comparison, enforce the checked-in hard
-entry ceiling, and retain current symlink escape, mtime/window, repository cwd,
-branch, warning, and deduplication behavior.
+Use dev/inode/mtimeNs/ctimeNs decimal tokens and an explicit capability check
+that positively identifies the child-set mutation guarantee; do not infer it
+from field shape. Stat every cached directory. Reuse listings only for unchanged
+proven tokens; readdir changed/new branches. Surround reconciliation with same-
+directory second stats, use full scan on uncertainty, and force full
+reconciliation on cursor multiples of 32. Never publish partial as complete.
 
-- [ ] **Step 2: Replace direct parser calls with consumer calls**
+- [ ] **Step 2: Implement exact scan bounds and warnings**
 
-Only use the consumer when supplied. Cold/custom paths still call the current
-parser directly. A cache warning joins existing global source warnings without
-including cache payload or rejected values. Cached parser evidence then follows
-the exact existing canonicalization/filter/branch/alignment path.
+Use checked-in inclusive entry/depth constants and current adapter symlink rules.
+Count before classification, checkpoint every operation, keep deterministic
+prefixes, and route partial warnings/errors exactly as Task 7 specifies.
 
-- [ ] **Step 3: Wire one lifecycle into `analyze()`**
+- [ ] **Step 3: Union/sort before every admission**
 
-Resolve Store paths before constructing the built-in source, create the
-consumer only for the persisted built-in path, and close it in `finally` around
-discovery. Pass optional `incrementalSourceDependencies` from `AnalyzeOptions`
-as the embedder/testing dependency seam. Injected `SessionSource` and
-`persist:false` remain unchanged.
+Load root-contained known paths, reconcile new paths, canonical-deduplicate the
+whole union, apply `compareSourceCandidates`, and only then visit/admit. Pass each
+candidate through prepare, unwindowed repo eligibility, and optional commit
+before existing time/branch/alignment logic.
 
-- [ ] **Step 4: Delegate GREEN and impacted regression verification**
+- [ ] **Step 4: Wire analyzer lifecycle without custom-source drift**
+
+Resolve Store paths and roots once, create the consumer only for persisted
+built-in sources, and close it in `finally`. Add optional
+`incrementalSourceDependencies` to `AnalyzeOptions` without changing existing
+callers. Cache/store failures fall back fresh and surface one sanitized warning.
+
+- [ ] **Step 5: Document the sensitive boundary**
+
+README must say normalized parser state can contain prompt, command, path, edit,
+and output evidence; raw JSONL is not copied; Store currently uses local 0700/
+0600/symlink protections; identities/errors omit content; encryption,
+configurable retention/quota, and GC/repair are separate future controls. Make
+the Task 7 docs assertion GREEN without weakening it.
+
+- [ ] **Step 6: Delegate GREEN and impacted regressions**
 
 Delegate:
 
 ```sh
 npm run build:test
-node --test .test-dist/test/incremental-source-catalog.test.js .test-dist/test/claude-discover.test.js .test-dist/test/codex-discover.test.js .test-dist/test/analyze-integration.test.js .test-dist/test/analysis-budgets-integration.test.js .test-dist/test/determinism-golden.test.js
+node --test .test-dist/test/incremental-source-catalog.test.js .test-dist/test/claude-discover.test.js .test-dist/test/codex-discover.test.js .test-dist/test/analyze-integration.test.js .test-dist/test/analysis-budgets-integration.test.js .test-dist/test/determinism-golden.test.js .test-dist/test/docs.test.js
 ```
 
-Delegate LanguageService references for discover functions/classes and
-`AnalyzeOptions`; expected semantic diagnostics are zero.
+Delegate LanguageService refs/diagnostics for discover classes/functions and
+`AnalyzeOptions`; require zero diagnostics.
 
-- [ ] **Step 5: Commit production separately**
+- [ ] **Step 7: Commit production/docs**
 
 ```sh
-git add src/sources/claude/discover.ts src/sources/codex/discover.ts src/core/analyze.ts
-git commit -m "feat(core): consume the persistent source catalog"
+git add src/sources/claude/discover.ts src/sources/codex/discover.ts src/core/analyze.ts README.md
+git commit -m "feat(core): reconcile incremental source discovery"
 ```
 
-### Task 7: Document the persistent sensitive-evidence boundary
+- [ ] **Step 8: Run task spec then quality/security review**
 
-**Files:**
+With the worktree clean, run independent specification review followed by the
+separate quality/security review. Fix in new commits, never amend, and repeat the
+affected review.
 
-- Modify: `README.md`
+### Task 9: Whole-branch verification and PR lifecycle
 
-- [ ] **Step 1: Add exact privacy and lifecycle documentation**
+- [ ] **Step 1: Run independent whole-spec review**
 
-Document that ccprof stores normalized evidence needed for cross-process
-incremental analysis; this can contain prompt, command, path, edit, and tool
-output content. State the existing per-repository local Store location model,
-directory/database modes, symlink rejection, and local-only intent. State that
-raw JSONL rows are not copied and metadata digests/errors never contain content.
+Give a fresh reviewer the audit, revised design/plan, merge base, commits, and
+diff. Require explicit verdicts for T1/T2, closed continuation, foreign binding,
+repo gate, no-follow receipts/ABA, admission-before-hash, append equivalence,
+directory no-miss capability/fallback, exact bounds, deterministic budgets,
+Store migrations/races, privacy disclosure, and no extra scope. Fix all P0–P2
+introduced issues in new commits and re-review.
 
-- [ ] **Step 2: State controls not yet provided**
+- [ ] **Step 2: Run separate whole quality/security review**
 
-Explicitly say encryption at rest and configurable cache retention/quota are
-planned separate controls, so users should treat the local Store as sensitive
-raw evidence today. Do not claim operating-system ACL guarantees beyond the
-implemented `0700`/`0600` boundary.
+Check hostile data, secrets, resource bounds, digest domains, handle/database
+lifecycle, transaction visibility, Windows/null identity, cursor token safety,
+TOCTOU/ABA, deterministic ordering, and maintainability. Fix and re-review.
 
-- [ ] **Step 3: Add a docs contract assertion and delegate it**
+- [ ] **Step 3: Delegate fresh full verification**
 
-Add the directly relevant assertion to `test/incremental-source-catalog.test.ts`
-or `test/docs.test.ts`, then delegate:
-
-```sh
-npm run build:test
-node --test .test-dist/test/docs.test.js .test-dist/test/incremental-source-catalog.test.js
-```
-
-- [ ] **Step 4: Commit documentation**
-
-```sh
-git add README.md test/docs.test.ts test/incremental-source-catalog.test.ts
-git commit -m "docs: disclose normalized evidence caching"
-```
-
-Stage only files actually changed by this task.
-
-### Task 8: Independent review, full verification, and PR lifecycle
-
-**Files:**
-
-- Review every file changed from the exact merge-base with `origin/main`.
-
-- [ ] **Step 1: Run independent specification review**
-
-Provide the audit section, approved design, complete plan, commit list, and diff
-to a fresh reviewer. Require a line-by-line verdict for persistent CLI restart,
-unchanged parser-zero reuse, strict cache validation, append equivalence,
-fallback matrix, discovery split, budget accounting, Store compatibility,
-privacy labels, transactional failure, deterministic ordering, and no unrelated
-scope. Fix findings in new commits and re-review until approved.
-
-- [ ] **Step 2: Run separate quality/security review**
-
-After specification approval, use a fresh reviewer for hostile data, secret
-leakage, digest domain separation, TOCTOU, SQLite transaction/permissions,
-resource bounds, clone aliasing, file descriptor lifecycle, cross-platform file
-identity, and maintainability. Fix introduced P0–P2 issues in new commits and
-re-review until approved.
-
-- [ ] **Step 3: Delegate fresh focused and full verification**
-
-The owner must not execute these commands. Delegate them and retain complete
-exit codes/counts:
+The owner must not run tests/static analysis. Delegate and retain exact output:
 
 ```sh
 npm run build
@@ -660,21 +945,20 @@ npm run check
 git diff --check origin/main...HEAD
 ```
 
-Then delegate `/run-github-actions-locally` because logic changed. Any failure
-must be reproduced and fixed by a subagent, followed by the full fresh commands.
+Then delegate `/run-github-actions-locally`. Any failure gets a reproducing RED,
+new fix commit, and full fresh rerun.
 
-- [ ] **Step 4: Rebase latest main and repeat required verification**
+- [ ] **Step 4: Rebase latest main and repeat verification**
 
 ```sh
 git fetch origin main
 git rebase origin/main
 ```
 
-Do not resolve a semantic conflict by choosing a side without review. After a
-successful rebase, delegate the focused suite, `npm run check`, and local Actions
-again.
+Do not choose a semantic conflict side without review. Delegate focused/full
+checks and local Actions again after rebase.
 
-- [ ] **Step 5: Push and open a ready PR**
+- [ ] **Step 5: Push and create the ready PR**
 
 ```sh
 git push -u origin feature/incremental-source-catalog
@@ -683,28 +967,31 @@ gh pr create --base main --head feature/incremental-source-catalog \
   --body-file /tmp/ccprof-incremental-source-catalog-pr.md
 ```
 
-The PR body must summarize behavior, privacy boundary, schema migration,
-append/cold equivalence evidence, delegated local verification, and known
-out-of-scope controls.
+The PR body includes schema/privacy boundary, cold/warm evidence, cursor fallback,
+budget facts, local Actions evidence, and excluded future controls.
 
-- [ ] **Step 6: Complete remote CI/review, merge, and cleanup**
+- [ ] **Step 6: Complete CI/review, merge, and cleanup**
 
-Wait for every remote check and review. Treat all-jobs-under-five-seconds billing
-failures according to repository instructions and use delegated local Actions as
-the green basis. Fix actionable introduced findings in new commits. Under the
-standing user authorization, merge through the PR, never locally. Read and run
-`worktree-pr-flow:cleanup` after merge to remove only this worktree and local
-feature branch.
+Wait for remote checks/reviews. Apply the repository billing-block rule when all
+jobs fail under five seconds. Fix actionable introduced findings in new commits.
+Under standing authorization merge through the PR, never locally. Read and run
+`worktree-pr-flow:cleanup` to remove only this worktree and local branch.
 
-## Plan self-review
+## Plan self-review and requirement map
 
-- Spec coverage maps every approved requirement to Tasks 1–8, including the
-  persistent cache correction, restart test, discovery split, budget accounting,
-  privacy disclosure, append equivalence property, and crash rollback.
-- No task adds background infrastructure, new CLI flags, encryption, retention,
-  quota, Report v3, or rule behavior.
-- Public/shared signature changes are optional and retain current call forms.
-  Type and function names are consistent across Store, consumer, parser,
-  discoverer, analyzer, and tests.
-- Every unsafe merge state has an explicit cold-parse result and no step defers
-  required implementation work.
+- Review item 1: query-independent state/common projector/T1/T2 — Tasks 1–2.
+- Item 2: closed adapter continuation and cold fallback — Tasks 1–2, 5–6.
+- Item 3: union comparator and four non-time budget equivalence — Tasks 5–8.
+- Item 4: repo eligibility before commit/root containment — Tasks 5–6, 8.
+- Item 5: same no-follow handle/parser receipt/ABA — Tasks 1–2, 5–6.
+- Item 6: admission immediately after stat/no over-limit hash — Tasks 5–6.
+- Item 7: self-contained API and dependency order — API vocabulary, Tasks 1–8.
+- Items 8–9: complete directory cursor, fallback, exact bounds/placement —
+  Tasks 3–4, 7–8.
+- Item 10: foreign-bound digest/path/adapter/cardinality — Tasks 3–4.
+- Item 11: Windows capability and migration/pair races — Tasks 3–7.
+- Every production task follows an observed RED and receives spec review before
+  quality review. RED and production commits remain separate; no amend or local
+  merge is used.
+- Encryption, retention/quota, GC/repair, background infrastructure, Report v3,
+  and new rules/CLI surface remain explicitly outside this PR.
