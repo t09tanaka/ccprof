@@ -539,3 +539,87 @@ test("logical repository reports no identity when no source is supplied", () => 
     reason: "no_identity",
   });
 });
+
+function throwingGetter(field: string): object {
+  return Object.defineProperty({}, field, {
+    get() {
+      throw new Error("private getter failure");
+    },
+  });
+}
+
+test("logical repository fails closed when the provider input cannot be read", () => {
+  assert.deepEqual(
+    resolveLogicalRepositoryIdentity(
+      throwingGetter("trusted_provider") as LogicalRepositoryIdentityInput,
+    ),
+    { status: "unavailable", reason: "invalid_provider" },
+  );
+  assert.deepEqual(
+    resolveLogicalRepositoryIdentity({
+      trusted_provider: throwingGetter("provider") as never,
+    }),
+    { status: "unavailable", reason: "invalid_provider" },
+  );
+  assert.deepEqual(
+    resolveLogicalRepositoryIdentity(null as never),
+    { status: "unavailable", reason: "invalid_provider" },
+  );
+});
+
+test("logical repository fails closed when the remotes input cannot be read", () => {
+  assert.deepEqual(
+    resolveLogicalRepositoryIdentity(
+      throwingGetter("remotes") as LogicalRepositoryIdentityInput,
+    ),
+    { status: "unavailable", reason: "invalid_remote" },
+  );
+  assert.deepEqual(
+    resolveLogicalRepositoryIdentity({
+      remotes: new Proxy([], {
+        get() {
+          throw new Error("private collection failure");
+        },
+      }),
+    }),
+    { status: "unavailable", reason: "invalid_remote" },
+  );
+  assert.deepEqual(
+    resolveLogicalRepositoryIdentity({
+      remotes: [
+        new Proxy({ name: "origin", fetch_url: "https://example.com/repo" }, {
+          get() {
+            throw new Error("private entry failure");
+          },
+        }),
+      ],
+    }),
+    { status: "unavailable", reason: "invalid_remote" },
+  );
+});
+
+test("logical repository rejects malformed remotes without falling through", () => {
+  assert.deepEqual(
+    resolveLogicalRepositoryIdentity({
+      remotes: {} as never,
+      offline_uuid: "550e8400-e29b-41d4-a716-446655440000",
+      local_path: "/fallback",
+    }),
+    { status: "unavailable", reason: "invalid_remote" },
+  );
+});
+
+test("logical repository maps fallback getter failures to their source", () => {
+  assert.deepEqual(
+    resolveLogicalRepositoryIdentity(
+      throwingGetter("offline_uuid") as LogicalRepositoryIdentityInput,
+    ),
+    { status: "unavailable", reason: "invalid_offline_uuid" },
+  );
+  assert.deepEqual(
+    resolveLogicalRepositoryIdentity(
+      throwingGetter("local_path") as LogicalRepositoryIdentityInput,
+    ),
+    { status: "unavailable", reason: "invalid_local_path" },
+  );
+});

@@ -277,13 +277,22 @@ function resolveLocal(path: string): LogicalRepositoryIdentityResult {
 export function resolveLogicalRepositoryIdentity(
   input: LogicalRepositoryIdentityInput,
 ): LogicalRepositoryIdentityResult {
-  if (input.trusted_provider !== undefined) {
-    return resolveProvider(input.trusted_provider);
+  let reason: "invalid_provider" | "invalid_remote" | "invalid_offline_uuid" | "invalid_local_path" = "invalid_provider";
+  try {
+    const provider = input.trusted_provider;
+    if (provider !== undefined) return resolveProvider(provider);
+    reason = "invalid_remote";
+    const remotes = input.remotes;
+    if (remotes !== undefined && !Array.isArray(remotes)) return { status: "unavailable", reason };
+    if (remotes !== undefined && remotes.length > 0) return resolveRemotes(remotes);
+    reason = "invalid_offline_uuid";
+    const uuid = input.offline_uuid;
+    if (uuid !== undefined) return resolveOffline(uuid);
+    reason = "invalid_local_path";
+    const path = input.local_path;
+    if (path !== undefined) return resolveLocal(path);
+    return { status: "unavailable", reason: "no_identity" };
+  } catch {
+    return { status: "unavailable", reason };
   }
-  if (input.remotes !== undefined && input.remotes.length > 0) {
-    return resolveRemotes(input.remotes);
-  }
-  if (input.offline_uuid !== undefined) return resolveOffline(input.offline_uuid);
-  if (input.local_path !== undefined) return resolveLocal(input.local_path);
-  return { status: "unavailable", reason: "no_identity" };
 }
