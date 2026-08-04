@@ -32,7 +32,10 @@ import type { AnalysisBudgetResult } from "../src/analysis/budgets.js";
 import {
   aggregateTerminalStats,
   cohortDistribution,
+  exactCohortKey,
+  selectComparableTerminalSnapshots,
   selectTerminalSnapshots,
+  type CohortEvaluationMode,
   type TerminalStatsSnapshotV1 as ExportedTerminalStatsSnapshotV1,
 } from "../src/analysis/stats-aggregation.js";
 import {
@@ -4856,6 +4859,87 @@ test("terminal selectors detach valid projected inputs from later mutation", () 
   assert.deepEqual(aggregate, expectedAggregate);
 });
 
+test("terminal comparable selectors require exact passive cohort evaluation modes", () => {
+  const canary = "TASK6_COHORT_MODE_CANARY";
+  const input = projectStatsAggregationInput(comparableHistoryEntry({
+    id: "cohort-mode-boundary",
+    createdAtMs: 8_100,
+    metric: 0.5,
+  }));
+  assert.ok(input.work_unit_key !== undefined);
+  assert.ok(input.cohort_key !== undefined);
+
+  let hostileReads = 0;
+  const trap = (): never => {
+    hostileReads += 1;
+    throw new Error(canary);
+  };
+  const accessorMode = {
+    current_work_unit_key: input.work_unit_key,
+    current_cohort_key: input.cohort_key,
+  };
+  Object.defineProperty(accessorMode, "mode", {
+    enumerable: true,
+    get: trap,
+  });
+  const proxiedMode = new Proxy({ mode: "stats_all_groups" }, {
+    get: trap,
+    getPrototypeOf: trap,
+    ownKeys: trap,
+    getOwnPropertyDescriptor: trap,
+  });
+  const revokedMode = Proxy.revocable({ mode: "stats_all_groups" }, {});
+  revokedMode.revoke();
+
+  const invalidModes: ReadonlyArray<readonly [string, unknown]> = [
+    ["inherited mode", Object.create({ mode: "stats_all_groups" })],
+    ["unknown mode", {
+      mode: "bogus",
+      current_work_unit_key: input.work_unit_key,
+      current_cohort_key: input.cohort_key,
+    }],
+    ["stats mode unknown field", {
+      mode: "stats_all_groups",
+      [canary]: canary,
+    }],
+    ["analysis mode missing field", {
+      mode: "analysis_current",
+      current_work_unit_key: input.work_unit_key,
+    }],
+    ["analysis mode unknown field", {
+      mode: "analysis_current",
+      current_work_unit_key: input.work_unit_key,
+      current_cohort_key: input.cohort_key,
+      [canary]: canary,
+    }],
+    ["mode accessor", accessorMode],
+    ["mode proxy", proxiedMode],
+    ["revoked mode proxy", revokedMode.proxy],
+  ];
+  const actions = [
+    ["select", (mode: CohortEvaluationMode) =>
+      selectComparableTerminalSnapshots([input], mode)],
+    ["aggregate", (mode: CohortEvaluationMode) =>
+      aggregateTerminalStats([input], mode)],
+  ] as const;
+
+  for (const [caseName, mode] of invalidModes) {
+    for (const [actionName, action] of actions) {
+      assert.throws(
+        () => action(mode as CohortEvaluationMode),
+        (error: unknown) => {
+          assert.ok(error instanceof TypeError);
+          assert.equal(error.message, "invalid cohort evaluation mode");
+          assert.doesNotMatch(String(error), new RegExp(canary, "u"));
+          return true;
+        },
+        `${actionName}: ${caseName}`,
+      );
+    }
+  }
+  assert.equal(hostileReads, 0);
+});
+
 test("robust distributions are order invariant and exact cohort buckets are fixed", () => {
   const values = [1, 2, 3, 100];
   const expectedDistribution = {
@@ -4953,6 +5037,60 @@ test("robust distributions are order invariant and exact cohort buckets are fixe
   }));
   assert.equal(missingLines.cohort_key, undefined);
   assert.ok(missingLines.reason_codes.includes("missing_changed_lines"));
+});
+
+test("terminal aggregation rejects forged cohort keys before minimum-size grouping", () => {
+  const changedFiles = [0, 1, 2, 5, 10] as const;
+  const projected = changedFiles.map((files, index) =>
+    projectStatsAggregationInput(comparableHistoryEntry({
+      id: `forged-cohort-${index.toString(10)}`,
+      createdAtMs: 9_000 + index,
+      metric: index + 1,
+      selectorNumber: 200 + index,
+      changedFiles: files,
+      changedLines: 199,
+    }))
+  );
+  const tupleKeys = projected.map((entry) => {
+    assert.ok(entry.repository_key !== undefined);
+    assert.ok(entry.workspace_key !== undefined);
+    assert.ok(entry.changed_files_bucket !== undefined);
+    assert.ok(entry.changed_lines_bucket !== undefined);
+    assert.ok(entry.cohort_key !== undefined);
+    return JSON.stringify([
+      entry.repository_key,
+      entry.workspace_key,
+      entry.changed_files_bucket,
+      entry.changed_lines_bucket,
+    ]);
+  });
+  assert.equal(new Set(tupleKeys).size, projected.length);
+
+  const forgedCohortKey = exactCohortKey({
+    repository_key: "e".repeat(64),
+    workspace_key: "f".repeat(64),
+    changed_files_bucket: "files_50_plus",
+    changed_lines_bucket: "lines_1000_plus",
+  });
+  for (const entry of projected) {
+    assert.notEqual(entry.cohort_key, forgedCohortKey);
+    entry.cohort_key = forgedCohortKey;
+  }
+
+  for (const input of [[projected[0]!], projected]) {
+    assert.throws(
+      () => aggregateTerminalStats(
+        input,
+        { mode: "stats_all_groups" },
+        5,
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof TypeError);
+        assert.equal(error.message, "invalid stats aggregation input");
+        return true;
+      },
+    );
+  }
 });
 
 test("baseline selects terminal exact cohorts before opaque self exclusion", () => {
