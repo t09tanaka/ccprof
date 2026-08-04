@@ -42,7 +42,7 @@ run `git diff --check`, and commit the two required documents as
 - Add: `test/report-schema-command.test.ts`
 - Modify: `test/release-workflow.test.ts`
 
-- [ ] **Step 1: Write failing schema-command tests**
+- [x] **Step 1: Write failing schema-command tests**
 
 Add table-driven parse/exit tests for the exact `report-v3` target, missing,
 unknown, duplicate, extra, and flag-like arguments, plus global help precedence.
@@ -56,13 +56,13 @@ constant, required top-level sections, recursive object closure, numeric and
 identifier patterns, finding fields, and the exact runtime-constraint texts.
 Keep a Report v2 JSON compatibility assertion on the existing path.
 
-- [ ] **Step 2: Lock installed-package coverage**
+- [x] **Step 2: Lock installed-package coverage**
 
 Extend the release-workflow contract test to require package smoke to invoke
 `ccprof schema report-v3`, parse its redirected stdout, and assert the v3
 version constant.
 
-- [ ] **Step 3: Verify RED and commit tests only**
+- [x] **Step 3: Verify RED and commit tests only**
 
 Run:
 
@@ -83,7 +83,7 @@ as `test: define report v3 schema publication contract`.
 - Modify: `src/cli.ts`
 - Test: `test/report-schema-command.test.ts`
 
-- [ ] **Step 1: Add the closed Draft 2020-12 schema**
+- [x] **Step 1: Add the closed Draft 2020-12 schema**
 
 Define reusable `$defs` for safe integers, semantic versions, Git OIDs,
 SHA-256 digests, identifiers, JSON evidence, finding, source coverage, and rule
@@ -91,7 +91,7 @@ coverage. Require the approved envelope and finding fields. Put every
 non-schema sibling/identity invariant in the root
 `x-ccprof-runtime-constraints` array; do not add placeholder-producing code.
 
-- [ ] **Step 2: Add a cwd-independent all-or-nothing loader**
+- [x] **Step 2: Add a cwd-independent all-or-nothing loader**
 
 In `src/commands/schema.ts`, walk upward from the module directory until
 `schemas/report-v3.schema.json` can be read. Accept an optional reader function
@@ -99,7 +99,7 @@ only as the narrow failure-test seam. Parse first, then return
 `JSON.stringify(schema, null, 2) + "\n"`. Convert missing/malformed input to a
 fixed content-free error before returning any output.
 
-- [ ] **Step 3: Extend CLI parsing and early dispatch**
+- [x] **Step 3: Extend CLI parsing and early dispatch**
 
 After the completed Language Service reference audit, add a closed
 `ParsedSchemaCommand` member to `ParsedCliCommand`. Parse exactly one
@@ -107,7 +107,7 @@ After the completed Language Service reference audit, add a closed
 command before cwd, CI, policy, handlers, Store, or privacy. Map usage errors to
 2 and loader failures to 5 using existing exit conventions.
 
-- [ ] **Step 4: Verify focused GREEN and commit**
+- [x] **Step 4: Verify focused GREEN and commit**
 
 Run the compiled report-schema command test alone, then the existing CLI and
 Report v2 reporter tests most directly affected. Expect all focused tests to
@@ -121,19 +121,19 @@ pass while the release-workflow contract remains RED pending Task 4. Commit as
 - Modify: `README.md`
 - Test: `test/release-workflow.test.ts`
 
-- [ ] **Step 1: Extend installed-tarball smoke**
+- [x] **Step 1: Extend installed-tarball smoke**
 
 After globally installing the packed tarball and before creating any fixture
 repository, redirect `ccprof schema report-v3` to a temporary file. Parse it
 with Node and fail unless `schema.properties.schema_version.const === 3`.
 
-- [ ] **Step 2: Document the compatibility boundary**
+- [x] **Step 2: Document the compatibility boundary**
 
 Add the command to the public command list and a concise schema-publication
 section. State explicitly that current `--json` is Report v2 and publishing the
 v3 schema does not switch a producer.
 
-- [ ] **Step 3: Verify and commit**
+- [x] **Step 3: Verify and commit**
 
 Run the focused release-workflow and documentation tests. Commit workflow and
 README changes as `docs: expose report v3 schema command`.
