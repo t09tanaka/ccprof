@@ -1203,9 +1203,23 @@ test("truncated patch marks textual content incomplete without losing status evi
   assert.match(evidence.caveats[0] ?? "", /truncated/i);
 });
 
-test("mid-record commit-log truncation returns incomplete evidence instead of throwing", async () => {
+test("log-only truncation preserves complete diff line evidence", async () => {
   const partialLog = ["a".repeat(40), "100", "subject without body"].join("\0");
   const fixture = fakeRunner(({ args }) => {
+    if (args[1] === "diff" && args.includes("--name-status")) {
+      return ok("M\0src/a.ts\0");
+    }
+    if (args[1] === "diff") {
+      return ok([
+        "diff --git a/src/a.ts b/src/a.ts",
+        "--- a/src/a.ts",
+        "+++ b/src/a.ts",
+        "@@ -1 +1 @@",
+        "-before",
+        "+after",
+        "",
+      ].join("\n"));
+    }
     if (args[1] === "log") {
       return ok(partialLog, { stdoutTruncated: true });
     }
@@ -1220,6 +1234,8 @@ test("mid-record commit-log truncation returns incomplete evidence instead of th
   });
 
   assert.equal(evidence.truncated, true);
+  assert.equal(evidence.changedLineCount, 2);
+  assert.equal(evidence.files[0]?.contentComplete, true);
   assert.deepEqual(evidence.commits, []);
   assert.deepEqual(evidence.reverts, []);
   assert.match(
