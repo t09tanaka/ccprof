@@ -4368,7 +4368,7 @@ test("R006 uses the full absent-command denominator and one summed sample per sn
   );
   assert.equal(aggregates.length, 1);
   assert.deepEqual(aggregates[0], {
-    cohort_key: projected[0]!.cohort_key,
+    cohort_key: projected[0]!.cohort_key!,
     command_key: projected[0]!.command_costs[0]!.command_key,
     cache_state: "cold",
     history_count: 6,
