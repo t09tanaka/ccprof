@@ -10,16 +10,29 @@ import type {
   FindingScoringRationale,
   FindingSeverity,
   ImpactEstimate,
+  Interval,
   MatchedAction,
+  RuleId,
   TimelineAction,
   ToolResultEvent,
 } from "../src/core/model.js";
+import {
+  findingScoringRationale,
+  findingSeverity,
+  projectFindingConfidence,
+} from "../src/core/model.js";
 import { classifyCommand } from "../src/analysis/command.js";
+import {
+  buildTerminalStatsSnapshot,
+  normalizeTerminalStatsSnapshot,
+  type TerminalStatsSnapshotV1 as ExportedTerminalStatsSnapshotV1,
+} from "../src/analysis/stats-aggregation.js";
 import {
   buildCommandIdentity,
   commandIdentityKey,
 } from "../src/analysis/command-identity.js";
 import { buildFlakyEditRelevance } from "../src/core/analyze.js";
+import { reconcileLedger, type LedgerResult } from "../src/core/ledger.js";
 import { parseExplicitTestMap } from "../src/analysis/test-map.js";
 import type { AnalysisRecord } from "../src/store/analyses.js";
 import { detectContextBloat } from "../src/rules/context-bloat.js";
@@ -28,6 +41,7 @@ import {
   flakyEditRelevanceKey,
 } from "../src/rules/flaky-test.js";
 import { findingKey } from "../src/rules/shared.js";
+import { ruleManifest, type RuleManifest } from "../src/rules/manifest.js";
 import { detectSerialSlack } from "../src/rules/serial-slack.js";
 
 function assertCanonicalCandidate(
@@ -2153,4 +2167,759 @@ test("R008 orders extracted failed test names by code units", () => {
     "tests/test_a.py::test_one",
     "tests::flaky_case",
   ]);
+});
+
+interface TerminalStatsSnapshotV1 {
+  schema_version: 1;
+  measured_wall_ms: number;
+  confirmed_critical_path_ms: number;
+  estimated_critical_path_upper_ms: number;
+  resource_cost_ms: number;
+  human_wait_ms: number;
+  unexplained_ms: number;
+  cohort: {
+    repository_id: string;
+    workspace_id: string;
+    changed_files: number;
+    changed_lines?: number;
+  };
+  rules: Array<{
+    rule_id: RuleId;
+    rule_version: string;
+    compatibility_epoch: number;
+    confirmed_critical_path_ms: number;
+    estimated_critical_path_upper_ms: number;
+    resource_cost_ms: number;
+  }>;
+  incomplete_interval_findings: number;
+}
+
+type TerminalStatsExportContract =
+  ExportedTerminalStatsSnapshotV1 extends TerminalStatsSnapshotV1
+    ? true
+    : false;
+const terminalStatsExportContract: TerminalStatsExportContract = true;
+void terminalStatsExportContract;
+
+type TerminalCandidate = FindingCandidate & {
+  rule_version?: string;
+  compatibility_epoch?: number;
+};
+
+function terminalCandidate(
+  ruleId: RuleId,
+  findingKeyValue: string,
+  lowerMs: number,
+  upperMs: number,
+  intervals: readonly Interval[],
+  overrides: {
+    expectedMs?: number;
+    impactKind?: ImpactEstimate["kind"];
+    findingConfidence?: FindingConfidence;
+    ruleVersion?: string | null;
+    compatibilityEpoch?: number | null;
+  } = {},
+): TerminalCandidate {
+  const manifest = ruleManifest(ruleId);
+  const findingConfidence = overrides.findingConfidence ?? {
+    evidence: "high",
+    causal: "high",
+    source_completeness: 1,
+  };
+  const impact: ImpactEstimate = {
+    lower_ms: lowerMs,
+    ...(overrides.expectedMs === undefined
+      ? {}
+      : { expected_ms: overrides.expectedMs }),
+    upper_ms: upperMs,
+    kind: overrides.impactKind ??
+      (ruleId === "R005" || ruleId === "R006"
+        ? "resource_cost"
+        : "critical_path_latency"),
+  };
+  return {
+    finding_key: findingKeyValue,
+    rule_id: ruleId,
+    title: findingKeyValue,
+    classification: "behavior",
+    cause: null,
+    scope: "separate_issue",
+    confidence: projectFindingConfidence(findingConfidence),
+    evidence: {
+      session_refs: [`terminal#${findingKeyValue}`],
+      interval_ids: intervals.map((_, index) =>
+        `${findingKeyValue}-${index}`),
+    },
+    fix_recipe: { suggestion: "fix", verify: "verify" },
+    caveats: [],
+    target: findingKeyValue,
+    recoverable: {
+      bound: lowerMs > 0 ? "point" : "upper",
+      estimated_ms: upperMs,
+      intervals: intervals.map((interval, index) => ({
+        ...interval,
+        interval_id: `${findingKeyValue}-${index}`,
+        target: findingKeyValue,
+      })),
+    },
+    impact,
+    finding_confidence: findingConfidence,
+    severity: findingSeverity(impact, findingConfidence),
+    scoring_rationale: findingScoringRationale(impact, findingConfidence),
+    ...(overrides.ruleVersion === null
+      ? {}
+      : { rule_version: overrides.ruleVersion ?? manifest.version }),
+    ...(overrides.compatibilityEpoch === null
+      ? {}
+      : {
+          compatibility_epoch:
+            overrides.compatibilityEpoch ?? manifest.compatibility_epoch,
+        }),
+  };
+}
+
+function terminalLedger(
+  measuredIntervals: readonly Interval[],
+  options: {
+    observedHumanWaitIntervals?: readonly Interval[];
+    normalIntervals?: readonly Interval[];
+  } = {},
+): LedgerResult {
+  return reconcileLedger({
+    rawIntervals: measuredIntervals,
+    activeIntervals: measuredIntervals,
+    contributingIntervals: options.normalIntervals ?? measuredIntervals,
+    humanWaitIntervals: options.observedHumanWaitIntervals ?? [],
+    candidates: [],
+  });
+}
+
+const TERMINAL_REPOSITORY_ID = "1".repeat(64);
+const TERMINAL_WORKSPACE_ID = "2".repeat(64);
+
+function buildTerminalFixture(
+  ledger: LedgerResult,
+  candidates: readonly TerminalCandidate[],
+  manifestResolver?: (id: RuleId) => RuleManifest,
+): TerminalStatsSnapshotV1 {
+  const input = {
+    repositoryId: TERMINAL_REPOSITORY_ID,
+    workspaceId: TERMINAL_WORKSPACE_ID,
+    changedFiles: 4,
+    changedLines: 199,
+    ledger,
+    candidates,
+  };
+  return manifestResolver === undefined
+    ? buildTerminalStatsSnapshot(input)
+    : buildTerminalStatsSnapshot(input, { ruleManifest: manifestResolver });
+}
+
+test("terminal snapshot stores the full critical-path upper envelope", () => {
+  const ledger = terminalLedger(
+    [{ start_ms: 0, end_ms: 2_875 }],
+    {
+      observedHumanWaitIntervals: [{ start_ms: 1_500, end_ms: 1_750 }],
+      normalIntervals: [{ start_ms: 1_875, end_ms: 2_875 }],
+    },
+  );
+  const snapshot = buildTerminalFixture(ledger, [
+    terminalCandidate(
+      "R001",
+      "critical-envelope",
+      1_000,
+      1_500,
+      [{ start_ms: 0, end_ms: 1_500 }],
+    ),
+    terminalCandidate("R005", "resource", 0, 4_000, [
+      { start_ms: 0, end_ms: 1_000 },
+    ]),
+  ]);
+
+  assert.equal(snapshot.measured_wall_ms, 2_875);
+  assert.equal(snapshot.confirmed_critical_path_ms, 1_000);
+  assert.equal(snapshot.estimated_critical_path_upper_ms, 1_500);
+  assert.equal(snapshot.resource_cost_ms, 4_000);
+  assert.equal(snapshot.human_wait_ms, 250);
+  assert.equal(snapshot.unexplained_ms, 125);
+  assert.ok(
+    snapshot.estimated_critical_path_upper_ms + snapshot.human_wait_ms +
+      snapshot.unexplained_ms <= snapshot.measured_wall_ms,
+  );
+  assert.ok(
+    snapshot.confirmed_critical_path_ms <=
+      snapshot.estimated_critical_path_upper_ms,
+  );
+});
+
+function terminalRuleRow(
+  snapshot: TerminalStatsSnapshotV1,
+  ruleId: RuleId,
+): TerminalStatsSnapshotV1["rules"][number] {
+  const row = snapshot.rules.find((entry) => entry.rule_id === ruleId);
+  assert.ok(row !== undefined, `missing terminal rule row ${ruleId}`);
+  return row;
+}
+
+test("terminal snapshot applies every built-in manifest aggregation policy", () => {
+  for (const ruleId of ["R001", "R002", "R003", "R008"] as const) {
+    const snapshot = buildTerminalFixture(
+      terminalLedger([{ start_ms: 0, end_ms: 300 }]),
+      [
+        terminalCandidate(ruleId, `${ruleId}-left`, 100, 100, [
+          { start_ms: 0, end_ms: 100 },
+        ]),
+        terminalCandidate(ruleId, `${ruleId}-right`, 100, 100, [
+          { start_ms: 50, end_ms: 150 },
+        ]),
+      ],
+    );
+    assert.deepEqual(terminalRuleRow(snapshot, ruleId), {
+      rule_id: ruleId,
+      rule_version: ruleManifest(ruleId).version,
+      compatibility_epoch: ruleManifest(ruleId).compatibility_epoch,
+      confirmed_critical_path_ms: 150,
+      estimated_critical_path_upper_ms: 150,
+      resource_cost_ms: 0,
+    });
+  }
+
+  const maxCritical = buildTerminalFixture(
+    terminalLedger([{ start_ms: 0, end_ms: 400 }]),
+    [
+      terminalCandidate("R007", "short-strict", 150, 150, [
+        { start_ms: 0, end_ms: 150 },
+      ]),
+      terminalCandidate("R007", "long-upper", 0, 200, [
+        { start_ms: 100, end_ms: 300 },
+      ], {
+        findingConfidence: {
+          evidence: "medium",
+          causal: "medium",
+          source_completeness: 1,
+        },
+      }),
+    ],
+  );
+  assert.deepEqual(terminalRuleRow(maxCritical, "R007"), {
+    rule_id: "R007",
+    rule_version: ruleManifest("R007").version,
+    compatibility_epoch: ruleManifest("R007").compatibility_epoch,
+    confirmed_critical_path_ms: 150,
+    estimated_critical_path_upper_ms: 200,
+    resource_cost_ms: 0,
+  });
+
+  const resource = buildTerminalFixture(
+    terminalLedger([{ start_ms: 0, end_ms: 1_000 }]),
+    [
+      terminalCandidate("R005", "r005-small", 0, 300, [
+        { start_ms: 0, end_ms: 300 },
+      ]),
+      terminalCandidate("R005", "r005-large", 0, 500, [
+        { start_ms: 0, end_ms: 500 },
+      ]),
+      terminalCandidate("R006", "r006-small", 0, 400, []),
+      terminalCandidate("R006", "r006-large", 0, 700, []),
+    ],
+  );
+  assert.equal(terminalRuleRow(resource, "R005").resource_cost_ms, 500);
+  assert.equal(terminalRuleRow(resource, "R006").resource_cost_ms, 700);
+  assert.equal(resource.resource_cost_ms, 1_200);
+  assert.equal(resource.incomplete_interval_findings, 0);
+
+  const never = buildTerminalFixture(
+    terminalLedger([{ start_ms: 0, end_ms: 300 }], {
+      observedHumanWaitIntervals: [{ start_ms: 0, end_ms: 200 }],
+    }),
+    [terminalCandidate("R004", "policy-wait", 100, 200, [
+      { start_ms: 0, end_ms: 200 },
+    ])],
+  );
+  assert.deepEqual(terminalRuleRow(never, "R004"), {
+    rule_id: "R004",
+    rule_version: ruleManifest("R004").version,
+    compatibility_epoch: ruleManifest("R004").compatibility_epoch,
+    confirmed_critical_path_ms: 0,
+    estimated_critical_path_upper_ms: 0,
+    resource_cost_ms: 0,
+  });
+  assert.equal(never.human_wait_ms, 200);
+});
+
+test("terminal snapshot supports sum through an injected manifest fixture", () => {
+  const snapshot = buildTerminalFixture(
+    terminalLedger([{ start_ms: 0, end_ms: 1_000 }]),
+    [
+      terminalCandidate("R005", "sum-a", 0, 300, [
+        { start_ms: 0, end_ms: 300 },
+      ]),
+      terminalCandidate("R005", "sum-b", 0, 500, [
+        { start_ms: 300, end_ms: 800 },
+      ]),
+    ],
+    (ruleId) => {
+      const manifest = ruleManifest(ruleId);
+      return ruleId === "R005"
+        ? { ...manifest, aggregation_policy: "sum" }
+        : manifest;
+    },
+  );
+
+  assert.equal(terminalRuleRow(snapshot, "R005").resource_cost_ms, 800);
+  assert.equal(snapshot.resource_cost_ms, 800);
+});
+
+test("max chooses confirmed and full-upper winners independently", () => {
+  const snapshot = buildTerminalFixture(
+    terminalLedger([{ start_ms: 0, end_ms: 400 }]),
+    [
+      terminalCandidate("R007", "z-strict", 100, 100, [
+        { start_ms: 0, end_ms: 100 },
+      ]),
+      terminalCandidate("R007", "a-medium-upper", 0, 200, [
+        { start_ms: 100, end_ms: 300 },
+      ], {
+        findingConfidence: {
+          evidence: "medium",
+          causal: "medium",
+          source_completeness: 1,
+        },
+      }),
+    ],
+  );
+
+  const row = terminalRuleRow(snapshot, "R007");
+  assert.equal(row.confirmed_critical_path_ms, 100);
+  assert.equal(row.estimated_critical_path_upper_ms, 200);
+  assert.equal(snapshot.confirmed_critical_path_ms, 100);
+  assert.equal(snapshot.estimated_critical_path_upper_ms, 200);
+});
+
+test("max winner ties use bound, key, then interval signature", () => {
+  const ledger = terminalLedger(
+    [{ start_ms: 0, end_ms: 400 }],
+    { observedHumanWaitIntervals: [{ start_ms: 0, end_ms: 100 }] },
+  );
+  const cases: Array<{
+    name: string;
+    candidates: TerminalCandidate[];
+  }> = [
+    {
+      name: "greater canonical bound",
+      candidates: [
+        terminalCandidate("R007", "a-smaller-bound", 0, 100, [
+          { start_ms: 200, end_ms: 300 },
+        ]),
+        terminalCandidate("R007", "z-greater-bound", 0, 200, [
+          { start_ms: 0, end_ms: 100 },
+        ]),
+      ],
+    },
+    {
+      name: "smaller finding key",
+      candidates: [
+        terminalCandidate("R007", "z-key", 0, 100, [
+          { start_ms: 200, end_ms: 300 },
+        ]),
+        terminalCandidate("R007", "a-key", 0, 100, [
+          { start_ms: 0, end_ms: 100 },
+        ]),
+      ],
+    },
+    {
+      name: "smaller interval signature",
+      candidates: [
+        terminalCandidate("R007", "same-key", 0, 100, [
+          { start_ms: 200, end_ms: 300 },
+        ]),
+        terminalCandidate("R007", "same-key", 0, 100, [
+          { start_ms: 0, end_ms: 100 },
+        ]),
+      ],
+    },
+  ];
+
+  for (const fixture of cases) {
+    const snapshot = buildTerminalFixture(ledger, fixture.candidates);
+    assert.equal(snapshot.estimated_critical_path_upper_ms, 100, fixture.name);
+    assert.equal(snapshot.human_wait_ms, 0, fixture.name);
+  }
+});
+
+test("critical aggregation rejects incomplete or incompatible candidates", () => {
+  const partialImpact = terminalCandidate(
+    "R001",
+    "partial-impact",
+    100,
+    100,
+    [{ start_ms: 0, end_ms: 100 }],
+  );
+  partialImpact.impact = {
+    lower_ms: 100,
+    kind: "critical_path_latency",
+  } as ImpactEstimate;
+  const invalid: TerminalCandidate[] = [
+    terminalCandidate("R001", "empty-placement", 100, 100, []),
+    terminalCandidate("R002", "outside-placement", 100, 100, [
+      { start_ms: 500, end_ms: 600 },
+    ]),
+    terminalCandidate("R003", "reversed-placement", 100, 100, [
+      { start_ms: 200, end_ms: 100 },
+    ]),
+    terminalCandidate("R003", "nonfinite-placement", 100, 100, [
+      { start_ms: 0, end_ms: Number.NaN },
+    ]),
+    terminalCandidate("R008", "impact-mismatch", 100, 100, [
+      { start_ms: 0, end_ms: 100 },
+    ], { impactKind: "resource_cost" }),
+    terminalCandidate("R001", "wrong-version", 100, 100, [
+      { start_ms: 0, end_ms: 100 },
+    ], { ruleVersion: "2.0.0" }),
+    terminalCandidate("R002", "wrong-epoch", 100, 100, [
+      { start_ms: 0, end_ms: 100 },
+    ], { compatibilityEpoch: 2 }),
+    terminalCandidate("R003", "legacy-metadata", 100, 100, [
+      { start_ms: 0, end_ms: 100 },
+    ], { ruleVersion: null, compatibilityEpoch: null }),
+    partialImpact,
+  ];
+  const snapshot = buildTerminalFixture(
+    terminalLedger([{ start_ms: 0, end_ms: 400 }]),
+    invalid,
+  );
+
+  assert.equal(snapshot.confirmed_critical_path_ms, 0);
+  assert.equal(snapshot.estimated_critical_path_upper_ms, 0);
+  assert.equal(snapshot.resource_cost_ms, 0);
+  assert.equal(snapshot.incomplete_interval_findings, invalid.length);
+});
+
+test("medium and incomplete-source candidates affect upper but not confirmed", () => {
+  const snapshot = buildTerminalFixture(
+    terminalLedger([{ start_ms: 0, end_ms: 500 }]),
+    [
+      terminalCandidate("R001", "medium", 100, 200, [
+        { start_ms: 0, end_ms: 200 },
+      ], {
+        findingConfidence: {
+          evidence: "medium",
+          causal: "medium",
+          source_completeness: 1,
+        },
+      }),
+      terminalCandidate("R002", "partial-source", 100, 200, [
+        { start_ms: 200, end_ms: 400 },
+      ], {
+        findingConfidence: {
+          evidence: "high",
+          causal: "high",
+          source_completeness: 0.5,
+        },
+      }),
+    ],
+  );
+
+  assert.equal(snapshot.confirmed_critical_path_ms, 0);
+  assert.equal(snapshot.estimated_critical_path_upper_ms, 400);
+  assert.equal(snapshot.incomplete_interval_findings, 0);
+});
+
+test("critical placements clip to measured wall and preserve fractional bounds", () => {
+  const candidates = [
+    terminalCandidate("R001", "fractional", 25.25, 50.5, [
+      { start_ms: 0, end_ms: 100 },
+    ]),
+    terminalCandidate("R002", "clipped", 100, 100, [
+      { start_ms: 150, end_ms: 250 },
+    ]),
+  ];
+  const ledger = terminalLedger([{ start_ms: 0, end_ms: 200 }]);
+  const forward = buildTerminalFixture(ledger, candidates);
+  const reversed = buildTerminalFixture(ledger, [...candidates].reverse());
+
+  assert.deepEqual(reversed, forward);
+  assert.equal(terminalRuleRow(forward, "R001").confirmed_critical_path_ms, 25.25);
+  assert.equal(terminalRuleRow(forward, "R001").estimated_critical_path_upper_ms, 50.5);
+  assert.equal(terminalRuleRow(forward, "R002").confirmed_critical_path_ms, 50);
+  assert.equal(terminalRuleRow(forward, "R002").estimated_critical_path_upper_ms, 50);
+  assert.equal(forward.confirmed_critical_path_ms, 75.25);
+  assert.equal(forward.estimated_critical_path_upper_ms, 100.5);
+});
+
+test("expected impact never changes terminal aggregation", () => {
+  const ledger = terminalLedger([{ start_ms: 0, end_ms: 300 }]);
+  const lowExpected = buildTerminalFixture(ledger, [
+    terminalCandidate("R001", "expected-neutral", 100, 200, [
+      { start_ms: 0, end_ms: 200 },
+    ], { expectedMs: 110 }),
+  ]);
+  const highExpected = buildTerminalFixture(ledger, [
+    terminalCandidate("R001", "expected-neutral", 100, 200, [
+      { start_ms: 0, end_ms: 200 },
+    ], { expectedMs: 190 }),
+  ]);
+
+  assert.deepEqual(highExpected, lowExpected);
+});
+
+test("overlapping rule ownership is deterministic and rows sum to totals", () => {
+  const ledger = terminalLedger([{ start_ms: 0, end_ms: 300 }]);
+  const candidates = [
+    terminalCandidate("R002", "r002-overlap", 100, 150, [
+      { start_ms: 0, end_ms: 150 },
+    ]),
+    terminalCandidate("R001", "r001-owner", 100, 150, [
+      { start_ms: 0, end_ms: 150 },
+    ]),
+    terminalCandidate("R008", "r008-tail", 50, 50, [
+      { start_ms: 150, end_ms: 200 },
+    ]),
+  ];
+  const expected = buildTerminalFixture(ledger, candidates);
+  const permutations = [
+    [...candidates].reverse(),
+    [candidates[1]!, candidates[2]!, candidates[0]!],
+    [candidates[2]!, candidates[0]!, candidates[1]!],
+  ];
+
+  for (const permutation of permutations) {
+    assert.deepEqual(buildTerminalFixture(ledger, permutation), expected);
+  }
+  assert.equal(terminalRuleRow(expected, "R001").confirmed_critical_path_ms, 100);
+  assert.equal(terminalRuleRow(expected, "R002").confirmed_critical_path_ms, 0);
+  assert.equal(terminalRuleRow(expected, "R008").confirmed_critical_path_ms, 50);
+  assert.equal(
+    expected.rules.reduce(
+      (total, row) => total + row.confirmed_critical_path_ms,
+      0,
+    ),
+    expected.confirmed_critical_path_ms,
+  );
+  assert.equal(
+    expected.rules.reduce(
+      (total, row) => total + row.estimated_critical_path_upper_ms,
+      0,
+    ),
+    expected.estimated_critical_path_upper_ms,
+  );
+  assert.equal(
+    expected.rules.reduce((total, row) => total + row.resource_cost_ms, 0),
+    expected.resource_cost_ms,
+  );
+});
+
+test("seeded terminal aggregation preserves partition and row invariants", () => {
+  let state = 0x5eed_1234;
+  const random = (): number => {
+    state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+    return state / 0x1_0000_0000;
+  };
+  const criticalRules = ["R001", "R002", "R003", "R007", "R008"] as const;
+
+  for (let iteration = 0; iteration < 48; iteration += 1) {
+    const candidates: TerminalCandidate[] = [];
+    const count = 1 + Math.floor(random() * 12);
+    for (let index = 0; index < count; index += 1) {
+      const ruleId = criticalRules[
+        Math.floor(random() * criticalRules.length)
+      ]!;
+      const start = Math.floor(random() * 900);
+      const duration = 1 + Math.floor(random() * (1_000 - start));
+      const lower = index % 3 === 0 ? 0 : Math.floor(duration * random());
+      const confidence: FindingConfidence = index % 3 === 0
+        ? { evidence: "medium", causal: "medium", source_completeness: 1 }
+        : { evidence: "high", causal: "high", source_completeness: 1 };
+      candidates.push(terminalCandidate(
+        ruleId,
+        `seed-${iteration}-${index}`,
+        lower,
+        duration,
+        [{ start_ms: start, end_ms: start + duration }],
+        { findingConfidence: confidence },
+      ));
+    }
+    candidates.push(
+      terminalCandidate("R005", `seed-r005-${iteration}`, 0,
+        Math.floor(random() * 2_000), [{ start_ms: 0, end_ms: 1 }]),
+      terminalCandidate("R006", `seed-r006-${iteration}`, 0,
+        Math.floor(random() * 2_000), []),
+    );
+    if (iteration % 2 === 1) candidates.reverse();
+
+    const snapshot = buildTerminalFixture(
+      terminalLedger([{ start_ms: 0, end_ms: 1_000 }]),
+      candidates,
+    );
+    assert.ok(snapshot.confirmed_critical_path_ms >= 0);
+    assert.ok(
+      snapshot.confirmed_critical_path_ms <=
+        snapshot.estimated_critical_path_upper_ms,
+    );
+    assert.ok(
+      snapshot.estimated_critical_path_upper_ms + snapshot.human_wait_ms +
+        snapshot.unexplained_ms <= snapshot.measured_wall_ms,
+    );
+    assert.equal(
+      snapshot.rules.reduce(
+        (total, row) => total + row.confirmed_critical_path_ms,
+        0,
+      ),
+      snapshot.confirmed_critical_path_ms,
+    );
+    assert.equal(
+      snapshot.rules.reduce(
+        (total, row) => total + row.estimated_critical_path_upper_ms,
+        0,
+      ),
+      snapshot.estimated_critical_path_upper_ms,
+    );
+    assert.equal(
+      snapshot.rules.reduce(
+        (total, row) => total + row.resource_cost_ms,
+        0,
+      ),
+      snapshot.resource_cost_ms,
+    );
+    assert.equal(snapshot.incomplete_interval_findings, 0);
+  }
+});
+
+function canonicalTerminalSnapshot(): TerminalStatsSnapshotV1 {
+  const ruleIds: readonly RuleId[] = [
+    "R001", "R002", "R003", "R004", "R005", "R006", "R007", "R008",
+  ];
+  return {
+    schema_version: 1,
+    measured_wall_ms: 100,
+    confirmed_critical_path_ms: 0,
+    estimated_critical_path_upper_ms: 0,
+    resource_cost_ms: 0,
+    human_wait_ms: 0,
+    unexplained_ms: 0,
+    cohort: {
+      repository_id: TERMINAL_REPOSITORY_ID,
+      workspace_id: TERMINAL_WORKSPACE_ID,
+      changed_files: 0,
+      changed_lines: 0,
+    },
+    rules: ruleIds.map((ruleId) => {
+      const manifest = ruleManifest(ruleId);
+      return {
+        rule_id: ruleId,
+        rule_version: manifest.version,
+        compatibility_epoch: manifest.compatibility_epoch,
+        confirmed_critical_path_ms: 0,
+        estimated_critical_path_upper_ms: 0,
+        resource_cost_ms: 0,
+      };
+    }),
+    incomplete_interval_findings: 0,
+  };
+}
+
+test("terminal snapshot normalizer clones closed canonical data", () => {
+  const input = canonicalTerminalSnapshot();
+  const normalized = normalizeTerminalStatsSnapshot(input);
+
+  assert.deepEqual(normalized, input);
+  assert.notEqual(normalized, input);
+  assert.notEqual(normalized.cohort, input.cohort);
+  assert.notEqual(normalized.rules, input.rules);
+  assert.notEqual(normalized.rules[0], input.rules[0]);
+  input.cohort.changed_files = 99;
+  input.rules[0]!.confirmed_critical_path_ms = 99;
+  assert.equal(normalized.cohort.changed_files, 0);
+  assert.equal(normalized.rules[0]?.confirmed_critical_path_ms, 0);
+
+  const { changed_lines: _changedLines, ...cohortWithoutLines } =
+    canonicalTerminalSnapshot().cohort;
+  const withoutLines = normalizeTerminalStatsSnapshot({
+    ...canonicalTerminalSnapshot(),
+    cohort: cohortWithoutLines,
+  });
+  assert.equal("changed_lines" in withoutLines.cohort, false);
+});
+
+test("terminal snapshot normalizer rejects unknown and non-canonical data", () => {
+  const canonical = canonicalTerminalSnapshot();
+  const invalid: unknown[] = [
+    { ...canonical, unknown: "secret" },
+    { ...canonical, cohort: { ...canonical.cohort, unknown: "secret" } },
+    {
+      ...canonical,
+      rules: canonical.rules.map((row, index) => index === 0
+        ? { ...row, unknown: "secret" }
+        : row),
+    },
+    { ...canonical, schema_version: 2 },
+    { ...canonical, measured_wall_ms: -1 },
+    { ...canonical, measured_wall_ms: -0 },
+    { ...canonical, measured_wall_ms: Number.NaN },
+    { ...canonical, resource_cost_ms: Number.POSITIVE_INFINITY },
+    { ...canonical, incomplete_interval_findings: 0.5 },
+    { ...canonical, incomplete_interval_findings: Number.MAX_SAFE_INTEGER + 1 },
+    { ...canonical, confirmed_critical_path_ms: 2,
+      estimated_critical_path_upper_ms: 1 },
+    { ...canonical, measured_wall_ms: 10,
+      estimated_critical_path_upper_ms: 6, human_wait_ms: 3,
+      unexplained_ms: 2 },
+    { ...canonical, cohort: { ...canonical.cohort, changed_files: -1 } },
+    { ...canonical, cohort: { ...canonical.cohort, changed_lines: 1.5 } },
+    { ...canonical, cohort: { ...canonical.cohort,
+      changed_files: Number.MAX_SAFE_INTEGER + 1 } },
+    { ...canonical, cohort: { ...canonical.cohort, repository_id: "raw/path" } },
+    { ...canonical, rules: [...canonical.rules].reverse() },
+    { ...canonical, rules: [canonical.rules[0]!, ...canonical.rules] },
+    {
+      ...canonical,
+      rules: canonical.rules.map((row, index) => index === 0
+        ? { ...row, rule_id: "R999" }
+        : row),
+    },
+    {
+      ...canonical,
+      rules: canonical.rules.map((row, index) => index === 0
+        ? { ...row, rule_version: "2.0.0" }
+        : row),
+    },
+    { ...canonical, confirmed_critical_path_ms: 1,
+      estimated_critical_path_upper_ms: 1 },
+    { ...canonical, resource_cost_ms: 1 },
+  ];
+
+  for (const value of invalid) {
+    assert.throws(() => normalizeTerminalStatsSnapshot(value), TypeError);
+  }
+});
+
+test("terminal snapshot normalizer does not invoke accessors or proxies", () => {
+  const canary = "TERMINAL_SNAPSHOT_CANARY";
+  let reads = 0;
+  const accessor = { ...canonicalTerminalSnapshot() };
+  Object.defineProperty(accessor, "measured_wall_ms", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      throw new Error(canary);
+    },
+  });
+  const proxied = new Proxy(canonicalTerminalSnapshot(), {
+    get() {
+      reads += 1;
+      throw new Error(canary);
+    },
+  });
+
+  for (const value of [accessor, proxied]) {
+    assert.throws(
+      () => normalizeTerminalStatsSnapshot(value),
+      (error: unknown) => {
+        assert.ok(error instanceof TypeError);
+        assert.equal(String(error).includes(canary), false);
+        return true;
+      },
+    );
+  }
+  assert.equal(reads, 0);
 });

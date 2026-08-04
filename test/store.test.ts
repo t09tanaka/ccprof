@@ -26,12 +26,17 @@ import type {
   FindingConfidence,
   ImpactEstimate,
   ReportV2,
+  RuleId,
 } from "../src/core/model.js";
 import type { AnalysisBudgetResult } from "../src/analysis/budgets.js";
+import type {
+  TerminalStatsSnapshotV1 as ExportedTerminalStatsSnapshotV1,
+} from "../src/analysis/stats-aggregation.js";
 import { commandIdentityKey } from "../src/analysis/command-identity.js";
 import { detectChronicCost } from "../src/rules/chronic-cost.js";
 import { projectReportPrivacy } from "../src/reporters/privacy.js";
 import { findingKey } from "../src/rules/shared.js";
+import { ruleManifest } from "../src/rules/manifest.js";
 import { selectorRefDigest } from "../src/git/pr-context.js";
 import {
   loadAdoptions,
@@ -3473,4 +3478,225 @@ test("privacy projections preserve canonical numeric and fixed finding fields", 
     );
     assert.notEqual(projected?.scoring_rationale, canonical.scoring_rationale);
   }
+});
+
+interface TerminalStatsSnapshotV1 {
+  schema_version: 1;
+  measured_wall_ms: number;
+  confirmed_critical_path_ms: number;
+  estimated_critical_path_upper_ms: number;
+  resource_cost_ms: number;
+  human_wait_ms: number;
+  unexplained_ms: number;
+  cohort: {
+    repository_id: string;
+    workspace_id: string;
+    changed_files: number;
+    changed_lines?: number;
+  };
+  rules: Array<{
+    rule_id: RuleId;
+    rule_version: string;
+    compatibility_epoch: number;
+    confirmed_critical_path_ms: number;
+    estimated_critical_path_upper_ms: number;
+    resource_cost_ms: number;
+  }>;
+  incomplete_interval_findings: number;
+}
+
+type StoredTerminalStatsExportContract =
+  ExportedTerminalStatsSnapshotV1 extends TerminalStatsSnapshotV1
+    ? true
+    : false;
+const storedTerminalStatsExportContract: StoredTerminalStatsExportContract = true;
+void storedTerminalStatsExportContract;
+
+type AnalysisRecordWithTerminalSnapshot = AnalysisRecord & {
+  terminal_stats_snapshot?: TerminalStatsSnapshotV1;
+};
+
+function storedTerminalStatsSnapshot(): TerminalStatsSnapshotV1 {
+  const ruleIds: readonly RuleId[] = [
+    "R001", "R002", "R003", "R004", "R005", "R006", "R007", "R008",
+  ];
+  return {
+    schema_version: 1,
+    measured_wall_ms: 1_000,
+    confirmed_critical_path_ms: 100,
+    estimated_critical_path_upper_ms: 200,
+    resource_cost_ms: 300,
+    human_wait_ms: 50,
+    unexplained_ms: 25,
+    cohort: {
+      repository_id: "1".repeat(64),
+      workspace_id: "2".repeat(64),
+      changed_files: 4,
+      changed_lines: 199,
+    },
+    rules: ruleIds.map((ruleId) => {
+      const manifest = ruleManifest(ruleId);
+      return {
+        rule_id: ruleId,
+        rule_version: manifest.version,
+        compatibility_epoch: manifest.compatibility_epoch,
+        confirmed_critical_path_ms: ruleId === "R001" ? 100 : 0,
+        estimated_critical_path_upper_ms: ruleId === "R001" ? 200 : 0,
+        resource_cost_ms: ruleId === "R005" ? 300 : 0,
+      };
+    }),
+    incomplete_interval_findings: 2,
+  };
+}
+
+test("analysis records clone and persist optional terminal stats snapshots", async () => {
+  const source = storedTerminalStatsSnapshot();
+  const expected = structuredClone(source);
+  const input = {
+    ...record("terminal-stats-round-trip", 100),
+    terminal_stats_snapshot: source,
+  };
+  const normalized = makeAnalysisRecord(input) as AnalysisRecordWithTerminalSnapshot;
+
+  assert.deepEqual(normalized.terminal_stats_snapshot, expected);
+  assert.notEqual(normalized.terminal_stats_snapshot, source);
+  assert.notEqual(normalized.terminal_stats_snapshot?.cohort, source.cohort);
+  assert.notEqual(normalized.terminal_stats_snapshot?.rules, source.rules);
+  source.cohort.changed_files = 99;
+  source.rules[0]!.confirmed_critical_path_ms = 99;
+  assert.deepEqual(normalized.terminal_stats_snapshot, expected);
+
+  await temporaryStore(async (paths) => {
+    assert.deepEqual((await saveAnalysis(paths, normalized)).warnings, []);
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded.warnings, []);
+    assert.deepEqual(loaded.records, [normalized]);
+    const loadedRecord = loaded.records[0] as
+      AnalysisRecordWithTerminalSnapshot | undefined;
+    assert.deepEqual(loadedRecord?.terminal_stats_snapshot, expected);
+    assert.notEqual(
+      loadedRecord?.terminal_stats_snapshot,
+      normalized.terminal_stats_snapshot,
+    );
+  });
+});
+
+test("legacy records omit rather than synthesize terminal stats snapshots", () => {
+  const legacy = makeAnalysisRecord(record("legacy-terminal-stats", 101)) as
+    AnalysisRecordWithTerminalSnapshot;
+  assert.equal("terminal_stats_snapshot" in legacy, false);
+
+  const explicitUndefined = {
+    ...record("undefined-terminal-stats", 102),
+    terminal_stats_snapshot: undefined,
+  };
+  const normalized = makeAnalysisRecord(explicitUndefined) as
+    AnalysisRecordWithTerminalSnapshot;
+  assert.equal("terminal_stats_snapshot" in normalized, false);
+});
+
+test("analysis records reject malformed terminal stats snapshot presence", () => {
+  const canonical = storedTerminalStatsSnapshot();
+  const malformed: unknown[] = [
+    null,
+    { ...canonical, schema_version: 2 },
+    { ...canonical, measured_wall_ms: -1 },
+    { ...canonical, unknown: "raw/private/path" },
+    { ...canonical, confirmed_critical_path_ms: 201 },
+    { ...canonical, resource_cost_ms: 301 },
+  ];
+
+  for (const terminalStats of malformed) {
+    const input = {
+      ...record("malformed-terminal-stats", 103),
+      terminal_stats_snapshot: terminalStats,
+    };
+    assert.throws(
+      () => makeAnalysisRecord(input),
+      TypeError,
+    );
+  }
+});
+
+test("terminal stats descriptors fail closed without evaluating hostile input", () => {
+  const canary = "TERMINAL_STORE_CANARY";
+  let reads = 0;
+  const accessor = record("terminal-stats-accessor", 104) as
+    AnalysisRecordWithTerminalSnapshot;
+  Object.defineProperty(accessor, "terminal_stats_snapshot", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      throw new Error(canary);
+    },
+  });
+  const hidden = record("terminal-stats-hidden", 105) as
+    AnalysisRecordWithTerminalSnapshot;
+  Object.defineProperty(hidden, "terminal_stats_snapshot", {
+    enumerable: false,
+    value: storedTerminalStatsSnapshot(),
+  });
+  const proxiedSnapshot = new Proxy(storedTerminalStatsSnapshot(), {
+    get() {
+      reads += 1;
+      throw new Error(canary);
+    },
+  });
+
+  for (const input of [
+    accessor,
+    hidden,
+    {
+      ...record("terminal-stats-proxy", 106),
+      terminal_stats_snapshot: proxiedSnapshot,
+    },
+  ]) {
+    assert.throws(
+      () => makeAnalysisRecord(input),
+      (error: unknown) => {
+        assert.ok(error instanceof TypeError);
+        assert.equal(String(error).includes(canary), false);
+        return true;
+      },
+    );
+  }
+  assert.equal(reads, 0);
+});
+
+test("snapshot reads reject malformed terminal stats despite a valid digest", async () => {
+  await temporaryStore(async (paths) => {
+    const stored = record("malformed-terminal-read", 107);
+    const { analysis_id: executionId, created_at_ms: executedAtMs, ...payload } =
+      stored;
+    const envelope = {
+      schema_version: 1 as const,
+      identity: { mode: "content-fallback" as const },
+      payload: {
+        ...payload,
+        terminal_stats_snapshot: {
+          ...storedTerminalStatsSnapshot(),
+          measured_wall_ms: -1,
+        },
+      },
+    };
+    const recordJson = canonicalJson(envelope);
+    const snapshotId = analysisDigest("analysis-snapshot-v1", envelope);
+    const database = openStoreDatabase(paths);
+    try {
+      database.prepare(`INSERT INTO analysis_snapshots
+        (snapshot_id, created_at_ms, record_json) VALUES (?, ?, ?)`)
+        .run(snapshotId, executedAtMs, recordJson);
+      database.prepare(`INSERT INTO analysis_executions
+        (execution_id, snapshot_id, executed_at_ms) VALUES (?, ?, ?)`)
+        .run(executionId, snapshotId, executedAtMs);
+    } finally {
+      database.close();
+    }
+
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded.records, []);
+    assert.ok(loaded.warnings.some(
+      ({ code }) => code === "corrupt_analysis_record",
+    ));
+  });
 });
