@@ -27,6 +27,8 @@ import { runAnalyzeCommand } from "../src/commands/analyze.js";
 import { runStatsCommand } from "../src/commands/stats.js";
 import type { AnalyzeOptions } from "../src/core/analyze.js";
 import type { ReportV2 } from "../src/core/model.js";
+import * as organizationPolicyModule from
+  "../src/policy/organization-policy.js";
 import {
   canonicalOrganizationPolicy,
   loadConfiguredOrganizationPolicy,
@@ -85,6 +87,37 @@ type RepositoryPolicyWithRuleSafety = RepositoryPolicyPreferences & {
 type EffectivePolicyWithRuleSafety = EffectivePolicy & {
   rule_safety?: EffectiveRuleSafetyPolicy;
 };
+
+type OrganizationPolicyWithMinimumCohort = OrganizationPolicy & {
+  minimum_cohort_size?: number;
+};
+
+type RepositoryPolicyWithMinimumCohort = RepositoryPolicyPreferences & {
+  minimum_cohort_size?: number;
+};
+
+type EffectivePolicyWithMinimumCohort = EffectivePolicy & {
+  minimum_cohort_size: number;
+};
+
+const cohortPolicyExports = organizationPolicyModule as unknown as {
+  DEFAULT_MINIMUM_COHORT_SIZE?: number;
+  MINIMUM_COHORT_SIZE?: number;
+  MAXIMUM_COHORT_SIZE?: number;
+};
+
+function policyWithMinimumCohort(
+  minimumCohortSize: number,
+): OrganizationPolicy {
+  return {
+    ...policy(),
+    minimum_cohort_size: minimumCohortSize,
+  } as OrganizationPolicyWithMinimumCohort;
+}
+
+function minimumCohortSize(value: EffectivePolicy): unknown {
+  return (value as EffectivePolicyWithMinimumCohort).minimum_cohort_size;
+}
 
 function ruleSafetyPolicy(
   overrides: Partial<OrganizationPolicyWithRuleSafety> = {},
@@ -172,7 +205,7 @@ function report(repoRoot: string): ReportV2 {
 
 function effectivePolicy(
   overrides: Partial<EffectivePolicy> = {},
-): EffectivePolicy {
+): EffectivePolicyWithMinimumCohort {
   return {
     governed: false,
     privacy: "raw",
@@ -181,6 +214,7 @@ function effectivePolicy(
     advisory_enabled: true,
     allow_export: true,
     required_source_coverage: 0,
+    minimum_cohort_size: 5,
     ...overrides,
   };
 }
@@ -317,10 +351,19 @@ test("published organization policy schema is closed and exact", async () => {
     "allow_export",
     "raw_retention_days_max",
     "required_source_coverage",
+    "minimum_cohort_size",
     "approval_policy",
     "resource_domains",
     "kill_switches",
   ]);
+  const minimumCohort = schema.properties?.minimum_cohort_size as {
+    type?: unknown;
+    minimum?: unknown;
+    maximum?: unknown;
+  };
+  assert.equal(minimumCohort.type, "integer");
+  assert.equal(minimumCohort.minimum, 3);
+  assert.equal(minimumCohort.maximum, 1_000);
   const approval = schema.properties?.approval_policy as {
     additionalProperties?: unknown;
     required?: unknown;
@@ -408,9 +451,18 @@ test("repository config schema publishes a closed optional policy section", asyn
     "allow_export",
     "raw_retention_days_max",
     "required_source_coverage",
+    "minimum_cohort_size",
     "approval_policy",
     "resource_domains",
   ]);
+  const minimumCohort = policySchema?.properties?.minimum_cohort_size as {
+    type?: unknown;
+    minimum?: unknown;
+    maximum?: unknown;
+  };
+  assert.equal(minimumCohort.type, "integer");
+  assert.equal(minimumCohort.minimum, 3);
+  assert.equal(minimumCohort.maximum, 1_000);
   const approval = policySchema?.properties?.approval_policy as {
     additionalProperties?: unknown;
     required?: unknown;
@@ -583,6 +635,7 @@ test("repository policy preferences are independently optional", async (t) => {
     allow_export: false,
     raw_retention_days_max: Number.MAX_SAFE_INTEGER,
     required_source_coverage: 0,
+    minimum_cohort_size: 3,
   } as const;
   for (const [key, value] of Object.entries(fields)) {
     const repoRoot = await temporaryRepository(t);
@@ -592,6 +645,19 @@ test("repository policy preferences are independently optional", async (t) => {
     });
     assert.deepEqual(await loadRepositoryPolicyPreferences(repoRoot), {
       [key]: value,
+    });
+  }
+});
+
+test("repository minimum cohort policy preserves both inclusive bounds", async (t) => {
+  for (const minimumCohortSize of [3, 1_000]) {
+    const repoRoot = await temporaryRepository(t);
+    await writeRepositoryConfig(repoRoot, {
+      schema_version: 1,
+      policy: { minimum_cohort_size: minimumCohortSize },
+    });
+    assert.deepEqual(await loadRepositoryPolicyPreferences(repoRoot), {
+      minimum_cohort_size: minimumCohortSize,
     });
   }
 });
@@ -779,6 +845,11 @@ test("repository policy validation is closed, bounded, and content-free", async 
     { raw_retention_days_max: Number.MAX_SAFE_INTEGER + 1 },
     { required_source_coverage: -Number.EPSILON },
     { required_source_coverage: 1 + Number.EPSILON },
+    { minimum_cohort_size: 2 },
+    { minimum_cohort_size: 1_001 },
+    { minimum_cohort_size: 3.5 },
+    { minimum_cohort_size: Number.NaN },
+    { minimum_cohort_size: Number.POSITIVE_INFINITY },
   ];
 
   for (const value of invalidPolicies) {
@@ -975,6 +1046,11 @@ test("organization policy validation is closed, bounded, and content-free", () =
     { ...policy(), raw_retention_days_max: Number.MAX_SAFE_INTEGER + 1 },
     { ...policy(), required_source_coverage: -Number.EPSILON },
     { ...policy(), required_source_coverage: 1 + Number.EPSILON },
+    policyWithMinimumCohort(2),
+    policyWithMinimumCohort(1_001),
+    policyWithMinimumCohort(3.5),
+    policyWithMinimumCohort(Number.NaN),
+    policyWithMinimumCohort(Number.POSITIVE_INFINITY),
     { ...policy(), kill_switches: { raw: false, advisory: false } },
     {
       ...policy(),
@@ -1008,6 +1084,23 @@ test("organization policy validation is closed, bounded, and content-free", () =
   );
 });
 
+test("minimum cohort policy exports its exact default and bounds", () => {
+  assert.equal(cohortPolicyExports.DEFAULT_MINIMUM_COHORT_SIZE, 5);
+  assert.equal(cohortPolicyExports.MINIMUM_COHORT_SIZE, 3);
+  assert.equal(cohortPolicyExports.MAXIMUM_COHORT_SIZE, 1_000);
+});
+
+test("signed minimum cohort policy preserves both inclusive bounds", () => {
+  for (const minimumCohortSize of [3, 1_000]) {
+    assert.equal(
+      (parseOrganizationPolicy(JSON.stringify(
+        policyWithMinimumCohort(minimumCohortSize),
+      )) as OrganizationPolicyWithMinimumCohort).minimum_cohort_size,
+      minimumCohortSize,
+    );
+  }
+});
+
 test("canonical policy bytes use fixed semantic order and exclude $schema", () => {
   const parsed = parseOrganizationPolicy(JSON.stringify({
     required_source_coverage: 0.9,
@@ -1029,6 +1122,33 @@ test("canonical policy bytes use fixed semantic order and exclude $schema", () =
       '"allow_advisory":false,"allow_export":true,' +
       '"raw_retention_days_max":14,"required_source_coverage":0.9,' +
       '"kill_switches":{"raw":true,"advisory":false,"export":true}}',
+  );
+});
+
+test("minimum cohort omission preserves bytes and presence has one fixed position", () => {
+  assert.equal(
+    canonicalOrganizationPolicy(policy()).toString("utf8"),
+    '{"policy_schema_version":1,"organization":"example-corp",' +
+      '"minimum_privacy":"strict","allow_raw":false,' +
+      '"allow_advisory":false,"allow_export":true,' +
+      '"raw_retention_days_max":14,"required_source_coverage":0.9}',
+  );
+  assert.equal(
+    canonicalOrganizationPolicy(policyWithMinimumCohort(20)).toString("utf8"),
+    '{"policy_schema_version":1,"organization":"example-corp",' +
+      '"minimum_privacy":"strict","allow_raw":false,' +
+      '"allow_advisory":false,"allow_export":true,' +
+      '"raw_retention_days_max":14,"required_source_coverage":0.9,' +
+      '"minimum_cohort_size":20}',
+  );
+});
+
+test("present minimum cohort field verifies under its detached signature", async (t) => {
+  const value = policyWithMinimumCohort(20);
+  const fixture = await signedPolicyFixture(t, value);
+  assert.deepEqual(
+    await loadConfiguredOrganizationPolicy(fixture.environment),
+    value,
   );
 });
 
@@ -1563,6 +1683,85 @@ test("canonicalization rejects hostile objects with content-free deterministic e
   assertHostile(revoked.proxy);
 });
 
+test("minimum cohort runtime values reject invalid numbers and hostile objects", () => {
+  const request: PolicyRequest = { privacy: "strict", advisory: false };
+  for (const value of [
+    2,
+    1_001,
+    3.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+  ]) {
+    assert.throws(
+      () => resolveEffectivePolicy({
+        repository: {
+          minimum_cohort_size: value,
+        } as RepositoryPolicyWithMinimumCohort,
+        request,
+      }),
+      (error: unknown) => assertPolicyError(error, "invalid_policy"),
+    );
+  }
+
+  let getterCalls = 0;
+  const repository = {} as Record<string, unknown>;
+  Object.defineProperty(repository, "minimum_cohort_size", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      throw new Error("CCPROF_PRIVATE_MINIMUM_COHORT_GETTER");
+    },
+  });
+  assert.throws(
+    () => resolveEffectivePolicy({
+      repository: repository as RepositoryPolicyWithMinimumCohort,
+      request,
+    }),
+    (error: unknown) => assertPolicyError(error, "invalid_policy"),
+  );
+  assert.equal(getterCalls, 0);
+
+  const hostile = new Proxy({ minimum_cohort_size: 5 }, {
+    ownKeys() {
+      throw new Error("CCPROF_PRIVATE_MINIMUM_COHORT_PROXY");
+    },
+  });
+  assert.throws(
+    () => resolveEffectivePolicy({
+      repository: hostile as RepositoryPolicyWithMinimumCohort,
+      request,
+    }),
+    (error: unknown) => assertPolicyError(error, "invalid_policy"),
+  );
+});
+
+test("minimum cohort policy defaults to five", () => {
+  assert.equal(minimumCohortSize(resolveEffectivePolicy({
+    request: { privacy: "raw", advisory: false },
+  })), 5);
+});
+
+test("repository minimum cohort cannot weaken the organization floor", () => {
+  assert.equal(minimumCohortSize(resolveEffectivePolicy({
+    organization: policyWithMinimumCohort(20),
+    repository: {
+      minimum_cohort_size: 10,
+    } as RepositoryPolicyWithMinimumCohort,
+    request: { privacy: "strict", advisory: false },
+  })), 20);
+});
+
+test("repository minimum cohort can tighten the organization floor", () => {
+  assert.equal(minimumCohortSize(resolveEffectivePolicy({
+    organization: policyWithMinimumCohort(10),
+    repository: {
+      minimum_cohort_size: 20,
+    } as RepositoryPolicyWithMinimumCohort,
+    request: { privacy: "strict", advisory: false },
+  })), 20);
+});
+
 test("organization constraints cannot be weakened by repository or CLI", () => {
   assert.deepEqual(resolveEffectivePolicy({
     organization: policy(),
@@ -1585,6 +1784,7 @@ test("organization constraints cannot be weakened by repository or CLI", () => {
     allow_export: true,
     raw_retention_days_max: 14,
     required_source_coverage: 0.9,
+    minimum_cohort_size: 5,
     rule_safety: { organization_resource_domains: [] },
   });
 });
@@ -1618,6 +1818,7 @@ test("repository preferences and CLI can only tighten organization policy", () =
     allow_export: false,
     raw_retention_days_max: 7,
     required_source_coverage: 0.75,
+    minimum_cohort_size: 5,
     rule_safety: { organization_resource_domains: [] },
   });
 });
@@ -1648,6 +1849,7 @@ test("signed administrative kill switches override every lower layer", () => {
     allow_export: false,
     raw_retention_days_max: 14,
     required_source_coverage: 0.9,
+    minimum_cohort_size: 5,
     rule_safety: { organization_resource_domains: [] },
   });
 });
@@ -1771,6 +1973,7 @@ test("ungoverned policy resolution preserves current CLI defaults", () => {
     advisory_enabled: true,
     allow_export: true,
     required_source_coverage: 0,
+    minimum_cohort_size: 5,
   });
 
   assert.deepEqual(resolveEffectivePolicy({
@@ -1790,6 +1993,7 @@ test("ungoverned policy resolution preserves current CLI defaults", () => {
     allow_export: true,
     raw_retention_days_max: 0,
     required_source_coverage: 1,
+    minimum_cohort_size: 5,
   });
 });
 
@@ -1822,6 +2026,7 @@ test("repository policy resolver composes signed and repository layers", async (
     allow_export: true,
     raw_retention_days_max: 14,
     required_source_coverage: 0.9,
+    minimum_cohort_size: 5,
     rule_safety: { organization_resource_domains: [] },
   });
 });
