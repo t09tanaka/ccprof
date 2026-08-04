@@ -50,6 +50,8 @@ const RULE_ROW_FIELDS = [
 
 const OPAQUE_ID = /^[0-9a-f]{64}$/u;
 
+export const TERMINAL_STATS_COLLECTION_LIMIT = 10_000;
+
 export interface TerminalStatsRuleV1 {
   rule_id: RuleId;
   rule_version: string;
@@ -261,7 +263,6 @@ function dataValue(
 function snapshotArray(value: unknown): unknown[] | null {
   try {
     if (!Array.isArray(value) || utilTypes.isProxy(value)) return null;
-    const descriptors = Object.getOwnPropertyDescriptors(value);
     const lengthDescriptor: PropertyDescriptor | undefined =
       Object.getOwnPropertyDescriptor(value, "length");
     const lengthValue: unknown = lengthDescriptor !== undefined &&
@@ -271,16 +272,25 @@ function snapshotArray(value: unknown): unknown[] | null {
     if (
       typeof lengthValue !== "number" ||
       !Number.isSafeInteger(lengthValue) ||
-      lengthValue < 0
+      lengthValue < 0 ||
+      lengthValue > TERMINAL_STATS_COLLECTION_LIMIT
     ) return null;
     const length = lengthValue;
-    const allowed = new Set<PropertyKey>([
-      "length",
-      ...Array.from({ length }, (_, index) => String(index)),
-    ]);
-    if (Reflect.ownKeys(descriptors).some((key) => !allowed.has(key))) {
+    const ownKeys = Reflect.ownKeys(value);
+    if (
+      ownKeys.length !== length + 1 ||
+      ownKeys.length > TERMINAL_STATS_COLLECTION_LIMIT + 1 ||
+      ownKeys.some((key) => {
+        if (key === "length") return false;
+        if (typeof key !== "string") return true;
+        const index = Number(key);
+        return !Number.isSafeInteger(index) || index < 0 || index >= length ||
+          String(index) !== key;
+      })
+    ) {
       return null;
     }
+    const descriptors = Object.getOwnPropertyDescriptors(value);
     const result: unknown[] = [];
     for (let index = 0; index < length; index += 1) {
       const descriptor = descriptors[String(index)];
@@ -555,6 +565,17 @@ function normalizeRuleRows(value: unknown): TerminalStatsRuleV1[] {
     const upper = metricValue(entry.get("estimated_critical_path_upper_ms"));
     const resource = metricValue(entry.get("resource_cost_ms"));
     if (confirmed > upper) throw new TypeError("invalid terminal stats snapshot");
+    const hasCritical = confirmed !== 0 || upper !== 0;
+    const hasResource = resource !== 0;
+    if (
+      (manifest.aggregation_policy === "never_aggregate" &&
+        (hasCritical || hasResource)) ||
+      (manifest.impact_kind === "critical_path_latency" && hasResource) ||
+      (manifest.impact_kind === "resource_cost" && hasCritical) ||
+      ((manifest.impact_kind === "policy_latency" ||
+        manifest.impact_kind === "evidence_only") &&
+        (hasCritical || hasResource))
+    ) throw new TypeError("invalid terminal stats snapshot");
     rows.push({
       rule_id: ruleId as RuleId,
       rule_version: manifest.version,
