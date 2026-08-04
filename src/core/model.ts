@@ -6,6 +6,8 @@
  * the producing source cannot determine the repository root.
  */
 
+import { types as utilTypes } from "node:util";
+
 import type { EventIdentity } from "./event-identity.js";
 import type { SourceDescriptor } from "./source-descriptor.js";
 import type { AnalysisBudgetResult } from "../analysis/budgets.js";
@@ -18,6 +20,28 @@ export interface JsonObject {
 
 export type Confidence = "low" | "medium" | "high";
 export type Bound = "point" | "upper";
+export interface ImpactEstimate {
+  lower_ms: number;
+  expected_ms?: number;
+  upper_ms: number;
+  kind: "critical_path_latency" | "resource_cost";
+}
+export interface FindingConfidence {
+  evidence: "low" | "medium" | "high";
+  causal: "low" | "medium" | "high";
+  source_completeness: number;
+}
+export type FindingSeverity = "info" | "low" | "medium" | "high";
+export const FINDING_SCORING_RATIONALE_ORDER = [
+  "observed_lower_bound",
+  "estimated_upper_only",
+  "resource_cost_only",
+  "policy_dependent",
+  "partial_source",
+  "legacy_projection",
+] as const;
+export type FindingScoringRationale =
+  (typeof FINDING_SCORING_RATIONALE_ORDER)[number];
 export type CommandExecutor = "shell" | "native-tool";
 export interface CommandIdentity {
   repo_relative_cwd: string;
@@ -301,6 +325,10 @@ interface FindingMetadata {
 export interface FindingCandidate extends FindingMetadata {
   target: string;
   recoverable: RecoverableClaim;
+  impact: ImpactEstimate;
+  finding_confidence: FindingConfidence;
+  severity: FindingSeverity;
+  scoring_rationale: FindingScoringRationale[];
 }
 
 export interface FindingRecoverable {
@@ -311,8 +339,214 @@ export interface FindingRecoverable {
 export interface Finding extends FindingMetadata {
   target?: string;
   recoverable: FindingRecoverable;
+  /** Present on every newly produced finding; optional only for v2 input. */
+  impact?: ImpactEstimate;
+  /** Present on every newly produced finding; optional only for v2 input. */
+  finding_confidence?: FindingConfidence;
+  /** Present on every newly produced finding; optional only for v2 input. */
+  severity?: FindingSeverity;
+  /** Present on every newly produced finding; optional only for v2 input. */
+  scoring_rationale?: FindingScoringRationale[];
   rule_version?: string;
   compatibility_epoch?: number;
+}
+
+const FINDING_CONFIDENCE_RANK: Readonly<Record<Confidence, number>> = {
+  low: 0,
+  medium: 1,
+  high: 2,
+};
+
+function validNonnegativeNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 &&
+    !Object.is(value, -0);
+}
+
+function exactDataObject(
+  value: unknown,
+  required: readonly string[],
+  optional: readonly string[],
+  message: string,
+): Record<string, unknown> {
+  try {
+    if (
+      value === null ||
+      typeof value !== "object" ||
+      Array.isArray(value) ||
+      utilTypes.isProxy(value) ||
+      Object.getPrototypeOf(value) !== Object.prototype
+    ) {
+      throw new TypeError();
+    }
+    const allowed = new Set([...required, ...optional]);
+    const keys = Reflect.ownKeys(value);
+    if (
+      keys.some((key) => typeof key !== "string" || !allowed.has(key)) ||
+      required.some((key) => !keys.includes(key))
+    ) {
+      throw new TypeError();
+    }
+    const snapshot: Record<string, unknown> = {};
+    for (const key of keys) {
+      if (typeof key !== "string") throw new TypeError();
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (
+        descriptor === undefined ||
+        descriptor.enumerable !== true ||
+        !("value" in descriptor)
+      ) {
+        throw new TypeError();
+      }
+      snapshot[key] = descriptor.value;
+    }
+    return snapshot;
+  } catch {
+    throw new TypeError(message);
+  }
+}
+
+export function snapshotImpactEstimate(value: unknown): ImpactEstimate {
+  try {
+    const snapshot = exactDataObject(
+      value,
+      ["lower_ms", "upper_ms", "kind"],
+      ["expected_ms"],
+      "invalid impact estimate",
+    );
+    const lower = snapshot.lower_ms;
+    const upper = snapshot.upper_ms;
+    const expected = snapshot.expected_ms;
+    const kind = snapshot.kind;
+    if (
+      !validNonnegativeNumber(lower) ||
+      !validNonnegativeNumber(upper) ||
+      lower > upper ||
+      (kind !== "critical_path_latency" && kind !== "resource_cost")
+    ) {
+      throw new TypeError();
+    }
+    let expectedValue: number | undefined;
+    if ("expected_ms" in snapshot) {
+      if (
+        !validNonnegativeNumber(expected) ||
+        expected < lower ||
+        expected > upper
+      ) throw new TypeError();
+      expectedValue = expected;
+    }
+    return {
+      lower_ms: lower,
+      ...(expectedValue === undefined ? {} : { expected_ms: expectedValue }),
+      upper_ms: upper,
+      kind,
+    };
+  } catch {
+    throw new TypeError("invalid impact estimate");
+  }
+}
+
+export function snapshotFindingConfidence(value: unknown): FindingConfidence {
+  try {
+    const snapshot = exactDataObject(
+      value,
+      ["evidence", "causal", "source_completeness"],
+      [],
+      "invalid finding confidence",
+    );
+    const evidence = snapshot.evidence;
+    const causal = snapshot.causal;
+    const completeness = snapshot.source_completeness;
+    if (
+      (evidence !== "low" && evidence !== "medium" && evidence !== "high") ||
+      (causal !== "low" && causal !== "medium" && causal !== "high") ||
+      !validNonnegativeNumber(completeness) ||
+      completeness > 1
+    ) {
+      throw new TypeError();
+    }
+    return {
+      evidence,
+      causal,
+      source_completeness: completeness,
+    };
+  } catch {
+    throw new TypeError("invalid finding confidence");
+  }
+}
+
+export function projectFindingConfidence(value: FindingConfidence): Confidence {
+  const confidence = snapshotFindingConfidence(value);
+  const completeness: Confidence = confidence.source_completeness === 1
+    ? "high"
+    : confidence.source_completeness === 0
+      ? "low"
+      : "medium";
+  return [confidence.evidence, confidence.causal, completeness]
+    .reduce<Confidence>((minimum, entry) =>
+      FINDING_CONFIDENCE_RANK[entry] < FINDING_CONFIDENCE_RANK[minimum]
+        ? entry
+        : minimum, "high");
+}
+
+export function projectFindingRecoverable(
+  value: ImpactEstimate,
+): FindingRecoverable {
+  const impact = snapshotImpactEstimate(value);
+  return {
+    min: impact.upper_ms / 60_000,
+    bound: impact.lower_ms === impact.upper_ms ? "point" : "upper",
+  };
+}
+
+export function isStrictHighConfidence(value: FindingConfidence): boolean {
+  const confidence = snapshotFindingConfidence(value);
+  return confidence.evidence === "high" && confidence.causal === "high" &&
+    confidence.source_completeness === 1;
+}
+
+export function findingSeverity(
+  impactValue: ImpactEstimate,
+  confidenceValue: FindingConfidence,
+): FindingSeverity {
+  const impact = snapshotImpactEstimate(impactValue);
+  const confidence = snapshotFindingConfidence(confidenceValue);
+  if (impact.upper_ms === 0) return "info";
+  if (
+    impact.kind === "critical_path_latency" &&
+    impact.lower_ms > 0 &&
+    isStrictHighConfidence(confidence)
+  ) return "high";
+  if (
+    FINDING_CONFIDENCE_RANK[confidence.evidence] >=
+        FINDING_CONFIDENCE_RANK.medium &&
+    FINDING_CONFIDENCE_RANK[confidence.causal] >=
+        FINDING_CONFIDENCE_RANK.medium &&
+    confidence.source_completeness > 0
+  ) return "medium";
+  return "low";
+}
+
+export function findingScoringRationale(
+  impactValue: ImpactEstimate,
+  confidenceValue: FindingConfidence,
+  options: {
+    policy_dependent?: boolean;
+    legacy_projection?: boolean;
+  } = {},
+): FindingScoringRationale[] {
+  const impact = snapshotImpactEstimate(impactValue);
+  const confidence = snapshotFindingConfidence(confidenceValue);
+  return [
+    ...(impact.lower_ms > 0
+      ? ["observed_lower_bound" as const]
+      : impact.upper_ms > 0
+        ? ["estimated_upper_only" as const]
+        : []),
+    ...(impact.kind === "resource_cost" ? ["resource_cost_only" as const] : []),
+    ...(options.policy_dependent === true ? ["policy_dependent" as const] : []),
+    ...(confidence.source_completeness < 1 ? ["partial_source" as const] : []),
+    ...(options.legacy_projection === true ? ["legacy_projection" as const] : []),
+  ];
 }
 
 export function findingCompatibilityMetadata(value: unknown):

@@ -11,6 +11,7 @@ import {
 } from "../core/event-identity.js";
 import {
   createFindingCandidate,
+  impactFromClaim,
   minimumConfidence,
   orderedActions,
   recoverableClaim,
@@ -19,6 +20,7 @@ import {
 
 export interface ReworkOptions {
   userEvents?: readonly GenuineUserEvent[];
+  sourceCompleteness?: number;
 }
 
 interface ReworkBlock {
@@ -244,7 +246,7 @@ export function detectRework(
         action.match_confidence,
       ]),
     );
-    const confidence = correctionSignal
+    const causalConfidence = correctionSignal
       ? evidenceConfidence
       : downgradeConfidence(evidenceConfidence);
     const recoverable = recoverableClaim("R001", target, block.actions);
@@ -271,7 +273,12 @@ export function detectRework(
           : cause === "requirements_changed" || cause === "scope_creep"
             ? "this_pr"
             : "separate_issue",
-      confidence,
+      impact: impactFromClaim(recoverable, "critical_path_latency"),
+      finding_confidence: {
+        evidence: evidenceConfidence,
+        causal: causalConfidence,
+        source_completeness: options.sourceCompleteness ?? 1,
+      },
       target,
       evidence: {
         session_refs: sortedUnique([
@@ -286,7 +293,7 @@ export function detectRework(
         duration_ms: recoverable.estimated_ms,
         correction_signal: correctionSignal,
       },
-      recoverable,
+      intervals: recoverable.intervals,
       fix_recipe: recipeFor(cause),
       caveats,
     });

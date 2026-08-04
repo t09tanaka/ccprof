@@ -9,6 +9,7 @@ import type {
   ReportV2,
 } from "../core/model.js";
 import type { StatsReport } from "./stats.js";
+import { findingForDisplay } from "./tty.js";
 export type PrivacyProfile = "strict" | "balanced" | "raw";
 type DisplayProfile = Exclude<PrivacyProfile, "raw">;
 type Copy = readonly [raw: string, replacement: string];
@@ -179,6 +180,18 @@ function projectedFinding(finding: Finding, profile: DisplayProfile,
     confidence: finding.confidence,
     evidence,
     recoverable: { ...finding.recoverable },
+    ...(finding.impact === undefined
+      ? {}
+      : { impact: { ...finding.impact } }),
+    ...(finding.finding_confidence === undefined
+      ? {}
+      : { finding_confidence: { ...finding.finding_confidence } }),
+    ...(finding.severity === undefined
+      ? {}
+      : { severity: finding.severity }),
+    ...(finding.scoring_rationale === undefined
+      ? {}
+      : { scoring_rationale: [...finding.scoring_rationale] }),
     fix_recipe: {
       suggestion: safeText(finding.fix_recipe.suggestion, profile, repoRoot, sessions, copies),
       verify: trustedVerificationCommand(finding) ?? REDACTED_COMMAND,
@@ -228,7 +241,24 @@ function projectedAnalysisBudget(
 
 export function projectReportPrivacy(report: ReportV2, profile: PrivacyProfile): ReportV2 {
   if (profile === "raw") return report;
-  const scope = createHash("sha256").update(JSON.stringify(report)).digest("hex");
+  const findings = report.findings.map(findingForDisplay);
+  const normalizedReport: ReportV2 = {
+    version: 2,
+    unit: report.unit,
+    ...(report.sources === undefined ? {} : { sources: report.sources }),
+    summary: report.summary,
+    findings,
+    caveats: report.caveats,
+    ...(report.rule_coverage === undefined
+      ? {}
+      : { rule_coverage: report.rule_coverage }),
+    ...(report.skipped_rules === undefined
+      ? {}
+      : { skipped_rules: report.skipped_rules }),
+  };
+  const scope = createHash("sha256")
+    .update(JSON.stringify(normalizedReport))
+    .digest("hex");
   const repoRoot = report.unit.repo;
   const sessions = report.unit.sessions;
   return {
@@ -245,10 +275,10 @@ export function projectReportPrivacy(report: ReportV2, profile: PrivacyProfile):
       ? {}
       : { sources: structuredClone(report.sources) }),
     summary: structuredClone(report.summary),
-    findings: report.findings.map((finding) => projectedFinding(
+    findings: findings.map((finding) => projectedFinding(
       finding, profile, scope, repoRoot, sessions,
     )),
-    caveats: reportCaveats(report, profile, repoRoot, sessions),
+    caveats: reportCaveats(normalizedReport, profile, repoRoot, sessions),
     ...(report.rule_coverage === undefined ? {} : {
       rule_coverage: report.rule_coverage.map((entry) => ({
         rule_id: entry.rule_id,

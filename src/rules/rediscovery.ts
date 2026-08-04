@@ -11,6 +11,7 @@ import { normalizeRepoPath } from "../analysis/test-map.js";
 import type { AnalysisRecord } from "../store/analyses.js";
 import {
   createFindingCandidate, findingKey, normalizeFindingTarget,
+  impactFromClaim,
   minimumConfidence,
   orderedActions,
   recoverableClaim,
@@ -21,6 +22,7 @@ export interface RediscoveryOptions {
   estimatedTokensByEventIdentity?: ReadonlyMap<string, number>;
   history?: readonly AnalysisRecord[];
   currentObjectIdsByPath?: ReadonlyMap<string, string>; crossPrEligibleReadKeys?: ReadonlySet<string>;
+  sourceCompleteness?: number;
 }
 
 interface CurrentRead {
@@ -252,18 +254,28 @@ export function detectRediscovery(
       );
       const confidenceActions =
         claimedActions.length === 0 ? evidenceActions : claimedActions;
+      const causalConfidence = minimumConfidence(
+        confidenceActions.flatMap((action) => [
+          action.confidence,
+          action.match_confidence,
+        ]),
+      );
+      const evidenceConfidence = minimumConfidence([
+        causalConfidence,
+        ...(historical === undefined ? [] : [historical.confidence]),
+      ]);
       return [{ ...createFindingCandidate({
         rule_id: "R003",
         title: "Repeated file rediscovery",
         classification: "behavior",
         cause: null,
         scope: "claude_md",
-        confidence: minimumConfidence(
-          confidenceActions.flatMap((action) => [
-            action.confidence,
-            action.match_confidence,
-          ]).concat(historical?.confidence ?? []),
-        ),
+        impact: impactFromClaim(recoverable, "critical_path_latency"),
+        finding_confidence: {
+          evidence: evidenceConfidence,
+          causal: causalConfidence,
+          source_completeness: options.sourceCompleteness ?? 1,
+        },
         target,
         evidence: {
           session_refs: sortedUnique(
@@ -289,7 +301,7 @@ export function detectRediscovery(
               historical_session_refs: historical.sessionRefs,
             }),
         },
-        recoverable,
+        intervals: recoverable.intervals,
         fix_recipe: {
           suggestion:
             `Record why and when to inspect \`${target}\` in CLAUDE.md so unchanged content is not reread.`,

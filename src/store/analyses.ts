@@ -7,6 +7,7 @@ import {
   unlink,
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { types as utilTypes } from "node:util";
 
 import { normalizeCommand } from "../analysis/command.js";
 import { commandIdentityKey } from "../analysis/command-identity.js";
@@ -15,7 +16,15 @@ import {
   type AnalysisBudgetResult,
 } from "../analysis/budgets.js";
 import { normalizeRepoPath } from "../analysis/test-map.js";
-import { findingCompatibilityMetadata } from "../core/model.js";
+import {
+  findingCompatibilityMetadata,
+  findingScoringRationale,
+  findingSeverity,
+  projectFindingConfidence,
+  projectFindingRecoverable,
+  snapshotFindingConfidence,
+  snapshotImpactEstimate,
+} from "../core/model.js";
 import type {
   AnalysisSummary,
   AnalysisUnit,
@@ -23,6 +32,9 @@ import type {
   CommandIdentity,
   Confidence,
   Finding,
+  FindingConfidence,
+  FindingScoringRationale,
+  ImpactEstimate,
 } from "../core/model.js";
 import { canonicalJson, readLegacyJson } from "./legacy-json.js";
 import type { StorePaths } from "./paths.js";
@@ -208,8 +220,110 @@ function isStoredFinding(value: unknown): value is Finding {
   );
 }
 
+function snapshotScoringRationale(value: unknown): FindingScoringRationale[] {
+  if (
+    !Array.isArray(value) ||
+    utilTypes.isProxy(value) ||
+    Object.getPrototypeOf(value) !== Array.prototype
+  ) throw new TypeError();
+  const ownKeys = Reflect.ownKeys(value);
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (
+    lengthDescriptor === undefined ||
+    !("value" in lengthDescriptor) ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0 ||
+    ownKeys.length !== lengthDescriptor.value + 1
+  ) throw new TypeError();
+  const snapshot: FindingScoringRationale[] = [];
+  for (let index = 0; index < lengthDescriptor.value; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (
+      descriptor === undefined ||
+      descriptor.enumerable !== true ||
+      !("value" in descriptor) ||
+      typeof descriptor.value !== "string"
+    ) throw new TypeError();
+    snapshot.push(descriptor.value as FindingScoringRationale);
+  }
+  return snapshot;
+}
+
+function legacyImpactKind(ruleId: Finding["rule_id"]): ImpactEstimate["kind"] {
+  return ruleId === "R005" || ruleId === "R006"
+    ? "resource_cost"
+    : "critical_path_latency";
+}
+
+function legacyImpact(finding: Finding): ImpactEstimate {
+  return snapshotImpactEstimate({
+    lower_ms: 0,
+    upper_ms: finding.recoverable.min * 60_000,
+    kind: legacyImpactKind(finding.rule_id),
+  });
+}
+
+function legacyFindingConfidence(confidence: Confidence): FindingConfidence {
+  if (confidence === "low") {
+    return { evidence: "low", causal: "low", source_completeness: 0 };
+  }
+  return {
+    evidence: confidence,
+    causal: "medium",
+    source_completeness: 0.5,
+  };
+}
+
+function isLegacyProjectedConfidence(value: FindingConfidence): boolean {
+  return (
+    value.evidence === "low" &&
+    value.causal === "low" &&
+    value.source_completeness === 0
+  ) || (
+    (value.evidence === "medium" || value.evidence === "high") &&
+    value.causal === "medium" &&
+    value.source_completeness === 0.5
+  );
+}
+
+function exactRationale(
+  actual: readonly FindingScoringRationale[],
+  expected: readonly FindingScoringRationale[],
+): boolean {
+  return actual.length === expected.length &&
+    actual.every((entry, index) => entry === expected[index]);
+}
+
+function isCanonicalLegacyProjection(
+  base: Finding,
+  impact: ImpactEstimate,
+  confidence: FindingConfidence,
+  rationale: readonly FindingScoringRationale[],
+): boolean {
+  const projectedRecoverable = projectFindingRecoverable(impact);
+  const expectedRationale = findingScoringRationale(impact, confidence, {
+    ...(base.rule_id === "R004" ? { policy_dependent: true } : {}),
+    legacy_projection: true,
+  });
+  return impact.kind === legacyImpactKind(base.rule_id) &&
+    impact.lower_ms === 0 &&
+    !("expected_ms" in impact) &&
+    isLegacyProjectedConfidence(confidence) &&
+    base.confidence === projectFindingConfidence(confidence) &&
+    base.recoverable.min === projectedRecoverable.min &&
+    base.recoverable.bound === projectedRecoverable.bound &&
+    exactRationale(rationale, expectedRationale);
+}
+
 function snapshotStoredFinding(value: Finding): Finding {
   try {
+    if (
+      value === null ||
+      typeof value !== "object" ||
+      Array.isArray(value) ||
+      utilTypes.isProxy(value) ||
+      Object.getPrototypeOf(value) !== Object.prototype
+    ) throw new TypeError();
     const descriptors = Object.getOwnPropertyDescriptors(value);
     const compatibilitySource: Record<string, unknown> = {};
     for (const field of ["rule_version", "compatibility_epoch"] as const) {
@@ -222,12 +336,17 @@ function snapshotStoredFinding(value: Finding): Finding {
     if (!compatibility.valid) throw new TypeError();
     const read = (field: keyof Finding): unknown => {
       const descriptor = descriptors[field] as PropertyDescriptor | undefined;
-      if (descriptor === undefined) return undefined;
-      return "value" in descriptor
-        ? descriptor.value
-        : descriptor.get?.call(value);
+      if (
+        descriptor === undefined ||
+        descriptor.enumerable !== true ||
+        !("value" in descriptor)
+      ) {
+        if (descriptor === undefined) return undefined;
+        throw new TypeError();
+      }
+      return descriptor.value;
     };
-    const snapshot = cloneJson({
+    const base = cloneJson({
       finding_key: read("finding_key"),
       rule_id: read("rule_id"),
       title: read("title"),
@@ -242,35 +361,95 @@ function snapshotStoredFinding(value: Finding): Finding {
       caveats: read("caveats"),
       ...(compatibility.metadata ?? {}),
     });
-    if (!isStoredFinding(snapshot)) throw new TypeError();
-    return snapshot;
+    if (!isStoredFinding(base)) throw new TypeError();
+
+    const canonicalFields = [
+      "impact",
+      "finding_confidence",
+      "severity",
+      "scoring_rationale",
+    ] as const;
+    const presentCanonicalFields = canonicalFields.filter(
+      (field) => descriptors[field] !== undefined,
+    );
+    if (
+      presentCanonicalFields.length !== 0 &&
+      presentCanonicalFields.length !== canonicalFields.length
+    ) throw new TypeError();
+
+    let impact: ImpactEstimate;
+    let confidence: FindingConfidence;
+    let rationale: FindingScoringRationale[];
+    if (presentCanonicalFields.length === 0) {
+      impact = legacyImpact(base);
+      confidence = legacyFindingConfidence(base.confidence);
+      rationale = findingScoringRationale(impact, confidence, {
+        ...(base.rule_id === "R004" ? { policy_dependent: true } : {}),
+        legacy_projection: true,
+      });
+    } else {
+      impact = snapshotImpactEstimate(read("impact"));
+      confidence = snapshotFindingConfidence(read("finding_confidence"));
+      rationale = snapshotScoringRationale(read("scoring_rationale"));
+      const expectedSeverity = findingSeverity(impact, confidence);
+      const expectedRationale = findingScoringRationale(impact, confidence, {
+        ...(base.rule_id === "R004" ? { policy_dependent: true } : {}),
+      });
+      const legacyProjection = rationale.includes("legacy_projection");
+      if (
+        read("severity") !== expectedSeverity ||
+        (legacyProjection
+          ? !isCanonicalLegacyProjection(base, impact, confidence, rationale)
+          : !exactRationale(rationale, expectedRationale))
+      ) throw new TypeError();
+    }
+    const { target, ...baseWithoutTarget } = base;
+    return {
+      ...baseWithoutTarget,
+      ...(target === undefined ? {} : { target }),
+      confidence: projectFindingConfidence(confidence),
+      impact,
+      finding_confidence: confidence,
+      severity: findingSeverity(impact, confidence),
+      scoring_rationale: rationale,
+      recoverable: projectFindingRecoverable(impact),
+    };
   } catch {
-    throw new TypeError("invalid finding compatibility metadata");
+    throw new TypeError("invalid finding");
   }
 }
 
 function snapshotStoredFindings(values: readonly Finding[]): Finding[] {
   try {
-    if (!Array.isArray(values)) throw new TypeError();
+    if (
+      values === null ||
+      typeof values !== "object" ||
+      utilTypes.isProxy(values) ||
+      !Array.isArray(values) ||
+      Object.getPrototypeOf(values) !== Array.prototype
+    ) throw new TypeError();
+    const ownKeys = Reflect.ownKeys(values);
     const lengthDescriptor = Object.getOwnPropertyDescriptor(values, "length");
     if (
       lengthDescriptor === undefined ||
       !("value" in lengthDescriptor) ||
       !Number.isSafeInteger(lengthDescriptor.value) ||
-      lengthDescriptor.value < 0
+      lengthDescriptor.value < 0 ||
+      ownKeys.length !== lengthDescriptor.value + 1
     ) throw new TypeError();
     const snapshots: Finding[] = [];
     for (let index = 0; index < lengthDescriptor.value; index += 1) {
       const descriptor = Object.getOwnPropertyDescriptor(values, String(index));
-      if (descriptor === undefined) throw new TypeError();
-      const value = "value" in descriptor
-        ? descriptor.value
-        : descriptor.get?.call(values);
-      snapshots.push(snapshotStoredFinding(value as Finding));
+      if (
+        descriptor === undefined ||
+        descriptor.enumerable !== true ||
+        !("value" in descriptor)
+      ) throw new TypeError();
+      snapshots.push(snapshotStoredFinding(descriptor.value as Finding));
     }
     return snapshots;
   } catch {
-    throw new TypeError("invalid finding compatibility metadata");
+    throw new TypeError("invalid finding");
   }
 }
 
@@ -555,6 +734,17 @@ function isAnalysisBudgetResult(value: unknown): value is AnalysisBudgetResult {
   } catch {
     return false;
   }
+}
+
+function normalizeRecordFindings(record: AnalysisRecord): AnalysisRecord {
+  const normalized = {
+    ...record,
+    findings: snapshotStoredFindings(record.findings),
+  };
+  if (!isRecord(normalized)) {
+    throw new TypeError("unsupported or invalid analysis record");
+  }
+  return normalized;
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -881,7 +1071,11 @@ function readLegacyRecord(path: string): AnalysisRecord {
   if (read.kind === "missing") throw new Error("legacy analysis file disappeared while scanning");
   if (read.kind === "corrupt") throw new CorruptLegacyRecord(read.message);
   if (!isRecord(read.value)) throw new CorruptLegacyRecord("unsupported or invalid analysis record");
-  return read.value;
+  try {
+    return normalizeRecordFindings(read.value);
+  } catch (error) {
+    throw new CorruptLegacyRecord(errorMessage(error));
+  }
 }
 function scanLegacyAnalyses(paths: StorePaths): { records: AnalysisRecord[]; warnings: StoreWarning[] } {
   let directory;
@@ -949,7 +1143,7 @@ function parseSnapshot(recordJson: string, snapshotId: string,
   }
   const record = { ...value.payload, analysis_id: executionId, created_at_ms: executedAtMs };
   if (!isRecord(record)) throw new TypeError("unsupported or invalid analysis record");
-  return record;
+  return normalizeRecordFindings(record);
 }
 
 export async function loadAnalyses(paths: StorePaths): Promise<AnalysisHistoryResult> {

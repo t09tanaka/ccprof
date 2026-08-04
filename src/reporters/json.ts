@@ -1,5 +1,6 @@
 import type { AdvisoryText } from "../advisory/advisory.js";
 import type { ReportV2 } from "../core/model.js";
+import { findingForDisplay } from "./tty.js";
 
 export interface JsonReportOptions {
   advisory?: AdvisoryText;
@@ -89,7 +90,7 @@ function reportForDisplay(
       unexplained_min: report.summary.unexplained_min,
       baseline: report.summary.baseline,
     },
-    findings: report.findings.slice(0, 3),
+    findings: report.findings.slice(0, 3).map(findingForDisplay),
     caveats: [...report.caveats],
     ...(report.rule_coverage === undefined
       ? {}

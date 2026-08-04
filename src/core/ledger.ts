@@ -1,10 +1,13 @@
 import {
   durationMs,
   intersectIntervals,
-  roundMinutes,
   subtractIntervals,
   unionIntervals,
 } from "./intervals.js";
+import {
+  isStrictHighConfidence,
+  projectFindingRecoverable,
+} from "./model.js";
 import type {
   AnalysisSummary,
   BaselineComparison,
@@ -63,6 +66,7 @@ export interface LedgerResult {
   raw_observed_min: number;
   normal_min: number;
   totals_ms: LedgerTotalsMs;
+  highConfidenceLowerBoundIntervals: Interval[];
   pointRecoverableIntervals: Interval[];
   humanWaitIntervals: Interval[];
   normalIntervals: Interval[];
@@ -74,6 +78,72 @@ export interface LedgerResult {
 interface IndexedCandidate {
   candidate: FindingCandidate;
   index: number;
+}
+
+function takeIntervalDuration(
+  intervals: readonly Interval[],
+  maximumMs: number,
+): Interval[] {
+  let remainingMs = Number.isFinite(maximumMs) && maximumMs > 0
+    ? maximumMs
+    : 0;
+  const result: Interval[] = [];
+  for (const interval of unionIntervals(intervals)) {
+    if (!(remainingMs > 0)) break;
+    const duration = interval.end_ms - interval.start_ms;
+    const claimed = Math.min(duration, remainingMs);
+    if (claimed > 0) {
+      result.push({
+        start_ms: interval.start_ms,
+        end_ms: interval.start_ms + claimed,
+      });
+      remainingMs -= claimed;
+    }
+  }
+  return result;
+}
+
+function unionLowerBoundIntervals(
+  intervals: readonly Interval[],
+): Interval[] {
+  const sorted = [...intervals].sort(
+    (left, right) =>
+      left.start_ms - right.start_ms || left.end_ms - right.end_ms,
+  );
+  const result: Interval[] = [];
+  for (const interval of sorted) {
+    if (
+      !Number.isFinite(interval.start_ms) ||
+      !Number.isFinite(interval.end_ms) ||
+      interval.start_ms >= interval.end_ms
+    ) continue;
+    const previous = result.at(-1);
+    if (previous !== undefined && interval.start_ms <= previous.end_ms) {
+      previous.end_ms = Math.max(previous.end_ms, interval.end_ms);
+    } else {
+      result.push({ ...interval });
+    }
+  }
+  return result;
+}
+
+function confirmedLowerBoundIntervals(
+  candidates: readonly FindingCandidate[],
+  activeIntervals: readonly Interval[],
+): Interval[] {
+  return unionLowerBoundIntervals(candidates.flatMap((candidate) => {
+    if (
+      candidate.impact.kind !== "critical_path_latency" ||
+      !(candidate.impact.lower_ms > 0) ||
+      !isStrictHighConfidence(candidate.finding_confidence)
+    ) {
+      return [];
+    }
+    return takeIntervalDuration(
+      intersectIntervals(candidate.recoverable.intervals, activeIntervals),
+      candidate.impact.lower_ms,
+    );
+  }));
 }
 
 type PartitionName = "recoverable" | "human_wait" | "normal" | "unexplained";
@@ -168,17 +238,11 @@ function upperEstimateMs(candidate: FindingCandidate): number {
   return Number.isFinite(estimate) && estimate > 0 ? estimate : 0;
 }
 
-function publicFinding(
-  candidate: FindingCandidate,
-  reportedMs: number,
-): Finding {
+function publicFinding(candidate: FindingCandidate): Finding {
   const { recoverable, ...metadata } = candidate;
   return {
     ...metadata,
-    recoverable: {
-      min: roundMinutes(reportedMs),
-      bound: recoverable.bound,
-    },
+    recoverable: projectFindingRecoverable(candidate.impact),
   };
 }
 
@@ -187,6 +251,10 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
   const activeIntervals = intersectIntervals(
     input.activeIntervals,
     rawIntervals,
+  );
+  const highConfidenceLowerBoundIntervals = confirmedLowerBoundIntervals(
+    input.candidates,
+    activeIntervals,
   );
   const indexed = input.candidates.map((candidate, index) => ({
     candidate,
@@ -276,6 +344,13 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
     rawObservedHundredths - measuredHundredths,
   );
   const recoverableHundredths = partitionHundredths.recoverable;
+  const confirmedHundredths = Math.min(
+    measuredHundredths,
+    roundedHundredths(highConfidenceLowerBoundIntervals.reduce(
+      (total, interval) => total + interval.end_ms - interval.start_ms,
+      0,
+    )),
+  );
 
   const attributions = indexed.map(({ candidate, index }) =>
     attributionsByIndex.get(index) ?? {
@@ -293,7 +368,7 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
       measured_min: minutesFromHundredths(measuredHundredths),
       idle_excluded_min: minutesFromHundredths(idleHundredths),
       estimated_floor_min: minutesFromHundredths(
-        measuredHundredths - recoverableHundredths,
+        measuredHundredths - confirmedHundredths,
       ),
       recoverable_min: minutesFromHundredths(recoverableHundredths),
       human_wait_min: minutesFromHundredths(
@@ -304,15 +379,11 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
       ),
       baseline: input.baseline ?? null,
     },
-    findings: indexed.map(({ candidate, index }) =>
-      publicFinding(
-        candidate,
-        attributionsByIndex.get(index)?.reported_ms ?? 0,
-      )
-    ),
+    findings: indexed.map(({ candidate }) => publicFinding(candidate)),
     raw_observed_min: minutesFromHundredths(rawObservedHundredths),
     normal_min: minutesFromHundredths(partitionHundredths.normal),
     totals_ms: totalsMs,
+    highConfidenceLowerBoundIntervals,
     pointRecoverableIntervals,
     humanWaitIntervals,
     normalIntervals,

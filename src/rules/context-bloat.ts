@@ -14,6 +14,7 @@ import {
 } from "../core/event-identity.js";
 import {
   createFindingCandidate,
+  impactFromClaim,
   minimumConfidence,
   orderedActions,
   recoverableClaim,
@@ -25,6 +26,7 @@ export const LARGE_RESULT_TOKEN_THRESHOLD = 50_000;
 export interface ContextBloatOptions {
   events: readonly NormalizedEvent[];
   externalToolNames?: ReadonlySet<string>;
+  sourceCompleteness?: number;
 }
 
 interface ResultSignal {
@@ -254,16 +256,21 @@ export function detectContextBloat(
       ]);
       const hasUnlinkedCompaction =
         group.target === "compaction" && group.compactions.length > 0;
+      const evidenceConfidence = confidenceValues.length === 0
+        ? "low"
+        : minimumConfidence(confidenceValues);
       return createFindingCandidate({
         rule_id: "R007",
         title: "Large tool output increased context pressure",
         classification: external ? "repo" : "behavior",
         cause: null,
         scope: external ? "separate_issue" : "claude_md",
-        confidence:
-          confidenceValues.length === 0
-            ? "low"
-            : minimumConfidence(confidenceValues),
+        impact: impactFromClaim(recoverable, "critical_path_latency"),
+        finding_confidence: {
+          evidence: evidenceConfidence,
+          causal: minimumConfidence([evidenceConfidence, "medium"]),
+          source_completeness: options.sourceCompleteness ?? 1,
+        },
         target: group.target,
         evidence: {
           session_refs: sessionRefs,
@@ -296,7 +303,7 @@ export function detectContextBloat(
             ),
           ),
         },
-        recoverable,
+        intervals: recoverable.intervals,
         fix_recipe: {
           suggestion:
             group.target === "compaction"
