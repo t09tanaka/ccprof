@@ -214,6 +214,7 @@ function approvalToolUse(
   command: string,
   sourceIndex: number,
   timestampMs = 0,
+  approvalRequired = true,
 ): ToolUseEvent {
   return {
     ...eventBase(`use-${toolUseId}`, timestampMs, sourceIndex),
@@ -225,7 +226,7 @@ function approvalToolUse(
     edit_fragments: [],
     command,
     approval: {
-      required: true,
+      required: approvalRequired,
       reason: "Bash requires approval",
     },
   };
@@ -2092,6 +2093,39 @@ test("timeline makes multiple same-turn approval commands irreversibly ambiguous
   });
 
   assert.equal(new Set(serialized).size, 1);
+});
+
+test("timeline never promotes multiple non-required uses into approval latency", () => {
+  const uses = [
+    approvalToolUse("optional-first", "npm test", 1, 0, false),
+    approvalToolUse("optional-second", "pnpm test", 2, 0, false),
+  ] as const;
+  const timeline = buildTimeline([
+    timelineSession([
+      assistantEvent("No approval is required.", 0, "optional-prompt"),
+      ...uses,
+      userEvent("continue", 100, "optional-answer", 3),
+      ...uses.map((use, index) =>
+        successfulToolResult(use.tool_use_id, 4 + index, 110 + index)
+      ),
+    ]),
+  ]);
+  const wait = timeline.actions.find(({ kind }) => kind === "human_wait") as
+    | (AttributedTimelineAction & {
+      approval_command_ambiguous?: boolean;
+    })
+    | undefined;
+
+  assert.ok(wait);
+  assert.equal("approval" in wait, false);
+  assert.equal("command" in wait, false);
+  assert.equal("approval_command_ambiguous" in wait, false);
+  const findings = detectR004([wait], {
+    ruleSafety: approvalRuleSafety(["*"]),
+  });
+  assert.equal(findings.length, 1);
+  const generic = genericR004(findings, 0);
+  assert.equal(generic.evidence.approval_count, 0);
 });
 
 test("R004 keeps unproven or unsafe approval latency generic", () => {

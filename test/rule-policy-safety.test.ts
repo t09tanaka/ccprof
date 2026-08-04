@@ -535,6 +535,29 @@ test("rejects Windows expansion and composite syntax through every decision path
   }
 });
 
+test("rejects cross-shell composite provenance for plain Windows launchers", () => {
+  const dangerous = [
+    "npm test 'x&calc'",
+    "npm test x\\&calc",
+    "pnpm test 'x&calc'",
+    "pnpm test x\\&calc",
+  ];
+  const wildcard = resolvedPolicy(
+    { safe_patterns: ["*"], allow_rule_recommendation: true },
+    [{ match: ["*"], domain: "validation", parallel_safe: true }],
+  );
+  for (const raw of dangerous) {
+    assert.equal(safeCanonicalCommand(raw), undefined, raw);
+    assert.deepEqual(approvalRecommendationDecision([raw], wildcard), {
+      kind: "evaluated",
+      commands: [{ allowed: false }],
+    }, raw);
+    assert.deepEqual(resourceDomainDecision([raw], wildcard), {
+      kind: "investigation_candidate",
+    }, raw);
+  }
+});
+
 test("rejects Windows caret provenance through every decision path", () => {
   const raw = "npm.cmd test ^\"x&calc^\"";
   const wildcard = resolvedPolicy(
