@@ -42,7 +42,8 @@ async function observe(handle: FileHandle, status: Stats): Promise<Observation> 
     suffix = Buffer.concat([suffix, bytes]).subarray(-RANGE_BYTES);
     position += bytesRead;
   }
-  return { device: status.dev, inode: status.ino, mtimeMs: Math.trunc(status.mtimeMs),
+  const fileIdentity = Number.isSafeInteger(status.dev) && Number.isSafeInteger(status.ino);
+  return { device: fileIdentity ? status.dev : null, inode: fileIdentity ? status.ino : null, mtimeMs: Math.trunc(status.mtimeMs),
     sizeBytes: position, prefixHash: hash(Buffer.concat(prefix)), suffixHash: hash(suffix),
     contentRevision: `sha256:${full.digest("hex")}` };
 }
