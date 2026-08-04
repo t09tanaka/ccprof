@@ -49,6 +49,7 @@ export interface DiffEvidence extends CommitLogEvidence {
   changedPaths: string[];
   survivingPaths: string[];
   renames: RenameEvidence[];
+  changedLineCount?: number;
   truncated: boolean;
   caveats: string[];
 }
@@ -178,20 +179,34 @@ function patchSections(stdout: string): string[] {
 
 function parsePatchSection(section: string | undefined): {
   addedLines: string[];
+  addedLineCount: number;
+  deletedLineCount: number;
   binary: boolean;
 } {
-  if (section === undefined) return { addedLines: [], binary: false };
+  if (section === undefined) {
+    return {
+      addedLines: [],
+      addedLineCount: 0,
+      deletedLineCount: 0,
+      binary: false,
+    };
+  }
   const binary = /^(?:GIT binary patch|Binary files .* differ)$/m.test(section);
   const addedLines: string[] = [];
+  let addedLineCount = 0;
+  let deletedLineCount = 0;
   let inHunk = false;
   for (const line of section.split("\n")) {
     if (line.startsWith("@@")) {
       inHunk = true;
     } else if (inHunk && line.startsWith("+")) {
       addedLines.push(line.slice(1));
+      addedLineCount += 1;
+    } else if (inHunk && line.startsWith("-")) {
+      deletedLineCount += 1;
     }
   }
-  return { addedLines, binary };
+  return { addedLines, addedLineCount, deletedLineCount, binary };
 }
 
 function requireSuccess(args: readonly string[], result: CommandResult): void {
@@ -279,16 +294,23 @@ export async function collectDiffEvidence(
   if (!patchPairingComplete) {
     caveats.push("Patch sections could not be paired completely with name-status records.");
   }
+  let parsedChangedLineCount = 0;
   const files = changes.map((change, index): FileDiffEvidence => {
     const section = patchPairingComplete ? sections[index] : undefined;
     const content = parsePatchSection(section);
+    parsedChangedLineCount += content.addedLineCount + content.deletedLineCount;
     return {
       ...change,
-      ...content,
+      addedLines: content.addedLines,
+      binary: content.binary,
       contentComplete:
         patchPairingComplete && !truncated && !content.binary && section !== undefined,
     };
   });
+  const changedLineCount = patchPairingComplete && !truncated &&
+    files.every(({ contentComplete }) => contentComplete)
+      ? parsedChangedLineCount
+      : undefined;
   const binaryPaths = files.filter((file) => file.binary).map((file) => file.path);
   if (binaryPaths.length > 0) {
     caveats.push(`Binary content is unavailable for: ${binaryPaths.join(", ")}`);
@@ -323,6 +345,7 @@ export async function collectDiffEvidence(
     changedPaths,
     survivingPaths,
     renames,
+    ...(changedLineCount === undefined ? {} : { changedLineCount }),
     truncated,
     caveats,
     ...log,
