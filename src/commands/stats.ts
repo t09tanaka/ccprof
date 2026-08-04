@@ -178,7 +178,7 @@ export async function runStatsCommand(
     (warning) => ({
       code: warning.code,
       message: warning.message,
-      source: warning.path,
+      source: "path" in warning ? warning.path : undefined,
     }),
   );
   return {
