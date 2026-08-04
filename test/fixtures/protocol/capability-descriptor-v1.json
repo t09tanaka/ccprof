@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/capability-descriptor-v1.schema.json",
+  "schema_version": 1,
+  "descriptor_version": "1.0.0",
+  "undeclared_capability_state": "unknown",
+  "capabilities": [
+    { "id": "ccprof.dev/capabilities/approvals", "legacy_id": "approvals", "version": "1.0.0", "requirement": "optional", "state": "supported_partial", "evidence": { "quality": "unknown", "provenance": "adapter_declared" }, "timestamp_precision": "not_applicable" },
+    { "id": "ccprof.dev/capabilities/branch_rows", "legacy_id": "branch_rows", "version": "1.0.0", "requirement": "optional", "state": "supported_partial", "evidence": { "quality": "unknown", "provenance": "adapter_declared" }, "timestamp_precision": "not_applicable" },
+    { "id": "ccprof.dev/capabilities/edit_fragments", "legacy_id": "edit_fragments", "version": "1.0.0", "requirement": "optional", "state": "supported_partial", "evidence": { "quality": "unknown", "provenance": "adapter_declared" }, "timestamp_precision": "not_applicable" },
+    { "id": "ccprof.dev/capabilities/sidechains", "legacy_id": "sidechains", "version": "1.0.0", "requirement": "optional", "state": "supported_partial", "evidence": { "quality": "unknown", "provenance": "adapter_declared" }, "timestamp_precision": "not_applicable" },
+    { "id": "ccprof.dev/capabilities/token_usage", "legacy_id": "token_usage", "version": "1.0.0", "requirement": "optional", "state": "supported_partial", "evidence": { "quality": "unknown", "provenance": "adapter_declared" }, "timestamp_precision": "not_applicable" },
+    { "id": "ccprof.dev/capabilities/tool_timestamps", "legacy_id": "tool_timestamps", "version": "1.0.0", "requirement": "optional", "state": "supported_partial", "evidence": { "quality": "unknown", "provenance": "adapter_declared" }, "timestamp_precision": "unknown" }
+  ]
+}
