@@ -1,3 +1,4 @@
+import { open as openFile, type FileHandle } from "node:fs/promises";
 import { basename } from "node:path";
 
 import {
@@ -19,10 +20,28 @@ import {
   boundedJsonlLines,
   boundedWarnings,
   budgetWarningCode,
+  IncrementalParserStateCapacityError,
+  jsonlLinePhysicalRange,
   JsonlBudgetTracker,
+  MAX_INCREMENTAL_PARSER_STATE_BYTES,
+  PARSER_STATE_SCHEMA_FINGERPRINT,
   ParserBudgetExceededError,
   type JsonlParserControls,
+  type ParserProjectionBudgets,
+  type ParserReadBudgets,
+  type ParserStateReadResult,
+  type ParserStateRowBaseV1,
+  type ParserStateWarningV1,
+  type SourceReadReceipt,
 } from "../jsonl-budget.js";
+
+export {
+  IncrementalParserStateCapacityError,
+  MAX_INCREMENTAL_PARSER_STATE_BYTES,
+  PARSER_STATE_SCHEMA_FINGERPRINT,
+} from "../jsonl-budget.js";
+
+export const CLAUDE_PARSER_VERSION = "2.0.0";
 
 export const MAX_TOOL_OUTPUT_BYTES = 16_384;
 /** Maximum UTF-8 bytes retained for any non-path/command tool-input string. */
@@ -87,6 +106,72 @@ interface ParsedRow {
   parentUuid?: string;
   agentId?: string;
   isSidechain: boolean;
+}
+
+export interface ClaudeStateToolResultV1 {
+  tool_use_id: string | null;
+  status_evidence: ResultStatusEvidence;
+  output: string;
+  output_bytes: number;
+  estimated_tokens: number;
+  has_unknown_schema: boolean;
+  exit_code: number | null;
+}
+
+export interface ClaudeStateRowV1 extends ParserStateRowBaseV1 {
+  kind: "claude-row-v1";
+  source_index: number;
+  session_id: string;
+  entry_uuid: string;
+  has_synthetic_uuid: boolean;
+  cwd: string | null;
+  branch: string | null;
+  parent_uuid: string | null;
+  agent_id: string | null;
+  is_sidechain: boolean;
+  value: JsonObject;
+  tool_results: ClaudeStateToolResultV1[];
+}
+
+export interface ClaudeBranchLaneV1 {
+  session_id: string;
+  lane_id: string;
+  source_index: number;
+  branch: string;
+}
+
+export interface ClaudeAncestryV1 {
+  session_id: string;
+  entry_uuid: string;
+  parent_uuid: string;
+  source_index: number;
+  agent_id: string | null;
+}
+
+export interface ClaudeAssistantGroupV1 {
+  session_id: string;
+  message_id: string;
+  source_indexes: number[];
+}
+
+export interface ClaudeResultPositionV1 {
+  session_id: string;
+  tool_use_id: string;
+  source_index: number;
+}
+
+export interface ClaudeParserStateV1 {
+  kind: "claude-state-v1";
+  canonical_path: string;
+  parsed_offset: number;
+  line_count: number;
+  ends_with_newline: boolean;
+  rows: ClaudeStateRowV1[];
+  branch_lanes: ClaudeBranchLaneV1[];
+  ancestry: ClaudeAncestryV1[];
+  assistant_groups: ClaudeAssistantGroupV1[];
+  result_positions: ClaudeResultPositionV1[];
+  warnings: ParserStateWarningV1[];
 }
 
 interface PendingWarning extends SourceWarning {
@@ -846,6 +931,539 @@ function parserBudgetWarning(
   return warning(sourcePath, budgetWarningCode(error), error.message,
     error.line === undefined ? {} : { line: error.line });
 }
+
+function snapshotJson(value: unknown, depth = 0): JsonValue {
+  if (depth > 256) throw new TypeError("Parser state is too deeply nested.");
+  if (
+    value === null || typeof value === "string" ||
+    typeof value === "boolean"
+  ) return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("Invalid parser-state number.");
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = descriptors[index.toString(10)];
+      if (descriptor === undefined || !("value" in descriptor)) {
+        throw new TypeError("Parser-state arrays must be dense data arrays.");
+      }
+    }
+    return value.map((item) => snapshotJson(item, depth + 1));
+  }
+  if (typeof value !== "object" || value === undefined) {
+    throw new TypeError("Invalid parser-state value.");
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError("Parser-state objects must be plain objects.");
+  }
+  const result: JsonObject = {};
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string") {
+      throw new TypeError("Parser-state symbol properties are forbidden.");
+    }
+    const descriptor = descriptors[key];
+    if (
+      descriptor === undefined || !("value" in descriptor) ||
+      descriptor.enumerable !== true
+    ) {
+      throw new TypeError("Parser-state properties must be enumerable data fields.");
+    }
+    result[key] = snapshotJson(descriptor.value, depth + 1);
+  }
+  return result;
+}
+
+function exactKeys(
+  value: UnknownRecord,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): void {
+  const keys = Object.keys(value).sort();
+  const allowed = [...required, ...optional].sort();
+  if (
+    keys.some((key) => !allowed.includes(key)) ||
+    required.some((key) => !keys.includes(key))
+  ) {
+    throw new TypeError("Parser state has an invalid field set.");
+  }
+}
+
+function nonnegativeInteger(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new TypeError("Parser-state integer is invalid.");
+  }
+  return value as number;
+}
+
+function stateString(value: unknown, nullable = false): string | null {
+  if (nullable && value === null) return null;
+  if (typeof value !== "string" || value.includes("\0")) {
+    throw new TypeError("Parser-state text is invalid.");
+  }
+  return value;
+}
+
+function validateWarningFact(value: unknown, expectedOrder: number): void {
+  if (!isRecord(value)) throw new TypeError("Invalid parser-state warning fact.");
+  exactKeys(value, [
+    "order", "applicability", "scope", "target_session_id", "warning",
+  ]);
+  if (nonnegativeInteger(value.order) !== expectedOrder) {
+    throw new TypeError("Parser-state warning order is invalid.");
+  }
+  if (!isRecord(value.applicability)) {
+    throw new TypeError("Invalid parser-state warning applicability.");
+  }
+  if (value.applicability.kind === "unconditional") {
+    exactKeys(value.applicability, ["kind"]);
+  } else if (value.applicability.kind === "timestamp") {
+    exactKeys(value.applicability, ["kind", "timestamp_ms"]);
+    nonnegativeInteger(value.applicability.timestamp_ms);
+  } else {
+    throw new TypeError("Unknown parser-state warning applicability.");
+  }
+  if (value.scope !== "source" && value.scope !== "session") {
+    throw new TypeError("Invalid parser-state warning scope.");
+  }
+  stateString(value.target_session_id, true);
+  if (!isRecord(value.warning)) throw new TypeError("Invalid source warning.");
+  exactKeys(
+    value.warning,
+    ["code", "message", "source_path"],
+    ["line", "session_ref"],
+  );
+  stateString(value.warning.code);
+  stateString(value.warning.message);
+  stateString(value.warning.source_path);
+  if (value.warning.line !== undefined) nonnegativeInteger(value.warning.line);
+  if (value.warning.session_ref !== undefined) stateString(value.warning.session_ref);
+}
+
+export function normalizeClaudeParserState(value: unknown): ClaudeParserStateV1 {
+  const cloned = snapshotJson(value);
+  if (!isRecord(cloned)) throw new TypeError("Claude parser state must be an object.");
+  exactKeys(cloned, [
+    "kind", "canonical_path", "parsed_offset", "line_count",
+    "ends_with_newline", "rows", "branch_lanes", "ancestry",
+    "assistant_groups", "result_positions", "warnings",
+  ]);
+  if (cloned.kind !== "claude-state-v1") {
+    throw new TypeError("Unknown Claude parser-state kind.");
+  }
+  stateString(cloned.canonical_path);
+  const parsedOffset = nonnegativeInteger(cloned.parsed_offset);
+  const lineCount = nonnegativeInteger(cloned.line_count);
+  if (typeof cloned.ends_with_newline !== "boolean") {
+    throw new TypeError("Invalid Claude newline state.");
+  }
+  if (
+    !Array.isArray(cloned.rows) || !Array.isArray(cloned.branch_lanes) ||
+    !Array.isArray(cloned.ancestry) ||
+    !Array.isArray(cloned.assistant_groups) ||
+    !Array.isArray(cloned.result_positions) ||
+    !Array.isArray(cloned.warnings)
+  ) throw new TypeError("Invalid Claude parser-state collection.");
+
+  let previousLine = 0;
+  let previousEnd = 0;
+  for (const row of cloned.rows) {
+    if (!isRecord(row)) throw new TypeError("Invalid Claude state row.");
+    exactKeys(row, [
+      "kind", "original_bytes", "byte_start", "byte_end", "line",
+      "timestamp_ms", "source_index", "session_id", "entry_uuid",
+      "has_synthetic_uuid", "cwd", "branch", "parent_uuid", "agent_id",
+      "is_sidechain", "value", "tool_results",
+    ]);
+    if (row.kind !== "claude-row-v1") throw new TypeError("Unknown Claude row kind.");
+    const originalBytes = nonnegativeInteger(row.original_bytes);
+    const byteStart = nonnegativeInteger(row.byte_start);
+    const byteEnd = nonnegativeInteger(row.byte_end);
+    const line = nonnegativeInteger(row.line);
+    const sourceIndex = nonnegativeInteger(row.source_index);
+    nonnegativeInteger(row.timestamp_ms);
+    if (
+      line < 1 || line <= previousLine || sourceIndex !== line - 1 ||
+      byteStart < previousEnd || byteEnd < byteStart ||
+      byteEnd - byteStart < originalBytes || byteEnd > parsedOffset
+    ) throw new TypeError("Inconsistent Claude physical row indexes.");
+    stateString(row.session_id);
+    stateString(row.entry_uuid);
+    stateString(row.cwd, true);
+    stateString(row.branch, true);
+    stateString(row.parent_uuid, true);
+    stateString(row.agent_id, true);
+    if (
+      typeof row.has_synthetic_uuid !== "boolean" ||
+      typeof row.is_sidechain !== "boolean" || !isRecord(row.value) ||
+      !Array.isArray(row.tool_results)
+    ) throw new TypeError("Invalid Claude state row payload.");
+    previousLine = line;
+    previousEnd = byteEnd;
+  }
+  if (previousLine > lineCount || previousEnd > parsedOffset) {
+    throw new TypeError("Claude parser-state progress is inconsistent.");
+  }
+  cloned.warnings.forEach((fact, index) => validateWarningFact(fact, index));
+  const bytes = Buffer.byteLength(JSON.stringify(cloned));
+  if (bytes > MAX_INCREMENTAL_PARSER_STATE_BYTES) {
+    throw new IncrementalParserStateCapacityError();
+  }
+  return cloned as unknown as ClaudeParserStateV1;
+}
+
+function stateToolResult(result: IngestedToolResult): ClaudeStateToolResultV1 {
+  return {
+    tool_use_id: result.toolUseId ?? null,
+    status_evidence: { ...result.statusEvidence },
+    output: result.output,
+    output_bytes: result.outputBytes,
+    estimated_tokens: result.estimatedTokens,
+    has_unknown_schema: result.hasUnknownSchema,
+    exit_code: result.exitCode ?? null,
+  };
+}
+
+function parsedToolResult(result: ClaudeStateToolResultV1): IngestedToolResult {
+  return {
+    statusEvidence: { ...result.status_evidence },
+    output: result.output,
+    outputBytes: result.output_bytes,
+    estimatedTokens: result.estimated_tokens,
+    hasUnknownSchema: result.has_unknown_schema,
+    ...(result.tool_use_id === null ? {} : { toolUseId: result.tool_use_id }),
+    ...(result.exit_code === null ? {} : { exitCode: result.exit_code }),
+  };
+}
+
+function warningFact(
+  pending: PendingWarning,
+  order: number,
+  timestampMs?: number,
+): ParserStateWarningV1 {
+  const { targetSessionId, ...sourceWarning } = pending;
+  return {
+    order,
+    applicability: timestampMs === undefined
+      ? { kind: "unconditional" }
+      : { kind: "timestamp", timestamp_ms: timestampMs },
+    scope: targetSessionId === undefined ? "source" : "session",
+    target_session_id: targetSessionId ?? null,
+    warning: sourceWarning,
+  };
+}
+
+function buildClaudeIndexes(rows: readonly ClaudeStateRowV1[]): Pick<
+  ClaudeParserStateV1,
+  "branch_lanes" | "ancestry" | "assistant_groups" | "result_positions"
+> {
+  const branchLanes: ClaudeBranchLaneV1[] = [];
+  const ancestry: ClaudeAncestryV1[] = [];
+  const assistantGroups = new Map<string, ClaudeAssistantGroupV1>();
+  const resultPositions = new Map<string, ClaudeResultPositionV1>();
+  for (const row of rows) {
+    if (row.branch !== null) {
+      branchLanes.push({
+        session_id: row.session_id,
+        lane_id: row.agent_id ?? row.session_id,
+        source_index: row.source_index,
+        branch: row.branch,
+      });
+    }
+    if (row.parent_uuid !== null) {
+      ancestry.push({
+        session_id: row.session_id,
+        entry_uuid: row.entry_uuid,
+        parent_uuid: row.parent_uuid,
+        source_index: row.source_index,
+        agent_id: row.agent_id,
+      });
+    }
+    const message = isRecord(row.value.message) ? row.value.message : undefined;
+    const messageId = message === undefined ? undefined : nonEmptyString(message.id);
+    if (row.value.type === "assistant" && messageId !== undefined) {
+      const key = `${row.session_id}\0${messageId}`;
+      const group = assistantGroups.get(key);
+      if (group === undefined) {
+        assistantGroups.set(key, {
+          session_id: row.session_id,
+          message_id: messageId,
+          source_indexes: [row.source_index],
+        });
+      } else {
+        group.source_indexes.push(row.source_index);
+      }
+    }
+    for (const result of row.tool_results) {
+      if (result.tool_use_id !== null) {
+        resultPositions.set(`${row.session_id}\0${result.tool_use_id}`, {
+          session_id: row.session_id,
+          tool_use_id: result.tool_use_id,
+          source_index: row.source_index,
+        });
+      }
+    }
+  }
+  return {
+    branch_lanes: branchLanes,
+    ancestry,
+    assistant_groups: [...assistantGroups.values()],
+    result_positions: [...resultPositions.values()],
+  };
+}
+
+async function rangeEndsWithNewline(
+  handle: FileHandle,
+  endOffset: number,
+  emptyFallback: boolean,
+): Promise<boolean> {
+  if (endOffset === 0) return false;
+  const byte = Buffer.allocUnsafe(1);
+  const { bytesRead } = await handle.read(byte, 0, 1, endOffset - 1);
+  return bytesRead === 0 ? emptyFallback : byte[0] === 0x0a;
+}
+
+export async function readClaudeParserState(options: {
+  sourcePath: string;
+  fileHandle: FileHandle;
+  range?: { start_offset: number; starting_line: number };
+  seed?: ClaudeParserStateV1;
+  budgets?: Partial<ParserReadBudgets>;
+  signal?: AbortSignal;
+}): Promise<ParserStateReadResult<ClaudeParserStateV1>> {
+  const seed = options.seed === undefined
+    ? undefined
+    : normalizeClaudeParserState(options.seed);
+  const startOffset = options.range?.start_offset ?? 0;
+  const startingLine = options.range?.starting_line ?? 1;
+  if (
+    (seed === undefined && (startOffset !== 0 || startingLine !== 1)) ||
+    (seed !== undefined && (
+      seed.canonical_path !== options.sourcePath ||
+      seed.parsed_offset !== startOffset ||
+      seed.line_count + 1 !== startingLine
+    ))
+  ) throw new TypeError("Claude parser seed/range is inconsistent.");
+  const configured = new JsonlBudgetTracker({
+    ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  });
+  const remainingFileBytes = Math.max(
+    0,
+    configured.budgets.maxFileBytes - startOffset,
+  );
+  const tracker = new JsonlBudgetTracker({
+    budgets: { ...options.budgets, maxFileBytes: remainingFileBytes },
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  });
+  const stat = await options.fileHandle.stat();
+  const rows = seed?.rows.map((row) => structuredClone(row)) ?? [];
+  const warnings = seed?.warnings.map((fact) => structuredClone(fact)) ?? [];
+  let warningOrder = warnings.length;
+  let readStopIndex = 0;
+  const pushReadStops = (): void => {
+    while (readStopIndex < tracker.readStops.length) {
+      const error = tracker.readStops[readStopIndex]!;
+      warnings.push(warningFact(
+        parserBudgetWarning(options.sourcePath, error),
+        warningOrder,
+      ));
+      warningOrder += 1;
+      readStopIndex += 1;
+    }
+  };
+  let lastLine = seed?.line_count ?? 0;
+  const iterator = boundedJsonlLines(options.sourcePath, tracker, {
+    file_handle: options.fileHandle,
+    start_offset: startOffset,
+    starting_line: startingLine,
+  });
+  let receipt: SourceReadReceipt | undefined;
+  while (true) {
+    const next = await iterator.next();
+    pushReadStops();
+    if (next.done) {
+      receipt = next.value;
+      break;
+    }
+    const inputLine = next.value;
+    const { text: rawLine, bytes: rawBytes, line } = inputLine;
+    lastLine = line;
+    const pushWarning = (pending: PendingWarning, timestampMs?: number): void => {
+      warnings.push(warningFact(pending, warningOrder, timestampMs));
+      warningOrder += 1;
+    };
+    if (rawLine.trim().length === 0) {
+      pushWarning(warning(
+        options.sourcePath,
+        "empty_line",
+        "Ignored an empty JSONL row.",
+        { line },
+      ));
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawLine) as unknown;
+    } catch {
+      pushWarning(warning(
+        options.sourcePath,
+        "invalid_json",
+        "Ignored malformed JSON.",
+        { line },
+      ));
+      continue;
+    }
+    if (!isRecord(parsed)) {
+      pushWarning(warning(
+        options.sourcePath,
+        "invalid_row",
+        "JSONL row is not an object.",
+        { line },
+      ));
+      continue;
+    }
+    const timestampMs = parseTimestamp(parsed.timestamp);
+    try {
+      tracker.assertNodes(parsed, line);
+    } catch (error) {
+      tracker.throwIfAborted();
+      if (!(error instanceof ParserBudgetExceededError)) throw error;
+      pushWarning(parserBudgetWarning(options.sourcePath, error), timestampMs);
+      continue;
+    }
+    if (timestampMs === undefined) {
+      const sessionId = nonEmptyString(parsed.sessionId);
+      const rowType = nonEmptyString(parsed.type);
+      const isKnownAuxiliaryRow =
+        rowType !== undefined && KNOWN_AUXILIARY_ROW_TYPES.has(rowType);
+      if (sessionId === undefined) {
+        pushWarning(warning(
+          options.sourcePath,
+          "missing_session_id",
+          "Ignored a row without a sessionId.",
+          { line },
+        ));
+      } else if (!isKnownAuxiliaryRow) {
+        pushWarning(warning(
+          options.sourcePath,
+          "invalid_timestamp",
+          "Ignored a row with an invalid timestamp.",
+          { line, sessionId },
+        ));
+      }
+      continue;
+    }
+    const sessionId = nonEmptyString(parsed.sessionId);
+    if (sessionId === undefined) {
+      pushWarning(warning(
+        options.sourcePath,
+        "missing_session_id",
+        "Ignored a row without a sessionId.",
+        { line },
+      ), timestampMs);
+      continue;
+    }
+    const rowType = nonEmptyString(parsed.type);
+    const isKnownAuxiliaryRow =
+      rowType !== undefined && KNOWN_AUXILIARY_ROW_TYPES.has(rowType);
+    const sourceIndex = line - 1;
+    const observedUuid = nonEmptyString(parsed.uuid);
+    const entryUuid = observedUuid ??
+      `${sessionId}:source-${sourceIndex.toString(10)}`;
+    const cwd = nonEmptyString(parsed.cwd);
+    const branch = nonEmptyString(parsed.gitBranch);
+    const parentUuid = nonEmptyString(parsed.parentUuid);
+    const agentId = nonEmptyString(parsed.agentId);
+    const toolResults = ingestToolResults(parsed);
+    const compacted = compactRowValue(parsed, toolResults);
+    const range = jsonlLinePhysicalRange(inputLine);
+    const stateRow: ClaudeStateRowV1 = {
+      kind: "claude-row-v1",
+      original_bytes: rawBytes,
+      byte_start: range.byte_start,
+      byte_end: range.byte_end,
+      line,
+      timestamp_ms: timestampMs,
+      source_index: sourceIndex,
+      session_id: sessionId,
+      entry_uuid: entryUuid,
+      has_synthetic_uuid: observedUuid === undefined,
+      cwd: cwd ?? null,
+      branch: branch ?? null,
+      parent_uuid: parentUuid ?? null,
+      agent_id: agentId ?? null,
+      is_sidechain: parsed.isSidechain === true,
+      value: compacted.value as unknown as JsonObject,
+      tool_results: toolResults.map(stateToolResult),
+    };
+    rows.push(stateRow);
+    const parsedRow: ParsedRow = {
+      value: compacted.value,
+      toolResults,
+      sessionId,
+      timestampMs,
+      entryUuid,
+      hasSyntheticUuid: observedUuid === undefined,
+      sourceIndex,
+      line,
+      isSidechain: parsed.isSidechain === true,
+      ...(cwd === undefined ? {} : { cwd }),
+      ...(branch === undefined ? {} : { branch }),
+      ...(parentUuid === undefined ? {} : { parentUuid }),
+      ...(agentId === undefined ? {} : { agentId }),
+    };
+    if (compacted.discardedPayload) {
+      pushWarning(warning(
+        options.sourcePath,
+        "content_payload_compacted",
+        `Discarded ${compacted.discardedPayloadBytes.toString(10)} UTF-8 bytes from an unrecognized message content payload.`,
+        { line, row: parsedRow },
+      ), timestampMs);
+    }
+    if (observedUuid === undefined && !isKnownAuxiliaryRow) {
+      pushWarning(warning(
+        options.sourcePath,
+        "missing_entry_uuid",
+        "Used a deterministic entry UUID fallback.",
+        { row: parsedRow },
+      ), timestampMs);
+    }
+  }
+  if (receipt === undefined) throw new TypeError("Missing Claude read receipt.");
+  lastLine = Math.max(lastLine, tracker.lastPhysicalLine);
+  const completeness = receipt.end_offset === stat.size ? "complete" : "partial";
+  if (
+    completeness === "partial" &&
+    !tracker.readStops.some((error) => error.budget === "file")
+  ) {
+    const error = new ParserBudgetExceededError("file", lastLine + 1);
+    warnings.push(warningFact(
+      parserBudgetWarning(options.sourcePath, error),
+      warningOrder,
+    ));
+  }
+  const indexes = buildClaudeIndexes(rows);
+  const state = normalizeClaudeParserState({
+    kind: "claude-state-v1",
+    canonical_path: options.sourcePath,
+    parsed_offset: receipt.end_offset,
+    line_count: lastLine,
+    ends_with_newline: await rangeEndsWithNewline(
+      options.fileHandle,
+      receipt.end_offset,
+      seed?.ends_with_newline ?? false,
+    ),
+    rows,
+    ...indexes,
+    warnings,
+  });
+  return { state, receipt, completeness };
+}
+
 async function readRows(
   sourcePath: string,
   options: ClaudeTranscriptParseOptions,
@@ -1712,7 +2330,104 @@ function normalizeSession(
   };
 }
 
-export async function parseClaudeTranscriptDetailed(
+export function projectClaudeParserState(
+  value: ClaudeParserStateV1,
+  options: {
+    endedAtMs?: number;
+    budgets?: Partial<ParserProjectionBudgets>;
+    signal?: AbortSignal;
+    onAgentAncestryStep?(): void;
+    onAssistantPrefixProbe?(): void;
+  } = {},
+): ClaudeTranscriptParseResult {
+  const state = normalizeClaudeParserState(value);
+  const tracker = new JsonlBudgetTracker({
+    ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  });
+  const admittedRows: ParsedRow[] = [];
+  let retainedFailure: ParserBudgetExceededError | undefined;
+  for (const row of state.rows) {
+    tracker.throwIfAborted();
+    if (options.endedAtMs !== undefined && row.timestamp_ms > options.endedAtMs) {
+      continue;
+    }
+    try {
+      tracker.retain(row.original_bytes, row.line);
+    } catch (error) {
+      tracker.throwIfAborted();
+      if (!(error instanceof ParserBudgetExceededError)) throw error;
+      retainedFailure = error;
+      break;
+    }
+    admittedRows.push({
+      value: structuredClone(row.value) as UnknownRecord,
+      toolResults: row.tool_results.map(parsedToolResult),
+      sessionId: row.session_id,
+      timestampMs: row.timestamp_ms,
+      entryUuid: row.entry_uuid,
+      hasSyntheticUuid: row.has_synthetic_uuid,
+      sourceIndex: row.source_index,
+      line: row.line,
+      isSidechain: row.is_sidechain,
+      ...(row.cwd === null ? {} : { cwd: row.cwd }),
+      ...(row.branch === null ? {} : { branch: row.branch }),
+      ...(row.parent_uuid === null ? {} : { parentUuid: row.parent_uuid }),
+      ...(row.agent_id === null ? {} : { agentId: row.agent_id }),
+    });
+  }
+  const warnings = boundedWarnings<PendingWarning>(
+    tracker.budgets.maxWarnings,
+    () => warning(
+      state.canonical_path,
+      "parser_warning_budget_exceeded",
+      "Suppressed further parser warnings after reaching maxWarnings.",
+    ),
+  );
+  for (const fact of state.warnings) {
+    const applicable = fact.applicability.kind === "unconditional" ||
+      options.endedAtMs === undefined ||
+      fact.applicability.timestamp_ms <= options.endedAtMs;
+    const beforeRetainedStop = retainedFailure === undefined ||
+      fact.warning.line === undefined ||
+      fact.warning.line < (retainedFailure.line ?? Number.MAX_SAFE_INTEGER);
+    if (!applicable || !beforeRetainedStop) continue;
+    warnings.push({
+      ...structuredClone(fact.warning),
+      ...(fact.target_session_id === null
+        ? {}
+        : { targetSessionId: fact.target_session_id }),
+    });
+  }
+  if (retainedFailure !== undefined) {
+    warnings.push(parserBudgetWarning(state.canonical_path, retainedFailure));
+  }
+  const grouped = new Map<string, ParsedRow[]>();
+  for (const row of admittedRows) {
+    const group = grouped.get(row.sessionId);
+    if (group === undefined) grouped.set(row.sessionId, [row]);
+    else group.push(row);
+  }
+  const sessions: Session[] = [];
+  for (const sessionRows of grouped.values()) {
+    tracker.throwIfAborted();
+    const session = normalizeSession(
+      state.canonical_path,
+      sessionRows,
+      warnings,
+      options,
+    );
+    if (session !== undefined) sessions.push(session);
+  }
+  return {
+    sessions,
+    warnings: warnings.map(
+      ({ targetSessionId: _targetSessionId, ...sourceWarning }) => sourceWarning,
+    ),
+  };
+}
+
+async function parseClaudeTranscriptDetailedLegacy(
   sourcePath: string,
   instrumentation: ClaudeTranscriptParseOptions = {},
 ): Promise<ClaudeTranscriptParseResult> {
@@ -1746,6 +2461,49 @@ export async function parseClaudeTranscriptDetailed(
         sourceWarning,
     ),
   };
+}
+
+export async function parseClaudeTranscriptDetailed(
+  sourcePath: string,
+  instrumentation: ClaudeTranscriptParseOptions = {},
+): Promise<ClaudeTranscriptParseResult> {
+  const fileHandle = await openFile(sourcePath, "r");
+  try {
+    try {
+      const read = await readClaudeParserState({
+        sourcePath,
+        fileHandle,
+        ...(instrumentation.budgets === undefined
+          ? {}
+          : { budgets: instrumentation.budgets }),
+        ...(instrumentation.signal === undefined
+          ? {}
+          : { signal: instrumentation.signal }),
+      });
+      return projectClaudeParserState(read.state, {
+        ...(instrumentation.endedAtMs === undefined
+          ? {}
+          : { endedAtMs: instrumentation.endedAtMs }),
+        ...(instrumentation.budgets === undefined
+          ? {}
+          : { budgets: instrumentation.budgets }),
+        ...(instrumentation.signal === undefined
+          ? {}
+          : { signal: instrumentation.signal }),
+        ...(instrumentation.onAgentAncestryStep === undefined
+          ? {}
+          : { onAgentAncestryStep: instrumentation.onAgentAncestryStep }),
+        ...(instrumentation.onAssistantPrefixProbe === undefined
+          ? {}
+          : { onAssistantPrefixProbe: instrumentation.onAssistantPrefixProbe }),
+      });
+    } catch (error) {
+      if (!(error instanceof IncrementalParserStateCapacityError)) throw error;
+    }
+  } finally {
+    await fileHandle.close();
+  }
+  return parseClaudeTranscriptDetailedLegacy(sourcePath, instrumentation);
 }
 
 export async function parseClaudeTranscript(
