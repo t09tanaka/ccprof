@@ -146,4 +146,3 @@ the additive return fields can stay confined to Store and core.
   `src/core/analyze.ts` changes.
 - The PR changes at most seven planned files and fewer than 300 production
   TypeScript lines.
-
