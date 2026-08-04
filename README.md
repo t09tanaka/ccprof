@@ -666,9 +666,9 @@ configuration, unreadable or unsafe files, invalid JSON or fields, an
 organization mismatch, a non-Ed25519 key, or a failed signature fails closed
 with a fixed error that does not echo paths or untrusted contents. Policy,
 signature, and public-key inputs must be stable, non-symlink regular files and
-are limited to 64 KiB, 1 KiB, and 16 KiB respectively. The canonical signed
-policy payload has its own 65,536-byte ceiling in addition to the raw policy
-file's 65,536-byte ceiling.
+are limited to 64 KiB, 1 KiB, and 16 KiB respectively.
+The canonical signed policy payload has its own 65,536-byte ceiling in addition
+to the raw policy file's 65,536-byte ceiling.
 
 The v1 document is closed and is described by the packaged
 `schemas/organization-policy.schema.json`. The core fields remain required;
@@ -688,13 +688,18 @@ members are required.
   "raw_retention_days_max": 14,
   "required_source_coverage": 0.9,
   "approval_policy": {
-    "safe_patterns": ["npm test", "npm run build"],
+    "safe_patterns": ["cargo test", "npm test"],
     "allow_rule_recommendation": true
   },
   "resource_domains": [
     {
-      "match": ["npm test"],
-      "domain": "node-tests",
+      "match": ["npm run build", "npm test"],
+      "domain": "node-workspace",
+      "parallel_safe": false
+    },
+    {
+      "match": ["cat *", "git show *", "rg *"],
+      "domain": "read-only",
       "parallel_safe": true
     }
   ],
@@ -808,7 +813,29 @@ export CCPROF_ORGANIZATION_POLICY_PUBLIC_KEY_PATH=/managed/ccprof/organization-p
 
 An optional `.ccprof/config.json` `policy` object can tighten the signed policy
 for one repository using the same fields except organization, schema version,
-and kill switches. Organization, repository, and CLI layers combine
+and kill switches. For example:
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/config.schema.json",
+  "schema_version": 1,
+  "policy": {
+    "approval_policy": {
+      "safe_patterns": ["cargo test"],
+      "allow_rule_recommendation": true
+    },
+    "resource_domains": [
+      {
+        "match": ["cat *", "rg *"],
+        "domain": "read-only",
+        "parallel_safe": true
+      }
+    ]
+  }
+}
+```
+
+Organization, repository, and CLI layers combine
 monotonically: the strongest requested privacy wins; permission booleans use
 logical AND; the minimum retention limit wins; and the maximum source coverage
 requirement wins. A signed `kill_switches` value of `true` disables raw,
@@ -821,6 +848,71 @@ rule safety: approval booleans combine with logical AND, repository patterns
 form an additional intersection, and repository domains must agree with the
 signed organization domain. Repository rule settings alone never authorize a
 recommendation.
+
+#### Rule recommendation safety and compatibility
+
+Without a signed organization policy, ccprof will deny concrete rule
+recommendations; repository settings alone cannot authorize them.
+Repository approval patterns form an additional intersection with the signed
+patterns, never a union.
+
+R004 is observe-only: positive approval duration is an upper-only policy
+latency estimate, not confirmed recoverable time. Its generic result recommends
+a permission-policy investigation; only a repeated command authorized by every
+layer can recommend administrator review of an allowlist change.
+For R004, zero duration is a point-zero harmless observation rather than an
+upper bound.
+
+R005 keeps the neutral title `Path-disjoint tool calls ran serially` for every
+classification. `parallel_safe` alone recommends a parallel invocation.
+`parallel_unsafe` means no parallel invocation is recommended, while
+`investigation_candidate` asks the operator to review shared resources before
+changing execution. Every action must resolve to exactly one common resource
+domain. Multiple matching resource-domain entries are ambiguous. Entries that
+name the same domain are still ambiguous, as are missing and cross-domain
+matches.
+
+Patterns are matched without regular expressions. ccprof never executes a
+shell or filesystem glob during matching. Pattern and domain ordering uses a
+locale-independent UTF-8 byte comparator over the full tuple.
+An exact duplicate tuple is rejected, and duplicate normalized patterns within
+one array are rejected.
+
+The raw signed policy file has a separate 65,536-byte limit.
+The canonical policy payload has its own 65,536-byte limit. Each pattern has a
+256-byte UTF-8 limit; a raw command has a 4,096-byte UTF-8 preflight, and its
+canonical command has the same 4,096-byte ceiling. Each shared decision accepts
+at most 64 actions, 32 distinct raw commands, and a 65,536-step budget. Budget
+exhaustion denies an R004 recommendation or makes R005 an investigation
+candidate; an authorized prefix is never retained.
+
+The raw first token must be a bare executable. Every Unix and Windows executable
+path is rejected before classification. The fixed Windows launcher mapping is:
+`npm.cmd` -> `npm`, `pnpm.cmd` -> `pnpm`, `yarn.cmd` -> `yarn`,
+`bun.exe` -> `bun`, `cargo.exe` -> `cargo`, `git.exe` -> `git`,
+`node.exe` -> `node`, and `rg.exe` -> `rg`. A `.bat` launcher is unsupported,
+and arbitrary suffix normalization is also unsupported. `node` and `node.exe`
+are recognized only when the next token is exactly `--test`; other Node modes
+are unsafe for rule recommendations.
+
+The JSON Schema is the structural contract.
+`x-ccprof-runtime-constraints` is the authoritative runtime semantic supplement
+for UTF-8 byte counts, normalization duplicates, hostile descriptors, canonical
+payload limits, ordering, and monotonic resolution.
+ccprof does not claim exact schema/runtime parity.
+
+For Store identity, only the outer `policy_digest` is persisted.
+ccprof never persists policy patterns or complete resource-domain contract entries.
+It also never persists the effective policy snapshot or
+the inner rule-safety digest.
+Ordinary authorized Finding evidence may retain approved canonical commands.
+Of all resource-domain policy material, only the selected `resource_domain` identifier
+may be retained in authorized Finding evidence. These values remain
+subject to the existing privacy profiles: strict removes these details,
+balanced sanitizes command values, and raw retains them. R004 and R005 use
+manifest version `2.0.0`, compatibility epoch 2, and evidence schema v2.
+Explicit epoch-1 records and legacy findings remain readable without migration
+or backfill.
 
 Today `analyze` and `stats` consume the effective privacy policy, and `analyze`
 also consumes advisory permission. The following resolved values are not yet consumed
