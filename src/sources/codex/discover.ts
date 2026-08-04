@@ -22,7 +22,8 @@ import {
   type SessionSource,
 } from "../session-source.js";
 import { ParserBudgetExceededError } from "../jsonl-budget.js";
-import { parseCodexSession } from "./parser.js";
+import { parseCodexSession, projectCodexParserState, readCodexParserState } from "./parser.js";
+import type { ExactSourceEvidenceCache } from "../exact-source-evidence-cache.js";
 
 export interface CodexDiscoverOptions {
   sessionsDirectory?: string;
@@ -165,6 +166,7 @@ function withinDiscoveryWindow(
 async function discoverCodexSessionsUnbudgeted(
   sessionsDirectory: string,
   query: SessionQuery,
+  evidenceCache?: ExactSourceEvidenceCache,
 ): Promise<Session[]> {
   let root: string;
   try {
@@ -182,10 +184,12 @@ async function discoverCodexSessionsUnbudgeted(
     if (!withinDiscoveryWindow(root, file, query)) continue;
     let parsed: Session | null;
     try {
-      parsed = await parseCodexSession({
-        sourcePath: file,
-        endedAtMs: query.endedAtMs,
-      });
+      parsed = evidenceCache === undefined
+        ? await parseCodexSession({ sourcePath: file, endedAtMs: query.endedAtMs })
+        : await evidenceCache.consume({ adapterId: "codex", sourceRoot: root,
+            sourcePath: file, endedAtMs: query.endedAtMs,
+            readState: readCodexParserState, projectState: projectCodexParserState,
+            coldFallback: () => parseCodexSession({ sourcePath: file, endedAtMs: query.endedAtMs }) });
     } catch {
       globalWarnings.push(
         sourceWarning(
@@ -230,10 +234,11 @@ async function discoverCodexSessionsUnbudgeted(
 export async function discoverCodexSessions(
   sessionsDirectory: string,
   query: SessionQuery,
+  evidenceCache?: ExactSourceEvidenceCache,
 ): Promise<Session[]> {
   const meter = query.analysisBudgetMeter;
   if (meter === undefined) {
-    return discoverCodexSessionsUnbudgeted(sessionsDirectory, query);
+    return discoverCodexSessionsUnbudgeted(sessionsDirectory, query, evidenceCache);
   }
   if (!meter.checkpoint()) return [];
   let root: string;
@@ -371,10 +376,12 @@ export class CodexSessionSource implements SessionSource {
   readonly contract = CODEX_SESSION_SOURCE_CONTRACT;
   readonly #sessionsDirectory: string | undefined;
   readonly #env: NodeJS.ProcessEnv;
+  readonly #evidenceCache: ExactSourceEvidenceCache | undefined;
 
-  constructor(options?: CodexDiscoverOptions) {
+  constructor(options?: CodexDiscoverOptions, evidenceCache?: ExactSourceEvidenceCache) {
     this.#sessionsDirectory = options?.sessionsDirectory;
     this.#env = options?.env ?? process.env;
+    this.#evidenceCache = evidenceCache;
   }
 
   async discover(query: SessionQuery): Promise<Session[]> {
@@ -382,6 +389,6 @@ export class CodexSessionSource implements SessionSource {
       this.#sessionsDirectory ??
       this.#env.CCPROF_CODEX_SESSIONS_DIR ??
       join(homedir(), ".codex", "sessions");
-    return discoverCodexSessions(sessionsDirectory, query);
+    return discoverCodexSessions(sessionsDirectory, query, this.#evidenceCache);
   }
 }

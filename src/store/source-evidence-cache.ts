@@ -77,6 +77,18 @@ export interface SourceEvidenceCacheEntry {
   updated_at_ms: number;
 }
 
+export interface SourceEvidencePairOptions {
+  adapterId: SourceAdapterId; canonicalPath: string; repositoryIdentity: string;
+  eligibilityIdentity: string; observedAtMs: number;
+  observation: {
+    device: number | null; inode: number | null; mtimeMs: number; sizeBytes: number;
+    prefixHash: string; suffixHash: string; contentRevision: string;
+  };
+  parserState: ClaudeParserStateV1 | CodexParserStateV1;
+  evidence: { sessions: Session[]; warnings: SourceWarning[];
+    negativeReason?: NoEvidenceMarkerV1["reason"] };
+}
+
 export type SourceEvidenceCacheErrorCode =
   | "invalid_shape"
   | "unknown_field"
@@ -718,6 +730,69 @@ function expectedDescriptorDigest(
     ...cacheBinding(cache),
     descriptors,
   });
+}
+
+export function sourceEvidenceIdentity(
+  adapterId: SourceAdapterId, canonicalPath: string,
+): string {
+  const source = adapter(adapterId);
+  return `source-${createHash("sha256")
+    .update(`ccprof\0source-evidence-identity-v1\0${source}\0${text(canonicalPath)}`)
+    .digest("hex")}`;
+}
+
+export function createSourceEvidencePair(
+  options: SourceEvidencePairOptions,
+): { catalog: SourceCatalogEntry; cache: SourceEvidenceCacheEntry } {
+  const source = adapter(options.adapterId);
+  const canonicalPath = text(options.canonicalPath);
+  const continuation = source === "claude"
+    ? normalizeClaudeParserState(options.parserState)
+    : normalizeCodexParserState(options.parserState);
+  if (continuation.canonical_path !== canonicalPath) fail("foreign_binding");
+  const envelope = normalizeSourceEvidenceEnvelope(
+    options.evidence.negativeReason === undefined
+      ? { schema_version: 1, kind: "eligible-evidence-v1", adapter_id: source,
+          canonical_path: canonicalPath, full_sessions: options.evidence.sessions,
+          parse_warnings: options.evidence.warnings, continuation }
+      : { schema_version: 1, kind: "no-evidence-v1", adapter_id: source,
+          canonical_path: canonicalPath, reason: options.evidence.negativeReason },
+  );
+  const sourceId = sourceEvidenceIdentity(source, canonicalPath);
+  const parserVersion = source === "claude" ? CLAUDE_PARSER_VERSION : CODEX_PARSER_VERSION;
+  const catalog = validateSourceCatalogEntry({
+    adapter_id: source, adapter_version: "1.0.0", source_identity: sourceId,
+    canonical_path: canonicalPath, device: options.observation.device,
+    inode: options.observation.inode, mtime_ms: Math.trunc(options.observation.mtimeMs),
+    size_bytes: options.observation.sizeBytes, prefix_hash: options.observation.prefixHash,
+    suffix_hash: options.observation.suffixHash,
+    content_revision: options.observation.contentRevision,
+    discovery_cursor: options.observation.sizeBytes, last_parsed_offset: continuation.parsed_offset,
+    last_normalized_event_index: options.evidence.sessions.reduce((total, session) =>
+      total + session.events.length, 0),
+    parser_version: parserVersion, schema_fingerprint: PARSER_STATE_SCHEMA_FINGERPRINT,
+    observed_at_ms: options.observedAtMs, completeness: "complete",
+  });
+  const row: CacheWithoutDigests = {
+    source_identity: sourceId, repository_identity: options.repositoryIdentity,
+    eligibility_identity: options.eligibilityIdentity,
+    adapter_id: source, canonical_path: canonicalPath,
+    content_revision: options.observation.contentRevision,
+    parser_version: parserVersion, schema_fingerprint: PARSER_STATE_SCHEMA_FINGERPRINT,
+    last_parsed_offset: continuation.parsed_offset, line_count: continuation.line_count,
+    ends_with_newline: continuation.ends_with_newline,
+    payload_json: canonicalJson(envelope), sensitivity: "sensitive",
+    retention_class: "raw_evidence", updated_at_ms: options.observedAtMs,
+  };
+  const descriptors = envelope.kind === "eligible-evidence-v1" ?
+    sourceDescriptorsForSessions(envelope.full_sessions) : [];
+  const cache = validateSourceEvidenceCacheEntry({
+    ...row, payload_digest: expectedPayloadDigest(row, envelope),
+    descriptor_digest: expectedDescriptorDigest(row, descriptors),
+  });
+  const pair = { catalog, cache };
+  assertPairBinding(options.repositoryIdentity, options.eligibilityIdentity, pair);
+  return pair;
 }
 
 export function validateSourceEvidenceCacheEntry(

@@ -1018,6 +1018,14 @@ identity and evidence. Privacy profiles govern rendered output and advisory
 input; they do not rewrite the Store. Protect the data directory as local
 sensitive data.
 
+Persisted, unbudgeted analyses using the built-in Claude and Codex sources may
+reuse sensitive parser evidence from the Store only when a full-file digest
+proves the exact source revision. Discovery still scans every source, and the
+saved query-independent state is freshly projected for the requested analysis
+time. Custom sources, non-persisted and budgeted runs bypass this cache; any
+cache failure safely falls back to reading the source without exposing its path
+in the cache warning.
+
 Source descriptors contain only fixed registry metadata and opaque hashes.
 Strict, balanced, and raw output therefore preserve the same descriptor values;
 none of the profiles introduces a raw session ID, transcript path, or secret.

@@ -59,6 +59,7 @@ import {
   type EffectiveRuleSafetyPolicy,
 } from "../src/policy/rule-safety.js";
 import type { EffectivePolicy } from "../src/policy/organization-policy.js";
+import { renderJsonReport } from "../src/reporters/json.js";
 
 const NOW_MS = Date.parse("2026-01-01T01:00:00.000Z");
 const FEATURE_COMMIT_DATE = "2026-01-01T00:00:00.000Z";
@@ -3479,4 +3480,129 @@ test("fixed-window analysis is invariant to high-impact events outside the snaps
   assert.ok(intervals.every(({ start_ms, end_ms }) =>
     start_ms >= startedAtMs && end_ms <= NOW_MS));
   await assert.rejects(run({ ...stable, events: outside }), NoMatchingSessionsError);
+});
+
+test("built-in exact evidence is report-transparent and disabled by analyzer gates", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-analyze-exact-evidence-"));
+  try {
+    const repo = await makeRepository(root);
+    const projects = await makeClaudeProjects(root, repo);
+    const codexSessionsDirectory = join(root, "codex-sessions-empty");
+    await mkdir(codexSessionsDirectory);
+    const pathsFor = async (name: string) => await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, name) },
+    });
+    const evidenceCount = (storePaths: Awaited<ReturnType<typeof pathsFor>>) => {
+      const database = openStoreDatabase(storePaths);
+      try {
+        return (database.prepare(
+          "SELECT count(*) AS count FROM source_evidence_cache",
+        ).get() as { count: number }).count;
+      } finally {
+        database.close();
+      }
+    };
+    const snapshotDigest = (storePaths: Awaited<ReturnType<typeof pathsFor>>) => {
+      const database = openStoreDatabase(storePaths);
+      try {
+        return (database.prepare(`SELECT snapshot_id FROM analysis_executions
+          ORDER BY rowid DESC LIMIT 1`).get() as { snapshot_id: string })
+          .snapshot_id;
+      } finally {
+        database.close();
+      }
+    };
+    const common = {
+      cwd: repo, pr: "main...feature", nowMs: NOW_MS,
+      claudeProjectsDirectory: projects, codexSessionsDirectory,
+    } as const;
+    const storePaths = await pathsFor("cold-warm-data");
+    const cold = await analyze({ ...common, storePaths });
+    const coldOutput = renderJsonReport(cold.report);
+    const coldDigest = snapshotDigest(storePaths);
+    const warm = await analyze({ ...common, storePaths });
+    assert.equal(cold.report.version, 2);
+    assert.deepEqual(warm.report, cold.report);
+    assert.deepEqual(warm.report.sources, cold.report.sources);
+    assert.deepEqual(warm.warnings, cold.warnings);
+    assert.equal(renderJsonReport(warm.report), coldOutput);
+    assert.equal(snapshotDigest(storePaths), coldDigest);
+    assert.ok(evidenceCount(storePaths) > 0);
+
+    const persistFalsePaths = await pathsFor("persist-false-data");
+    await analyze({ ...common, storePaths: persistFalsePaths, persist: false });
+    assert.equal(evidenceCount(persistFalsePaths), 0);
+
+    const customPaths = await pathsFor("custom-data");
+    await analyze({
+      ...common, storePaths: customPaths,
+      sessionSource: new ClaudeSessionSource(projects),
+    });
+    assert.equal(evidenceCount(customPaths), 0);
+
+    const budgetPaths = await pathsFor("budget-data");
+    await analyze({
+      ...common, storePaths: budgetPaths,
+      budgets: {
+        max_input_bytes: 10_000_000, max_input_events: 10_000,
+        max_wall_ms: 10_000_000, max_cpu_ms: 10_000_000,
+        max_output_bytes: 10_000_000, max_source_items: 10_000,
+      },
+    });
+    assert.equal(evidenceCount(budgetPaths), 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("linked worktrees keep exact evidence eligibility rows isolated in one Store", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-linked-exact-evidence-"));
+  try {
+    const repo = await makeRepository(root);
+    const linkedPath = join(repo, ".test-worktrees", "exact-evidence-linked");
+    await mkdir(dirname(linkedPath), { recursive: true });
+    await git(repo, ["worktree", "add", "--detach", linkedPath, "feature"]);
+    const linkedRepo = await realpath(linkedPath);
+    const projects = await makeClaudeProjects(root, repo);
+    const transcript = join(projects, "fixture", "e2e-session.jsonl");
+    const raw = await readFile(transcript, "utf8");
+    await writeFile(transcript, `${raw.endsWith("\n") ? raw : `${raw}\n`}${JSON.stringify({
+      type: "user", sessionId: "e2e-session", uuid: "linked-root-row",
+      timestamp: "2026-01-01T00:02:55.000Z", cwd: linkedRepo,
+      gitBranch: "feature", message: { content: "linked root evidence" },
+    })}\n`);
+    const codexSessionsDirectory = join(root, "codex-empty-linked");
+    await mkdir(codexSessionsDirectory);
+    const dataRoot = join(root, "shared-data");
+    const mainPaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: dataRoot },
+    });
+    const linkedPaths = await resolveStorePaths(linkedRepo, {
+      env: { CCPROF_DATA_DIR: dataRoot },
+    });
+    assert.equal(linkedPaths.repo_dir, mainPaths.repo_dir);
+    const common = {
+      pr: "main...feature", nowMs: NOW_MS,
+      claudeProjectsDirectory: projects, codexSessionsDirectory,
+    } as const;
+    await analyze({ ...common, cwd: repo, storePaths: mainPaths });
+    await analyze({ ...common, cwd: linkedRepo, storePaths: linkedPaths });
+    await analyze({ ...common, cwd: repo, storePaths: mainPaths });
+
+    const database = openStoreDatabase(mainPaths);
+    try {
+      const counts = database.prepare(`SELECT count(*) AS rows,
+        count(DISTINCT eligibility_identity) AS roots,
+        sum(cache.updated_at_ms = catalog.observed_at_ms
+          AND cache.content_revision = catalog.content_revision
+          AND cache.last_parsed_offset = catalog.last_parsed_offset) AS valid
+        FROM source_evidence_cache cache JOIN source_catalog catalog
+          USING (source_identity)`).get() as { rows: number; roots: number; valid: number };
+      assert.deepEqual(counts, { rows: 2, roots: 2, valid: 2 });
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

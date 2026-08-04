@@ -139,6 +139,7 @@ import {
 } from "../sources/claude/discover.js";
 import { CodexSessionSource } from "../sources/codex/discover.js";
 import { CombinedSessionSource } from "../sources/combined.js";
+import { ExactSourceEvidenceCache } from "../sources/exact-source-evidence-cache.js";
 import {
   admitSessionEventPrefix,
   isSessionSourceValidationError,
@@ -829,16 +830,18 @@ async function resolveTestMap(
 function defaultSessionSource(
   options: AnalyzeOptions,
   onSourceError?: (error: unknown) => void,
+  evidenceCache?: ExactSourceEvidenceCache,
 ): CombinedSessionSource {
   const projectsDirectory =
     options.claudeProjectsDirectory ??
     process.env.CCPROF_CLAUDE_PROJECTS_DIR ??
     join(homedir(), ".claude", "projects");
-  const claudeSource = new ClaudeSessionSource(projectsDirectory);
+  const claudeSource = new ClaudeSessionSource(projectsDirectory, evidenceCache);
   const codexSource = new CodexSessionSource(
     options.codexSessionsDirectory === undefined
       ? undefined
       : { sessionsDirectory: options.codexSessionsDirectory },
+    evidenceCache,
   );
   return new CombinedSessionSource([claudeSource, codexSource], onSourceError);
 }
@@ -1507,8 +1510,15 @@ export async function analyze(
   // behavior untouched.
   const sourceErrors: unknown[] = [];
   const usingDefaultSource = validatedSource === undefined;
+  const evidencePaths = usingDefaultSource && persist && budgetMeter === undefined
+    ? options.storePaths ?? await resolveStorePaths(context.repoRoot)
+    : undefined;
+  const evidenceCache = evidencePaths === undefined ? undefined
+    : new ExactSourceEvidenceCache({ storePaths: evidencePaths,
+        eligibilityRoot: context.repoRoot,
+        onWarning: (warning) => warnings.push(textWarning(warning.code, warning.message)) });
   const source = validatedSource ??
-    defaultSessionSource(options, (error) => sourceErrors.push(error));
+    defaultSessionSource(options, (error) => sourceErrors.push(error), evidenceCache);
   let discoveredSessions: Session[];
   try {
     discoveredSessions = await source.discover({
@@ -1602,9 +1612,9 @@ export async function analyze(
   // hook-recorded wall clock times must be folded into `sessions` before
   // `buildTimeline` runs; diff and testMap have no such ordering
   // requirement and stay parallelized together.
-  const paths = options.storePaths === undefined
+  const paths = evidencePaths ?? (options.storePaths === undefined
     ? await resolveStorePaths(context.repoRoot)
-    : options.storePaths;
+    : options.storePaths);
   if (budgetMeter !== undefined && !budgetMeter.checkpoint()) {
     return finishBudgetedPartialAnalysis(
       options,

@@ -23,8 +23,11 @@ import {
 } from "../session-source.js";
 import {
   parseClaudeTranscriptDetailed,
+  projectClaudeParserState,
+  readClaudeParserState,
   type ClaudeTranscriptParseResult,
 } from "./parser.js";
+import type { ExactSourceEvidenceCache } from "../exact-source-evidence-cache.js";
 
 export class ClaudeDiscoveryError extends Error {
   readonly warnings: SourceWarning[];
@@ -371,6 +374,7 @@ async function canonicalizeSession(session: Session): Promise<Session> {
 export async function discoverClaudeSessions(
   projectsDirectory: string,
   query: SessionQuery,
+  evidenceCache?: ExactSourceEvidenceCache,
 ): Promise<Session[]> {
   const meter = query.analysisBudgetMeter;
   if (meter !== undefined && !meter.checkpoint()) return [];
@@ -448,12 +452,14 @@ export async function discoverClaudeSessions(
     }
     let parsed: ClaudeTranscriptParseResult;
     try {
-      parsed = await parseClaudeTranscriptDetailed(file, {
-        endedAtMs: query.endedAtMs,
-        ...(admittedFileBytes === undefined
-          ? {}
-          : { budgets: { maxFileBytes: admittedFileBytes } }),
-      });
+      parsed = evidenceCache === undefined
+        ? await parseClaudeTranscriptDetailed(file, { endedAtMs: query.endedAtMs,
+            ...(admittedFileBytes === undefined ? {}
+              : { budgets: { maxFileBytes: admittedFileBytes } }) })
+        : await evidenceCache.consume({ adapterId: "claude", sourceRoot: projectsRoot,
+            sourcePath: file, endedAtMs: query.endedAtMs,
+            readState: readClaudeParserState, projectState: projectClaudeParserState,
+            coldFallback: () => parseClaudeTranscriptDetailed(file, { endedAtMs: query.endedAtMs }) });
     } catch {
       const readWarning = sourceWarning(
         "source_read_error",
@@ -570,13 +576,15 @@ export async function discoverClaudeSessions(
 export class ClaudeSessionSource implements SessionSource {
   readonly contract = CLAUDE_SESSION_SOURCE_CONTRACT;
   readonly #projectsDirectory: string;
+  readonly #evidenceCache: ExactSourceEvidenceCache | undefined;
 
-  constructor(projectsDirectory: string) {
+  constructor(projectsDirectory: string, evidenceCache?: ExactSourceEvidenceCache) {
     this.#projectsDirectory = projectsDirectory;
+    this.#evidenceCache = evidenceCache;
   }
 
   async discover(query: SessionQuery): Promise<Session[]> {
-    return (await discoverClaudeSessions(this.#projectsDirectory, query))
+    return (await discoverClaudeSessions(this.#projectsDirectory, query, this.#evidenceCache))
       .map((session) => ({ ...session, capabilities: this.contract.capabilities }));
   }
 }
