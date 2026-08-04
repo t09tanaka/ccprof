@@ -85,26 +85,26 @@ const EXPECTED: RuleManifest[] = [
   },
   {
     id: "R004",
-    version: "1.0.0",
-    compatibility_epoch: 1,
+    version: "2.0.0",
+    compatibility_epoch: 2,
     required_capabilities: [],
     supported_sources: [...SOURCES],
     impact_kind: "policy_latency",
     default_mode: "observe_only",
     aggregation_policy: "never_aggregate",
-    evidence_schema: "ccprof://rules/R004/evidence/v1",
+    evidence_schema: "ccprof://rules/R004/evidence/v2",
     policy_risk: "high",
   },
   {
     id: "R005",
-    version: "1.0.0",
-    compatibility_epoch: 1,
+    version: "2.0.0",
+    compatibility_epoch: 2,
     required_capabilities: ["tool_timestamps"],
     supported_sources: [...SOURCES],
     impact_kind: "resource_cost",
     default_mode: "enabled",
     aggregation_policy: "max",
-    evidence_schema: "ccprof://rules/R005/evidence/v1",
+    evidence_schema: "ccprof://rules/R005/evidence/v2",
     policy_risk: "medium",
   },
   {
@@ -490,6 +490,23 @@ test("epoch one preserves legacy finding keys while later epochs isolate series"
     () => findingKeyForCompatibility("R002", target, 0),
     /compatibility epoch must be a positive safe integer/u,
   );
+});
+
+test("R004 and R005 use exact epoch-two preimages without joining epoch one", () => {
+  for (const ruleId of ["R004", "R005"] as const) {
+    const target = `${ruleId} policy target`;
+    const epochOne = createHash("sha256")
+      .update(`${ruleId}\0${target}`)
+      .digest("hex");
+    const epochTwo = createHash("sha256")
+      .update(`${ruleId}@2\0${target}`)
+      .digest("hex");
+
+    assert.equal(findingKeyForCompatibility(ruleId, target, 1), epochOne);
+    assert.equal(findingKeyForCompatibility(ruleId, target, 2), epochTwo);
+    assert.equal(findingKey(ruleId, target), epochTwo);
+    assert.notEqual(epochTwo, epochOne);
+  }
 });
 
 test("new findings publish manifest compatibility metadata without mutating inputs", () => {

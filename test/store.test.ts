@@ -35,7 +35,10 @@ import type {
 import { commandIdentityKey } from "../src/analysis/command-identity.js";
 import { detectChronicCost } from "../src/rules/chronic-cost.js";
 import { projectReportPrivacy } from "../src/reporters/privacy.js";
-import { findingKey } from "../src/rules/shared.js";
+import {
+  findingKey,
+  findingKeyForCompatibility,
+} from "../src/rules/shared.js";
 import { ruleManifest } from "../src/rules/manifest.js";
 import { selectorRefDigest } from "../src/git/pr-context.js";
 import {
@@ -1566,6 +1569,72 @@ test("snapshot envelopes retain authorized evidence but no rule policy material"
     } finally {
       database.close();
     }
+  });
+});
+
+test("Store round-trips explicit epoch-one and metadata-less legacy rule findings", async () => {
+  await temporaryStore(async (paths) => {
+    const epochOneTarget = "legacy approval-policy-latency";
+    const legacyTarget = "legacy serial-slack";
+    const explicitEpochOne: Finding = {
+      ...legacyFinding("explicit-epoch-one-r004", {
+        ruleId: "R004",
+        bound: "upper",
+      }),
+      finding_key: findingKeyForCompatibility(
+        "R004",
+        epochOneTarget,
+        1,
+      ),
+      rule_id: "R004",
+      rule_version: "1.0.0",
+      compatibility_epoch: 1,
+      target: epochOneTarget,
+    };
+    const metadataLessLegacy: Finding = {
+      ...legacyFinding("metadata-less-r005", {
+        ruleId: "R005",
+        bound: "upper",
+      }),
+      finding_key: findingKeyForCompatibility("R005", legacyTarget, 1),
+      rule_id: "R005",
+      target: legacyTarget,
+    };
+    const source = record("legacy-rule-compatibility", 100);
+    const input = makeAnalysisRecord({
+      analysis_id: source.analysis_id,
+      created_at_ms: source.created_at_ms,
+      unit: source.unit,
+      summary: source.summary,
+      findings: [explicitEpochOne, metadataLessLegacy],
+      metrics: source.metrics,
+      command_costs: [],
+    });
+    const expected = structuredClone(input);
+
+    const saved = await saveAnalysis(paths, input);
+    assert.deepEqual(saved.warnings, []);
+    assert.deepEqual(saved.record, expected);
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded.warnings, []);
+    assert.deepEqual(loaded.records, [expected]);
+
+    const [loadedEpochOne, loadedLegacy] = loaded.records[0]?.findings ?? [];
+    assert.equal(loadedEpochOne?.rule_version, "1.0.0");
+    assert.equal(loadedEpochOne?.compatibility_epoch, 1);
+    assert.equal(
+      loadedEpochOne?.finding_key,
+      findingKeyForCompatibility("R004", epochOneTarget, 1),
+    );
+    assert.equal(Object.hasOwn(loadedLegacy ?? {}, "rule_version"), false);
+    assert.equal(
+      Object.hasOwn(loadedLegacy ?? {}, "compatibility_epoch"),
+      false,
+    );
+    assert.equal(
+      loadedLegacy?.finding_key,
+      findingKeyForCompatibility("R005", legacyTarget, 1),
+    );
   });
 });
 
