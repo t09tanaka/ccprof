@@ -558,7 +558,7 @@ test("budgeted analyze isolates hostile and forged discovery errors", async () =
 test("analyze uses a captured CombinedSessionSource discovery method", async () => {
   const baseRunner = analysisRunner();
   const runner: CommandRunner = async (command, args, options) =>
-    args[0] === "--no-pager" && args[1] === "diff"
+    args[0] === "--no-pager" && (args[1] === "diff" || args[1] === "log")
       ? { code: 0, stdout: "", stderr: "" }
       : baseRunner(command, args, options);
   const combined = new CombinedSessionSource([source([session({
