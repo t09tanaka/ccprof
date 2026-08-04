@@ -1,6 +1,12 @@
 import { detectability } from "../analysis/adoption.js";
 import { commandIdentityKey, formatCommandIdentityTarget } from "../analysis/command-identity.js";
 import type {
+  TerminalMetricAggregate,
+  TerminalStatsAggregateMetadata,
+  TerminalStatsAggregateResult,
+  TerminalStatsCohortAggregate,
+} from "../analysis/stats-aggregation.js";
+import type {
   BaselineNotable,
   Bound,
   CommandIdentity,
@@ -70,6 +76,9 @@ export interface StatsAdoptionCoverage {
 
 export interface StatsReport {
   history_count: number;
+  metadata?: TerminalStatsAggregateMetadata;
+  terminal_metrics?: TerminalMetricAggregate;
+  cohorts?: TerminalStatsCohortAggregate[];
   baseline_metrics: StatsBaselineMetric[];
   chronic_commands: StatsChronicCommand[];
   rule_minutes: StatsRuleMinutes[];
@@ -352,9 +361,70 @@ export function summarizeStats(
   };
 }
 
+function cloneCohortDistributions(
+  distributions: NonNullable<TerminalStatsCohortAggregate["distributions"]>,
+): NonNullable<TerminalStatsCohortAggregate["distributions"]> {
+  return Object.fromEntries(Object.entries(distributions).map(
+    ([axis, distribution]) => [axis, { ...distribution }],
+  )) as NonNullable<TerminalStatsCohortAggregate["distributions"]>;
+}
+
+export function summarizeTerminalStats(
+  aggregate: TerminalStatsAggregateResult,
+  terminalRecords: readonly AnalysisRecord[],
+  adoptions: readonly AdoptionRecord[] = [],
+): StatsReport {
+  const observational = summarizeStats(terminalRecords, adoptions);
+  return {
+    history_count: aggregate.metadata.distinct_work_unit_count,
+    metadata: {
+      ...aggregate.metadata,
+      reason_codes: [...aggregate.metadata.reason_codes],
+    },
+    ...(aggregate.terminal_metrics === undefined ? {} : {
+      terminal_metrics: { ...aggregate.terminal_metrics },
+    }),
+    cohorts: aggregate.cohorts.map((cohort) => ({
+      cohort_key: cohort.cohort_key,
+      metadata: {
+        ...cohort.metadata,
+        reason_codes: [...cohort.metadata.reason_codes],
+      },
+      ...(cohort.distributions === undefined ? {} : {
+        distributions: cloneCohortDistributions(cohort.distributions),
+      }),
+    })),
+    baseline_metrics: observational.baseline_metrics,
+    chronic_commands: observational.chronic_commands,
+    rule_minutes: aggregate.rule_minutes.map((entry) => ({ ...entry })),
+    recurring_findings: observational.recurring_findings,
+    adoptions: observational.adoptions,
+    adoption_coverage: observational.adoption_coverage,
+  };
+}
+
 export function renderStatsJson(stats: StatsReport): string {
   const stable: StatsReport = {
     history_count: stats.history_count,
+    ...(stats.metadata === undefined ? {} : { metadata: {
+      ...stats.metadata,
+      reason_codes: [...stats.metadata.reason_codes],
+    } }),
+    ...(stats.terminal_metrics === undefined ? {} : {
+      terminal_metrics: { ...stats.terminal_metrics },
+    }),
+    ...(stats.cohorts === undefined ? {} : {
+      cohorts: stats.cohorts.map((cohort) => ({
+        ...cohort,
+        metadata: {
+          ...cohort.metadata,
+          reason_codes: [...cohort.metadata.reason_codes],
+        },
+        ...(cohort.distributions === undefined ? {} : {
+          distributions: cloneCohortDistributions(cohort.distributions),
+        }),
+      })),
+    }),
     baseline_metrics: [...stats.baseline_metrics],
     chronic_commands: stats.chronic_commands.map((entry) => ({
       ...entry,
@@ -405,9 +475,14 @@ function chronicCommandLabel(entry: StatsChronicCommand): string {
 }
 
 export function renderStatsTty(stats: StatsReport): string {
+  const terminalStats = stats.metadata !== undefined;
   const lines = [
-    `History: ${stats.history_count} analyses`,
-    "Aggregate rule minutes:",
+    `History: ${stats.history_count} ${
+      terminalStats ? "terminal work units" : "analyses"
+    }`,
+    terminalStats
+      ? "Confirmed critical-path minutes by rule:"
+      : "Aggregate rule minutes:",
     ...(stats.rule_minutes.length === 0
       ? ["- none"]
       : stats.rule_minutes.map(

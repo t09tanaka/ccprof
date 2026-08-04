@@ -50,6 +50,8 @@ const RULE_ROW_FIELDS = [
 ] as const;
 
 const OPAQUE_ID = /^[0-9a-f]{64}$/u;
+const DEFAULT_TERMINAL_MINIMUM_COHORT_SIZE = 5;
+const MAXIMUM_TERMINAL_COHORT_SIZE = 1_000;
 
 export type OpaqueDigest = string;
 
@@ -125,12 +127,58 @@ export type CohortEvaluationMode =
 
 export interface TerminalSelectionResult {
   terminals: StatsAggregationInput[];
+  eligible_terminals: StatsAggregationInput[];
   metadata: {
     stored_snapshot_count: number;
     terminal_snapshot_count: number;
     superseded_snapshot_count: number;
     ineligible_snapshot_count: number;
   };
+}
+
+export type TerminalMetricAxis =
+  | "confirmed_critical_path_ms"
+  | "estimated_critical_path_upper_ms"
+  | "resource_cost_ms"
+  | "human_wait_ms"
+  | "unexplained_ms";
+
+export interface TerminalMetricAggregate {
+  confirmed_critical_path_ms: number;
+  estimated_critical_path_upper_ms: number;
+  resource_cost_ms: number;
+  human_wait_ms: number;
+  unexplained_ms: number;
+}
+
+export interface TerminalAggregatePopulationMetadata {
+  sample_count: number;
+  minimum_cohort_size: number;
+  status: "available" | "suppressed";
+  reason_codes: Array<"below_minimum">;
+}
+
+export interface TerminalStatsAggregateMetadata
+  extends TerminalAggregatePopulationMetadata {
+  stored_snapshot_count: number;
+  distinct_work_unit_count: number;
+  terminal_snapshot_count: number;
+  superseded_snapshot_count: number;
+  ineligible_snapshot_count: number;
+}
+
+export interface TerminalStatsCohortAggregate {
+  cohort_key: OpaqueDigest;
+  metadata: TerminalAggregatePopulationMetadata;
+  distributions?: Record<TerminalMetricAxis, CohortDistribution>;
+}
+
+export interface TerminalStatsAggregateResult {
+  selected_snapshot_ids: OpaqueDigest[];
+  metadata: TerminalStatsAggregateMetadata;
+  terminal_metrics?: TerminalMetricAggregate;
+  rule_minutes: Array<{ rule_id: RuleId; minutes: number }>;
+  cohorts: TerminalStatsCohortAggregate[];
 }
 
 export const TERMINAL_STATS_COLLECTION_LIMIT = 10_000;
@@ -935,22 +983,58 @@ export function exactCohortKey(input: {
   ]);
 }
 
-function roundedDistributionValue(value: number): number {
-  const rounded = Math.round((value + Number.EPSILON) * 10_000) / 10_000;
+const INVALID_COHORT_DISTRIBUTION_INPUT =
+  "invalid cohort distribution input";
+const INVALID_COHORT_EVALUATION_MODE = "invalid cohort evaluation mode";
+const INVALID_STATS_AGGREGATION_INPUT = "invalid stats aggregation input";
+
+function finiteMathResult(value: number, message: string): number {
+  if (!Number.isFinite(value)) throw new TypeError(message);
+  return value;
+}
+
+function checkedFiniteSum(
+  values: readonly number[],
+  message: string,
+): number {
+  let total = 0;
+  for (const value of values) {
+    total = finiteMathResult(total + value, message);
+  }
+  return total;
+}
+
+function roundedDistributionValue(value: number, message: string): number {
+  const adjusted = finiteMathResult(value + Number.EPSILON, message);
+  const scaled = finiteMathResult(adjusted * 10_000, message);
+  const rounded = finiteMathResult(Math.round(scaled) / 10_000, message);
   return Object.is(rounded, -0) ? 0 : rounded;
 }
 
-function quantile(sorted: readonly number[], probability: number): number {
-  const position = (sorted.length - 1) * probability;
+function quantile(
+  sorted: readonly number[],
+  probability: number,
+  message: string,
+): number {
+  const position = finiteMathResult(
+    (sorted.length - 1) * probability,
+    message,
+  );
   const lowerIndex = Math.floor(position);
   const upperIndex = Math.ceil(position);
   const lower = sorted[lowerIndex]!;
   const upper = sorted[upperIndex]!;
-  return lower + ((upper - lower) * (position - lowerIndex));
+  const spread = finiteMathResult(upper - lower, message);
+  const offset = finiteMathResult(
+    spread * (position - lowerIndex),
+    message,
+  );
+  return finiteMathResult(lower + offset, message);
 }
 
-export function cohortDistribution(
+function normalizedCohortDistribution(
   input: readonly number[],
+  message: string,
 ): CohortDistribution {
   const values = snapshotArray(input);
   if (
@@ -962,20 +1046,40 @@ export function cohortDistribution(
       value < 0 ||
       Object.is(value, -0)
     )
-  ) throw new TypeError("invalid cohort distribution input");
+  ) throw new TypeError(message);
   const sorted = (values as number[]).sort((left, right) => left - right);
-  const median = quantile(sorted, 0.5);
+  const median = quantile(sorted, 0.5, message);
   const deviations = sorted
-    .map((value) => Math.abs(value - median))
+    .map((value) => finiteMathResult(Math.abs(value - median), message))
     .sort((left, right) => left - right);
   return {
-    median: roundedDistributionValue(median),
-    p50: roundedDistributionValue(quantile(sorted, 0.5)),
-    p75: roundedDistributionValue(quantile(sorted, 0.75)),
-    mad: roundedDistributionValue(quantile(deviations, 0.5)),
+    median: roundedDistributionValue(median, message),
+    p50: roundedDistributionValue(quantile(sorted, 0.5, message), message),
+    p75: roundedDistributionValue(quantile(sorted, 0.75, message), message),
+    mad: roundedDistributionValue(
+      quantile(deviations, 0.5, message),
+      message,
+    ),
     sample_count: sorted.length,
   };
 }
+
+export function cohortDistribution(
+  input: readonly number[],
+): CohortDistribution {
+  return normalizedCohortDistribution(
+    input,
+    INVALID_COHORT_DISTRIBUTION_INPUT,
+  );
+}
+
+const TERMINAL_METRIC_AXES = [
+  "confirmed_critical_path_ms",
+  "estimated_critical_path_upper_ms",
+  "resource_cost_ms",
+  "human_wait_ms",
+  "unexplained_ms",
+] as const satisfies readonly TerminalMetricAxis[];
 
 const PROJECTED_REQUIRED_FIELDS = [
   "schema_version",
@@ -996,63 +1100,237 @@ const PROJECTED_OPTIONAL_FIELDS = [
   "terminal_metrics",
 ] as const;
 
-function projectedInput(value: unknown): StatsAggregationInput {
-  const descriptors = plainDataDescriptors(value);
-  if (descriptors === null) throw new TypeError("invalid stats aggregation input");
-  const keys = Reflect.ownKeys(descriptors);
-  const allowed = new Set<string>([
-    ...PROJECTED_REQUIRED_FIELDS,
-    ...PROJECTED_OPTIONAL_FIELDS,
-  ]);
+const PROJECTED_TERMINAL_METRIC_FIELDS = [
+  "measured_wall_ms",
+  ...TERMINAL_METRIC_AXES,
+  "rules",
+] as const;
+const PROJECTED_BASELINE_ROW_FIELDS = ["metric", "value"] as const;
+const CHANGED_FILES_BUCKETS = new Set<ChangedFilesBucket>([
+  "files_0",
+  "files_1",
+  "files_2_4",
+  "files_5_9",
+  "files_10_19",
+  "files_20_49",
+  "files_50_plus",
+]);
+const CHANGED_LINES_BUCKETS = new Set<ChangedLinesBucket>([
+  "lines_0",
+  "lines_1_9",
+  "lines_10_49",
+  "lines_50_199",
+  "lines_200_999",
+  "lines_1000_plus",
+]);
+const BASELINE_METRICS = new Set<BoundedBaselineMetric>([
+  "human_wait_ratio",
+]);
+const STATS_INPUT_REASONS = new Set<StatsInputReason>([
+  "content_fallback",
+  "invalid_repository_identity",
+  "missing_changed_lines",
+  "missing_selector",
+  "missing_terminal_metrics",
+]);
+
+function normalizedProjectedTerminalMetrics(
+  value: unknown,
+): NonNullable<StatsAggregationInput["terminal_metrics"]> {
+  const entries = exactDataValues(value, PROJECTED_TERMINAL_METRIC_FIELDS);
+  const measured = metricValue(entries.get("measured_wall_ms"));
+  const confirmed = metricValue(entries.get("confirmed_critical_path_ms"));
+  const upper = metricValue(
+    entries.get("estimated_critical_path_upper_ms"),
+  );
+  const resource = metricValue(entries.get("resource_cost_ms"));
+  const wait = metricValue(entries.get("human_wait_ms"));
+  const unexplained = metricValue(entries.get("unexplained_ms"));
+  const rules = normalizeRuleRows(entries.get("rules"));
+  const confirmedSum = checkedFiniteSum(
+    rules.map((row) => row.confirmed_critical_path_ms),
+    INVALID_STATS_AGGREGATION_INPUT,
+  );
+  const upperSum = checkedFiniteSum(
+    rules.map((row) => row.estimated_critical_path_upper_ms),
+    INVALID_STATS_AGGREGATION_INPUT,
+  );
+  const resourceSum = checkedFiniteSum(
+    rules.map((row) => row.resource_cost_ms),
+    INVALID_STATS_AGGREGATION_INPUT,
+  );
+  const accountedWall = checkedFiniteSum(
+    [upper, wait, unexplained],
+    INVALID_STATS_AGGREGATION_INPUT,
+  );
   if (
-    keys.some((key) => typeof key !== "string" || !allowed.has(key)) ||
-    PROJECTED_REQUIRED_FIELDS.some((key) => !keys.includes(key))
-  ) throw new TypeError("invalid stats aggregation input");
-  for (const key of keys) {
-    if (typeof key !== "string") {
-      throw new TypeError("invalid stats aggregation input");
-    }
-    const descriptor = descriptors[key];
-    if (descriptor === undefined || descriptor.enumerable !== true ||
-      !("value" in descriptor)) {
-      throw new TypeError("invalid stats aggregation input");
-    }
-  }
-  const snapshotId = dataValue(descriptors, "snapshot_id");
-  const createdAt = dataValue(descriptors, "created_at_ms");
-  if (
-    dataValue(descriptors, "schema_version") !== 1 ||
-    typeof snapshotId !== "string" ||
-    !OPAQUE_ID.test(snapshotId) ||
-    typeof createdAt !== "number" ||
-    !Number.isSafeInteger(createdAt) ||
-    createdAt < 0 ||
-    snapshotArray(dataValue(descriptors, "baseline_metrics")) === null ||
-    snapshotArray(dataValue(descriptors, "command_costs")) === null ||
-    snapshotArray(dataValue(descriptors, "reason_codes")) === null
-  ) throw new TypeError("invalid stats aggregation input");
-  for (const key of [
-    "work_unit_key",
-    "git_state_key",
-    "repository_key",
-    "workspace_key",
-    "cohort_key",
-  ]) {
-    const entry = dataValue(descriptors, key);
-    if (entry !== undefined &&
-      (typeof entry !== "string" || !OPAQUE_ID.test(entry))) {
-      throw new TypeError("invalid stats aggregation input");
-    }
-  }
-  return value as StatsAggregationInput;
+    confirmed > upper ||
+    accountedWall > measured ||
+    confirmedSum !== confirmed ||
+    upperSum !== upper ||
+    resourceSum !== resource
+  ) throw new TypeError(INVALID_STATS_AGGREGATION_INPUT);
+  return {
+    measured_wall_ms: measured,
+    confirmed_critical_path_ms: confirmed,
+    estimated_critical_path_upper_ms: upper,
+    resource_cost_ms: resource,
+    human_wait_ms: wait,
+    unexplained_ms: unexplained,
+    rules,
+  };
 }
 
-export function selectTerminalSnapshots(
-  input: readonly StatsAggregationInput[],
+function normalizedProjectedBaselineMetrics(
+  value: unknown,
+): Array<{ metric: BoundedBaselineMetric; value: number }> {
+  const values = snapshotArray(value);
+  if (values === null) throw new TypeError(INVALID_STATS_AGGREGATION_INPUT);
+  const result: Array<{ metric: BoundedBaselineMetric; value: number }> = [];
+  let previous = "";
+  for (const rowValue of values) {
+    const row = exactDataValues(rowValue, PROJECTED_BASELINE_ROW_FIELDS);
+    const metric = row.get("metric");
+    if (
+      typeof metric !== "string" ||
+      !BASELINE_METRICS.has(metric as BoundedBaselineMetric) ||
+      (previous !== "" && compareStrings(previous, metric) >= 0)
+    ) throw new TypeError(INVALID_STATS_AGGREGATION_INPUT);
+    previous = metric;
+    result.push({
+      metric: metric as BoundedBaselineMetric,
+      value: metricValue(row.get("value")),
+    });
+  }
+  return result;
+}
+
+function normalizedProjectedReasonCodes(value: unknown): StatsInputReason[] {
+  const values = snapshotArray(value);
+  if (values === null) throw new TypeError(INVALID_STATS_AGGREGATION_INPUT);
+  const result: StatsInputReason[] = [];
+  let previous = "";
+  for (const reason of values) {
+    if (
+      typeof reason !== "string" ||
+      !STATS_INPUT_REASONS.has(reason as StatsInputReason) ||
+      (previous !== "" && compareStrings(previous, reason) >= 0)
+    ) throw new TypeError(INVALID_STATS_AGGREGATION_INPUT);
+    previous = reason;
+    result.push(reason as StatsInputReason);
+  }
+  return result;
+}
+
+function optionalOpaqueValue(
+  entries: ReadonlyMap<string, unknown>,
+  key: string,
+): OpaqueDigest | undefined {
+  return entries.has(key) ? opaqueId(entries.get(key)) : undefined;
+}
+
+function optionalClosedValue<T extends string>(
+  entries: ReadonlyMap<string, unknown>,
+  key: string,
+  allowed: ReadonlySet<T>,
+): T | undefined {
+  if (!entries.has(key)) return undefined;
+  const value = entries.get(key);
+  if (typeof value !== "string" || !allowed.has(value as T)) {
+    throw new TypeError(INVALID_STATS_AGGREGATION_INPUT);
+  }
+  return value as T;
+}
+
+function projectedInput(value: unknown): StatsAggregationInput {
+  try {
+    const entries = exactDataValues(
+      value,
+      PROJECTED_REQUIRED_FIELDS,
+      PROJECTED_OPTIONAL_FIELDS,
+    );
+    const snapshotId = opaqueId(entries.get("snapshot_id"));
+    const createdAt = entries.get("created_at_ms");
+    if (
+      entries.get("schema_version") !== 1 ||
+      typeof createdAt !== "number" ||
+      !Number.isSafeInteger(createdAt) ||
+      createdAt < 0
+    ) throw new TypeError(INVALID_STATS_AGGREGATION_INPUT);
+    const commandCosts = snapshotArray(entries.get("command_costs"));
+    if (commandCosts === null || commandCosts.length !== 0) {
+      throw new TypeError(INVALID_STATS_AGGREGATION_INPUT);
+    }
+    const workUnitKey = optionalOpaqueValue(entries, "work_unit_key");
+    const gitStateKey = optionalOpaqueValue(entries, "git_state_key");
+    const repositoryKey = optionalOpaqueValue(entries, "repository_key");
+    const workspaceKey = optionalOpaqueValue(entries, "workspace_key");
+    const cohortKey = optionalOpaqueValue(entries, "cohort_key");
+    const filesBucket = optionalClosedValue(
+      entries,
+      "changed_files_bucket",
+      CHANGED_FILES_BUCKETS,
+    );
+    const linesBucket = optionalClosedValue(
+      entries,
+      "changed_lines_bucket",
+      CHANGED_LINES_BUCKETS,
+    );
+    const terminalMetrics = entries.has("terminal_metrics")
+      ? normalizedProjectedTerminalMetrics(entries.get("terminal_metrics"))
+      : undefined;
+    const baselineMetrics = normalizedProjectedBaselineMetrics(
+      entries.get("baseline_metrics"),
+    );
+    const reasonCodes = normalizedProjectedReasonCodes(
+      entries.get("reason_codes"),
+    );
+    if (
+      terminalMetrics !== undefined &&
+      repositoryKey !== undefined &&
+      workspaceKey !== undefined &&
+      filesBucket !== undefined &&
+      linesBucket !== undefined &&
+      cohortKey !== undefined &&
+      cohortKey !== exactCohortKey({
+        repository_key: repositoryKey,
+        workspace_key: workspaceKey,
+        changed_files_bucket: filesBucket,
+        changed_lines_bucket: linesBucket,
+      })
+    ) throw new TypeError(INVALID_STATS_AGGREGATION_INPUT);
+    return {
+      schema_version: 1,
+      snapshot_id: snapshotId,
+      created_at_ms: createdAt,
+      ...(workUnitKey === undefined ? {} : { work_unit_key: workUnitKey }),
+      ...(gitStateKey === undefined ? {} : { git_state_key: gitStateKey }),
+      ...(repositoryKey === undefined
+        ? {}
+        : { repository_key: repositoryKey }),
+      ...(workspaceKey === undefined ? {} : { workspace_key: workspaceKey }),
+      ...(filesBucket === undefined
+        ? {}
+        : { changed_files_bucket: filesBucket }),
+      ...(linesBucket === undefined
+        ? {}
+        : { changed_lines_bucket: linesBucket }),
+      ...(cohortKey === undefined ? {} : { cohort_key: cohortKey }),
+      ...(terminalMetrics === undefined
+        ? {}
+        : { terminal_metrics: terminalMetrics }),
+      baseline_metrics: baselineMetrics,
+      command_costs: [],
+      reason_codes: reasonCodes,
+    };
+  } catch {
+    throw new TypeError(INVALID_STATS_AGGREGATION_INPUT);
+  }
+}
+
+function selectNormalizedTerminalSnapshots(
+  entries: readonly StatsAggregationInput[],
 ): TerminalSelectionResult {
-  const values = snapshotArray(input);
-  if (values === null) throw new TypeError("invalid stats aggregation input");
-  const entries = values.map(projectedInput);
   const byWorkUnit = new Map<OpaqueDigest, StatsAggregationInput[]>();
   let ineligible = 0;
   for (const entry of entries) {
@@ -1065,6 +1343,7 @@ export function selectTerminalSnapshots(
     else group.push(entry);
   }
   const terminals: StatsAggregationInput[] = [];
+  const eligibleTerminals: StatsAggregationInput[] = [];
   let eligibleCount = 0;
   for (const workUnitEntries of byWorkUnit.values()) {
     eligibleCount += workUnitEntries.length;
@@ -1091,35 +1370,233 @@ export function selectTerminalSnapshots(
       compareStrings(left.snapshot_id, right.snapshot_id))
       .at(-1)!;
     terminals.push(terminal);
+    if (
+      terminal.terminal_metrics === undefined ||
+      terminal.repository_key === undefined ||
+      terminal.workspace_key === undefined ||
+      terminal.changed_files_bucket === undefined ||
+      terminal.changed_lines_bucket === undefined ||
+      terminal.cohort_key === undefined
+    ) {
+      ineligible += 1;
+    } else {
+      eligibleTerminals.push(terminal);
+    }
   }
   terminals.sort((left, right) =>
     compareStrings(left.work_unit_key!, right.work_unit_key!) ||
     compareStrings(left.snapshot_id, right.snapshot_id));
+  eligibleTerminals.sort((left, right) =>
+    compareStrings(left.work_unit_key!, right.work_unit_key!) ||
+    compareStrings(left.snapshot_id, right.snapshot_id));
   return {
     terminals,
+    eligible_terminals: eligibleTerminals,
     metadata: {
       stored_snapshot_count: entries.length,
       terminal_snapshot_count: terminals.length,
-      superseded_snapshot_count: eligibleCount - terminals.length,
+      superseded_snapshot_count: eligibleCount - byWorkUnit.size,
       ineligible_snapshot_count: ineligible,
     },
   };
+}
+
+export function selectTerminalSnapshots(
+  input: readonly StatsAggregationInput[],
+): TerminalSelectionResult {
+  const values = snapshotArray(input);
+  if (values === null) throw new TypeError("invalid stats aggregation input");
+  return selectNormalizedTerminalSnapshots(values.map(projectedInput));
+}
+
+function normalizeCohortEvaluationMode(
+  value: unknown,
+): CohortEvaluationMode {
+  try {
+    const entries = exactDataValues(
+      value,
+      ["mode"],
+      ["current_work_unit_key", "current_cohort_key"],
+    );
+    const mode = entries.get("mode");
+    if (mode === "stats_all_groups" && entries.size === 1) {
+      return { mode };
+    }
+    if (
+      mode === "analysis_current" &&
+      entries.size === 3 &&
+      entries.has("current_work_unit_key") &&
+      entries.has("current_cohort_key")
+    ) {
+      return {
+        mode,
+        current_work_unit_key: opaqueId(entries.get("current_work_unit_key")),
+        current_cohort_key: opaqueId(entries.get("current_cohort_key")),
+      };
+    }
+    throw new TypeError(INVALID_COHORT_EVALUATION_MODE);
+  } catch {
+    throw new TypeError(INVALID_COHORT_EVALUATION_MODE);
+  }
+}
+
+function selectComparableTerminals(
+  terminals: readonly StatsAggregationInput[],
+  mode: CohortEvaluationMode,
+): StatsAggregationInput[] {
+  if (mode.mode === "stats_all_groups") {
+    return terminals.filter(({ cohort_key }) => cohort_key !== undefined);
+  }
+  return terminals
+    .filter(({ cohort_key }) => cohort_key === mode.current_cohort_key)
+    .filter(({ work_unit_key }) =>
+      work_unit_key !== mode.current_work_unit_key);
 }
 
 export function selectComparableTerminalSnapshots(
   input: readonly StatsAggregationInput[],
   mode: CohortEvaluationMode,
 ): StatsAggregationInput[] {
-  const terminals = selectTerminalSnapshots(input).terminals;
-  if (mode.mode === "stats_all_groups") {
-    return terminals.filter(({ cohort_key }) => cohort_key !== undefined);
+  const normalizedMode = normalizeCohortEvaluationMode(mode);
+  return selectComparableTerminals(
+    selectTerminalSnapshots(input).eligible_terminals,
+    normalizedMode,
+  );
+}
+
+function aggregatePopulationMetadata(
+  sampleCount: number,
+  minimumCohortSize: number,
+): TerminalAggregatePopulationMetadata {
+  const available = sampleCount >= minimumCohortSize;
+  return {
+    sample_count: sampleCount,
+    minimum_cohort_size: minimumCohortSize,
+    status: available ? "available" : "suppressed",
+    reason_codes: available ? [] : ["below_minimum"],
+  };
+}
+
+function sortedMetricSum(values: readonly number[]): number {
+  return checkedFiniteSum(
+    [...values].sort((left, right) => left - right),
+    INVALID_STATS_AGGREGATION_INPUT,
+  );
+}
+
+function aggregateTerminalMetrics(
+  terminals: readonly StatsAggregationInput[],
+): TerminalMetricAggregate {
+  return Object.fromEntries(TERMINAL_METRIC_AXES.map((axis) => [
+    axis,
+    roundedDistributionValue(sortedMetricSum(terminals.map((entry) =>
+      entry.terminal_metrics![axis])), INVALID_STATS_AGGREGATION_INPUT),
+  ])) as unknown as TerminalMetricAggregate;
+}
+
+function aggregateRuleMinutes(
+  terminals: readonly StatsAggregationInput[],
+): Array<{ rule_id: RuleId; minutes: number }> {
+  const byRule = new Map<RuleId, number[]>();
+  for (const terminal of terminals) {
+    for (const row of terminal.terminal_metrics!.rules) {
+      if (!(row.confirmed_critical_path_ms > 0)) continue;
+      const values = byRule.get(row.rule_id);
+      if (values === undefined) {
+        byRule.set(row.rule_id, [row.confirmed_critical_path_ms]);
+      } else {
+        values.push(row.confirmed_critical_path_ms);
+      }
+    }
   }
+  return [...byRule.entries()]
+    .map(([rule_id, values]) => ({
+      rule_id,
+      minutes: roundedDistributionValue(
+        finiteMathResult(
+          sortedMetricSum(values) / 60_000,
+          INVALID_STATS_AGGREGATION_INPUT,
+        ),
+        INVALID_STATS_AGGREGATION_INPUT,
+      ),
+    }))
+    .filter(({ minutes }) => minutes > 0)
+    .sort((left, right) => compareStrings(left.rule_id, right.rule_id));
+}
+
+export function aggregateTerminalStats(
+  input: readonly StatsAggregationInput[],
+  mode: CohortEvaluationMode,
+  minimumCohortSize = DEFAULT_TERMINAL_MINIMUM_COHORT_SIZE,
+): TerminalStatsAggregateResult {
   if (
-    !OPAQUE_ID.test(mode.current_work_unit_key) ||
-    !OPAQUE_ID.test(mode.current_cohort_key)
-  ) throw new TypeError("invalid cohort evaluation mode");
-  return terminals
-    .filter(({ cohort_key }) => cohort_key === mode.current_cohort_key)
-    .filter(({ work_unit_key }) =>
-      work_unit_key !== mode.current_work_unit_key);
+    !Number.isSafeInteger(minimumCohortSize) ||
+    minimumCohortSize < DEFAULT_TERMINAL_MINIMUM_COHORT_SIZE ||
+    minimumCohortSize > MAXIMUM_TERMINAL_COHORT_SIZE
+  ) throw new TypeError("invalid minimum cohort size");
+
+  const normalizedMode = normalizeCohortEvaluationMode(mode);
+  const values = snapshotArray(input);
+  if (values === null) throw new TypeError("invalid stats aggregation input");
+  const entries = values.map(projectedInput);
+  const selection = selectNormalizedTerminalSnapshots(entries);
+  const population = aggregatePopulationMetadata(
+    selection.eligible_terminals.length,
+    minimumCohortSize,
+  );
+  const distinctWorkUnits = selection.terminals.length;
+  const comparable = selectComparableTerminals(
+    selection.eligible_terminals,
+    normalizedMode,
+  );
+  const byCohort = new Map<OpaqueDigest, StatsAggregationInput[]>();
+  for (const terminal of comparable) {
+    const cohortKey = terminal.cohort_key!;
+    const group = byCohort.get(cohortKey);
+    if (group === undefined) byCohort.set(cohortKey, [terminal]);
+    else group.push(terminal);
+  }
+  const cohorts = [...byCohort.entries()]
+    .sort(([left], [right]) => compareStrings(left, right))
+    .map(([cohort_key, terminals]): TerminalStatsCohortAggregate => {
+      const metadata = aggregatePopulationMetadata(
+        terminals.length,
+        minimumCohortSize,
+      );
+      return {
+        cohort_key,
+        metadata,
+        ...(metadata.status === "suppressed" ? {} : {
+          distributions: Object.fromEntries(TERMINAL_METRIC_AXES.map((axis) => [
+            axis,
+            normalizedCohortDistribution(
+              terminals.map((entry) => entry.terminal_metrics![axis]),
+              INVALID_STATS_AGGREGATION_INPUT,
+            ),
+          ])) as Record<TerminalMetricAxis, CohortDistribution>,
+        }),
+      };
+    });
+
+  return {
+    selected_snapshot_ids: selection.terminals.map(({ snapshot_id }) =>
+      snapshot_id),
+    metadata: {
+      stored_snapshot_count: selection.metadata.stored_snapshot_count,
+      distinct_work_unit_count: distinctWorkUnits,
+      terminal_snapshot_count: selection.metadata.terminal_snapshot_count,
+      superseded_snapshot_count: selection.metadata.superseded_snapshot_count,
+      ineligible_snapshot_count: selection.metadata.ineligible_snapshot_count,
+      ...population,
+    },
+    ...(population.status === "suppressed" ? {} : {
+      terminal_metrics: aggregateTerminalMetrics(
+        selection.eligible_terminals,
+      ),
+    }),
+    rule_minutes: population.status === "suppressed"
+      ? []
+      : aggregateRuleMinutes(selection.eligible_terminals),
+    cohorts,
+  };
 }
