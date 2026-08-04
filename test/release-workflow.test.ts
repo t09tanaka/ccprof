@@ -175,8 +175,26 @@ test("attestations and GitHub Release consume the downloaded verified bytes", as
   assert.doesNotMatch(workflow, /npm unpublish|npm deprecate|rollback|republish/iu);
 });
 
-test("CI package smoke exercises strict stats privacy", async () => {
+test("CI package smoke exercises the installed schema and strict stats privacy", async () => {
   const workflow = await readProjectFile(".github/workflows/ci.yml");
   const packageJob = blockBefore(workflow, "  package-smoke:", "  determinism-golden:");
+  assert.match(
+    packageJob,
+    /"\$RUNNER_TEMP\/ccprof-prefix\/bin\/ccprof" schema report-v3\s*>\s*"\$RUNNER_TEMP\/ccprof-report-v3\.schema\.json"/u,
+  );
+  assert.match(packageJob, /const schema = JSON\.parse\(/u);
+  assert.match(
+    packageJob,
+    /schema\.properties\.schema_version\.const !== 3/u,
+  );
+  assert.match(
+    packageJob,
+    /' "\$RUNNER_TEMP\/ccprof-report-v3\.schema\.json"/u,
+  );
+  assertBefore(
+    packageJob,
+    "ccprof\" schema report-v3",
+    'mkdir -p "$RUNNER_TEMP/ccprof-smoke-repo"',
+  );
   assert.match(packageJob, /ccprof" stats --privacy strict --json/u);
 });
