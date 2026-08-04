@@ -48,9 +48,11 @@ import { commandIdentityKey } from "../src/analysis/command-identity.js";
 import {
   aggregateTerminalStats,
   exactCohortKey,
+  selectTerminalSnapshots,
   statsOpaqueDigest,
 } from "../src/analysis/stats-aggregation.js";
 import {
+  boundTerminalHistory,
   projectStatsAggregationInput,
   type StatsAggregationInput,
 } from "../src/analysis/stats-input.js";
@@ -3545,6 +3547,48 @@ test("stats keeps exact cohort distributions independently policy-sized", () => 
   );
 });
 
+test("terminal history window keeps deterministic recent ties and reports truncated work units", () => {
+  const projected = Array.from({ length: 10_002 }, (_, index) =>
+    task6TerminalInput({
+      id: `window-tie-${index.toString(10).padStart(5, "0")}`,
+      createdAtMs: 1_000,
+    })
+  );
+  const expected = [...projected]
+    .sort((left, right) =>
+      left.created_at_ms - right.created_at_ms ||
+      left.snapshot_id.localeCompare(right.snapshot_id))
+    .slice(-10_000);
+  const expectedIds = new Set(expected.map(({ snapshot_id }) => snapshot_id));
+  const dropped = projected.filter(({ snapshot_id }) =>
+    !expectedIds.has(snapshot_id));
+
+  for (const input of [projected, [...projected].reverse()]) {
+    const window = boundTerminalHistory(input);
+    assert.deepEqual(
+      window.entries.map(({ snapshot_id }) => snapshot_id),
+      expected.map(({ snapshot_id }) => snapshot_id),
+    );
+    assert.deepEqual(window.metadata, {
+      total_snapshot_count: 10_002,
+      window_snapshot_count: 10_000,
+      truncated_snapshot_count: 2,
+    });
+    assert.deepEqual(
+      [...window.truncated_work_unit_keys].sort(),
+      dropped.map(({ work_unit_key }) => work_unit_key!).sort(),
+    );
+  }
+});
+
+test("terminal history window does not weaken the aggregation collection guard", () => {
+  const entry = task6TerminalInput({ id: "nested-guard", createdAtMs: 1 });
+  assert.throws(
+    () => selectTerminalSnapshots(Array.from({ length: 10_001 }, () => entry)),
+    /invalid stats aggregation input/u,
+  );
+});
+
 test("terminal snapshot IDs bound recurrence adoption and the history label", () => {
   const projected = [
     task6TerminalInput({
@@ -4061,6 +4105,9 @@ test("stats CLI bounds ordinary terminal history before aggregation", async () =
 
   const stats = JSON.parse(result.stdout) as StatsReport;
   assert.equal(stats.metadata?.stored_snapshot_count, 10_000);
+  assert.equal(stats.metadata?.total_snapshot_count, 10_001);
+  assert.equal(stats.metadata?.window_snapshot_count, 10_000);
+  assert.equal(stats.metadata?.truncated_snapshot_count, 1);
   assert.ok(result.warnings.some((warning) =>
     warning.includes("terminal_history_truncated")
   ));
