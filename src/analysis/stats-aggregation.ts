@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { types as utilTypes } from "node:util";
 
 import type { LedgerResult } from "../core/ledger.js";
@@ -49,6 +50,88 @@ const RULE_ROW_FIELDS = [
 ] as const;
 
 const OPAQUE_ID = /^[0-9a-f]{64}$/u;
+
+export type OpaqueDigest = string;
+
+export type ChangedFilesBucket =
+  | "files_0"
+  | "files_1"
+  | "files_2_4"
+  | "files_5_9"
+  | "files_10_19"
+  | "files_20_49"
+  | "files_50_plus";
+
+export type ChangedLinesBucket =
+  | "lines_0"
+  | "lines_1_9"
+  | "lines_10_49"
+  | "lines_50_199"
+  | "lines_200_999"
+  | "lines_1000_plus";
+
+export type BoundedBaselineMetric = "human_wait_ratio";
+
+export type StatsInputReason =
+  | "content_fallback"
+  | "invalid_repository_identity"
+  | "missing_changed_lines"
+  | "missing_selector"
+  | "missing_terminal_metrics";
+
+export interface StatsAggregationInput {
+  schema_version: 1;
+  snapshot_id: OpaqueDigest;
+  created_at_ms: number;
+  work_unit_key?: OpaqueDigest;
+  git_state_key?: OpaqueDigest;
+  repository_key?: OpaqueDigest;
+  workspace_key?: OpaqueDigest;
+  changed_files_bucket?: ChangedFilesBucket;
+  changed_lines_bucket?: ChangedLinesBucket;
+  cohort_key?: OpaqueDigest;
+  terminal_metrics?: {
+    measured_wall_ms: number;
+    confirmed_critical_path_ms: number;
+    estimated_critical_path_upper_ms: number;
+    resource_cost_ms: number;
+    human_wait_ms: number;
+    unexplained_ms: number;
+    rules: readonly TerminalStatsRuleV1[];
+  };
+  baseline_metrics: readonly {
+    metric: BoundedBaselineMetric;
+    value: number;
+  }[];
+  command_costs: readonly [];
+  reason_codes: readonly StatsInputReason[];
+}
+
+export interface CohortDistribution {
+  median: number;
+  p50: number;
+  p75: number;
+  mad: number;
+  sample_count: number;
+}
+
+export type CohortEvaluationMode =
+  | {
+      mode: "analysis_current";
+      current_work_unit_key: OpaqueDigest;
+      current_cohort_key: OpaqueDigest;
+    }
+  | { mode: "stats_all_groups" };
+
+export interface TerminalSelectionResult {
+  terminals: StatsAggregationInput[];
+  metadata: {
+    stored_snapshot_count: number;
+    terminal_snapshot_count: number;
+    superseded_snapshot_count: number;
+    ineligible_snapshot_count: number;
+  };
+}
 
 export const TERMINAL_STATS_COLLECTION_LIMIT = 10_000;
 
@@ -787,4 +870,256 @@ export function buildTerminalStatsSnapshot(
     rules: rows,
     incomplete_interval_findings: incomplete,
   });
+}
+
+export function statsOpaqueDigest(
+  domain: string,
+  value: unknown,
+): OpaqueDigest {
+  if (domain === "" || domain.includes("\0")) {
+    throw new TypeError("stats digest domain must be non-empty");
+  }
+  const encoded = JSON.stringify(value);
+  if (encoded === undefined) throw new TypeError("invalid stats digest input");
+  return createHash("sha256")
+    .update(`ccprof\0${domain}\0`)
+    .update(encoded)
+    .digest("hex");
+}
+
+function boundedCount(value: number): number {
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    Object.is(value, -0)
+  ) throw new TypeError("cohort size must be a nonnegative safe integer");
+  return value;
+}
+
+export function changedFilesBucket(value: number): ChangedFilesBucket {
+  const count = boundedCount(value);
+  if (count === 0) return "files_0";
+  if (count === 1) return "files_1";
+  if (count <= 4) return "files_2_4";
+  if (count <= 9) return "files_5_9";
+  if (count <= 19) return "files_10_19";
+  if (count <= 49) return "files_20_49";
+  return "files_50_plus";
+}
+
+export function changedLinesBucket(value: number): ChangedLinesBucket {
+  const count = boundedCount(value);
+  if (count === 0) return "lines_0";
+  if (count <= 9) return "lines_1_9";
+  if (count <= 49) return "lines_10_49";
+  if (count <= 199) return "lines_50_199";
+  if (count <= 999) return "lines_200_999";
+  return "lines_1000_plus";
+}
+
+export function exactCohortKey(input: {
+  repository_key: OpaqueDigest;
+  workspace_key: OpaqueDigest;
+  changed_files_bucket: ChangedFilesBucket;
+  changed_lines_bucket: ChangedLinesBucket;
+}): OpaqueDigest {
+  if (!OPAQUE_ID.test(input.repository_key) ||
+    !OPAQUE_ID.test(input.workspace_key)) {
+    throw new TypeError("invalid exact cohort identity");
+  }
+  return statsOpaqueDigest("stats-exact-cohort-v1", [
+    input.repository_key,
+    input.workspace_key,
+    input.changed_files_bucket,
+    input.changed_lines_bucket,
+  ]);
+}
+
+function roundedDistributionValue(value: number): number {
+  const rounded = Math.round((value + Number.EPSILON) * 10_000) / 10_000;
+  return Object.is(rounded, -0) ? 0 : rounded;
+}
+
+function quantile(sorted: readonly number[], probability: number): number {
+  const position = (sorted.length - 1) * probability;
+  const lowerIndex = Math.floor(position);
+  const upperIndex = Math.ceil(position);
+  const lower = sorted[lowerIndex]!;
+  const upper = sorted[upperIndex]!;
+  return lower + ((upper - lower) * (position - lowerIndex));
+}
+
+export function cohortDistribution(
+  input: readonly number[],
+): CohortDistribution {
+  const values = snapshotArray(input);
+  if (
+    values === null ||
+    values.length === 0 ||
+    values.some((value) =>
+      typeof value !== "number" ||
+      !Number.isFinite(value) ||
+      value < 0 ||
+      Object.is(value, -0)
+    )
+  ) throw new TypeError("invalid cohort distribution input");
+  const sorted = (values as number[]).sort((left, right) => left - right);
+  const median = quantile(sorted, 0.5);
+  const deviations = sorted
+    .map((value) => Math.abs(value - median))
+    .sort((left, right) => left - right);
+  return {
+    median: roundedDistributionValue(median),
+    p50: roundedDistributionValue(quantile(sorted, 0.5)),
+    p75: roundedDistributionValue(quantile(sorted, 0.75)),
+    mad: roundedDistributionValue(quantile(deviations, 0.5)),
+    sample_count: sorted.length,
+  };
+}
+
+const PROJECTED_REQUIRED_FIELDS = [
+  "schema_version",
+  "snapshot_id",
+  "created_at_ms",
+  "baseline_metrics",
+  "command_costs",
+  "reason_codes",
+] as const;
+const PROJECTED_OPTIONAL_FIELDS = [
+  "work_unit_key",
+  "git_state_key",
+  "repository_key",
+  "workspace_key",
+  "changed_files_bucket",
+  "changed_lines_bucket",
+  "cohort_key",
+  "terminal_metrics",
+] as const;
+
+function projectedInput(value: unknown): StatsAggregationInput {
+  const descriptors = plainDataDescriptors(value);
+  if (descriptors === null) throw new TypeError("invalid stats aggregation input");
+  const keys = Reflect.ownKeys(descriptors);
+  const allowed = new Set<string>([
+    ...PROJECTED_REQUIRED_FIELDS,
+    ...PROJECTED_OPTIONAL_FIELDS,
+  ]);
+  if (
+    keys.some((key) => typeof key !== "string" || !allowed.has(key)) ||
+    PROJECTED_REQUIRED_FIELDS.some((key) => !keys.includes(key))
+  ) throw new TypeError("invalid stats aggregation input");
+  for (const key of keys) {
+    if (typeof key !== "string") {
+      throw new TypeError("invalid stats aggregation input");
+    }
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || descriptor.enumerable !== true ||
+      !("value" in descriptor)) {
+      throw new TypeError("invalid stats aggregation input");
+    }
+  }
+  const snapshotId = dataValue(descriptors, "snapshot_id");
+  const createdAt = dataValue(descriptors, "created_at_ms");
+  if (
+    dataValue(descriptors, "schema_version") !== 1 ||
+    typeof snapshotId !== "string" ||
+    !OPAQUE_ID.test(snapshotId) ||
+    typeof createdAt !== "number" ||
+    !Number.isSafeInteger(createdAt) ||
+    createdAt < 0 ||
+    snapshotArray(dataValue(descriptors, "baseline_metrics")) === null ||
+    snapshotArray(dataValue(descriptors, "command_costs")) === null ||
+    snapshotArray(dataValue(descriptors, "reason_codes")) === null
+  ) throw new TypeError("invalid stats aggregation input");
+  for (const key of [
+    "work_unit_key",
+    "git_state_key",
+    "repository_key",
+    "workspace_key",
+    "cohort_key",
+  ]) {
+    const entry = dataValue(descriptors, key);
+    if (entry !== undefined &&
+      (typeof entry !== "string" || !OPAQUE_ID.test(entry))) {
+      throw new TypeError("invalid stats aggregation input");
+    }
+  }
+  return value as StatsAggregationInput;
+}
+
+export function selectTerminalSnapshots(
+  input: readonly StatsAggregationInput[],
+): TerminalSelectionResult {
+  const values = snapshotArray(input);
+  if (values === null) throw new TypeError("invalid stats aggregation input");
+  const entries = values.map(projectedInput);
+  const byWorkUnit = new Map<OpaqueDigest, StatsAggregationInput[]>();
+  let ineligible = 0;
+  for (const entry of entries) {
+    if (entry.work_unit_key === undefined || entry.git_state_key === undefined) {
+      ineligible += 1;
+      continue;
+    }
+    const group = byWorkUnit.get(entry.work_unit_key);
+    if (group === undefined) byWorkUnit.set(entry.work_unit_key, [entry]);
+    else group.push(entry);
+  }
+  const terminals: StatsAggregationInput[] = [];
+  let eligibleCount = 0;
+  for (const workUnitEntries of byWorkUnit.values()) {
+    eligibleCount += workUnitEntries.length;
+    const byState = new Map<OpaqueDigest, StatsAggregationInput[]>();
+    for (const entry of workUnitEntries) {
+      const stateKey = entry.git_state_key!;
+      const state = byState.get(stateKey);
+      if (state === undefined) byState.set(stateKey, [entry]);
+      else state.push(entry);
+    }
+    const terminalState = [...byState.entries()]
+      .map(([gitStateKey, variants]) => ({
+        gitStateKey,
+        variants,
+        firstSeenAtMs: Math.min(...variants.map(({ created_at_ms }) =>
+          created_at_ms)),
+      }))
+      .sort((left, right) =>
+        left.firstSeenAtMs - right.firstSeenAtMs ||
+        compareStrings(left.gitStateKey, right.gitStateKey))
+      .at(-1)!;
+    const terminal = [...terminalState.variants].sort((left, right) =>
+      left.created_at_ms - right.created_at_ms ||
+      compareStrings(left.snapshot_id, right.snapshot_id))
+      .at(-1)!;
+    terminals.push(terminal);
+  }
+  terminals.sort((left, right) =>
+    compareStrings(left.work_unit_key!, right.work_unit_key!) ||
+    compareStrings(left.snapshot_id, right.snapshot_id));
+  return {
+    terminals,
+    metadata: {
+      stored_snapshot_count: entries.length,
+      terminal_snapshot_count: terminals.length,
+      superseded_snapshot_count: eligibleCount - terminals.length,
+      ineligible_snapshot_count: ineligible,
+    },
+  };
+}
+
+export function selectComparableTerminalSnapshots(
+  input: readonly StatsAggregationInput[],
+  mode: CohortEvaluationMode,
+): StatsAggregationInput[] {
+  const terminals = selectTerminalSnapshots(input).terminals;
+  if (mode.mode === "stats_all_groups") {
+    return terminals.filter(({ cohort_key }) => cohort_key !== undefined);
+  }
+  if (
+    !OPAQUE_ID.test(mode.current_work_unit_key) ||
+    !OPAQUE_ID.test(mode.current_cohort_key)
+  ) throw new TypeError("invalid cohort evaluation mode");
+  return terminals
+    .filter(({ cohort_key }) => cohort_key === mode.current_cohort_key)
+    .filter(({ work_unit_key }) =>
+      work_unit_key !== mode.current_work_unit_key);
 }

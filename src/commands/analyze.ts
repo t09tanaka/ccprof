@@ -27,9 +27,12 @@ import { sanitizeHumanText } from "../reporters/sanitize.js";
 import { renderTtyReport } from "../reporters/tty.js";
 import {
   resolveRepositoryPolicy,
-  type EffectivePolicy,
   type RepositoryPolicyResolver,
 } from "../policy/organization-policy.js";
+import {
+  resolveStorePaths,
+  type StorePaths,
+} from "../store/paths.js";
 
 const POLICY_ADVISORY_DISABLED_WARNING =
   "[policy_advisory_disabled] Advisory execution is disabled by active policy.";
@@ -67,6 +70,7 @@ export interface AnalyzeCommandDependencies {
   ) => Promise<CommandAnalysis>;
   /** Runner for the external `claude` CLI behind `--advisory`. */
   runCommand?: CommandRunner;
+  resolveStorePaths?: (cwd: string) => Promise<StorePaths>;
   resolvePolicy?: RepositoryPolicyResolver;
   onPrivacyResolved?: (privacy: PrivacyProfile) => void;
 }
@@ -92,28 +96,24 @@ export async function runAnalyzeCommand(
   const analyze = dependencies.analyze ?? analyzeCore;
   const requestedPrivacy = options.privacy ??
     defaultPrivacyProfile(options.format, false);
-  let resolvedPolicy:
-    | { repoRoot: string; value: EffectivePolicy }
-    | undefined;
-  const policyFor = async (repoRoot: string): Promise<EffectivePolicy> => {
-    if (resolvedPolicy?.repoRoot === repoRoot) return resolvedPolicy.value;
-    const value = await (
-      dependencies.resolvePolicy ?? resolveRepositoryPolicy
-    )(repoRoot, {
-      privacy: requestedPrivacy,
-      advisory: options.advisory === true,
-    });
-    resolvedPolicy = { repoRoot, value };
-    dependencies.onPrivacyResolved?.(value.privacy);
-    return value;
-  };
+  const storePaths = await (
+    dependencies.resolveStorePaths ?? resolveStorePaths
+  )(options.cwd);
+  const effectivePolicy = await (
+    dependencies.resolvePolicy ?? resolveRepositoryPolicy
+  )(storePaths.canonical_repo, {
+    privacy: requestedPrivacy,
+    advisory: options.advisory === true,
+  });
+  dependencies.onPrivacyResolved?.(effectivePolicy.privacy);
   const projectorWarnings: string[] = [];
   let projectorAdvisory: AdvisoryText | undefined;
   let projectorInvoked = false;
   const analyzeOptions: AnalyzeOptions = {
     cwd: options.cwd,
-    resolveRuleSafetyPolicy: async (repoRoot) =>
-      (await policyFor(repoRoot)).rule_safety,
+    resolveRuleSafetyPolicy: async () => effectivePolicy.rule_safety,
+    storePaths,
+    minimumCohortSize: effectivePolicy.minimum_cohort_size,
     ...(options.pr === undefined ? {} : { pr: options.pr }),
     ...(options.sinceMs === undefined ? {} : { sinceMs: options.sinceMs }),
     ...(options.commitAnchorLookbackMs === undefined
@@ -136,7 +136,6 @@ export async function runAnalyzeCommand(
           projectorInvoked = true;
           const repoRoot = unprojectedReport.unit.repo;
           const sessions = unprojectedReport.unit.sessions;
-          const effectivePolicy = await policyFor(repoRoot);
           const privacy = effectivePolicy.privacy;
           const promptReport = projectReportPrivacy(unprojectedReport, privacy);
           if (options.advisory === true) {
@@ -199,7 +198,6 @@ export async function runAnalyzeCommand(
   };
   const result = await analyze(analyzeOptions);
   const repoRoot = result.report.unit.repo;
-  const effectivePolicy = await policyFor(repoRoot);
   const privacy = effectivePolicy.privacy;
   const report = projectReportPrivacy(result.report, privacy);
   const sessions = result.report.unit.sessions;

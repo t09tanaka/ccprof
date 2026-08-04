@@ -16,9 +16,13 @@ import {
   type AnalysisBudgetResult,
 } from "../analysis/budgets.js";
 import {
+  cohortDistribution,
   normalizeTerminalStatsSnapshot,
+  selectComparableTerminalSnapshots,
+  type CohortEvaluationMode,
   type TerminalStatsSnapshotV1,
 } from "../analysis/stats-aggregation.js";
+import type { StatsAggregationInput } from "../analysis/stats-input.js";
 import { normalizeRepoPath } from "../analysis/test-map.js";
 import {
   findingCompatibilityMetadata,
@@ -43,6 +47,11 @@ import type {
 import { canonicalJson, readLegacyJson } from "./legacy-json.js";
 import type { StorePaths } from "./paths.js";
 import { openStoreDatabase, storeDatabasePath } from "./sqlite.js";
+import {
+  DEFAULT_MINIMUM_COHORT_SIZE,
+  MAXIMUM_COHORT_SIZE,
+  MINIMUM_COHORT_SIZE,
+} from "../policy/organization-policy.js";
 
 export interface StoreWarning {
   code: string;
@@ -1404,39 +1413,37 @@ function roundedMetric(value: number): number {
 }
 
 export function computeBaseline(
-  current: AnalysisRecord,
-  history: readonly AnalysisRecord[],
-  windowSize = 10,
+  current: StatsAggregationInput["baseline_metrics"],
+  history: readonly StatsAggregationInput[],
+  mode: CohortEvaluationMode,
+  minimumCohortSize = DEFAULT_MINIMUM_COHORT_SIZE,
 ): BaselineComparison | null {
-  if (!Number.isSafeInteger(windowSize) || windowSize <= 0) {
-    throw new TypeError("baseline window must be a positive safe integer");
+  if (
+    !Number.isSafeInteger(minimumCohortSize) ||
+    minimumCohortSize < MINIMUM_COHORT_SIZE ||
+    minimumCohortSize > MAXIMUM_COHORT_SIZE
+  ) {
+    throw new TypeError("invalid minimum cohort size");
   }
-  const prior = history
-    .filter(
-      (record) =>
-        record.analysis_id !== current.analysis_id &&
-        record.created_at_ms < current.created_at_ms,
-    )
-    .sort(recordOrder)
-    .slice(-windowSize);
-  if (prior.length < 3) return null;
+  const prior = selectComparableTerminalSnapshots(history, mode);
+  if (prior.length < minimumCohortSize) return null;
 
-  const notable = Object.entries(current.metrics)
-    .sort(([left], [right]) => left.localeCompare(right))
-    .flatMap(([metric, value]) => {
+  const notable = [...current]
+    .sort((left, right) => left.metric.localeCompare(right.metric))
+    .flatMap(({ metric, value }) => {
       if (!Number.isFinite(value)) return [];
       const historical = prior.flatMap((record) => {
-        const entry = record.metrics[metric];
+        const entry = record.baseline_metrics.find((candidate) =>
+          candidate.metric === metric)?.value;
         return entry !== undefined && Number.isFinite(entry) ? [entry] : [];
       });
-      if (historical.length < 3) return [];
+      if (historical.length < minimumCohortSize) return [];
+      const distribution = cohortDistribution(historical);
       return [{
         metric,
         value: roundedMetric(value),
-        baseline: roundedMetric(
-          historical.reduce((total, entry) => total + entry, 0) /
-            historical.length,
-        ),
+        baseline: distribution.median,
+        ...distribution,
       }];
     });
   return { prs: prior.length, notable };

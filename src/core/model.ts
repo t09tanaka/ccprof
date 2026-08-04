@@ -596,6 +596,11 @@ export interface BaselineNotable {
   metric: string;
   value: number;
   baseline: number;
+  median?: number;
+  p50?: number;
+  p75?: number;
+  mad?: number;
+  sample_count?: number;
 }
 
 export interface BaselineComparison {

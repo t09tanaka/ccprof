@@ -71,6 +71,10 @@ import {
   mergeTestMaps,
   type TestMap,
 } from "../analysis/test-map.js";
+import { projectStatsAggregationInput } from
+  "../analysis/stats-input.js";
+import { buildTerminalStatsSnapshot } from
+  "../analysis/stats-aggregation.js";
 import { loadRepositoryConfig } from "../analysis/repository-config.js";
 import { runCommand, type CommandRunner } from "../git/client.js";
 import { collectDiffEvidence } from "../git/diff.js";
@@ -111,6 +115,7 @@ import { detectRework } from "../rules/rework.js";
 import { detectSerialSlack } from "../rules/serial-slack.js";
 import {
   listRuleManifests,
+  ruleManifest,
   withRuleManifest,
 } from "../rules/manifest.js";
 import { minimumConfidence } from "../rules/shared.js";
@@ -132,6 +137,7 @@ import {
   loadAnalyses,
   makeAnalysisRecord,
   saveAnalysis,
+  type AnalysisHistoryEntry,
   type AnalysisRecord,
   type AnalysisSnapshotIdentity,
   type StoreWarning,
@@ -152,6 +158,11 @@ import {
   resolveStorePaths,
   type StorePaths,
 } from "../store/paths.js";
+import {
+  DEFAULT_MINIMUM_COHORT_SIZE,
+  MAXIMUM_COHORT_SIZE,
+  MINIMUM_COHORT_SIZE,
+} from "../policy/organization-policy.js";
 
 const KNOWN_LIMITATIONS = [
   "Claude timestamps are log write times, not exact operation start and end times.",
@@ -170,6 +181,8 @@ export interface AnalyzeOptions {
   claudeProjectsDirectory?: string;
   codexSessionsDirectory?: string;
   storePaths?: StorePaths;
+  /** Effective policy floor for comparable terminal work-unit cohorts. */
+  minimumCohortSize?: number;
   runner?: CommandRunner;
   nowMs?: number;
   externalToolNames?: ReadonlySet<string>;
@@ -234,6 +247,16 @@ export class InvalidAnalysisWindowError extends Error {
     super(message);
     this.name = "InvalidAnalysisWindowError";
   }
+}
+
+function resolvedMinimumCohortSize(options: AnalyzeOptions): number {
+  const value = options.minimumCohortSize ?? DEFAULT_MINIMUM_COHORT_SIZE;
+  if (
+    !Number.isSafeInteger(value) ||
+    value < MINIMUM_COHORT_SIZE ||
+    value > MAXIMUM_COHORT_SIZE
+  ) throw new TypeError("invalid minimum cohort size");
+  return value;
 }
 
 function uniqueSorted(values: readonly string[]): string[] {
@@ -1117,10 +1140,14 @@ function sourceSnapshot(sessions: readonly Session[], repoRoot: string): unknown
 }
 function snapshotIdentity(paths: StorePaths, context: PrContext, window: AnalysisWindow,
   sessions: readonly Session[], testMap: TestMap, options: AnalyzeOptions,
+  minimumCohortSize: number,
   history: readonly AnalysisRecord[], coverage: readonly RuleCoverage[],
   inapplicable: readonly SkippedRule[], ruleSafetyDigest: string,
   sourceErrors: readonly unknown[],
   hookWarnings: readonly StoreWarning[]): AnalysisSnapshotIdentity {
+  if (context.selector === undefined) {
+    throw new TypeError("analysis selector identity is required");
+  }
   const mappings = testMap.mappings.map((mapping) => ({ source: uniqueSorted(mapping.source),
     tests: uniqueSorted(mapping.tests),
     commands: uniqueSorted(mapping.commands), confidence: mapping.confidence,
@@ -1134,6 +1161,7 @@ function snapshotIdentity(paths: StorePaths, context: PrContext, window: Analysi
   return {
     repo_id: paths.repo_hash, base_oid: context.base.oid.toLowerCase(),
     head_oid: context.head.oid.toLowerCase(), merge_base_oid: context.mergeBaseOid.toLowerCase(),
+    selector: context.selector,
     window: { started_at_ms: window.started_at_ms, start_source: window.start_source,
       end_source: window.end_source, completeness: window.completeness,
       ...(window.end_source === "explicit" ? { ended_at_ms: window.ended_at_ms } : {}) },
@@ -1148,6 +1176,7 @@ function snapshotIdentity(paths: StorePaths, context: PrContext, window: Analysi
       }) }),
     policy_digest: analysisDigest("analysis-policy-v1", {
       fingerprint: "ccprof-rule-policy-2026-08-04-v2",
+      minimum_cohort_size: minimumCohortSize,
       rule_coverage: coverage, skipped_rules: inapplicable,
       rule_manifest: listRuleManifests(),
       rule_safety_digest: ruleSafetyDigest }),
@@ -1310,6 +1339,7 @@ export async function analyze(
   const validatedSource = injectedSource === undefined
     ? undefined : combinedSnapshot ?? validateSessionSource(injectedSource);
   const persist = options.persist ?? true;
+  const minimumCohortSize = resolvedMinimumCohortSize(options);
   const budgetMeter = options.budgets === undefined
     ? undefined
     : new AnalysisBudgetMeter(
@@ -1556,7 +1586,11 @@ export async function analyze(
         loadAdoptions(paths),
       ])
     : [
-        { records: [] as AnalysisRecord[], warnings: [] as StoreWarning[] },
+        {
+          records: [] as AnalysisRecord[],
+          entries: [] as AnalysisHistoryEntry[],
+          warnings: [] as StoreWarning[],
+        },
         { records: [], warnings: [] as StoreWarning[] },
         { records: [] as AdoptionRecord[], warnings: [] as StoreWarning[] },
       ];
@@ -1578,6 +1612,17 @@ export async function analyze(
     );
   }
   const history = priorRecords(historyResult.records, context);
+  const projectedHistory = (historyResult.entries ?? []).flatMap((entry) => {
+    try {
+      return [projectStatsAggregationInput(entry)];
+    } catch {
+      warnings.push(textWarning(
+        "stats_history_ineligible",
+        "One history snapshot was ineligible for comparable statistics.",
+      ));
+      return [];
+    }
+  });
 
   // Adoption detection only exists to feed a save; when persist is false
   // (e.g. a hook-driven `--notify` analysis) skip it entirely rather than
@@ -1741,6 +1786,41 @@ export async function analyze(
   const preliminaryLedger = reconcileLedger(ledgerInput);
   const metrics = analysisMetrics(timeline);
   const costs = commandCosts(matched);
+  const terminalStatsSnapshot = buildTerminalStatsSnapshot({
+    repositoryId: paths.repo_hash,
+    workspaceId: analysisDigest(
+      "terminal-stats-workspace-v1",
+      paths.canonical_repo,
+    ),
+    changedFiles: diff.files.length,
+    ...(diff.changedLineCount === undefined
+      ? {}
+      : { changedLines: diff.changedLineCount }),
+    ledger: preliminaryLedger,
+    candidates: candidates.map((candidate) => {
+      const manifest = ruleManifest(candidate.rule_id);
+      return {
+        ...candidate,
+        rule_version: manifest.version,
+        compatibility_epoch: manifest.compatibility_epoch,
+      };
+    }),
+  });
+  const currentSnapshotIdentity = snapshotIdentity(
+    paths,
+    context,
+    window,
+    sessions,
+    testMap,
+    options,
+    minimumCohortSize,
+    history,
+    coverage,
+    inapplicableRules,
+    ruleSafetyDigest,
+    sourceErrors,
+    hookEvents.warnings,
+  );
   const draftRecord = makeAnalysisRecord({
     created_at_ms: context.resolvedAtMs,
     unit,
@@ -1749,8 +1829,35 @@ export async function analyze(
     metrics,
     command_costs: costs,
     read_observations: reads.observations,
+    terminal_stats_snapshot: terminalStatsSnapshot,
   });
-  const baseline = computeBaseline(draftRecord, history);
+  const {
+    analysis_id: _draftAnalysisId,
+    created_at_ms: _draftCreatedAtMs,
+    ...draftPayload
+  } = draftRecord;
+  const projectedCurrent = projectStatsAggregationInput({
+    snapshot_id: analysisDigest("analysis-snapshot-v1", {
+      schema_version: 1,
+      identity: currentSnapshotIdentity,
+      payload: draftPayload,
+    }),
+    identity: currentSnapshotIdentity,
+    record: draftRecord,
+  });
+  const baseline = projectedCurrent.work_unit_key === undefined ||
+      projectedCurrent.cohort_key === undefined
+    ? null
+    : computeBaseline(
+        projectedCurrent.baseline_metrics,
+        projectedHistory,
+        {
+          mode: "analysis_current",
+          current_work_unit_key: projectedCurrent.work_unit_key,
+          current_cohort_key: projectedCurrent.cohort_key,
+        },
+        minimumCohortSize,
+      );
   const ledger = baseline === null
     ? preliminaryLedger
     : reconcileLedger({ ...ledgerInput, baseline });
@@ -1794,14 +1901,10 @@ export async function analyze(
       command_costs: costs,
       read_observations: reads.observations,
       analysis_budget: prepared.analysisBudget,
+      terminal_stats_snapshot: terminalStatsSnapshot,
     });
     const saveResult = persist
-      ? await saveAnalysis(paths, record, { snapshot: snapshotIdentity(
-          paths, context, window, sessions, testMap, options, history, coverage,
-          inapplicableRules,
-          ruleSafetyDigest,
-          sourceErrors, hookEvents.warnings,
-        ) })
+      ? await saveAnalysis(paths, record, { snapshot: currentSnapshotIdentity })
       : { record, warnings: [] as StoreWarning[] };
     warnings.push(...saveResult.warnings.map(storeWarning));
     return {
@@ -1824,14 +1927,10 @@ export async function analyze(
     metrics,
     command_costs: costs,
     read_observations: reads.observations,
+    terminal_stats_snapshot: terminalStatsSnapshot,
   });
   const saveResult = persist
-    ? await saveAnalysis(paths, record, { snapshot: snapshotIdentity(
-        paths, context, window, sessions, testMap, options, history, coverage,
-        inapplicableRules,
-        ruleSafetyDigest,
-        sourceErrors, hookEvents.warnings,
-      ) })
+    ? await saveAnalysis(paths, record, { snapshot: currentSnapshotIdentity })
     : { record, warnings: [] as StoreWarning[] };
   warnings.push(...saveResult.warnings.map(storeWarning));
 
