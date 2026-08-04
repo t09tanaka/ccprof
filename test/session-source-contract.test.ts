@@ -6,7 +6,11 @@ import test from "node:test";
 
 import { AnalysisBudgetMeter } from "../src/analysis/budgets.js";
 import { analyze } from "../src/core/analyze.js";
-import type { Session, SessionCapability } from "../src/core/model.js";
+import type {
+  NormalizedEvent,
+  Session,
+  SessionCapability,
+} from "../src/core/model.js";
 import { deriveSourceDescriptor } from "../src/core/source-descriptor.js";
 import type { CommandRunner } from "../src/git/client.js";
 import { ClaudeSessionSource } from "../src/sources/claude/discover.js";
@@ -95,6 +99,97 @@ function session(
   };
 }
 
+function eventBase(sourceIndex: number) {
+  return {
+    timestamp_ms: 100 + sourceIndex,
+    session_id: "session-1",
+    entry_uuid: `entry-${sourceIndex}`,
+    session_ref: `session-1#entry-${sourceIndex}`,
+    source_index: sourceIndex,
+    agent_id: "main",
+    is_sidechain: false,
+    confidence: "high" as const,
+    event_identity: {
+      source_adapter_id: "claude",
+      source_instance_id: "/logs/session-1.jsonl",
+      session_id: "session-1",
+      agent_id: "main",
+      source_index: sourceIndex,
+    },
+    parent_uuid: "parent",
+    branch: "feature",
+    branch_epoch: 0,
+  };
+}
+
+function richSession(): Session {
+  return session({
+    capabilities: [...ALL_CAPABILITIES],
+    verified_ended_at_ms: 201,
+    events: [{
+      ...eventBase(0),
+      kind: "genuine_user",
+      text: "Please inspect this.",
+    }, {
+      ...eventBase(1),
+      kind: "assistant",
+      text: "Inspecting.",
+      message_id: "message-1",
+      input_tokens: 10,
+      output_tokens: 5,
+    }, {
+      ...eventBase(2),
+      kind: "tool_use",
+      event_identity: {
+        ...eventBase(2).event_identity,
+        tool_use_id: "tool-1",
+      },
+      tool_use_id: "tool-1",
+      tool_name: "Read",
+      input: {
+        path: "src/index.ts",
+        options: { line: 1 },
+        flags: [true, null, "safe"],
+      },
+      paths: ["src/index.ts"],
+      edit_fragments: ["replacement"],
+      command: "inspect",
+      cwd: "/repo",
+      approval: { required: true, reason: "read permission" },
+    }, {
+      ...eventBase(3),
+      kind: "tool_result",
+      event_identity: {
+        ...eventBase(3).event_identity,
+        tool_use_id: "tool-1",
+      },
+      tool_use_id: "tool-1",
+      status: "success",
+      status_evidence: {
+        status: "success",
+        source: "explicit_status",
+        confidence: "high",
+      },
+      output: "ok",
+      output_bytes: 2,
+      estimated_tokens: 1,
+      exit_code: 0,
+    }, {
+      ...eventBase(4),
+      kind: "compaction",
+      summary: "Earlier work.",
+      estimated_tokens: 3,
+    }],
+    warnings: [{
+      code: "partial_row",
+      message: "A row was skipped.",
+      source_path: "/logs/session-1.jsonl",
+      line: 7,
+      session_ref: "session-1#entry-4",
+    }],
+  });
+}
+
 function declaration(
   overrides: Partial<SessionSourceContract> = {},
 ): SessionSourceContract {
@@ -146,6 +241,13 @@ async function assertAsyncSourceError(
     assert.equal(sourceError.message.includes(canary), false);
     return true;
   });
+}
+
+function discoveryOf(value: unknown): Promise<Session[]> {
+  return validateSessionSource({
+    contract: declaration(),
+    discover: async () => value,
+  } as unknown as SessionSource).discover(QUERY);
 }
 
 test("built-in SessionSource v2 contracts are exact, canonical, and immutable", () => {
@@ -443,6 +545,408 @@ test("discovery results fail closed before invalid sessions reach consumers", as
   assert.equal(prototypeReads, 0);
 });
 
+test("discovery rejects incomplete, inexact, accessor, and mistyped Session records", async () => {
+  const requiredFields = [
+    "session_id",
+    "source",
+    "source_path",
+    "observed_cwds",
+    "observed_branches",
+    "started_at_ms",
+    "ended_at_ms",
+    "confidence",
+    "events",
+    "warnings",
+  ] as const;
+  for (const field of requiredFields) {
+    const candidate = { ...session() } as Record<string, unknown>;
+    delete candidate[field];
+    await assertAsyncSourceError(
+      () => discoveryOf([candidate]),
+      "invalid_result",
+    );
+  }
+
+  await assertAsyncSourceError(
+    () => discoveryOf([{ ...session(), extra: "SECRET_CANARY" }]),
+    "invalid_result",
+  );
+
+  const invalidFields: readonly [keyof Session, unknown][] = [
+    ["session_id", 1],
+    ["source", "other"],
+    ["source_path", null],
+    ["observed_cwds", "/repo"],
+    ["observed_branches", "feature"],
+    ["started_at_ms", Number.NaN],
+    ["ended_at_ms", Number.POSITIVE_INFINITY],
+    ["verified_ended_at_ms", Number.MAX_SAFE_INTEGER + 1],
+    ["confidence", "certain"],
+    ["events", {}],
+    ["warnings", {}],
+    ["capabilities", "approvals"],
+  ];
+  for (const [field, value] of invalidFields) {
+    const candidate = session();
+    (candidate as unknown as Record<string, unknown>)[field] = value;
+    await assertAsyncSourceError(
+      () => discoveryOf([candidate]),
+      field === "source"
+        ? "adapter_mismatch"
+        : field === "capabilities"
+          ? "invalid_capability"
+          : "invalid_result",
+    );
+  }
+
+  let reads = 0;
+  for (const field of requiredFields) {
+    const candidate = { ...session() } as Record<string, unknown>;
+    Object.defineProperty(candidate, field, {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        throw new Error(`SECRET_CANARY ${field}`);
+      },
+    });
+    await assertAsyncSourceError(
+      () => discoveryOf([candidate]),
+      "invalid_result",
+    );
+  }
+  assert.equal(reads, 0);
+});
+
+test("discovery passively rejects hostile nested Session containers", async () => {
+  let traps = 0;
+  const hostile = <T extends object>(value: T): T => new Proxy(value, {
+    get: () => {
+      traps += 1;
+      throw new Error("SECRET_CANARY nested get");
+    },
+    getOwnPropertyDescriptor: () => {
+      traps += 1;
+      throw new Error("SECRET_CANARY nested descriptor");
+    },
+    getPrototypeOf: () => {
+      traps += 1;
+      throw new Error("SECRET_CANARY nested prototype");
+    },
+    ownKeys: () => {
+      traps += 1;
+      throw new Error("SECRET_CANARY nested keys");
+    },
+  });
+  const mutateEvent = (
+    kind: NormalizedEvent["kind"],
+    update: (event: Record<string, unknown>) => void,
+  ): Session => {
+    const candidate = richSession();
+    const event = candidate.events.find((entry) => entry.kind === kind)!;
+    update(event as unknown as Record<string, unknown>);
+    return candidate;
+  };
+  const hostileEvent = richSession();
+  hostileEvent.events[0] = hostile(hostileEvent.events[0]!);
+  const hostileWarning = richSession();
+  hostileWarning.warnings[0] = revokedProxy(hostileWarning.warnings[0]!);
+  const hostileCases: readonly [Session, SessionSourceValidationCode][] = [
+    [session({ observed_cwds: hostile(["/repo"]) }), "invalid_result"],
+    [session({ observed_branches: revokedProxy(["feature"]) }), "invalid_result"],
+    [session({ events: hostile(richSession().events) }), "invalid_result"],
+    [session({ warnings: revokedProxy(richSession().warnings) }), "invalid_result"],
+    [
+      session({ capabilities: hostile([...ALL_CAPABILITIES]) }),
+      "invalid_capability",
+    ],
+    [hostileEvent, "invalid_result"],
+    [hostileWarning, "invalid_result"],
+    [mutateEvent("assistant", (event) => {
+      event.event_identity = hostile(event.event_identity as object);
+    }), "invalid_result"],
+    [mutateEvent("tool_use", (event) => {
+      event.input = revokedProxy(event.input as object);
+    }), "invalid_result"],
+    [mutateEvent("tool_result", (event) => {
+      event.status_evidence = hostile(event.status_evidence as object);
+    }), "invalid_result"],
+    [mutateEvent("tool_use", (event) => {
+      event.approval = revokedProxy(event.approval as object);
+    }), "invalid_result"],
+  ];
+  for (const [candidate, code] of hostileCases) {
+    await assertAsyncSourceError(
+      () => discoveryOf([candidate]),
+      code,
+    );
+  }
+
+  const accessorCases: Session[] = [];
+  const accessorArray = <T>(value: T[]): T[] => {
+    Object.defineProperty(value, "0", {
+      enumerable: true,
+      get: () => {
+        traps += 1;
+        throw new Error("SECRET_CANARY nested array accessor");
+      },
+    });
+    return value;
+  };
+  accessorCases.push(
+    session({ observed_cwds: accessorArray(["/repo"]) }),
+    session({ observed_branches: accessorArray(["feature"]) }),
+    session({ events: accessorArray(richSession().events) }),
+    session({ warnings: accessorArray(richSession().warnings) }),
+    session({ capabilities: accessorArray([...ALL_CAPABILITIES]) }),
+  );
+  const accessorRecord = (
+    record: object,
+    field: string,
+  ): void => {
+    Object.defineProperty(record, field, {
+      enumerable: true,
+      get: () => {
+        traps += 1;
+        throw new Error(`SECRET_CANARY nested ${field} accessor`);
+      },
+    });
+  };
+  accessorCases.push(
+    mutateEvent("genuine_user", (event) => {
+      accessorRecord(event, "timestamp_ms");
+    }),
+    mutateEvent("assistant", (event) => {
+      accessorRecord(event.event_identity as object, "agent_id");
+    }),
+    mutateEvent("tool_use", (event) => {
+      accessorRecord(event.input as object, "path");
+    }),
+    mutateEvent("tool_result", (event) => {
+      accessorRecord(event.status_evidence as object, "status");
+    }),
+    mutateEvent("tool_use", (event) => {
+      accessorRecord(event.approval as object, "required");
+    }),
+  );
+  const accessorWarning = richSession();
+  Object.defineProperty(accessorWarning.warnings[0]!, "code", {
+    enumerable: true,
+    get: () => {
+      traps += 1;
+      throw new Error("SECRET_CANARY nested warning accessor");
+    },
+  });
+  accessorCases.push(accessorWarning);
+  for (const [index, candidate] of accessorCases.entries()) {
+    await assertAsyncSourceError(
+      () => discoveryOf([candidate]),
+      index === 4 ? "invalid_capability" : "invalid_result",
+    );
+  }
+  assert.equal(traps, 0);
+});
+
+test("discovery validates exact nested records, safe counts, and enums", async () => {
+  const invalidSessions: Session[] = [];
+  const withEvent = (
+    kind: NormalizedEvent["kind"],
+    update: (event: Record<string, unknown>) => void,
+  ): void => {
+    const candidate = richSession();
+    update(
+      candidate.events.find((event) => event.kind === kind)! as unknown as
+        Record<string, unknown>,
+    );
+    invalidSessions.push(candidate);
+  };
+
+  const requiredEventFields = [
+    ["genuine_user", "text"],
+    ["assistant", "text"],
+    ["tool_use", "tool_use_id"],
+    ["tool_use", "tool_name"],
+    ["tool_use", "input"],
+    ["tool_use", "paths"],
+    ["tool_use", "edit_fragments"],
+    ["tool_result", "tool_use_id"],
+    ["tool_result", "status"],
+    ["tool_result", "output"],
+    ["tool_result", "output_bytes"],
+    ["tool_result", "estimated_tokens"],
+    ["compaction", "summary"],
+  ] as const;
+  for (const [kind, field] of requiredEventFields) {
+    withEvent(kind, (event) => delete event[field]);
+  }
+  for (const field of [
+    "timestamp_ms",
+    "session_id",
+    "entry_uuid",
+    "session_ref",
+    "source_index",
+    "agent_id",
+    "is_sidechain",
+    "confidence",
+    "kind",
+  ] as const) {
+    withEvent("genuine_user", (event) => delete event[field]);
+  }
+
+  for (const [field, value] of [
+    ["timestamp_ms", Number.NaN],
+    ["source_index", -1],
+    ["branch_epoch", Number.MAX_SAFE_INTEGER + 1],
+    ["confidence", "certain"],
+    ["is_sidechain", 1],
+    ["kind", "other"],
+  ] as const) {
+    withEvent("genuine_user", (event) => event[field] = value);
+  }
+  withEvent("genuine_user", (event) => event.extra = "SECRET_CANARY");
+  withEvent("assistant", (event) => event.input_tokens = -1);
+  withEvent("assistant", (event) => event.output_tokens = Number.POSITIVE_INFINITY);
+  withEvent("tool_use", (event) => event.paths = [1]);
+  withEvent("tool_use", (event) => event.edit_fragments = [null]);
+  withEvent("tool_use", (event) => event.input = { nested: undefined });
+  withEvent("tool_use", (event) => {
+    event.approval = { required: true, extra: "SECRET_CANARY" };
+  });
+  withEvent("tool_use", (event) => {
+    event.approval = { required: "yes" };
+  });
+  withEvent("tool_use", (event) => {
+    event.approval = {};
+  });
+  withEvent("tool_result", (event) => event.status = "done");
+  withEvent("tool_result", (event) => event.output_bytes = -1);
+  withEvent("tool_result", (event) => event.estimated_tokens = 1.5);
+  withEvent("tool_result", (event) => event.exit_code = Number.NaN);
+  withEvent("tool_result", (event) => {
+    event.status_evidence = {
+      status: "success",
+      source: "other",
+      confidence: "high",
+    };
+  });
+  withEvent("tool_result", (event) => {
+    event.status_evidence = {
+      status: "success",
+      source: "explicit_status",
+      confidence: "high",
+      extra: "SECRET_CANARY",
+    };
+  });
+  withEvent("tool_result", (event) => {
+    event.status_evidence = {
+      status: "success",
+      source: "explicit_status",
+    };
+  });
+  withEvent("compaction", (event) => event.estimated_tokens = -1);
+  withEvent("assistant", (event) => {
+    event.event_identity = {
+      source_adapter_id: "claude",
+      source_instance_id: "/logs/session-1.jsonl",
+      session_id: "session-1",
+      agent_id: "main",
+      source_index: Number.POSITIVE_INFINITY,
+    };
+  });
+  withEvent("assistant", (event) => {
+    event.event_identity = {
+      ...(event.event_identity as object),
+      extra: "SECRET_CANARY",
+    };
+  });
+  withEvent("assistant", (event) => {
+    const identity = event.event_identity as Record<string, unknown>;
+    delete identity.agent_id;
+  });
+
+  const invalidWarningLine = richSession();
+  invalidWarningLine.warnings[0]!.line = 1.5;
+  invalidSessions.push(invalidWarningLine);
+  const invalidWarningExtra = richSession();
+  (invalidWarningExtra.warnings[0] as unknown as Record<string, unknown>).extra =
+    "SECRET_CANARY";
+  invalidSessions.push(invalidWarningExtra);
+  const invalidWarningOptional = richSession();
+  (invalidWarningOptional.warnings[0] as unknown as Record<string, unknown>)
+    .session_ref = 1;
+  invalidSessions.push(invalidWarningOptional);
+  for (const field of ["code", "message", "source_path"] as const) {
+    const candidate = richSession();
+    delete (candidate.warnings[0] as unknown as Record<string, unknown>)[field];
+    invalidSessions.push(candidate);
+  }
+
+  for (const candidate of invalidSessions) {
+    await assertAsyncSourceError(
+      () => discoveryOf([candidate]),
+      "invalid_result",
+    );
+  }
+});
+
+test("validated discovery returns a fully detached Session snapshot", async () => {
+  const original = richSession();
+  const expected = structuredClone(original);
+  const [snapshot] = await discoveryOf([original]);
+  assert.ok(snapshot);
+
+  assert.notEqual(snapshot, original);
+  assert.notEqual(snapshot.observed_cwds, original.observed_cwds);
+  assert.notEqual(snapshot.observed_branches, original.observed_branches);
+  assert.notEqual(snapshot.capabilities, original.capabilities);
+  assert.notEqual(snapshot.events, original.events);
+  assert.notEqual(snapshot.warnings, original.warnings);
+  for (let index = 0; index < original.events.length; index += 1) {
+    assert.notEqual(snapshot.events[index], original.events[index]);
+    assert.notEqual(
+      snapshot.events[index]!.event_identity,
+      original.events[index]!.event_identity,
+    );
+  }
+  const originalUse = original.events[2]!;
+  const snapshotUse = snapshot.events[2]!;
+  assert.equal(originalUse.kind, "tool_use");
+  assert.equal(snapshotUse.kind, "tool_use");
+  assert.notEqual(snapshotUse.input, originalUse.input);
+  assert.notEqual(snapshotUse.input.options, originalUse.input.options);
+  assert.notEqual(snapshotUse.input.flags, originalUse.input.flags);
+  assert.notEqual(snapshotUse.paths, originalUse.paths);
+  assert.notEqual(snapshotUse.edit_fragments, originalUse.edit_fragments);
+  assert.notEqual(snapshotUse.approval, originalUse.approval);
+  const originalResult = original.events[3]!;
+  const snapshotResult = snapshot.events[3]!;
+  assert.equal(originalResult.kind, "tool_result");
+  assert.equal(snapshotResult.kind, "tool_result");
+  assert.notEqual(snapshotResult.status_evidence, originalResult.status_evidence);
+  assert.notEqual(snapshot.warnings[0], original.warnings[0]);
+
+  original.session_id = "mutated";
+  original.observed_cwds.push("/other");
+  original.observed_branches.push("other");
+  (original.capabilities as SessionCapability[]).push("approvals");
+  original.events.push({ ...original.events[0]!, entry_uuid: "new-entry" });
+  original.events[0]!.timestamp_ms = 999;
+  original.events[0]!.event_identity!.agent_id = "mutated";
+  (originalUse.input.options as { line: number }).line = 999;
+  (originalUse.input.flags as unknown[]).push("mutated");
+  originalUse.paths.push("other.ts");
+  originalUse.edit_fragments.push("mutated");
+  originalUse.approval!.reason = "mutated";
+  originalResult.status_evidence!.source = "none";
+  original.warnings.push({
+    code: "mutated",
+    message: "mutated",
+    source_path: "/mutated",
+  });
+  original.warnings[0]!.message = "mutated";
+
+  assert.deepEqual(snapshot, expected);
+});
+
 test("CombinedSessionSource rejects an invalid leaf before any discovery starts", () => {
   let calls = 0;
   const healthy = source([]);
@@ -545,6 +1049,10 @@ test("budgeted analyze isolates hostile and forged discovery errors", async () =
       persist: false,
       budgets: BUDGETS,
       budgetClock: STEADY_CLOCK,
+      outputProjector: async () => ({
+        format: "json",
+        render: () => ({ output: "" }),
+      }),
       sessionSource: throwing,
     });
     assert.equal(
@@ -553,6 +1061,38 @@ test("budgeted analyze isolates hostile and forged discovery errors", async () =
     );
   }
   assert.equal(traps, 0);
+});
+
+test("max_output_bytes takes precedence over a concurrent source_failure", async () => {
+  const throwing: SessionSource = {
+    contract: CLAUDE_SESSION_SOURCE_CONTRACT,
+    discover: async () => {
+      throw new Error("SECRET_CANARY source failure");
+    },
+  };
+  const result = await analyze({
+    cwd: "/repo",
+    pr: "main...feature",
+    sinceMs: 0,
+    nowMs: 1_000,
+    runner: analysisRunner(),
+    persist: false,
+    budgets: { ...BUDGETS, max_output_bytes: 1 },
+    budgetClock: STEADY_CLOCK,
+    outputProjector: async () => ({
+      format: "json",
+      render: () => ({ output: "xx" }),
+    }),
+    sessionSource: throwing,
+  });
+
+  assert.equal(
+    result.report.analysis_budget?.truncation_reason,
+    "max_output_bytes",
+  );
+  assert.equal(result.report.analysis_budget?.completeness, "partial");
+  assert.equal(result.report.analysis_budget?.consumed.output_bytes, 0);
+  assert.equal(result.report.analysis_budget?.observed.output_bytes, 2);
 });
 
 test("analyze uses a captured CombinedSessionSource discovery method", async () => {
