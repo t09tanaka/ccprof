@@ -201,8 +201,8 @@ function resolveRemotes(
   if (
     remotes.length > 32 ||
     remotes.some(
-      ({ name, fetch_url: url }) =>
-        !isBoundedValue(name, 128) || !isBoundedValue(url, 2048),
+      ({ name, fetch_url: url, explicit_identity: flag }) =>
+        !isBoundedValue(name, 128) || !isBoundedValue(url, 2048) || (flag !== undefined && typeof flag !== "boolean"),
     )
   ) {
     return { status: "unavailable", reason: "invalid_remote" };

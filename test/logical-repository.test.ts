@@ -250,6 +250,49 @@ test("logical repository remote explicit selection beats origin and other remote
   );
 });
 
+test("logical repository remote rejects malformed explicit selection flags", () => {
+  for (const explicit_identity of ["true", 1, null, {}]) {
+    assert.deepEqual(
+      resolveLogicalRepositoryIdentity({
+        remotes: [
+          {
+            name: "upstream",
+            fetch_url: "https://example.com/upstream/repo",
+            explicit_identity: explicit_identity as never,
+          },
+          { name: "origin", fetch_url: "https://example.com/origin/repo" },
+        ],
+        offline_uuid: "550e8400-e29b-41d4-a716-446655440000",
+        local_path: "/fallback",
+      }),
+      { status: "unavailable", reason: "invalid_remote" },
+    );
+  }
+});
+
+test("logical repository remote permits absent and false selection flags", () => {
+  const expected = resolveLogicalRepositoryIdentity({
+    remotes: [
+      { name: "origin", fetch_url: "https://example.com/origin/repo" },
+    ],
+  });
+  for (const explicit_identity of [undefined, false]) {
+    assert.deepEqual(
+      resolveLogicalRepositoryIdentity({
+        remotes: [
+          {
+            name: "upstream",
+            fetch_url: "https://example.com/upstream/repo",
+            ...(explicit_identity === undefined ? {} : { explicit_identity }),
+          },
+          { name: "origin", fetch_url: "https://example.com/origin/repo" },
+        ],
+      }),
+      expected,
+    );
+  }
+});
+
 test("logical repository remote origin selection beats other remotes", () => {
   const selected = "https://example.com/origin/repo";
   assert.deepEqual(
