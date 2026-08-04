@@ -34,6 +34,32 @@
 
 Add tests that call `runCli(["doctor"] ...)` and `runCli(["doctor", "--json"] ...)` in temporary repositories. Assert the eight IDs and stable order, JSON/text determinism across two runs, `0` for pass/warn, `1` for malformed repository config, `2` for extra/unknown arguments, no raw malformed content or configured paths in output, and no Store creation for a missing Store.
 
+Use this exact public assertion shape (helper setup may be shared within the test file):
+
+```ts
+const ids = [
+  "configuration",
+  "organization_policy",
+  "source_capabilities",
+  "parser_budgets",
+  "store_schema",
+  "store_migrations",
+  "store_open",
+  "encryption",
+];
+const first = await capture(["doctor", "--json"], repo, dataRoot);
+const second = await capture(["doctor", "--json"], repo, dataRoot);
+assert.equal(first.code, 0);
+assert.equal(second.code, 0);
+assert.equal(first.stdout, second.stdout);
+assert.deepEqual(
+  (JSON.parse(first.stdout) as { checks: { id: string }[] }).checks
+    .map((check) => check.id),
+  ids,
+);
+assert.equal(existsSync(dataRoot), false);
+```
+
 - [ ] **Step 2: Run the focused test and verify RED**
 
 Run: `npm run build:test && node --test .test-dist/test/doctor-command.test.js`
@@ -58,13 +84,76 @@ git commit -m "test: define doctor diagnostics contract"
 
 Create `DoctorCheck` and `DoctorReport` closed shapes with fixed status/code/message fields. Reuse `loadRepositoryConfig`, `loadRepositoryPolicyPreferences`, `loadConfiguredOrganizationPolicy`, `resolveEffectivePolicy`, `CLAUDE_SESSION_SOURCE_CONTRACT`, `CODEX_SESSION_SOURCE_CONTRACT`, `resolveStorePaths`, `storeDatabasePath`, `STORE_SCHEMA_VERSION`, and the three exported migration names. Open an existing regular non-symlink database only as `new Database(path, { readonly: true, fileMustExist: true })`, read `user_version`, current migration names, and `PRAGMA quick_check`, then close it in `finally`.
 
+The output contract is exactly:
+
+```ts
+export type DoctorStatus = "pass" | "warn" | "fail";
+export interface DoctorCheck {
+  id: "configuration" | "organization_policy" | "source_capabilities" |
+    "parser_budgets" | "store_schema" | "store_migrations" |
+    "store_open" | "encryption";
+  status: DoctorStatus;
+  code: string;
+  message: string;
+}
+export interface DoctorReport {
+  schema_version: 1;
+  command: "doctor";
+  status: DoctorStatus;
+  checks: DoctorCheck[];
+}
+```
+
+The read-only open must use this pattern:
+
+```ts
+let database: Database.Database | undefined;
+try {
+  database = new Database(databasePath, { readonly: true, fileMustExist: true });
+  const version = Number(database.pragma("user_version", { simple: true }));
+  const quickCheck = database.pragma("quick_check") as { quick_check: unknown }[];
+  // Convert only known state to fixed codes/messages; never return row text.
+} finally {
+  try {
+    database?.close();
+  } catch {
+    // A close failure is represented by the fixed store_open failure.
+  }
+}
+```
+
 - [ ] **Step 2: Implement deterministic rendering and exit status**
 
 Return `{ stdout, warnings: [], exitCode }`; JSON uses `JSON.stringify(report, null, 2)`, while text emits `ccprof doctor: <status>` followed by one `[PASS|WARN|FAIL] <id>: <message>` line per fixed-order check. Derive overall status from checks, with any fail winning over warn.
 
+```ts
+const overall = checks.some((check) => check.status === "fail")
+  ? "fail"
+  : checks.some((check) => check.status === "warn") ? "warn" : "pass";
+const stdout = json
+  ? `${JSON.stringify(report, null, 2)}\n`
+  : [
+      `ccprof doctor: ${overall}`,
+      ...checks.map((check) =>
+        `[${check.status.toUpperCase()}] ${check.id}: ${check.message}`
+      ),
+    ].join("\n") + "\n";
+return { stdout, warnings: [], exitCode: overall === "fail" ? 1 : 0 };
+```
+
 - [ ] **Step 3: Add strict CLI parsing and dispatch**
 
 Parse only `doctor` and `doctor --json`; include the command in usage; dispatch directly to `runDoctorCommand({ cwd, json, env: process.env })` and return its exit code. Do not change analysis, schema, rules, policy preloading, or existing handler contracts.
+
+```ts
+function parseDoctorArgs(args: readonly string[]): ParsedDoctorCommand {
+  if (args.length === 0) return { kind: "doctor", json: false };
+  if (args.length === 1 && args[0] === "--json") {
+    return { kind: "doctor", json: true };
+  }
+  throw new CliUsageError("doctor accepts only --json");
+}
+```
 
 - [ ] **Step 4: Run the focused test and verify GREEN**
 
@@ -88,6 +177,17 @@ git commit -m "feat: add read-only doctor diagnostics"
 - [ ] **Step 1: Add a failing documentation assertion**
 
 Assert README documents `ccprof doctor [--json]`, all eight check categories, read-only/no repair behavior, and exit codes `0`, `1`, and `2`.
+
+```ts
+const readme = await readFile(resolve(repoRoot, "README.md"), "utf8");
+assert.match(readme, /ccprof doctor \[--json\]/u);
+for (const phrase of [
+  "configuration", "organization policy", "source capabilities",
+  "parser budgets", "Store schema", "migration", "open health", "encryption",
+]) assert.match(readme, new RegExp(phrase, "iu"));
+assert.match(readme, /read-only/iu);
+assert.match(readme, /exit 0[\s\S]*exit 1[\s\S]*exit 2/iu);
+```
 
 - [ ] **Step 2: Run the focused test and verify RED**
 
