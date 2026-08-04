@@ -93,6 +93,7 @@ import {
   resolveEffectivePolicy,
   type PolicyRequest,
 } from "../src/policy/organization-policy.js";
+import { buildChronicCostAggregates } from "../src/rules/chronic-cost.js";
 import { listRuleManifests } from "../src/rules/manifest.js";
 import type { StorePaths } from "../src/store/paths.js";
 
@@ -3988,6 +3989,101 @@ test("stats CLI aggregates opaque terminal history before privacy rendering", as
     assert.equal(ttyResult.stdout.includes(TASK8_PRIVACY_CANARY), false);
   }
   assert.deepEqual(entries, before);
+});
+
+test("stats CLI preserves duplicate exact chronic command observations", async () => {
+  const rawCanary = "TASK8_DUPLICATE_RAW_CANARY";
+  const sessionCanary = "TASK8_DUPLICATE_SESSION_CANARY";
+  const commandIdentity: CommandIdentity = {
+    repo_relative_cwd: `packages/${rawCanary}`,
+    normalized_argv: ["npm", "test"],
+    executor: "shell",
+  };
+  const entries = Array.from({ length: 5 }, (_, index) => task8HistoryEntry({
+    id: `duplicate-command-${index + 1}`,
+    createdAtMs: index + 1,
+    selectorNumber: index + 40,
+    gitState: `duplicate-command-${index + 1}`,
+    cacheState: "cold",
+  }));
+  for (const [index, entry] of entries.entries()) {
+    entry.record.command_costs = [{
+      command: "npm test",
+      command_identity: structuredClone(commandIdentity),
+      cache_state: "cold",
+      duration_min: index === 0 ? 2 : 5,
+      session_refs: [`${sessionCanary}-${index + 1}-a`],
+    }, ...(index === 0 ? [{
+      command: "npm test",
+      command_identity: structuredClone(commandIdentity),
+      cache_state: "cold" as const,
+      duration_min: 3,
+      session_refs: [`${sessionCanary}-${index + 1}-b`],
+    }] : [])];
+  }
+
+  const projected = entries.map(projectStatsAggregationInput);
+  const aggregates = buildChronicCostAggregates(
+    projected,
+    { mode: "stats_all_groups" },
+    5,
+  );
+  assert.equal(aggregates.length, 1);
+  assert.deepEqual(aggregates[0], {
+    cohort_key: projected[0]!.cohort_key!,
+    command_key: projected[0]!.command_costs[0]!.command_key,
+    cache_state: "cold",
+    history_count: 5,
+    presence_count: 5,
+    distribution: {
+      median: 300_000,
+      p50: 300_000,
+      p75: 300_000,
+      mad: 0,
+      sample_count: 5,
+    },
+    ratio: 0.3333,
+    resource_upper_ms: 300_000,
+  });
+
+  const result = await runStatsCommand(
+    { cwd: "/private/task8-duplicate-repository", json: true, privacy: "strict" },
+    {
+      resolveRepoRoot: async () => "/private/task8-duplicate-repository",
+      resolveStorePaths: async () => storePaths,
+      resolvePolicy: async (_repoRoot: string, request: PolicyRequest) =>
+        resolveEffectivePolicy({ request }),
+      loadAnalyses: async () => ({
+        records: entries.map(({ record }) => record),
+        entries,
+        warnings: [],
+      }),
+      loadAdoptions: async () => ({ records: [], warnings: [] }),
+    },
+  );
+  const stats = JSON.parse(result.stdout) as StatsReport;
+  assert.deepEqual(stats.chronic_commands, [{
+    command: "npm test",
+    cache_state: "cold",
+    history_count: 5,
+    presence_count: 5,
+    sample_count: 5,
+    ratio: 0.3333,
+    resource_upper_ms: 300_000,
+    median: 300_000,
+    p50: 300_000,
+    p75: 300_000,
+    mad: 0,
+    cost_ratio: 0.3333,
+    estimated_min: 5,
+  }]);
+  for (const canary of [rawCanary, sessionCanary]) {
+    assert.equal(result.stdout.includes(canary), false);
+  }
+  assert.doesNotMatch(
+    result.stdout,
+    /cohort_key|command_key|session_refs|repo_relative_cwd/u,
+  );
 });
 
 test("stats CLI suppresses ordinary command rows without observed cache state", async () => {
