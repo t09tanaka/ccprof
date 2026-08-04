@@ -82,7 +82,10 @@ export function sortedUnique(values: readonly string[]): string[] {
 function canonicalJson(value: JsonValue, propertyName?: string): JsonValue {
   if (Array.isArray(value)) {
     if (value.every((entry) => typeof entry === "string")) {
-      return propertyName === "normalized_argv" ? [...value] : sortedUnique(value);
+      return propertyName === "normalized_argv" ||
+          propertyName === "canonical_commands"
+        ? [...value]
+        : sortedUnique(value);
     }
     return value.map((entry) => canonicalJson(entry));
   }

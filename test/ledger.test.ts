@@ -307,7 +307,7 @@ test("rounds a partition once without a negative residual", () => {
   );
 });
 
-test("partitions human wait separately with recoverable precedence", () => {
+test("R004 policy latency never attributes recoverable time or lowers the floor", () => {
   const result = reconcileLedger({
     rawIntervals: [{ start_ms: 0, end_ms: 120_000 }],
     activeIntervals: [{ start_ms: 0, end_ms: 120_000 }],
@@ -316,18 +316,38 @@ test("partitions human wait separately with recoverable precedence", () => {
     candidates: [
       candidate(
         "R004",
-        "approval",
-        "point",
+        "approval-upper",
+        "upper",
         [{ start_ms: 60_000, end_ms: 90_000 }],
+        30_000,
+        {
+          impact: {
+            lower_ms: 0,
+            upper_ms: 30_000,
+            kind: "critical_path_latency",
+          },
+        },
+      ),
+      candidate(
+        "R004",
+        "approval-zero",
+        "point",
+        [],
+        0,
+        {
+          impact: {
+            lower_ms: 0,
+            upper_ms: 0,
+            kind: "critical_path_latency",
+          },
+        },
       ),
     ],
   });
 
-  assert.deepEqual(result.pointRecoverableIntervals, [
-    { start_ms: 60_000, end_ms: 90_000 },
-  ]);
+  assert.deepEqual(result.pointRecoverableIntervals, []);
   assert.deepEqual(result.humanWaitIntervals, [
-    { start_ms: 30_000, end_ms: 60_000 },
+    { start_ms: 30_000, end_ms: 90_000 },
   ]);
   assert.deepEqual(result.normalIntervals, [
     { start_ms: 0, end_ms: 30_000 },
@@ -340,20 +360,43 @@ test("partitions human wait separately with recoverable precedence", () => {
     measured: 120_000,
     idle_excluded: 0,
     normal: 30_000,
-    recoverable: 30_000,
-    human_wait: 30_000,
+    recoverable: 0,
+    human_wait: 60_000,
     unexplained: 30_000,
   });
   assert.deepEqual(result.summary, {
     measured_min: 2,
     idle_excluded_min: 0,
-    estimated_floor_min: 1.5,
-    recoverable_min: 0.5,
-    human_wait_min: 0.5,
+    estimated_floor_min: 2,
+    recoverable_min: 0,
+    human_wait_min: 1,
     unexplained_min: 0.5,
     baseline: null,
   });
   assert.equal(result.normal_min, 0.5);
+  assert.deepEqual(attribution(result, "approval-upper"), {
+    finding_key: "approval-upper",
+    rule_id: "R004",
+    bound: "upper",
+    intervals: [],
+    attributed_ms: 0,
+    reported_ms: 30_000,
+  });
+  assert.deepEqual(attribution(result, "approval-zero"), {
+    finding_key: "approval-zero",
+    rule_id: "R004",
+    bound: "point",
+    intervals: [],
+    attributed_ms: 0,
+    reported_ms: 0,
+  });
+  assert.deepEqual(
+    result.findings.map(({ recoverable }) => recoverable),
+    [
+      { min: 0.5, bound: "upper" },
+      { min: 0, bound: "point" },
+    ],
+  );
 });
 
 test("preserves observed human wait before finding attribution", () => {

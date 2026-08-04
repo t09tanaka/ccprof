@@ -9,6 +9,10 @@ import {
 } from "./test-map.js";
 import type { RepositoryPolicyPreferences } from
   "../policy/organization-policy.js";
+import {
+  snapshotRepositoryApprovalRulePolicy,
+  snapshotResourceDomains,
+} from "../policy/rule-safety.js";
 
 const CONFIG_PATH = ".ccprof/config.json";
 const CONFIG_KEYS = new Set([
@@ -26,6 +30,8 @@ const POLICY_KEYS = new Set([
   "allow_export",
   "raw_retention_days_max",
   "required_source_coverage",
+  "approval_policy",
+  "resource_domains",
 ]);
 const SAFE_IO_CODES = new Set([
   "EACCES",
@@ -161,6 +167,14 @@ function assertOptionalCoverage(
   }
 }
 
+function snapshotRuleSafety<T>(action: () => T): T {
+  try {
+    return action();
+  } catch {
+    throw new RepositoryConfigError("policy contains invalid values");
+  }
+}
+
 function parsePolicyPreferences(
   value: unknown,
 ): RepositoryPolicyPreferences {
@@ -177,6 +191,16 @@ function parsePolicyPreferences(
   assertOptionalBoolean(allowExport);
   assertOptionalRetention(rawRetentionDaysMax);
   assertOptionalCoverage(requiredSourceCoverage);
+  const approvalPolicy = value.approval_policy === undefined
+    ? undefined
+    : snapshotRuleSafety(() =>
+      snapshotRepositoryApprovalRulePolicy(value.approval_policy)
+    );
+  const resourceDomains = value.resource_domains === undefined
+    ? undefined
+    : snapshotRuleSafety(() => snapshotResourceDomains(
+      value.resource_domains,
+    ));
   return {
     ...(minimumPrivacy === undefined
       ? {}
@@ -192,6 +216,12 @@ function parsePolicyPreferences(
     ...(requiredSourceCoverage === undefined
       ? {}
       : { required_source_coverage: requiredSourceCoverage }),
+    ...(approvalPolicy === undefined
+      ? {}
+      : { approval_policy: approvalPolicy }),
+    ...(resourceDomains === undefined
+      ? {}
+      : { resource_domains: resourceDomains }),
   };
 }
 
