@@ -3586,11 +3586,8 @@ test("legacy records omit rather than synthesize terminal stats snapshots", () =
     AnalysisRecordWithTerminalSnapshot;
   assert.equal("terminal_stats_snapshot" in legacy, false);
 
-  const explicitUndefined = {
-    ...record("undefined-terminal-stats", 102),
-    terminal_stats_snapshot: undefined,
-  };
-  const normalized = makeAnalysisRecord(explicitUndefined) as
+  const omitted = { ...record("omitted-terminal-stats", 102) };
+  const normalized = makeAnalysisRecord(omitted) as
     AnalysisRecordWithTerminalSnapshot;
   assert.equal("terminal_stats_snapshot" in normalized, false);
 });
@@ -3612,7 +3609,9 @@ test("analysis records reject malformed terminal stats snapshot presence", () =>
       terminal_stats_snapshot: terminalStats,
     };
     assert.throws(
-      () => makeAnalysisRecord(input),
+      () => makeAnalysisRecord(
+        input as unknown as Parameters<typeof makeAnalysisRecord>[0],
+      ),
       TypeError,
     );
   }
