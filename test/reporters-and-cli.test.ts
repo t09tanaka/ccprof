@@ -2245,6 +2245,47 @@ test("stats raw privacy clones the report and keeps JSON and TTY bytes unchanged
   assert.equal(renderStatsTty(projected), renderStatsTty(raw));
 });
 
+test("stats privacy preserves robust baselines while redacting identity", () => {
+  const raw = statsPrivacyReport();
+  raw.baseline_metrics = [{
+    ...raw.baseline_metrics[0]!,
+    median: 0.31,
+    p50: 0.32,
+    p75: 0.33,
+    mad: 0.34,
+    sample_count: 35,
+  }];
+  const expectedReference = findingPrivacyReference(
+    PRIVACY_REPO,
+    STATS_PRIVACY_KEY,
+  );
+
+  for (const profile of ["strict", "balanced"] as const) {
+    const projected = projectStatsPrivacy(raw, profile, PRIVACY_REPO);
+    const baseline = projected.baseline_metrics[0];
+    assert.ok(baseline !== undefined);
+    const { metric, ...numeric } = baseline;
+    assert.notEqual(metric, raw.baseline_metrics[0]?.metric);
+    assert.deepEqual(numeric, {
+      value: 0.42,
+      baseline: 0.17,
+      median: 0.31,
+      p50: 0.32,
+      p75: 0.33,
+      mad: 0.34,
+      sample_count: 35,
+    });
+    assert.equal(
+      projected.recurring_findings[0]?.finding_key,
+      expectedReference,
+    );
+    const output = renderStatsJson(projected);
+    for (const canary of STATS_PRIVACY_CANARIES) {
+      assert.equal(output.includes(canary), false, `${profile} leaked ${canary}`);
+    }
+  }
+});
+
 test("privacy keeps ordinary session-prefixed prose", () => {
   const prose = "session-based session-level session-scoped metrics";
   for (const profile of ["strict", "balanced"] as const) {
