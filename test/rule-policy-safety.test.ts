@@ -446,13 +446,22 @@ test("normalizes only the fixed bare Windows launcher aliases", () => {
 });
 
 test("rejects rg preprocessors and git grep pagers through every decision path", () => {
+  const pagerOption = "--open-files-in-pager";
+  const pagerAbbreviations = Array.from(
+    { length: pagerOption.length - "--op".length + 1 },
+    (_, index) => pagerOption.slice(0, "--op".length + index),
+  ).flatMap((option) => [option, `${option}=sh`]);
   const dangerous = [
     "rg --pre cat TODO src",
     "rg --pre=cat TODO src",
     "git grep -O TODO",
     "git grep -Oless TODO",
+    "git grep -nO TODO",
+    "git grep -nOsh TODO",
     "git grep --open-files-in-pager TODO",
     "git grep --open-files-in-pager=less TODO",
+    "git grep --open-files-in-page=sh TODO",
+    ...pagerAbbreviations.map((option) => `git grep ${option} TODO`),
   ];
   const wildcard = resolvedPolicy(
     { safe_patterns: ["*"], allow_rule_recommendation: true },
