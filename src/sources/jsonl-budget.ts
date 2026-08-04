@@ -59,9 +59,132 @@ export const PARSER_STATE_SCHEMA_FINGERPRINT =
   "sha256:bd3f8bd7da3819214a46fe96969bdc35b439803e30171218c0564e1f1d75f996";
 export class IncrementalParserStateCapacityError extends Error {
   readonly code = "incremental_state_capacity" as const;
-  constructor() {
-    super("Incremental parser state exceeds its fixed capacity.");
+  readonly limit = MAX_INCREMENTAL_PARSER_STATE_BYTES;
+  constructor(readonly observed: number) {
+    super(
+      `Incremental parser state requires ${observed.toString(10)} canonical bytes; ` +
+      `the fixed limit is ${MAX_INCREMENTAL_PARSER_STATE_BYTES.toString(10)}.`,
+    );
     this.name = "IncrementalParserStateCapacityError";
+  }
+}
+
+export function canonicalJsonStringBytes(value: string): number {
+  let bytes = 2;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (
+      code === 0x22 || code === 0x5c || code === 0x08 || code === 0x09 ||
+      code === 0x0a || code === 0x0c || code === 0x0d
+    ) {
+      bytes += 2;
+    } else if (code < 0x20) {
+      bytes += 6;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else {
+        bytes += 6;
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      bytes += 6;
+    } else if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+export function canonicalJsonBytes(value: unknown): number {
+  const ancestors = new Set<object>();
+  const measure = (current: unknown, depth: number): number => {
+    if (depth > 256) {
+      throw new TypeError("Incremental parser state is too deeply nested.");
+    }
+    if (current === null) return 4;
+    if (typeof current === "string") return canonicalJsonStringBytes(current);
+    if (typeof current === "boolean") return current ? 4 : 5;
+    if (typeof current === "number" && Number.isFinite(current)) {
+      const serialized = JSON.stringify(current);
+      if (serialized === undefined) {
+        throw new TypeError("Incremental parser state is not canonical JSON.");
+      }
+      return Buffer.byteLength(serialized);
+    }
+    if (typeof current !== "object" || current === undefined) {
+      throw new TypeError("Incremental parser state is not canonical JSON.");
+    }
+    if (ancestors.has(current)) {
+      throw new TypeError("Incremental parser state must be acyclic.");
+    }
+    ancestors.add(current);
+    let bytes = 2;
+    if (Array.isArray(current)) {
+      for (let index = 0; index < current.length; index += 1) {
+        bytes += (index === 0 ? 0 : 1) + measure(current[index], depth + 1);
+      }
+    } else {
+      const entries = Object.entries(current);
+      for (let index = 0; index < entries.length; index += 1) {
+        const [key, child] = entries[index]!;
+        bytes += (index === 0 ? 0 : 1) + canonicalJsonStringBytes(key) + 1 +
+          measure(child, depth + 1);
+      }
+    }
+    ancestors.delete(current);
+    return bytes;
+  };
+  const bytes = measure(value, 0);
+  if (!Number.isSafeInteger(bytes)) {
+    throw new TypeError("Canonical parser-state bytes are invalid.");
+  }
+  return bytes;
+}
+
+export class IncrementalParserStateByteTracker {
+  #observed = 0;
+  constructor(initialBytes = 0) {
+    this.addBytes(initialBytes);
+  }
+  get observed(): number {
+    return this.#observed;
+  }
+  addBytes(bytes: number): void {
+    if (!Number.isSafeInteger(bytes) || bytes < 0) {
+      throw new TypeError("Canonical parser-state bytes are invalid.");
+    }
+    const observed = this.#observed + bytes;
+    if (!Number.isSafeInteger(observed)) {
+      throw new TypeError("Canonical parser-state bytes are invalid.");
+    }
+    if (observed > MAX_INCREMENTAL_PARSER_STATE_BYTES) {
+      throw new IncrementalParserStateCapacityError(observed);
+    }
+    this.#observed = observed;
+  }
+  replaceBytes(previousBytes: number, nextBytes: number): void {
+    if (
+      !Number.isSafeInteger(previousBytes) || previousBytes < 0 ||
+      !Number.isSafeInteger(nextBytes) || nextBytes < 0 ||
+      previousBytes > this.#observed
+    ) throw new TypeError("Canonical parser-state bytes are invalid.");
+    const observed = this.#observed - previousBytes + nextBytes;
+    if (!Number.isSafeInteger(observed)) {
+      throw new TypeError("Canonical parser-state bytes are invalid.");
+    }
+    if (observed > MAX_INCREMENTAL_PARSER_STATE_BYTES) {
+      throw new IncrementalParserStateCapacityError(observed);
+    }
+    this.#observed = observed;
+  }
+  addArrayItem(value: unknown, currentLength: number): void {
+    this.addBytes(canonicalJsonBytes(value) + (currentLength === 0 ? 0 : 1));
   }
 }
 export const DEFAULT_JSONL_PARSER_BUDGETS: Readonly<JsonlParserBudgets> =
