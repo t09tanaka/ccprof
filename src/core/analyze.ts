@@ -52,6 +52,7 @@ import { sliceSessionsToAnalysisWindow } from "../analysis/window.js";
 import {
   classifyCommand,
   commandMayMutateRepo,
+  normalizeCommand,
 } from "../analysis/command.js";
 import { commandIdentityKey } from "../analysis/command-identity.js";
 import {
@@ -71,6 +72,19 @@ import {
   mergeTestMaps,
   type TestMap,
 } from "../analysis/test-map.js";
+import {
+  boundTerminalHistory,
+  projectStatsAggregationInput,
+  statsCommandKey,
+} from "../analysis/stats-input.js";
+import {
+  buildTerminalStatsSnapshot,
+  exactCohortKey,
+  selectComparableTerminalSnapshots,
+  type CohortEvaluationMode,
+  type StatsAggregationInput,
+} from
+  "../analysis/stats-aggregation.js";
 import { loadRepositoryConfig } from "../analysis/repository-config.js";
 import { runCommand, type CommandRunner } from "../git/client.js";
 import { collectDiffEvidence } from "../git/diff.js";
@@ -94,7 +108,11 @@ import {
   ruleCoverage,
   sessionSupportsRule,
 } from "../rules/capabilities.js";
-import { detectChronicCost } from "../rules/chronic-cost.js";
+import {
+  buildChronicCostAggregates,
+  materializeChronicCostFindings,
+  type ChronicCostMaterializationEntry,
+} from "../rules/chronic-cost.js";
 import { detectContextBloat } from "../rules/context-bloat.js";
 import {
   detectFlakyTests,
@@ -111,6 +129,7 @@ import { detectRework } from "../rules/rework.js";
 import { detectSerialSlack } from "../rules/serial-slack.js";
 import {
   listRuleManifests,
+  ruleManifest,
   withRuleManifest,
 } from "../rules/manifest.js";
 import { minimumConfidence } from "../rules/shared.js";
@@ -132,6 +151,7 @@ import {
   loadAnalyses,
   makeAnalysisRecord,
   saveAnalysis,
+  type AnalysisHistoryEntry,
   type AnalysisRecord,
   type AnalysisSnapshotIdentity,
   type StoreWarning,
@@ -152,6 +172,11 @@ import {
   resolveStorePaths,
   type StorePaths,
 } from "../store/paths.js";
+import {
+  DEFAULT_MINIMUM_COHORT_SIZE,
+  MAXIMUM_COHORT_SIZE,
+  MINIMUM_COHORT_SIZE,
+} from "../policy/organization-policy.js";
 
 const KNOWN_LIMITATIONS = [
   "Claude timestamps are log write times, not exact operation start and end times.",
@@ -170,6 +195,8 @@ export interface AnalyzeOptions {
   claudeProjectsDirectory?: string;
   codexSessionsDirectory?: string;
   storePaths?: StorePaths;
+  /** Effective policy floor for comparable terminal work-unit cohorts. */
+  minimumCohortSize?: number;
   runner?: CommandRunner;
   nowMs?: number;
   externalToolNames?: ReadonlySet<string>;
@@ -234,6 +261,16 @@ export class InvalidAnalysisWindowError extends Error {
     super(message);
     this.name = "InvalidAnalysisWindowError";
   }
+}
+
+function resolvedMinimumCohortSize(options: AnalyzeOptions): number {
+  const value = options.minimumCohortSize ?? DEFAULT_MINIMUM_COHORT_SIZE;
+  if (
+    !Number.isSafeInteger(value) ||
+    value < MINIMUM_COHORT_SIZE ||
+    value > MAXIMUM_COHORT_SIZE
+  ) throw new TypeError("invalid minimum cohort size");
+  return value;
 }
 
 function uniqueSorted(values: readonly string[]): string[] {
@@ -1006,6 +1043,111 @@ function findingSourceCompleteness(entry: RuleCoverage): number {
   return entry.truncated ? 0 : entry.completeness;
 }
 
+export function buildChronicCostMaterializationEntries(
+  projected: readonly StatsAggregationInput[],
+  historyEntries: readonly AnalysisHistoryEntry[],
+  mode: CohortEvaluationMode,
+): ChronicCostMaterializationEntry[] {
+  try {
+    const terminals = selectComparableTerminalSnapshots(projected, mode);
+    const terminalBySnapshot = new Map<string, StatsAggregationInput>();
+    for (const terminal of terminals) {
+      if (terminalBySnapshot.has(terminal.snapshot_id)) return [];
+      terminalBySnapshot.set(terminal.snapshot_id, terminal);
+    }
+    if (terminalBySnapshot.size === 0) return [];
+
+    const historyBySnapshot = new Map<string, AnalysisHistoryEntry>();
+    for (const entry of historyEntries) {
+      if (!terminalBySnapshot.has(entry.snapshot_id)) continue;
+      if (historyBySnapshot.has(entry.snapshot_id)) return [];
+      historyBySnapshot.set(entry.snapshot_id, entry);
+    }
+    if (historyBySnapshot.size !== terminalBySnapshot.size) return [];
+
+    const lanes = new Map<string, ChronicCostMaterializationEntry & {
+      identity_key: string;
+    }>();
+    for (const terminal of terminals) {
+      const raw = historyBySnapshot.get(terminal.snapshot_id);
+      if (raw === undefined) return [];
+      const reprojected = projectStatsAggregationInput(raw);
+      if (JSON.stringify(reprojected) !== JSON.stringify(terminal)) return [];
+      if (
+        terminal.cohort_key === undefined ||
+        terminal.repository_key === undefined ||
+        terminal.workspace_key === undefined ||
+        terminal.changed_files_bucket === undefined ||
+        terminal.changed_lines_bucket === undefined ||
+        exactCohortKey({
+          repository_key: terminal.repository_key,
+          workspace_key: terminal.workspace_key,
+          changed_files_bucket: terminal.changed_files_bucket,
+          changed_lines_bucket: terminal.changed_lines_bucket,
+        }) !== terminal.cohort_key
+      ) return [];
+
+      const expected = new Set(terminal.command_costs.map((cost) =>
+        `${cost.command_key}\0${cost.cache_state}`));
+      const seen = new Set<string>();
+      for (const cost of raw.record.command_costs) {
+        if (
+          cost.command_identity === undefined ||
+          (cost.cache_state !== "cold" && cost.cache_state !== "warm")
+        ) continue;
+        const command = normalizeCommand(cost.command);
+        if (command === null) return [];
+        const commandKey = statsCommandKey(cost.command_identity);
+        const projectedLane = `${commandKey}\0${cost.cache_state}`;
+        if (!expected.has(projectedLane)) return [];
+        seen.add(projectedLane);
+        const key = `${terminal.cohort_key}\0${projectedLane}`;
+        const identity = {
+          ...cost.command_identity,
+          normalized_argv: [...cost.command_identity.normalized_argv],
+        };
+        const identityKey = JSON.stringify(identity);
+        const existing = lanes.get(key);
+        if (existing === undefined) {
+          lanes.set(key, {
+            cohort_key: terminal.cohort_key,
+            command_key: commandKey,
+            cache_state: cost.cache_state,
+            command,
+            command_identity: identity,
+            session_refs: [...cost.session_refs].sort(),
+            identity_key: identityKey,
+          });
+        } else {
+          if (existing.command !== command || existing.identity_key !== identityKey) {
+            return [];
+          }
+          existing.session_refs = uniqueSorted([
+            ...existing.session_refs,
+            ...cost.session_refs,
+          ]);
+        }
+      }
+      if (seen.size !== expected.size) return [];
+    }
+    return [...lanes.values()]
+      .sort((left, right) =>
+        left.cohort_key.localeCompare(right.cohort_key) ||
+        left.command_key.localeCompare(right.command_key) ||
+        left.cache_state.localeCompare(right.cache_state))
+      .map(({ identity_key: _identityKey, ...entry }) => ({
+        ...entry,
+        command_identity: {
+          ...entry.command_identity,
+          normalized_argv: [...entry.command_identity.normalized_argv],
+        },
+        session_refs: [...entry.session_refs],
+      }));
+  } catch {
+    return [];
+  }
+}
+
 function ruleCandidates(
   lanes: Readonly<Record<RuleId, RuleEvidenceLane>>,
   coverage: readonly RuleCoverage[],
@@ -1057,9 +1199,6 @@ function ruleCandidates(
     ...detectSerialSlack(lanes.R005.matched, {
       ...(ruleSafety === undefined ? {} : { ruleSafety }),
       sourceCompleteness: completeness("R005"),
-    }),
-    ...detectChronicCost(history, {
-      sourceCompleteness: completeness("R006"),
     }),
     ...detectContextBloat(lanes.R007.matched, {
       events: lanes.R007.events,
@@ -1117,10 +1256,14 @@ function sourceSnapshot(sessions: readonly Session[], repoRoot: string): unknown
 }
 function snapshotIdentity(paths: StorePaths, context: PrContext, window: AnalysisWindow,
   sessions: readonly Session[], testMap: TestMap, options: AnalyzeOptions,
+  minimumCohortSize: number,
   history: readonly AnalysisRecord[], coverage: readonly RuleCoverage[],
   inapplicable: readonly SkippedRule[], ruleSafetyDigest: string,
   sourceErrors: readonly unknown[],
   hookWarnings: readonly StoreWarning[]): AnalysisSnapshotIdentity {
+  if (context.selector === undefined) {
+    throw new TypeError("analysis selector identity is required");
+  }
   const mappings = testMap.mappings.map((mapping) => ({ source: uniqueSorted(mapping.source),
     tests: uniqueSorted(mapping.tests),
     commands: uniqueSorted(mapping.commands), confidence: mapping.confidence,
@@ -1134,6 +1277,7 @@ function snapshotIdentity(paths: StorePaths, context: PrContext, window: Analysi
   return {
     repo_id: paths.repo_hash, base_oid: context.base.oid.toLowerCase(),
     head_oid: context.head.oid.toLowerCase(), merge_base_oid: context.mergeBaseOid.toLowerCase(),
+    selector: context.selector,
     window: { started_at_ms: window.started_at_ms, start_source: window.start_source,
       end_source: window.end_source, completeness: window.completeness,
       ...(window.end_source === "explicit" ? { ended_at_ms: window.ended_at_ms } : {}) },
@@ -1148,6 +1292,7 @@ function snapshotIdentity(paths: StorePaths, context: PrContext, window: Analysi
       }) }),
     policy_digest: analysisDigest("analysis-policy-v1", {
       fingerprint: "ccprof-rule-policy-2026-08-04-v2",
+      minimum_cohort_size: minimumCohortSize,
       rule_coverage: coverage, skipped_rules: inapplicable,
       rule_manifest: listRuleManifests(),
       rule_safety_digest: ruleSafetyDigest }),
@@ -1310,6 +1455,7 @@ export async function analyze(
   const validatedSource = injectedSource === undefined
     ? undefined : combinedSnapshot ?? validateSessionSource(injectedSource);
   const persist = options.persist ?? true;
+  const minimumCohortSize = resolvedMinimumCohortSize(options);
   const budgetMeter = options.budgets === undefined
     ? undefined
     : new AnalysisBudgetMeter(
@@ -1556,7 +1702,11 @@ export async function analyze(
         loadAdoptions(paths),
       ])
     : [
-        { records: [] as AnalysisRecord[], warnings: [] as StoreWarning[] },
+        {
+          records: [] as AnalysisRecord[],
+          entries: [] as AnalysisHistoryEntry[],
+          warnings: [] as StoreWarning[],
+        },
         { records: [], warnings: [] as StoreWarning[] },
         { records: [] as AdoptionRecord[], warnings: [] as StoreWarning[] },
       ];
@@ -1578,6 +1728,34 @@ export async function analyze(
     );
   }
   const history = priorRecords(historyResult.records, context);
+  const projectedHistoryWindow = boundTerminalHistory(
+    (historyResult.entries ?? []).flatMap((entry) => {
+      try {
+        return [projectStatsAggregationInput(entry)];
+      } catch {
+        warnings.push(textWarning(
+          "stats_history_ineligible",
+          "One history snapshot was ineligible for comparable statistics.",
+        ));
+        return [];
+      }
+    }),
+  );
+  const projectedHistory = projectedHistoryWindow.entries;
+  const historyEntryBySnapshot = new Map(
+    (historyResult.entries ?? []).map((entry) =>
+      [entry.snapshot_id, entry] as const),
+  );
+  const terminalHistoryEntries = projectedHistory.flatMap(({ snapshot_id }) => {
+    const entry = historyEntryBySnapshot.get(snapshot_id);
+    return entry === undefined ? [] : [entry];
+  });
+  if (projectedHistoryWindow.metadata.truncated_snapshot_count > 0) {
+    warnings.push(textWarning(
+      "terminal_history_truncated",
+      "Terminal statistics used a bounded recent history window.",
+    ));
+  }
 
   // Adoption detection only exists to feed a save; when persist is false
   // (e.g. a hook-driven `--notify` analysis) skip it entirely rather than
@@ -1713,7 +1891,7 @@ export async function analyze(
       paths,
     );
   }
-  const candidates = ruleCandidates(
+  let candidates = ruleCandidates(
     ruleLanes,
     coverage,
     history,
@@ -1728,7 +1906,7 @@ export async function analyze(
     pr_ref: context.prRef,
     sessions: uniqueSorted(sessions.map((session) => session.session_id)),
   };
-  const ledgerInput = {
+  let ledgerInput = {
     rawIntervals: timeline.rawIntervals,
     activeIntervals: timeline.activeIntervals,
     contributingIntervals: contributingIntervals(matched),
@@ -1738,22 +1916,152 @@ export async function analyze(
     humanWaitIntervals: timeline.humanWaitIntervals,
     candidates,
   };
-  const preliminaryLedger = reconcileLedger(ledgerInput);
+  let preliminaryLedger = reconcileLedger(ledgerInput);
   const metrics = analysisMetrics(timeline);
   const costs = commandCosts(matched);
-  const draftRecord = makeAnalysisRecord({
+  const currentSnapshotIdentity = snapshotIdentity(
+    paths,
+    context,
+    window,
+    sessions,
+    testMap,
+    options,
+    minimumCohortSize,
+    history,
+    coverage,
+    inapplicableRules,
+    ruleSafetyDigest,
+    sourceErrors,
+    hookEvents.warnings,
+  );
+  const buildCurrentTerminal = (
+    currentLedger: LedgerResult,
+    currentCandidates: readonly FindingCandidate[],
+  ) => buildTerminalStatsSnapshot({
+    repositoryId: paths.repo_hash,
+    workspaceId: analysisDigest(
+      "terminal-stats-workspace-v1",
+      paths.canonical_repo,
+    ),
+    changedFiles: diff.files.length,
+    ...(diff.changedLineCount === undefined
+      ? {}
+      : { changedLines: diff.changedLineCount }),
+    ledger: currentLedger,
+    candidates: currentCandidates.map((candidate) => {
+      const manifest = ruleManifest(candidate.rule_id);
+      return {
+        ...candidate,
+        rule_version: manifest.version,
+        compatibility_epoch: manifest.compatibility_epoch,
+      };
+    }),
+  });
+  const buildCurrentRecord = (
+    currentLedger: LedgerResult,
+    currentCandidates: readonly FindingCandidate[],
+  ): AnalysisRecord => makeAnalysisRecord({
     created_at_ms: context.resolvedAtMs,
     unit,
-    summary: preliminaryLedger.summary,
-    findings: [...preliminaryLedger.findings].sort(findingOrder),
+    summary: currentLedger.summary,
+    findings: [...currentLedger.findings].sort(findingOrder),
     metrics,
     command_costs: costs,
     read_observations: reads.observations,
+    terminal_stats_snapshot: buildCurrentTerminal(
+      currentLedger,
+      currentCandidates,
+    ),
   });
-  const baseline = computeBaseline(draftRecord, history);
+  const projectCurrentRecord = (record: AnalysisRecord) => {
+    const {
+      analysis_id: _draftAnalysisId,
+      created_at_ms: _draftCreatedAtMs,
+      ...payload
+    } = record;
+    return projectStatsAggregationInput({
+      snapshot_id: analysisDigest("analysis-snapshot-v1", {
+        schema_version: 1,
+        identity: currentSnapshotIdentity,
+        payload,
+      }),
+      identity: currentSnapshotIdentity,
+      record,
+    });
+  };
+  let draftRecord = buildCurrentRecord(preliminaryLedger, candidates);
+  let projectedCurrent = projectCurrentRecord(draftRecord);
+  const selectorHistoryTruncated = projectedCurrent.work_unit_key !== undefined &&
+    projectedHistoryWindow.truncated_work_unit_keys.has(
+      projectedCurrent.work_unit_key,
+    );
+  if (selectorHistoryTruncated) {
+    warnings.push(textWarning(
+      "terminal_history_selector_truncated",
+      "Terminal statistics were suppressed because current-selector history was truncated.",
+    ));
+  }
+  const comparableProjectedHistory = selectorHistoryTruncated
+    ? []
+    : projectedHistory;
+  const comparableHistoryEntries = selectorHistoryTruncated
+    ? []
+    : terminalHistoryEntries;
+  if (
+    projectedCurrent.work_unit_key !== undefined &&
+    projectedCurrent.cohort_key !== undefined
+  ) {
+    const mode = {
+      mode: "analysis_current",
+      current_work_unit_key: projectedCurrent.work_unit_key,
+      current_cohort_key: projectedCurrent.cohort_key,
+    } as const;
+    const chronicCoverage = coverage.find(({ rule_id }) => rule_id === "R006");
+    const chronicCandidates = materializeChronicCostFindings(
+      buildChronicCostAggregates(
+        comparableProjectedHistory,
+        mode,
+        minimumCohortSize,
+      ),
+      buildChronicCostMaterializationEntries(
+        comparableProjectedHistory,
+        comparableHistoryEntries,
+        mode,
+      ),
+      {
+        sourceCompleteness: chronicCoverage === undefined
+          ? 0
+          : findingSourceCompleteness(chronicCoverage),
+      },
+    );
+    if (chronicCandidates.length > 0) {
+      candidates = [...candidates, ...chronicCandidates];
+      ledgerInput = { ...ledgerInput, candidates };
+      preliminaryLedger = reconcileLedger(ledgerInput);
+      draftRecord = buildCurrentRecord(preliminaryLedger, candidates);
+      projectedCurrent = projectCurrentRecord(draftRecord);
+    }
+  }
+  const baseline = projectedCurrent.work_unit_key === undefined ||
+      projectedCurrent.cohort_key === undefined
+    ? null
+    : computeBaseline(
+        projectedCurrent.baseline_metrics,
+        comparableProjectedHistory,
+        {
+          mode: "analysis_current",
+          current_work_unit_key: projectedCurrent.work_unit_key,
+          current_cohort_key: projectedCurrent.cohort_key,
+        },
+        minimumCohortSize,
+      );
   const ledger = baseline === null
     ? preliminaryLedger
     : reconcileLedger({ ...ledgerInput, baseline });
+  const terminalStatsSnapshot = buildCurrentTerminal(
+    preliminaryLedger,
+    candidates,
+  );
   const allFindings = ledger.findings.map(withRuleManifest).sort(findingOrder);
   budgetMeter?.checkpoint();
   if (budgetMeter !== undefined) {
@@ -1794,14 +2102,10 @@ export async function analyze(
       command_costs: costs,
       read_observations: reads.observations,
       analysis_budget: prepared.analysisBudget,
+      terminal_stats_snapshot: terminalStatsSnapshot,
     });
     const saveResult = persist
-      ? await saveAnalysis(paths, record, { snapshot: snapshotIdentity(
-          paths, context, window, sessions, testMap, options, history, coverage,
-          inapplicableRules,
-          ruleSafetyDigest,
-          sourceErrors, hookEvents.warnings,
-        ) })
+      ? await saveAnalysis(paths, record, { snapshot: currentSnapshotIdentity })
       : { record, warnings: [] as StoreWarning[] };
     warnings.push(...saveResult.warnings.map(storeWarning));
     return {
@@ -1824,14 +2128,10 @@ export async function analyze(
     metrics,
     command_costs: costs,
     read_observations: reads.observations,
+    terminal_stats_snapshot: terminalStatsSnapshot,
   });
   const saveResult = persist
-    ? await saveAnalysis(paths, record, { snapshot: snapshotIdentity(
-        paths, context, window, sessions, testMap, options, history, coverage,
-        inapplicableRules,
-        ruleSafetyDigest,
-        sourceErrors, hookEvents.warnings,
-      ) })
+    ? await saveAnalysis(paths, record, { snapshot: currentSnapshotIdentity })
     : { record, warnings: [] as StoreWarning[] };
   warnings.push(...saveResult.warnings.map(storeWarning));
 

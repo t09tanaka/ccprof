@@ -1,5 +1,11 @@
 import { resolve } from "node:path";
 
+import { aggregateTerminalStats } from "../analysis/stats-aggregation.js";
+import {
+  boundTerminalHistory,
+  projectStatsAggregationInput,
+} from "../analysis/stats-input.js";
+import { buildChronicCostMaterializationEntries } from "../core/analyze.js";
 import {
   runCommand,
   type CommandRunner,
@@ -9,6 +15,7 @@ import {
   renderStatsJson,
   renderStatsTty,
   summarizeStats,
+  summarizeTerminalStats,
 } from "../reporters/stats.js";
 import {
   privacyWarningTexts,
@@ -32,6 +39,7 @@ import {
   resolveRepositoryPolicy,
   type RepositoryPolicyResolver,
 } from "../policy/organization-policy.js";
+import { buildChronicCostAggregates } from "../rules/chronic-cost.js";
 
 export interface StatsCommandOptions {
   cwd: string;
@@ -98,16 +106,81 @@ export async function runStatsCommand(
   const adoptions = await (
     dependencies.loadAdoptions ?? loadAdoptions
   )(paths);
+  const terminalHistoryWarnings: Array<{
+    code: string;
+    message: string;
+  }> = [];
+  const rawStats = history.entries === undefined
+    ? summarizeStats(history.records, adoptions.records)
+    : (() => {
+      const mode = { mode: "stats_all_groups" } as const;
+      const terminalWindow = boundTerminalHistory(history.entries.map(
+        (entry) => projectStatsAggregationInput(entry),
+      ));
+      const projected = terminalWindow.entries;
+      if (terminalWindow.metadata.truncated_snapshot_count > 0) {
+        terminalHistoryWarnings.push({
+          code: "terminal_history_truncated",
+          message: "Terminal statistics used a bounded recent history window.",
+        });
+      }
+      const aggregate = aggregateTerminalStats(
+        projected,
+        mode,
+        effectivePolicy.minimum_cohort_size,
+      );
+      const recordsBySnapshot = new Map(history.entries.map((entry) =>
+        [entry.snapshot_id, entry.record] as const
+      ));
+      const entriesBySnapshot = new Map(history.entries.map((entry) =>
+        [entry.snapshot_id, entry] as const
+      ));
+      const terminalRecords = aggregate.selected_snapshot_ids.flatMap(
+        (snapshotId) => {
+          const record = recordsBySnapshot.get(snapshotId);
+          return record === undefined ? [] : [record];
+        },
+      );
+      const chronicAggregates = buildChronicCostAggregates(
+        projected,
+        mode,
+        effectivePolicy.minimum_cohort_size,
+      );
+      const chronicEntries = buildChronicCostMaterializationEntries(
+        projected,
+        projected.flatMap(({ snapshot_id }) => {
+          const entry = entriesBySnapshot.get(snapshot_id);
+          return entry === undefined ? [] : [entry];
+        }),
+        mode,
+      );
+      return summarizeTerminalStats(
+        {
+          ...aggregate,
+          metadata: { ...aggregate.metadata, ...terminalWindow.metadata },
+        },
+        terminalRecords,
+        adoptions.records,
+        chronicAggregates,
+        chronicEntries,
+      );
+    })();
   const stats = projectStatsPrivacy(
-    summarizeStats(history.records, adoptions.records),
+    rawStats,
     privacy,
     repoRoot,
   );
-  const warnings = [...history.warnings, ...adoptions.warnings].map(
+  const warnings = [
+    ...history.warnings,
+    ...adoptions.warnings,
+    ...terminalHistoryWarnings,
+  ].map(
     (warning) => ({
       code: warning.code,
       message: warning.message,
-      source: warning.path,
+      ...("path" in warning && typeof warning.path === "string"
+        ? { source: warning.path }
+        : {}),
     }),
   );
   return {

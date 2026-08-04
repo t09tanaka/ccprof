@@ -109,14 +109,14 @@ const EXPECTED: RuleManifest[] = [
   },
   {
     id: "R006",
-    version: "1.0.0",
-    compatibility_epoch: 1,
+    version: "2.0.0",
+    compatibility_epoch: 2,
     required_capabilities: [],
     supported_sources: [...SOURCES],
     impact_kind: "resource_cost",
     default_mode: "enabled",
     aggregation_policy: "max",
-    evidence_schema: "ccprof://rules/R006/evidence/v1",
+    evidence_schema: "ccprof://rules/R006/evidence/v2",
     policy_risk: "medium",
   },
   {
@@ -569,6 +569,48 @@ test("Store records preserve new metadata and legacy findings remain readable", 
         error instanceof TypeError && error.message === "invalid finding",
     );
   }
+});
+
+test("R006 epoch two isolates new keys while explicit v1 rows remain readable", () => {
+  const target = "packages/api :: npm test [cold]";
+  const legacyKey = findingKeyForCompatibility("R006", target, 1);
+  const currentKey = findingKeyForCompatibility("R006", target, 2);
+  const legacy = {
+    ...finding("R006", target),
+    finding_key: legacyKey,
+    rule_version: "1.0.0",
+    compatibility_epoch: 1,
+  } satisfies Finding;
+  const stored = makeAnalysisRecord({
+    created_at_ms: 1,
+    unit: { repo: "repo-id", pr_ref: "pr-ref", sessions: ["session-id"] },
+    summary: reportWith(legacy).summary,
+    findings: [legacy],
+  });
+
+  assert.equal(stored.findings[0]?.finding_key, legacyKey);
+  const storedCompatibility = findingCompatibilityMetadata(stored.findings[0]!);
+  assert.deepEqual(storedCompatibility.valid
+    ? storedCompatibility.metadata
+    : undefined, {
+    rule_version: "1.0.0",
+    compatibility_epoch: 1,
+  });
+  assert.equal(hasValidFindingCompatibilityMetadata(stored.findings[0]!), true);
+
+  const current = withRuleManifest({
+    ...finding("R006", target),
+    finding_key: currentKey,
+  });
+  const currentCompatibility = findingCompatibilityMetadata(current);
+  assert.deepEqual(currentCompatibility.valid
+    ? currentCompatibility.metadata
+    : undefined, {
+    rule_version: "2.0.0",
+    compatibility_epoch: 2,
+  });
+  assert.equal(current.finding_key, findingKey("R006", target));
+  assert.notEqual(current.finding_key, legacyKey);
 });
 
 test("Store rejects finding Proxies without reading their values", () => {

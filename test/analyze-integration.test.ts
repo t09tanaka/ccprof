@@ -13,6 +13,7 @@ import test from "node:test";
 
 import {
   analyze,
+  type AnalyzeOptions,
   NoAnalyzableTimestampsError,
   NoMatchingSessionsError,
 } from "../src/core/analyze.js";
@@ -27,6 +28,8 @@ import {
   type CommandRunner,
 } from "../src/git/client.js";
 import { findGitMarker } from "../src/git/common-dir.js";
+import { selectorRefDigest } from "../src/git/pr-context.js";
+import { listRuleManifests } from "../src/rules/manifest.js";
 import {
   ClaudeDiscoveryError,
   ClaudeSessionSource,
@@ -306,6 +309,7 @@ function commandPolicy(
     allow_advisory: true,
     advisory_enabled: true,
     allow_export: true,
+    minimum_cohort_size: 5,
     required_source_coverage: 0,
     ...overrides,
   };
@@ -907,7 +911,7 @@ test("linked-worktree canonical policy failure precedes discovery and persistenc
   }
 });
 
-test("linked-worktree budget partial keeps canonical policy identity without Store paths", async () => {
+test("linked-worktree budget partial keeps canonical policy and Store identity", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-linked-budget-policy-"));
   try {
     const repo = await realpath(await makeRepository(root));
@@ -916,6 +920,8 @@ test("linked-worktree budget partial keeps canonical policy identity without Sto
     await git(repo, ["worktree", "add", "--detach", linkedRepoPath, "feature"]);
     const linkedRepo = await realpath(linkedRepoPath);
     assert.notEqual(linkedRepo, repo);
+    const storePaths = await resolveStorePaths(linkedRepo);
+    assert.equal(storePaths.canonical_repo, repo);
 
     const canonicalPolicy = commandPolicy({
       governed: true,
@@ -974,7 +980,12 @@ test("linked-worktree budget partial keeps canonical policy identity without Sto
       },
     }, {
       analyze: async (options) => {
-        assert.equal(Object.hasOwn(options, "storePaths"), false);
+        assert.ok(options.storePaths !== undefined);
+        assert.equal(
+          options.storePaths.canonical_repo,
+          storePaths.canonical_repo,
+        );
+        assert.equal(options.storePaths.root_dir, storePaths.root_dir);
         const outputProjector = options.outputProjector;
         assert.ok(outputProjector !== undefined);
         const result = await analyze({
@@ -1100,7 +1111,7 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
       first.window.ended_at_ms,
     );
     assert.deepEqual(first.report.unit.sessions, ["e2e-session"]);
-    assert.equal(first.report.summary.baseline?.prs, 3);
+    assert.equal(first.report.summary.baseline, null);
     assert.ok(
       first.warnings.some(({ code }) => code === "invalid_json"),
       "source warnings must survive orchestration",
@@ -1180,6 +1191,90 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
     );
     assert.ok(current);
     assert.equal(current.unit.repo, storePaths.canonical_repo);
+    const workspaceId = analysisDigest(
+      "terminal-stats-workspace-v1",
+      storePaths.canonical_repo,
+    );
+    const terminalStats = current.terminal_stats_snapshot;
+    assert.ok(terminalStats);
+    assert.deepEqual(terminalStats.cohort, {
+      repository_id: storePaths.repo_hash,
+      workspace_id: workspaceId,
+      changed_files: 1,
+      changed_lines: 2,
+    });
+    assert.equal(
+      terminalStats.measured_wall_ms,
+      first.ledger.totals_ms.measured,
+    );
+    assert.ok(
+      terminalStats.human_wait_ms <= first.ledger.totals_ms.human_wait,
+    );
+    assert.ok(
+      terminalStats.unexplained_ms <= first.ledger.totals_ms.unexplained,
+    );
+    assert.ok(
+      terminalStats.estimated_critical_path_upper_ms +
+          terminalStats.human_wait_ms + terminalStats.unexplained_ms <=
+        terminalStats.measured_wall_ms,
+    );
+    assert.deepEqual(
+      terminalStats.rules.map((row) => ({
+        rule_id: row.rule_id,
+        rule_version: row.rule_version,
+        compatibility_epoch: row.compatibility_epoch,
+      })),
+      listRuleManifests().map((manifest) => ({
+        rule_id: manifest.id,
+        rule_version: manifest.version,
+        compatibility_epoch: manifest.compatibility_epoch,
+      })),
+    );
+    assert.equal(
+      terminalStats.rules.reduce(
+        (total, row) => total + row.confirmed_critical_path_ms,
+        0,
+      ),
+      terminalStats.confirmed_critical_path_ms,
+    );
+    assert.equal(
+      terminalStats.rules.reduce(
+        (total, row) => total + row.estimated_critical_path_upper_ms,
+        0,
+      ),
+      terminalStats.estimated_critical_path_upper_ms,
+    );
+    assert.equal(
+      terminalStats.rules.reduce(
+        (total, row) => total + row.resource_cost_ms,
+        0,
+      ),
+      terminalStats.resource_cost_ms,
+    );
+    const currentEntry = stored.entries?.find(
+      ({ record }) => record.unit.pr_ref === "main...feature",
+    );
+    assert.ok(currentEntry);
+    assert.equal("mode" in currentEntry.identity, false);
+    assert.deepEqual(
+      "mode" in currentEntry.identity
+        ? undefined
+        : currentEntry.identity.selector,
+      {
+        kind: "explicit_range",
+        range: "triple_dot",
+        base_ref_digest: selectorRefDigest(
+          "explicit_range",
+          "base",
+          "main",
+        ),
+        head_ref_digest: selectorRefDigest(
+          "explicit_range",
+          "head",
+          "feature",
+        ),
+      },
+    );
     assert.equal(
       stored.records.filter(({ unit }) => unit.pr_ref === "main...feature")
         .length,
@@ -1222,7 +1317,7 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
       assert.deepEqual(finding.impact, allFinding.impact);
       assert.deepEqual(finding.recoverable, allFinding.recoverable);
     }
-    assert.equal(current.summary.baseline?.prs, 3);
+    assert.equal(current.summary.baseline, null);
     const npmTestCost = current.command_costs.find(
       ({ command }) => command === "npm test",
     );
@@ -1262,6 +1357,196 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
       "dismissal filters only the displayed top findings",
     );
     assert.ok(dismissed.suppressedKeys.includes(approval.finding_key));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("binary diffs suppress line cohorts and cohort policy changes snapshot identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-analyze-cohort-policy-"));
+  try {
+    const repo = await makeRepository(root);
+    await writeFile(join(repo, "asset.bin"), Buffer.from([0, 1, 2, 3]));
+    await git(repo, ["add", "asset.bin"]);
+    await git(repo, ["commit", "-m", "binary fixture"], {
+      GIT_AUTHOR_DATE: "2026-01-01T00:30:00.000Z",
+      GIT_COMMITTER_DATE: "2026-01-01T00:30:00.000Z",
+    });
+    const projects = await makeClaudeProjects(root, repo);
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const common = {
+      cwd: repo,
+      pr: "main...feature",
+      sessionSource: new ClaudeSessionSource(projects),
+      storePaths,
+    } as const;
+
+    const defaultFloor = await analyze({
+      ...common,
+      nowMs: NOW_MS,
+      minimumCohortSize: 5,
+    });
+    const organizationFloor = await analyze({
+      ...common,
+      nowMs: NOW_MS + 60_000,
+      minimumCohortSize: 20,
+    });
+
+    assert.equal(
+      "changed_lines" in
+        (defaultFloor.record.terminal_stats_snapshot?.cohort ?? {}),
+      false,
+    );
+    assert.equal(
+      defaultFloor.record.terminal_stats_snapshot?.cohort.changed_files,
+      2,
+    );
+    assert.equal(
+      "changed_lines" in
+        (organizationFloor.record.terminal_stats_snapshot?.cohort ?? {}),
+      false,
+    );
+
+    const entries = (await loadAnalyses(storePaths)).entries ?? [];
+    assert.equal(entries.length, 2);
+    const policyDigests = entries.flatMap(({ identity }) =>
+      "mode" in identity ? [] : [identity.policy_digest]
+    );
+    assert.equal(policyDigests.length, 2);
+    assert.notEqual(policyDigests[0], policyDigests[1]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("captures one cohort floor for baseline eligibility and persisted policy identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-analyze-cohort-capture-"));
+  try {
+    const repo = await makeRepository(root);
+    const projects = await makeClaudeProjects(root, repo);
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+
+    for (let index = 0; index < 5; index += 1) {
+      const base = `cohort-base-${index}`;
+      await git(repo, ["branch", base, "main"]);
+      await analyze({
+        cwd: repo,
+        pr: `${base}...feature`,
+        nowMs: NOW_MS + index,
+        sessionSource: new ClaudeSessionSource(projects),
+        storePaths,
+        minimumCohortSize: 20,
+      });
+    }
+    await git(repo, ["branch", "cohort-current", "main"]);
+    const currentOptions = {
+      cwd: repo,
+      pr: "cohort-current...feature",
+      storePaths,
+    } as const;
+
+    let mutableFloor = 5;
+    let getterReads = 0;
+    let markPaused!: () => void;
+    let resumeDiscovery!: () => void;
+    const paused = new Promise<void>((resolve) => {
+      markPaused = resolve;
+    });
+    const resumed = new Promise<void>((resolve) => {
+      resumeDiscovery = resolve;
+    });
+    const delegate = new ClaudeSessionSource(projects);
+    const pausingSource: SessionSource = {
+      contract: CLAUDE_SESSION_SOURCE_CONTRACT,
+      discover: async (query) => {
+        markPaused();
+        await resumed;
+        return await delegate.discover(query);
+      },
+    };
+    const mutableOptions: AnalyzeOptions = {
+      ...currentOptions,
+      nowMs: NOW_MS + 10,
+      sessionSource: pausingSource,
+      get minimumCohortSize() {
+        getterReads += 1;
+        return mutableFloor;
+      },
+    };
+
+    const pendingMutable = analyze(mutableOptions);
+    await paused;
+    mutableFloor = 20;
+    resumeDiscovery();
+    const capturedFive = await pendingMutable;
+    const immutableFive = await analyze({
+      ...currentOptions,
+      nowMs: NOW_MS + 11,
+      sessionSource: new ClaudeSessionSource(projects),
+      externalToolNames: new Set(["cohort-policy-digest-fixture"]),
+      minimumCohortSize: 5,
+    });
+    const immutableTwenty = await analyze({
+      ...currentOptions,
+      nowMs: NOW_MS + 12,
+      sessionSource: new ClaudeSessionSource(projects),
+      minimumCohortSize: 20,
+    });
+
+    const analysisPayload = (record: typeof capturedFive.record) => {
+      const {
+        analysis_id: analysisId,
+        created_at_ms: createdAtMs,
+        ...payload
+      } = record;
+      void analysisId;
+      void createdAtMs;
+      return payload;
+    };
+    assert.deepEqual(
+      analysisPayload(immutableFive.record),
+      analysisPayload(capturedFive.record),
+      "an unused config marker cannot alter the analysis payload",
+    );
+    assert.equal(capturedFive.record.summary.baseline?.prs, 5);
+    assert.equal(immutableFive.record.summary.baseline?.prs, 5);
+    assert.deepEqual(
+      immutableFive.record.summary.baseline,
+      capturedFive.record.summary.baseline,
+    );
+    assert.equal(immutableTwenty.record.summary.baseline, null);
+
+    const entries = (await loadAnalyses(storePaths)).entries ?? [];
+    const storedIdentity = (analysisId: string) => {
+      const entry = entries.find(({ record }) =>
+        record.analysis_id === analysisId
+      );
+      assert.ok(entry);
+      if ("mode" in entry.identity) {
+        assert.fail("analyze must persist a full snapshot identity");
+      }
+      return entry.identity;
+    };
+    const capturedDigest = storedIdentity(
+      capturedFive.record.analysis_id,
+    ).policy_digest;
+    const immutableFiveDigest = storedIdentity(
+      immutableFive.record.analysis_id,
+    ).policy_digest;
+    const immutableTwentyDigest = storedIdentity(
+      immutableTwenty.record.analysis_id,
+    ).policy_digest;
+    assert.equal(
+      capturedDigest,
+      immutableFiveDigest,
+      "mutation after analysis starts cannot change the captured policy floor",
+    );
+    assert.notEqual(capturedDigest, immutableTwentyDigest);
+    assert.equal(getterReads, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

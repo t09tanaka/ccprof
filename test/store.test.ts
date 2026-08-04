@@ -29,11 +29,26 @@ import type {
   RuleId,
 } from "../src/core/model.js";
 import type { AnalysisBudgetResult } from "../src/analysis/budgets.js";
-import type {
-  TerminalStatsSnapshotV1 as ExportedTerminalStatsSnapshotV1,
+import {
+  aggregateTerminalStats,
+  cohortDistribution,
+  exactCohortKey,
+  selectComparableTerminalSnapshots,
+  selectTerminalSnapshots,
+  type CohortEvaluationMode,
+  type TerminalStatsSnapshotV1 as ExportedTerminalStatsSnapshotV1,
 } from "../src/analysis/stats-aggregation.js";
+import {
+  projectStatsAggregationInput,
+  type StatsAggregationInput,
+} from "../src/analysis/stats-input.js";
 import { commandIdentityKey } from "../src/analysis/command-identity.js";
-import { detectChronicCost } from "../src/rules/chronic-cost.js";
+import { buildChronicCostMaterializationEntries } from "../src/core/analyze.js";
+import {
+  buildChronicCostAggregates,
+  materializeChronicCostFindings,
+  type ChronicCostAggregate,
+} from "../src/rules/chronic-cost.js";
 import { projectReportPrivacy } from "../src/reporters/privacy.js";
 import {
   findingKey,
@@ -56,6 +71,7 @@ import {
   loadAnalyses,
   makeAnalysisRecord,
   saveAnalysis,
+  type AnalysisHistoryEntry,
   type AnalysisRecord,
   type AnalysisSnapshotIdentity,
 } from "../src/store/analyses.js";
@@ -2922,24 +2938,6 @@ test("analysis write failures return warnings without throwing", async () => {
   }
 });
 
-test("baseline uses only the previous ten analyses and stays null below three", () => {
-  const histories = Array.from({ length: 12 }, (_, index) =>
-    record(`history-${String(index + 1).padStart(2, "0")}`, index + 1, {
-      metric: index + 1,
-    })
-  );
-  const current = record("current", 20, { metric: 99 });
-
-  assert.equal(computeBaseline(current, histories.slice(0, 2)), null);
-  const baseline = computeBaseline(current, [...histories, current]);
-  assert.ok(baseline !== null);
-  assert.equal(baseline.prs, 10);
-  assert.deepEqual(
-    baseline.notable.find(({ metric }) => metric === "human_wait_ratio"),
-    { metric: "human_wait_ratio", value: 99, baseline: 7.5 },
-  );
-});
-
 test("dismissals expire exactly at 14 days and revive only strictly over twice strength", () => {
   const day = 24 * 60 * 60 * 1_000;
   const dismissal = {
@@ -3529,175 +3527,6 @@ test("blocked SQLite store paths retain dismissal and adoption warning codes", a
   });
 });
 
-function r006FindingKey(identity: CommandIdentity): string {
-  return findingKey("R006", `command-identity:${Buffer.from(
-    commandIdentityKey(identity), "utf8").toString("hex")}`);
-}
-test("R006 requires five histories, identity presence in three, and a 30 percent cost ratio", () => {
-  const api = commandIdentity("packages/api");
-  const qualifying = Array.from({ length: 5 }, (_, index) =>
-    record(`r006-${index}`, index, {
-      commandMin: index < 3 ? 50 : 0,
-      includeCommand: index < 3,
-      commandIdentity: api,
-    })
-  );
-  const findings = detectChronicCost(qualifying);
-  assert.equal(findings.length, 1);
-  const chronic = findings[0];
-  assert.ok(chronic !== undefined);
-  assert.equal(chronic.rule_id, "R006");
-  assert.equal(chronic.classification, "repo");
-  assert.equal(chronic.scope, "separate_issue");
-  assert.equal(chronic.target, "packages/api :: npm test");
-  assert.equal(chronic.finding_key, r006FindingKey(api));
-  assert.deepEqual(chronic.evidence.command_identity, api);
-  assert.equal(chronic.evidence.history_count, 5);
-  assert.equal(chronic.evidence.presence_count, 3);
-  assert.equal(chronic.evidence.cost_ratio, 0.3);
-  assert.equal(chronic.evidence.minimum_history_count, 5);
-  assert.equal(chronic.evidence.minimum_presence_count, 3);
-  assert.equal(chronic.evidence.minimum_cost_ratio, 0.3);
-  assert.equal(chronic.recoverable.bound, "upper");
-  assert.deepEqual(chronic.impact, {
-    lower_ms: 0,
-    upper_ms: chronic.recoverable.estimated_ms,
-    kind: "resource_cost",
-  });
-  assert.deepEqual(chronic.finding_confidence, {
-    evidence: "high",
-    causal: "medium",
-    source_completeness: 1,
-  });
-  assert.equal(chronic.severity, "medium");
-  assert.deepEqual(chronic.scoring_rationale, [
-    "estimated_upper_only",
-    "resource_cost_only",
-  ]);
-  assert.equal(chronic.confidence, "medium");
-  assert.equal(chronic.fix_recipe.verify, "npm test");
-  assert.match(chronic.fix_recipe.suggestion, /packages\/api/u);
-
-  assert.deepEqual(detectChronicCost(qualifying.slice(0, 4)), []);
-  assert.deepEqual(
-    detectChronicCost(
-      qualifying.map((entry, index) =>
-        index < 2 ? entry : record(`presence-${index}`, index, {
-          includeCommand: false,
-        })
-      ),
-    ),
-    [],
-  );
-  assert.deepEqual(
-    detectChronicCost(
-      Array.from({ length: 5 }, (_, index) =>
-        record(`ratio-${index}`, index, {
-          commandMin: index < 3 ? 49.99 : 0,
-          includeCommand: index < 3,
-          commandIdentity: api,
-        })
-      ),
-    ),
-    [],
-  );
-});
-
-test("R006 isolates identity lanes and accepts only exact-identity finding refs", () => {
-  const api = commandIdentity("packages/api");
-  const web = commandIdentity("packages/web");
-  const native = commandIdentity("packages/api", undefined, "native-tool");
-  const cost = (identity: CommandIdentity | undefined, duration_min: number, ref: string) => ({
-    command: "npm test", ...(identity === undefined ? {} : { command_identity: identity }),
-    duration_min, session_refs: [ref],
-  });
-  const histories = Array.from({ length: 5 }, (_, index) => ({
-    ...record(`lanes-${index}`, index, { includeCommand: false }),
-    command_costs: [
-      ...(index < 3 ? [cost(api, 50, `api-cost-${index}`)] : []),
-      ...(index < 2 ? [cost(web, 80, `web-cost-${index}`),
-        cost(native, 80, `native-cost-${index}`)] : []),
-      cost(undefined, 100, `legacy-cost-${index}`),
-    ],
-  }));
-  const evidence = (key: string, identity?: CommandIdentity) => {
-    const value = finding(key, `different display ${key}`);
-    value.evidence.session_refs = [`${key}#finding`];
-    if (identity !== undefined) value.evidence.command_identity = identityEvidence(identity);
-    return value;
-  };
-  const malformed = evidence("malformed", api);
-  malformed.evidence.command_identity = { ...identityEvidence(api), repo_relative_cwd: "/repo" };
-  histories[0]!.findings = [evidence("api", api), evidence("web", web),
-    evidence("native", native), evidence("legacy"), malformed];
-  const chronic = detectChronicCost(histories)[0];
-  assert.ok(chronic !== undefined);
-  assert.equal(chronic.evidence.cost_min, 150);
-  assert.equal(chronic.evidence.presence_count, 3);
-  assert.deepEqual(chronic.evidence.session_refs,
-    ["api-cost-0", "api-cost-1", "api-cost-2", "api#finding"]);
-});
-test("R006 ignores legacy presence and sums duplicate decimal costs deterministically", () => {
-  const api = commandIdentity("packages/api");
-  const legacy = Array.from({ length: 5 }, (_, index) =>
-    record(`legacy-${index}`, index, { commandMin: 100, commandIdentity: undefined }));
-  assert.deepEqual(detectChronicCost(legacy), []);
-  assert.deepEqual(detectChronicCost(legacy.map((_, index) =>
-    record(`mixed-${index}`, index, { commandMin: 100,
-      commandIdentity: index < 2 ? api : undefined }))), []);
-  const fractional = Array.from({ length: 5 }, (_, index) => ({
-    ...record(`fractional-${index}`, index, { measuredMin: 1, includeCommand: false }),
-    command_costs: [0.1, 0.2, 0.3].map((duration_min, costIndex) => ({
-      command: "npm test", command_identity: api, duration_min,
-      session_refs: [`fractional-${index}#${costIndex}`],
-    })),
-  }));
-  const reversed = fractional.map((entry) => ({
-    ...entry, command_costs: [...entry.command_costs].reverse(),
-  })).reverse();
-  const findings = detectChronicCost(fractional);
-  assert.deepEqual(findings, detectChronicCost(reversed));
-  assert.equal(findings[0]?.evidence.cost_min, 3);
-  assert.equal(findings[0]?.evidence.presence_count, 5);
-});
-test("R006 distinguishes a native identity and clones its exact argv", () => {
-  const argv = ["npm", "test", "", "--flag", "--flag"];
-  const native = commandIdentity("packages/api", argv, "native-tool");
-  const histories = Array.from({ length: 5 }, (_, index) => record(`native-${index}`, index, {
-    commandMin: index < 3 ? 50 : 0, includeCommand: index < 3, commandIdentity: native,
-  }));
-  const chronic = detectChronicCost(histories)[0];
-  assert.ok(chronic !== undefined);
-  assert.equal(chronic.target, "packages/api :: npm test [native-tool]");
-  assert.equal(chronic.finding_key, r006FindingKey(native));
-  assert.notEqual(chronic.finding_key, r006FindingKey(commandIdentity("packages/api", argv)));
-  assert.deepEqual(chronic.evidence.command_identity, native);
-  assert.notEqual(chronic.evidence.command_identity?.normalized_argv, argv);
-});
-test("R006 defensively ignores malformed finding evidence at its boundary", () => {
-  const api = commandIdentity("packages/api");
-  const histories = Array.from({ length: 5 }, (_, index) =>
-    record(`defensive-${index}`, index, {
-      commandMin: index < 3 ? 50 : 0,
-      includeCommand: index < 3,
-      commandIdentity: api,
-    })
-  );
-  histories[0] = {
-    ...histories[0] as AnalysisRecord,
-    findings: [null] as unknown as Finding[],
-  };
-  histories[1] = {
-    ...histories[1] as AnalysisRecord,
-    findings: [{
-      ...finding("bad-evidence"),
-      evidence: null,
-    }] as unknown as Finding[],
-  };
-
-  assert.equal(detectChronicCost(histories).length, 1);
-});
-
 test("loads a legacy analysis record without human_wait_min and no warnings", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-legacy-summary-"));
   try {
@@ -4274,6 +4103,1613 @@ function storedTerminalStatsSnapshot(): TerminalStatsSnapshotV1 {
     incomplete_interval_findings: 2,
   };
 }
+
+interface ComparableHistoryOptions {
+  id: string;
+  createdAtMs: number;
+  metric: number;
+  selector?: NonNullable<AnalysisSnapshotIdentity["selector"]>;
+  selectorNumber?: number;
+  displayRef?: string;
+  gitState?: string;
+  analysisVariant?: string;
+  repositoryId?: string;
+  workspaceId?: string;
+  changedFiles?: number;
+  /** `null` models a binary/truncated diff with no authoritative line count. */
+  changedLines?: number | null;
+  measuredWallMs?: number;
+  commandCosts?: AnalysisRecord["command_costs"];
+  findings?: AnalysisRecord["findings"];
+}
+
+function comparableHistoryEntry(
+  options: ComparableHistoryOptions,
+): AnalysisHistoryEntry {
+  const repositoryId = options.repositoryId ?? "1".repeat(64);
+  const workspaceId = options.workspaceId ?? "2".repeat(64);
+  const terminal = storedTerminalStatsSnapshot();
+  terminal.measured_wall_ms = options.measuredWallMs ?? terminal.measured_wall_ms;
+  terminal.cohort = {
+    repository_id: repositoryId,
+    workspace_id: workspaceId,
+    changed_files: options.changedFiles ?? 4,
+    ...(options.changedLines === null
+      ? {}
+      : { changed_lines: options.changedLines ?? 199 }),
+  };
+  const source = record(options.id, options.createdAtMs, {
+    metric: options.metric,
+  });
+  const normalized = makeAnalysisRecord({
+    ...source,
+    unit: {
+      ...source.unit,
+      pr_ref: options.displayRef ?? "main...feature",
+    },
+    findings: options.findings ?? source.findings,
+    command_costs: options.commandCosts ?? source.command_costs,
+    terminal_stats_snapshot: terminal,
+  });
+  const stateDigest = analysisDigest(
+    "terminal-stats-test-git-state-v1",
+    options.gitState ?? options.id,
+  );
+  const identity: AnalysisSnapshotIdentity = {
+    repo_id: repositoryId,
+    base_oid: "a".repeat(40),
+    head_oid: stateDigest.slice(0, 40),
+    merge_base_oid: "a".repeat(40),
+    window: {
+      started_at_ms: 1,
+      start_source: "commit_anchor_lookback",
+      end_source: "analysis_time",
+      completeness: "partial",
+    },
+    source_digest: "3".repeat(64),
+    config_digest: "4".repeat(64),
+    policy_digest: analysisDigest(
+      "terminal-stats-test-policy-v1",
+      options.analysisVariant ?? "default",
+    ),
+    history_digest: "5".repeat(64),
+    selector: options.selector ?? {
+      kind: "github_pr",
+      number: options.selectorNumber ?? 1,
+    },
+  };
+  const {
+    analysis_id: _analysisId,
+    created_at_ms: _createdAtMs,
+    ...payload
+  } = normalized;
+  return {
+    snapshot_id: analysisDigest("analysis-snapshot-v1", {
+      schema_version: 1,
+      identity,
+      payload,
+    }),
+    identity,
+    record: normalized,
+  };
+}
+
+function projectComparableHistory(
+  entries: readonly AnalysisHistoryEntry[],
+): StatsAggregationInput[] {
+  return entries.map((entry) => projectStatsAggregationInput(entry));
+}
+
+type Task7CommandCost = AnalysisRecord["command_costs"][number] & {
+  cache_state?: "cold" | "warm";
+};
+
+function task7CommandCost(options: {
+  identity?: CommandIdentity;
+  cacheState?: "cold" | "warm";
+  durationMs?: number;
+  command?: string;
+  ref?: string;
+} = {}): Task7CommandCost {
+  return {
+    command: options.command ?? "npm test",
+    ...(options.identity === undefined
+      ? {}
+      : { command_identity: commandIdentity(
+          options.identity.repo_relative_cwd,
+          options.identity.normalized_argv,
+          options.identity.executor,
+        ) }),
+    ...(options.cacheState === undefined
+      ? {}
+      : { cache_state: options.cacheState }),
+    duration_min: (options.durationMs ?? 1_000) / 60_000,
+    session_refs: [options.ref ?? "session#command"],
+  };
+}
+
+function task7History(options: {
+  prefix: string;
+  count: number;
+  costs(index: number): AnalysisRecord["command_costs"];
+  findings?(index: number): AnalysisRecord["findings"];
+  repositoryId?: string;
+  workspaceId?: string;
+  changedFiles?: number;
+  changedLines?: number;
+  measuredWallMs?: number;
+  selectorOffset?: number;
+}): AnalysisHistoryEntry[] {
+  return Array.from({ length: options.count }, (_, index) =>
+    comparableHistoryEntry({
+      id: `${options.prefix}-${index + 1}`,
+      createdAtMs: index + 1,
+      metric: index + 1,
+      selectorNumber: (options.selectorOffset ?? 0) + index + 1,
+      ...(options.repositoryId === undefined
+        ? {}
+        : { repositoryId: options.repositoryId }),
+      ...(options.workspaceId === undefined
+        ? {}
+        : { workspaceId: options.workspaceId }),
+      ...(options.changedFiles === undefined
+        ? {}
+        : { changedFiles: options.changedFiles }),
+      ...(options.changedLines === undefined
+        ? {}
+        : { changedLines: options.changedLines }),
+      measuredWallMs: options.measuredWallMs ?? 2_000,
+      commandCosts: options.costs(index),
+      ...(options.findings === undefined
+        ? {}
+        : { findings: options.findings(index) }),
+    })
+  );
+}
+
+test("Store preserves optional command cache state and projection drops unobservable lanes", () => {
+  const api = commandIdentity("packages/api");
+  const missing = task7CommandCost({ identity: api, ref: "missing" });
+  const unknown = {
+    ...task7CommandCost({ identity: api, ref: "unknown" }),
+    cache_state: "unknown",
+  } as unknown as Task7CommandCost;
+  const entry = comparableHistoryEntry({
+    id: "r006-cache-projection",
+    createdAtMs: 1,
+    metric: 1,
+    selectorNumber: 501,
+    commandCosts: [
+      task7CommandCost({ identity: api, cacheState: "cold", durationMs: 400,
+        ref: "COLD_PRIVATE_REF_A" }),
+      task7CommandCost({ identity: api, cacheState: "cold", durationMs: 600,
+        ref: "COLD_PRIVATE_REF_B" }),
+      task7CommandCost({ identity: api, cacheState: "warm", ref: "WARM_PRIVATE_REF" }),
+      missing,
+      unknown,
+    ],
+  });
+
+  const storedStates = entry.record.command_costs.map((cost) =>
+    (cost as Task7CommandCost).cache_state);
+  assert.equal(storedStates.length, 3);
+  assert.equal(storedStates.filter((state) => state === undefined).length, 1);
+  assert.equal(storedStates.filter((state) => state === "cold").length, 1);
+  assert.equal(storedStates.filter((state) => state === "warm").length, 1);
+  const coldDuration = entry.record.command_costs.find(
+    (cost) => (cost as Task7CommandCost).cache_state === "cold")?.duration_min;
+  assert.ok(coldDuration !== undefined);
+  assert.ok(Math.abs(coldDuration - 1 / 60) < Number.EPSILON);
+
+  const projected = projectStatsAggregationInput(entry);
+  assert.deepEqual(projected.command_costs.map((cost) => ({
+    keys: Object.keys(cost).sort(),
+    cache_state: cost.cache_state,
+    duration_ms: cost.duration_ms,
+  })), [{
+    keys: ["cache_state", "command_key", "duration_ms"],
+    cache_state: "cold",
+    duration_ms: 1_000,
+  }, {
+    keys: ["cache_state", "command_key", "duration_ms"],
+    cache_state: "warm",
+    duration_ms: 1_000,
+  }]);
+  assert.equal(projected.command_costs[0]?.command_key,
+    projected.command_costs[1]?.command_key);
+  const serialized = JSON.stringify(projected);
+  for (const canary of [
+    "packages/api", "npm test", "COLD_PRIVATE_REF_A",
+    "COLD_PRIVATE_REF_B", "WARM_PRIVATE_REF", "missing", "unknown",
+  ]) assert.doesNotMatch(serialized, new RegExp(canary, "u"));
+
+  let accessorReads = 0;
+  const accessor = task7CommandCost({ identity: api }) as Task7CommandCost;
+  Object.defineProperty(accessor, "cache_state", {
+    enumerable: true,
+    get() {
+      accessorReads += 1;
+      return "cold";
+    },
+  });
+  const {
+    analysis_id: ignoredAnalysisId,
+    ...accessorRecordInput
+  } = entry.record;
+  void ignoredAnalysisId;
+  assert.throws(() => makeAnalysisRecord({
+    ...accessorRecordInput,
+    command_costs: [accessor],
+  }), TypeError);
+  assert.equal(accessorReads, 0);
+});
+
+test("R006 uses the full absent-command denominator and one summed sample per snapshot", () => {
+  const api = commandIdentity("packages/api");
+  const entries = task7History({
+    prefix: "r006-exact-milliseconds",
+    count: 6,
+    measuredWallMs: 2_000,
+    costs: (index) => index === 5 ? [] : index === 0
+      ? [
+          task7CommandCost({ identity: api, cacheState: "cold", durationMs: 400,
+            ref: "exact#0-a" }),
+          task7CommandCost({ identity: api, cacheState: "cold", durationMs: 600,
+            ref: "exact#0-b" }),
+        ]
+      : [task7CommandCost({ identity: api, cacheState: "cold", durationMs: 1_000,
+          ref: `exact#${index}` })],
+  });
+  const projected = projectComparableHistory(entries);
+  const aggregates = buildChronicCostAggregates(
+    projected,
+    { mode: "stats_all_groups" },
+    5,
+  );
+  assert.equal(aggregates.length, 1);
+  assert.deepEqual(aggregates[0], {
+    cohort_key: projected[0]!.cohort_key!,
+    command_key: projected[0]!.command_costs[0]!.command_key,
+    cache_state: "cold",
+    history_count: 6,
+    presence_count: 5,
+    distribution: {
+      median: 1_000,
+      p50: 1_000,
+      p75: 1_000,
+      mad: 0,
+      sample_count: 5,
+    },
+    ratio: 0.4167,
+    resource_upper_ms: 833.3333,
+  } satisfies ChronicCostAggregate);
+  assert.deepEqual(Object.keys(aggregates[0]!).sort(), [
+    "cache_state", "cohort_key", "command_key", "distribution",
+    "history_count", "presence_count", "ratio", "resource_upper_ms",
+  ]);
+  assert.doesNotMatch(JSON.stringify(aggregates),
+    /npm test|packages\/api|session|fix|argv|cwd/u);
+  assert.deepEqual(
+    buildChronicCostAggregates([...projected].reverse(),
+      { mode: "stats_all_groups" }, 5),
+    aggregates,
+  );
+});
+
+test("R006 selects terminals before current exclusion and isolates exact cohort, command, and cache lanes", () => {
+  const api = commandIdentity("packages/api");
+  const web = commandIdentity("packages/web");
+  const laneCosts = (ref: string): AnalysisRecord["command_costs"] => [
+    task7CommandCost({ identity: api, cacheState: "cold", durationMs: 1_000,
+      ref: `${ref}#api-cold` }),
+    task7CommandCost({ identity: api, cacheState: "warm", durationMs: 800,
+      ref: `${ref}#api-warm` }),
+    task7CommandCost({ identity: web, cacheState: "cold", durationMs: 700,
+      ref: `${ref}#web-cold` }),
+    task7CommandCost({ identity: api, durationMs: 50_000,
+      ref: `${ref}#missing-cache` }),
+  ];
+  const currentVariants = [
+    comparableHistoryEntry({ id: "r006-current-a", createdAtMs: 1_000, metric: 1,
+      selectorNumber: 700, gitState: "state-a", analysisVariant: "a",
+      displayRef: "shared-display", measuredWallMs: 2_000,
+      commandCosts: laneCosts("current-a") }),
+    comparableHistoryEntry({ id: "r006-current-b", createdAtMs: 2_000, metric: 2,
+      selectorNumber: 700, gitState: "state-b", analysisVariant: "b",
+      displayRef: "shared-display", measuredWallMs: 2_000,
+      commandCosts: laneCosts("current-b") }),
+    comparableHistoryEntry({ id: "r006-current-a-rerun", createdAtMs: 3_000, metric: 3,
+      selectorNumber: 700, gitState: "state-a", analysisVariant: "a-rerun",
+      displayRef: "shared-display", measuredWallMs: 2_000,
+      commandCosts: laneCosts("current-a-rerun") }),
+  ];
+  const comparables = task7History({
+    prefix: "r006-comparable",
+    count: 5,
+    selectorOffset: 710,
+    costs: (index) => laneCosts(`comparable-${index}`),
+  });
+  comparables[4] = comparableHistoryEntry({
+    id: "r006-same-display-different-selector",
+    createdAtMs: 4_000,
+    metric: 4,
+    displayRef: "shared-display",
+    selector: {
+      kind: "explicit_range",
+      range: "double_dot",
+      base_ref_digest: selectorRefDigest("explicit_range", "base", "main"),
+      head_ref_digest: selectorRefDigest("explicit_range", "head", "feature"),
+    },
+    measuredWallMs: 2_000,
+    commandCosts: laneCosts("different-selector"),
+  });
+  const neighboringDimensions: Array<{
+    prefix: string;
+    selectorOffset: number;
+    changedFiles?: number;
+    changedLines?: number;
+    repositoryId?: string;
+    workspaceId?: string;
+  }> = [{
+    prefix: "r006-neighboring-file-bucket",
+    selectorOffset: 800,
+    changedFiles: 5,
+  }, {
+    prefix: "r006-neighboring-line-bucket",
+    selectorOffset: 810,
+    changedLines: 200,
+  }, {
+    prefix: "r006-neighboring-repository",
+    selectorOffset: 820,
+    repositoryId: "6".repeat(64),
+  }, {
+    prefix: "r006-neighboring-workspace",
+    selectorOffset: 830,
+    workspaceId: "7".repeat(64),
+  }];
+  const neighboring = neighboringDimensions.flatMap((dimensions) => task7History({
+    ...dimensions,
+    count: 5,
+    costs: (index) => [task7CommandCost({ identity: api, cacheState: "cold",
+      durationMs: 1_000, ref: `${dimensions.prefix}#${index}` })],
+  }));
+  const history = [...currentVariants, ...comparables, ...neighboring];
+  const projected = projectComparableHistory(history);
+  const projectedCurrent = projected[0]!;
+  assert.ok(projectedCurrent.work_unit_key !== undefined);
+  assert.ok(projectedCurrent.cohort_key !== undefined);
+  const analysisMode = {
+    mode: "analysis_current",
+    current_work_unit_key: projectedCurrent.work_unit_key,
+    current_cohort_key: projectedCurrent.cohort_key,
+  } as const;
+  const analysis = buildChronicCostAggregates(projected, analysisMode, 5);
+  assert.equal(analysis.length, 3);
+  assert.ok(analysis.every(({ history_count, presence_count, cohort_key }) =>
+    history_count === 5 && presence_count === 5 &&
+    cohort_key === projectedCurrent.cohort_key));
+  assert.deepEqual(new Set(analysis.map(({ cache_state }) => cache_state)),
+    new Set(["cold", "warm"]));
+  assert.equal(new Set(analysis.map(({ command_key }) => command_key)).size, 2);
+
+  const stats = buildChronicCostAggregates(
+    projected,
+    { mode: "stats_all_groups" },
+    5,
+  );
+  assert.equal(stats.length, 7);
+  const currentGroup = stats.filter(
+    ({ cohort_key }) => cohort_key === projectedCurrent.cohort_key,
+  );
+  assert.equal(currentGroup.length, 3);
+  assert.ok(currentGroup.every(({ history_count, presence_count }) =>
+    history_count === 6 && presence_count === 6));
+  const neighboringGroup = stats.filter(
+    ({ cohort_key }) => cohort_key !== projectedCurrent.cohort_key,
+  );
+  assert.equal(neighboringGroup.length, 4);
+  assert.equal(new Set(neighboringGroup.map(({ cohort_key }) => cohort_key)).size, 4);
+  assert.ok(neighboringGroup.every(({ history_count, presence_count }) =>
+    history_count === 5 && presence_count === 5));
+  assert.equal(stats.some(({ cache_state }) =>
+    (cache_state as string) === "unknown"), false);
+});
+
+test("R006 applies exact history, presence, ratio, and organization floors", () => {
+  const api = commandIdentity("packages/api");
+  const population = (count: number, positive: number, durationMs = 1_000) =>
+    task7History({
+      prefix: `r006-floor-${count}-${positive}-${durationMs}`,
+      count,
+      costs: (index) => index < positive
+        ? [task7CommandCost({ identity: api, cacheState: "cold", durationMs,
+            ref: `floor#${index}` })]
+        : [],
+    });
+  const aggregate = (entries: readonly AnalysisHistoryEntry[], floor?: number) =>
+    buildChronicCostAggregates(projectComparableHistory(entries),
+      { mode: "stats_all_groups" }, floor);
+
+  assert.equal(aggregate(population(5, 5)).length, 1);
+  assert.deepEqual(aggregate(population(4, 4)), []);
+  assert.deepEqual(aggregate(population(5, 4)), []);
+  assert.deepEqual(aggregate(population(5, 5, 599)), []);
+  assert.deepEqual(aggregate(population(20, 3), 20), []);
+  assert.equal(aggregate(population(20, 20), 20)[0]?.history_count, 20);
+  assert.equal(aggregate(population(20, 20), 20)[0]?.presence_count, 20);
+
+  const zeroWall = projectComparableHistory(population(5, 5));
+  for (const input of zeroWall) {
+    const terminal = input.terminal_metrics!;
+    terminal.measured_wall_ms = 0;
+    terminal.confirmed_critical_path_ms = 0;
+    terminal.estimated_critical_path_upper_ms = 0;
+    terminal.resource_cost_ms = 0;
+    terminal.human_wait_ms = 0;
+    terminal.unexplained_ms = 0;
+    for (const rule of terminal.rules) {
+      rule.confirmed_critical_path_ms = 0;
+      rule.estimated_critical_path_upper_ms = 0;
+      rule.resource_cost_ms = 0;
+    }
+  }
+  assert.deepEqual(buildChronicCostAggregates(zeroWall,
+    { mode: "stats_all_groups" }, 5), []);
+  const missingWall = projectComparableHistory(population(5, 5));
+  delete missingWall[0]!.terminal_metrics;
+  assert.deepEqual(buildChronicCostAggregates(missingWall,
+    { mode: "stats_all_groups" }, 5), []);
+});
+
+test("R006 materialization uses only revalidated exact-composite detached entries", () => {
+  const api = commandIdentity("packages/api");
+  const legacyTarget = "packages/api :: npm test [cold]";
+  const legacyKey = findingKeyForCompatibility("R006", legacyTarget, 1);
+  const legacyR006 = {
+    ...finding("legacy-r006", "npm test"),
+    finding_key: legacyKey,
+    rule_id: "R006",
+    target: legacyTarget,
+    confidence: "medium",
+    evidence: {
+      session_refs: ["LEGACY_R006_REF_MUST_NOT_JOIN"],
+      interval_ids: [],
+      command: "npm test",
+      command_identity: identityEvidence(api),
+      cache_state: "cold",
+    },
+    recoverable: { min: 100, bound: "upper" },
+    impact: { lower_ms: 0, upper_ms: 6_000_000, kind: "resource_cost" },
+    finding_confidence: {
+      evidence: "high",
+      causal: "medium",
+      source_completeness: 1,
+    },
+    severity: "medium",
+    scoring_rationale: ["estimated_upper_only", "resource_cost_only"],
+    rule_version: "1.0.0",
+    compatibility_epoch: 1,
+  } satisfies Finding;
+  const entries = task7History({
+    prefix: "r006-materialize",
+    count: 5,
+    costs: (index) => [
+      task7CommandCost({ identity: api, cacheState: "cold", durationMs: 1_000,
+        ref: `materialize#cold-${index}` }),
+      task7CommandCost({ identity: api, cacheState: "warm", durationMs: 800,
+        ref: `materialize#warm-${index}` }),
+    ],
+    findings: (index) => index === 0 ? [legacyR006] : [],
+  });
+  const projected = projectComparableHistory(entries);
+  const mode = { mode: "stats_all_groups" } as const;
+  const aggregates = buildChronicCostAggregates(projected, mode, 5);
+  const materializations = buildChronicCostMaterializationEntries(
+    projected,
+    entries,
+    mode,
+  );
+  assert.equal(materializations.length, 2);
+  for (const entry of materializations) {
+    assert.deepEqual(Object.keys(entry).sort(), [
+      "cache_state", "cohort_key", "command", "command_identity",
+      "command_key", "session_refs",
+    ]);
+    assert.equal(Object.hasOwn(entry, "record"), false);
+    assert.equal(Object.hasOwn(entry, "history"), false);
+  }
+  assert.deepEqual(
+    buildChronicCostMaterializationEntries(
+      [...projected].reverse(),
+      [...entries].reverse(),
+      mode,
+    ),
+    materializations,
+  );
+
+  const candidates = materializeChronicCostFindings(
+    aggregates,
+    materializations,
+    { sourceCompleteness: 1 },
+  );
+  assert.equal(candidates.length, 2);
+  assert.notEqual(candidates[0]?.finding_key, candidates[1]?.finding_key);
+  assert.ok(candidates.every(({ finding_key }) => finding_key !== legacyKey));
+  for (const candidate of candidates) {
+    assert.equal(candidate.rule_id, "R006");
+    assert.equal(candidate.classification, "repo");
+    assert.equal(candidate.scope, "separate_issue");
+    assert.equal(candidate.evidence.cache_state === "cold" ||
+      candidate.evidence.cache_state === "warm", true);
+    assert.equal(candidate.evidence.history_count, 5);
+    assert.equal(candidate.evidence.presence_count, 5);
+    assert.equal(candidate.evidence.sample_count, 5);
+    assert.equal(candidate.evidence.ratio === 0.5 ||
+      candidate.evidence.ratio === 0.4, true);
+    assert.equal(candidate.evidence.resource_upper_ms === 1_000 ||
+      candidate.evidence.resource_upper_ms === 800, true);
+    assert.deepEqual(candidate.evidence.command_identity, api);
+    assert.deepEqual(candidate.evidence.interval_ids, []);
+    assert.equal(candidate.recoverable.bound, "upper");
+    assert.deepEqual(candidate.recoverable.intervals, []);
+    assert.equal(candidate.impact.kind, "resource_cost");
+    assert.equal(candidate.impact.lower_ms, 0);
+    assert.equal(candidate.impact.upper_ms, candidate.recoverable.estimated_ms);
+    assert.equal(candidate.fix_recipe.verify, "npm test");
+    assert.match(candidate.fix_recipe.suggestion, /packages\/api/u);
+    assert.notEqual(candidate.finding_key,
+      findingKeyForCompatibility("R006", candidate.target, 1));
+  }
+  const cold = candidates.find(({ evidence }) => evidence.cache_state === "cold");
+  assert.deepEqual(cold?.evidence.session_refs, [
+    "materialize#cold-0", "materialize#cold-1", "materialize#cold-2",
+    "materialize#cold-3", "materialize#cold-4",
+  ]);
+  assert.doesNotMatch(JSON.stringify(candidates), /LEGACY_R006_REF_MUST_NOT_JOIN/u);
+
+  const exact = materializations[0]!;
+  const aggregate = aggregates.find(({ cohort_key, command_key, cache_state }) =>
+    cohort_key === exact.cohort_key && command_key === exact.command_key &&
+    cache_state === exact.cache_state)!;
+  assert.deepEqual(materializeChronicCostFindings([aggregate], [],
+    { sourceCompleteness: 1 }), []);
+  for (const mismatched of [
+    { ...exact, cohort_key: "f".repeat(64) },
+    { ...exact, command_key: "e".repeat(64) },
+    { ...exact, cache_state: exact.cache_state === "cold" ? "warm" : "cold" },
+  ] satisfies Array<typeof exact>) {
+    assert.deepEqual(materializeChronicCostFindings([aggregate], [mismatched],
+      { sourceCompleteness: 1 }), []);
+  }
+});
+
+test("R006 materialization builder invalidates missing, duplicate, conflicting, or digest-mismatched lanes", () => {
+  const api = commandIdentity("packages/api");
+  const entries = task7History({
+    prefix: "r006-revalidation",
+    count: 5,
+    costs: (index) => [task7CommandCost({ identity: api, cacheState: "cold",
+      ref: `revalidation#${index}` })],
+  });
+  const projected = projectComparableHistory(entries);
+  const mode = { mode: "stats_all_groups" } as const;
+
+  assert.deepEqual(buildChronicCostMaterializationEntries(
+    projected,
+    entries.slice(1),
+    mode,
+  ), []);
+  assert.deepEqual(buildChronicCostMaterializationEntries(
+    projected,
+    [...entries, structuredClone(entries[0]!)],
+    mode,
+  ), []);
+
+  const wrongCommandDigest = structuredClone(projected);
+  wrongCommandDigest[0]!.command_costs[0]!.command_key = "f".repeat(64);
+  assert.deepEqual(buildChronicCostMaterializationEntries(
+    wrongCommandDigest,
+    entries,
+    mode,
+  ), []);
+  const wrongCohortDigest = structuredClone(projected);
+  wrongCohortDigest[0]!.cohort_key = "e".repeat(64);
+  assert.deepEqual(buildChronicCostMaterializationEntries(
+    wrongCohortDigest,
+    entries,
+    mode,
+  ), []);
+  const wrongRawIdentity = structuredClone(entries);
+  wrongRawIdentity[0]!.record.command_costs[0]!.command_identity =
+    commandIdentity("packages/web");
+  assert.deepEqual(buildChronicCostMaterializationEntries(
+    projected,
+    wrongRawIdentity,
+    mode,
+  ), []);
+
+  const conflicting = entries.map((entry, index) => index === 4
+    ? comparableHistoryEntry({
+        id: "r006-conflicting-display",
+        createdAtMs: 5,
+        metric: 5,
+        selectorNumber: 5,
+        measuredWallMs: 2_000,
+        commandCosts: [task7CommandCost({
+          identity: api,
+          cacheState: "cold",
+          command: "pnpm test",
+          ref: "revalidation#conflict",
+        })],
+      })
+    : entry);
+  assert.deepEqual(buildChronicCostMaterializationEntries(
+    projectComparableHistory(conflicting),
+    conflicting,
+    mode,
+  ), []);
+});
+
+type BaselineCurrentRejectsRawRecord = AnalysisRecord extends
+  Parameters<typeof computeBaseline>[0] ? false : true;
+type BaselineHistoryRejectsRawRecords = readonly AnalysisRecord[] extends
+  Parameters<typeof computeBaseline>[1] ? false : true;
+const baselineCurrentRejectsRawRecord: BaselineCurrentRejectsRawRecord = true;
+const baselineHistoryRejectsRawRecords: BaselineHistoryRejectsRawRecords = true;
+void baselineCurrentRejectsRawRecord;
+void baselineHistoryRejectsRawRecords;
+
+test("terminal selection suppresses an incomplete terminal without historical fallback", () => {
+  const completeEntries = [
+    comparableHistoryEntry({
+      id: "terminal-a-original",
+      createdAtMs: 1_000,
+      metric: 1,
+      selectorNumber: 70,
+      gitState: "state-a",
+      analysisVariant: "a-original",
+    }),
+    comparableHistoryEntry({
+      id: "terminal-b",
+      createdAtMs: 2_000,
+      metric: 2,
+      selectorNumber: 70,
+      gitState: "state-b",
+      analysisVariant: "b",
+    }),
+    comparableHistoryEntry({
+      id: "terminal-a-rerun",
+      createdAtMs: 3_000,
+      metric: 3,
+      selectorNumber: 70,
+      gitState: "state-a",
+      analysisVariant: "a-rerun",
+    }),
+  ];
+  const completeProjected = projectComparableHistory(completeEntries);
+  assert.deepEqual(
+    selectTerminalSnapshots(completeProjected).terminals.map(
+      ({ snapshot_id }) => snapshot_id,
+    ),
+    [completeEntries[1]!.snapshot_id],
+    "the later A variant cannot resurrect state A after state B",
+  );
+
+  const incompleteEntries = structuredClone(completeEntries);
+  const incompleteTerminal = incompleteEntries[1]!;
+  delete incompleteTerminal.record.terminal_stats_snapshot;
+  const {
+    analysis_id: ignoredAnalysisId,
+    created_at_ms: ignoredCreatedAtMs,
+    ...incompletePayload
+  } = incompleteTerminal.record;
+  void ignoredAnalysisId;
+  void ignoredCreatedAtMs;
+  incompleteTerminal.snapshot_id = analysisDigest("analysis-snapshot-v1", {
+    schema_version: 1,
+    identity: incompleteTerminal.identity,
+    payload: incompletePayload,
+  });
+
+  const projected = projectComparableHistory(incompleteEntries);
+  assert.equal(projected[1]?.terminal_metrics, undefined);
+  assert.ok(projected[1]?.reason_codes.includes("missing_terminal_metrics"));
+  const selected = selectTerminalSnapshots(projected);
+  assert.deepEqual(
+    selected.terminals.map(({ snapshot_id }) => snapshot_id),
+    [incompleteTerminal.snapshot_id],
+    "the incomplete terminal state must remain selected instead of falling back",
+  );
+  assert.equal(selected.terminals[0]?.terminal_metrics, undefined);
+  assert.deepEqual(selected.metadata, {
+    stored_snapshot_count: 3,
+    terminal_snapshot_count: 1,
+    superseded_snapshot_count: 2,
+    ineligible_snapshot_count: 1,
+  });
+});
+
+test("terminal selection resolves equal state and variant times by opaque digests", () => {
+  const entries = [
+    ...["left-a", "left-b"].map((variant) => comparableHistoryEntry({
+      id: `digest-tie-${variant}`,
+      createdAtMs: 4_000,
+      metric: 1,
+      selectorNumber: 71,
+      gitState: "tie-left",
+      analysisVariant: variant,
+    })),
+    ...["right-a", "right-b"].map((variant) => comparableHistoryEntry({
+      id: `digest-tie-${variant}`,
+      createdAtMs: 4_000,
+      metric: 1,
+      selectorNumber: 71,
+      gitState: "tie-right",
+      analysisVariant: variant,
+    })),
+  ];
+  const projected = projectComparableHistory(entries);
+  const terminalStateKey = [...new Set(projected.map(({ git_state_key }) => {
+    assert.ok(git_state_key !== undefined);
+    return git_state_key;
+  }))].sort((left, right) => left.localeCompare(right)).at(-1);
+  assert.ok(terminalStateKey !== undefined);
+  const expectedSnapshotId = projected
+    .filter(({ git_state_key }) => git_state_key === terminalStateKey)
+    .map(({ snapshot_id }) => snapshot_id)
+    .sort((left, right) => left.localeCompare(right))
+    .at(-1);
+  assert.ok(expectedSnapshotId !== undefined);
+
+  for (const input of [projected, [...projected].reverse()]) {
+    const selected = selectTerminalSnapshots(input);
+    assert.deepEqual(
+      selected.terminals.map(({ snapshot_id }) => snapshot_id),
+      [expectedSnapshotId],
+    );
+    assert.equal(selected.metadata.superseded_snapshot_count, 3);
+  }
+});
+
+test("stats projection exposes only closed numeric bounded and opaque data", () => {
+  const canary = "TASK6_RAW_PROJECTION_CANARY";
+  const rawEntry = comparableHistoryEntry({
+    id: "projection-canary",
+    createdAtMs: 5_000,
+    metric: 0.5,
+    displayRef: `${canary}-selector-token`,
+    selector: {
+      kind: "explicit_range",
+      range: "triple_dot",
+      base_ref_digest: selectorRefDigest(
+        "explicit_range",
+        "base",
+        `${canary}-base`,
+      ),
+      head_ref_digest: selectorRefDigest(
+        "explicit_range",
+        "head",
+        `${canary}-head`,
+      ),
+    },
+  });
+  rawEntry.record.unit = {
+    repo: `/private/${canary}/repository`,
+    pr_ref: `${canary}-display-selector`,
+    sessions: [`${canary}-session`],
+  };
+  rawEntry.record.command_costs = [{
+    command: `${canary}-command`,
+    command_identity: {
+      repo_relative_cwd: `packages/${canary}`,
+      normalized_argv: ["runner", `${canary}-argv`],
+      executor: "native-tool",
+    },
+    duration_min: 1,
+    session_refs: [`${canary}-command-session`],
+  }];
+  const rawFinding = finding("projection-canary-finding");
+  rawFinding.title = `${canary}-title`;
+  rawFinding.evidence = {
+    ...rawFinding.evidence,
+    session_refs: [`${canary}-finding-session`],
+    interval_ids: [`${canary}-interval-id`],
+    url: `https://example.invalid/${canary}`,
+    prompt: `${canary}-prompt`,
+    intervals: [{ start_ms: 1, end_ms: 2, token: canary }],
+  };
+  rawFinding.fix_recipe = {
+    suggestion: `${canary}-suggestion`,
+    verify: `${canary}-verify`,
+  };
+  rawEntry.record.findings = [rawFinding];
+
+  const objectReferences = (value: unknown): Set<object> => {
+    const result = new Set<object>();
+    const visit = (entry: unknown): void => {
+      if (entry === null || typeof entry !== "object" || result.has(entry)) {
+        return;
+      }
+      result.add(entry);
+      for (const child of Object.values(entry)) visit(child);
+    };
+    visit(value);
+    return result;
+  };
+  const rawReferences = objectReferences(rawEntry);
+  const projected = projectStatsAggregationInput(rawEntry);
+  const serialized = JSON.stringify(projected);
+  assert.equal(serialized.includes(canary), false);
+  for (const forbidden of [
+    "unit",
+    "findings",
+    "evidence",
+    "normalized_argv",
+    "repo_relative_cwd",
+    "executor",
+    "session_refs",
+    "interval_ids",
+    "fix_recipe",
+  ]) {
+    assert.equal(serialized.includes(`\"${forbidden}\"`), false, forbidden);
+  }
+  assert.deepEqual(Object.keys(projected).sort(), [
+    "baseline_metrics",
+    "changed_files_bucket",
+    "changed_lines_bucket",
+    "cohort_key",
+    "command_costs",
+    "created_at_ms",
+    "git_state_key",
+    "reason_codes",
+    "repository_key",
+    "schema_version",
+    "snapshot_id",
+    "terminal_metrics",
+    "work_unit_key",
+    "workspace_key",
+  ]);
+  const projectedReferences = objectReferences(projected);
+  for (const reference of rawReferences) {
+    assert.equal(projectedReferences.has(reference), false);
+  }
+  const snapshot = structuredClone(projected);
+  rawEntry.record.unit.repo = `/${canary}-mutated`;
+  rawEntry.record.findings.length = 0;
+  assert.deepEqual(projected, snapshot);
+
+  let hostileReads = 0;
+  const accessor = comparableHistoryEntry({
+    id: "projection-accessor",
+    createdAtMs: 5_001,
+    metric: 1,
+  });
+  Object.defineProperty(accessor.record.unit, "repo", {
+    enumerable: true,
+    get() {
+      hostileReads += 1;
+      throw new Error(canary);
+    },
+  });
+  const proxied = comparableHistoryEntry({
+    id: "projection-proxy",
+    createdAtMs: 5_002,
+    metric: 1,
+  });
+  proxied.record.command_costs = new Proxy(proxied.record.command_costs, {
+    get() {
+      hostileReads += 1;
+      throw new Error(canary);
+    },
+  });
+  const unknown = {
+    ...comparableHistoryEntry({
+      id: "projection-unknown",
+      createdAtMs: 5_003,
+      metric: 1,
+    }),
+    unexpected: canary,
+  };
+  for (const hostile of [accessor, proxied, unknown]) {
+    assert.throws(
+      () => projectStatsAggregationInput(hostile),
+      (error: unknown) => {
+        assert.ok(error instanceof TypeError);
+        assert.equal(error.message.includes(canary), false);
+        return true;
+      },
+    );
+  }
+  assert.equal(hostileReads, 0);
+});
+
+test("terminal selectors reject unclosed nested projected inputs content-free", () => {
+  const canary = "TASK6_DIRECT_AGGREGATION_RAW_CANARY";
+  let nextId = 0;
+  const fresh = (): StatsAggregationInput => projectStatsAggregationInput(
+    comparableHistoryEntry({
+      id: `direct-boundary-${(nextId += 1).toString(10)}`,
+      createdAtMs: 6_000 + nextId,
+      metric: 0.5,
+    }),
+  );
+
+  const unknownTerminalMetric = fresh();
+  unknownTerminalMetric.terminal_metrics = {
+    ...unknownTerminalMetric.terminal_metrics!,
+    [canary]: canary,
+  } as unknown as NonNullable<StatsAggregationInput["terminal_metrics"]>;
+
+  const unknownBaselineRow = fresh();
+  unknownBaselineRow.baseline_metrics = [{
+    metric: "human_wait_ratio",
+    value: 0.5,
+    [canary]: canary,
+  }] as unknown as StatsAggregationInput["baseline_metrics"];
+
+  const unknownRuleRow = fresh();
+  const unknownRuleMetrics = unknownRuleRow.terminal_metrics!;
+  unknownRuleMetrics.rules = unknownRuleMetrics.rules.map((row, index) =>
+    index === 0 ? { ...row, [canary]: canary } : { ...row }
+  ) as unknown as typeof unknownRuleMetrics.rules;
+
+  const rawCommandCosts = fresh();
+  rawCommandCosts.command_costs = [{
+    command: canary,
+    normalized_argv: [canary],
+  }] as unknown as StatsAggregationInput["command_costs"];
+
+  const unknownReasonCode = fresh();
+  unknownReasonCode.reason_codes = [canary] as unknown as
+    StatsAggregationInput["reason_codes"];
+
+  const unclosed = [
+    ["terminal metric", unknownTerminalMetric],
+    ["baseline row", unknownBaselineRow],
+    ["rule row", unknownRuleRow],
+    ["command costs", rawCommandCosts],
+    ["reason code", unknownReasonCode],
+  ] as const;
+  const actions = [
+    ["select", (input: StatsAggregationInput) =>
+      selectTerminalSnapshots([input])],
+    ["aggregate", (input: StatsAggregationInput) =>
+      aggregateTerminalStats([input], { mode: "stats_all_groups" })],
+  ] as const;
+
+  for (const [caseName, input] of unclosed) {
+    for (const [actionName, action] of actions) {
+      assert.throws(
+        () => action(input),
+        (error: unknown) => {
+          assert.ok(error instanceof TypeError);
+          assert.equal(error.message, "invalid stats aggregation input");
+          assert.doesNotMatch(String(error), new RegExp(canary, "u"));
+          return true;
+        },
+        `${actionName}: ${caseName}`,
+      );
+    }
+  }
+});
+
+test("terminal selectors reject nested accessors and proxies without invoking them", () => {
+  const canary = "TASK6_DIRECT_AGGREGATION_TRAP_CANARY";
+  let nextId = 0;
+  let hostileReads = 0;
+  const trap = (): never => {
+    hostileReads += 1;
+    throw new Error(canary);
+  };
+  const fresh = (): StatsAggregationInput => projectStatsAggregationInput(
+    comparableHistoryEntry({
+      id: `direct-hostile-${(nextId += 1).toString(10)}`,
+      createdAtMs: 7_000 + nextId,
+      metric: 0.5,
+    }),
+  );
+
+  const metricAccessor = fresh();
+  const accessorMetrics = { ...metricAccessor.terminal_metrics! };
+  Object.defineProperty(accessorMetrics, "measured_wall_ms", {
+    enumerable: true,
+    get: trap,
+  });
+  metricAccessor.terminal_metrics = accessorMetrics;
+
+  const metricProxy = fresh();
+  metricProxy.terminal_metrics = new Proxy(
+    { ...metricProxy.terminal_metrics! },
+    { ownKeys: trap },
+  );
+
+  const baselineAccessor = fresh();
+  const accessorBaseline = baselineAccessor.baseline_metrics.map((row) => ({
+    ...row,
+  }));
+  assert.ok(accessorBaseline[0] !== undefined);
+  Object.defineProperty(accessorBaseline[0]!, "value", {
+    enumerable: true,
+    get: trap,
+  });
+  baselineAccessor.baseline_metrics = accessorBaseline;
+
+  const baselineProxy = fresh();
+  const proxiedBaseline = baselineProxy.baseline_metrics.map((row, index) =>
+    index === 0
+      ? new Proxy({ ...row }, { ownKeys: trap })
+      : { ...row }
+  );
+  baselineProxy.baseline_metrics = proxiedBaseline;
+
+  const reasonAccessor = fresh();
+  const accessorReasons: Array<
+    StatsAggregationInput["reason_codes"][number]
+  > = ["missing_terminal_metrics"];
+  Object.defineProperty(accessorReasons, "0", {
+    enumerable: true,
+    get: trap,
+  });
+  reasonAccessor.reason_codes = accessorReasons;
+
+  const reasonProxy = fresh();
+  reasonProxy.reason_codes = new Proxy(
+    ["missing_terminal_metrics"] as Array<
+      StatsAggregationInput["reason_codes"][number]
+    >,
+    { ownKeys: trap },
+  );
+
+  const ruleAccessor = fresh();
+  const accessorRuleMetrics = ruleAccessor.terminal_metrics!;
+  const accessorRules = accessorRuleMetrics.rules.map((row) => ({ ...row }));
+  assert.ok(accessorRules[0] !== undefined);
+  Object.defineProperty(accessorRules[0]!, "rule_version", {
+    enumerable: true,
+    get: trap,
+  });
+  accessorRuleMetrics.rules = accessorRules;
+
+  const ruleProxy = fresh();
+  const proxiedRuleMetrics = ruleProxy.terminal_metrics!;
+  proxiedRuleMetrics.rules = proxiedRuleMetrics.rules.map((row, index) =>
+    index === 0
+      ? new Proxy({ ...row }, { ownKeys: trap })
+      : { ...row }
+  );
+
+  const hostile = [
+    ["terminal metric accessor", metricAccessor],
+    ["terminal metric proxy", metricProxy],
+    ["baseline accessor", baselineAccessor],
+    ["baseline proxy", baselineProxy],
+    ["reason accessor", reasonAccessor],
+    ["reason proxy", reasonProxy],
+    ["rule accessor", ruleAccessor],
+    ["rule proxy", ruleProxy],
+  ] as const;
+  const actions = [
+    ["select", (input: StatsAggregationInput) =>
+      selectTerminalSnapshots([input])],
+    ["aggregate", (input: StatsAggregationInput) =>
+      aggregateTerminalStats([input], { mode: "stats_all_groups" })],
+  ] as const;
+
+  for (const [caseName, input] of hostile) {
+    for (const [actionName, action] of actions) {
+      assert.throws(
+        () => action(input),
+        (error: unknown) => {
+          assert.ok(error instanceof TypeError);
+          assert.equal(error.message, "invalid stats aggregation input");
+          assert.doesNotMatch(String(error), new RegExp(canary, "u"));
+          return true;
+        },
+        `${actionName}: ${caseName}`,
+      );
+    }
+  }
+  assert.equal(hostileReads, 0);
+});
+
+test("terminal selectors detach valid projected inputs from later mutation", () => {
+  const input = projectStatsAggregationInput(comparableHistoryEntry({
+    id: "direct-detached-input",
+    createdAtMs: 8_000,
+    metric: 0.5,
+  }));
+  const expectedInput = structuredClone(input);
+  const selected = selectTerminalSnapshots([input]);
+  const aggregate = aggregateTerminalStats(
+    [input],
+    { mode: "stats_all_groups" },
+  );
+  const expectedAggregate = structuredClone(aggregate);
+  const selectedTerminal = selected.terminals[0];
+  assert.ok(selectedTerminal !== undefined);
+  assert.notEqual(selectedTerminal, input);
+  assert.notEqual(selectedTerminal.terminal_metrics, input.terminal_metrics);
+  assert.notEqual(
+    selectedTerminal.terminal_metrics?.rules,
+    input.terminal_metrics?.rules,
+  );
+  assert.notEqual(selectedTerminal.baseline_metrics, input.baseline_metrics);
+  assert.notEqual(selectedTerminal.reason_codes, input.reason_codes);
+
+  input.snapshot_id = "f".repeat(64);
+  input.terminal_metrics!.measured_wall_ms = 123_456;
+  input.terminal_metrics!.rules[0]!.confirmed_critical_path_ms = 123_456;
+  const baseline = input.baseline_metrics[0];
+  assert.ok(baseline !== undefined);
+  baseline.value = 0.75;
+  (input.reason_codes as Array<
+    StatsAggregationInput["reason_codes"][number]
+  >).push("missing_terminal_metrics");
+
+  assert.deepEqual(selected.terminals, [expectedInput]);
+  assert.deepEqual(selected.eligible_terminals, [expectedInput]);
+  assert.deepEqual(aggregate, expectedAggregate);
+});
+
+test("terminal comparable selectors require exact passive cohort evaluation modes", () => {
+  const canary = "TASK6_COHORT_MODE_CANARY";
+  const input = projectStatsAggregationInput(comparableHistoryEntry({
+    id: "cohort-mode-boundary",
+    createdAtMs: 8_100,
+    metric: 0.5,
+  }));
+  assert.ok(input.work_unit_key !== undefined);
+  assert.ok(input.cohort_key !== undefined);
+
+  let hostileReads = 0;
+  const trap = (): never => {
+    hostileReads += 1;
+    throw new Error(canary);
+  };
+  const accessorMode = {
+    current_work_unit_key: input.work_unit_key,
+    current_cohort_key: input.cohort_key,
+  };
+  Object.defineProperty(accessorMode, "mode", {
+    enumerable: true,
+    get: trap,
+  });
+  const proxiedMode = new Proxy({ mode: "stats_all_groups" }, {
+    get: trap,
+    getPrototypeOf: trap,
+    ownKeys: trap,
+    getOwnPropertyDescriptor: trap,
+  });
+  const revokedMode = Proxy.revocable({ mode: "stats_all_groups" }, {});
+  revokedMode.revoke();
+
+  const invalidModes: ReadonlyArray<readonly [string, unknown]> = [
+    ["inherited mode", Object.create({ mode: "stats_all_groups" })],
+    ["unknown mode", {
+      mode: "bogus",
+      current_work_unit_key: input.work_unit_key,
+      current_cohort_key: input.cohort_key,
+    }],
+    ["stats mode unknown field", {
+      mode: "stats_all_groups",
+      [canary]: canary,
+    }],
+    ["analysis mode missing field", {
+      mode: "analysis_current",
+      current_work_unit_key: input.work_unit_key,
+    }],
+    ["analysis mode unknown field", {
+      mode: "analysis_current",
+      current_work_unit_key: input.work_unit_key,
+      current_cohort_key: input.cohort_key,
+      [canary]: canary,
+    }],
+    ["mode accessor", accessorMode],
+    ["mode proxy", proxiedMode],
+    ["revoked mode proxy", revokedMode.proxy],
+  ];
+  const actions = [
+    ["select", (mode: CohortEvaluationMode) =>
+      selectComparableTerminalSnapshots([input], mode)],
+    ["aggregate", (mode: CohortEvaluationMode) =>
+      aggregateTerminalStats([input], mode)],
+  ] as const;
+
+  for (const [caseName, mode] of invalidModes) {
+    for (const [actionName, action] of actions) {
+      assert.throws(
+        () => action(mode as CohortEvaluationMode),
+        (error: unknown) => {
+          assert.ok(error instanceof TypeError);
+          assert.equal(error.message, "invalid cohort evaluation mode");
+          assert.doesNotMatch(String(error), new RegExp(canary, "u"));
+          return true;
+        },
+        `${actionName}: ${caseName}`,
+      );
+    }
+  }
+  assert.equal(hostileReads, 0);
+});
+
+test("robust distributions are order invariant and exact cohort buckets are fixed", () => {
+  const values = [1, 2, 3, 100];
+  const expectedDistribution = {
+    median: 2.5,
+    p50: 2.5,
+    p75: 27.25,
+    mad: 1,
+    sample_count: 4,
+  };
+  assert.deepEqual(cohortDistribution(values), expectedDistribution);
+  assert.deepEqual(
+    cohortDistribution([100, 3, 1, 2]),
+    expectedDistribution,
+  );
+
+  const cohortKey = (
+    changedFiles: number,
+    changedLines: number | null,
+    repositoryId = "1".repeat(64),
+    workspaceId = "2".repeat(64),
+  ): string | undefined => projectStatsAggregationInput(
+    comparableHistoryEntry({
+      id: `bucket-${repositoryId[0]}-${workspaceId[0]}-${changedFiles}-${String(changedLines)}`,
+      createdAtMs: 1,
+      metric: 1,
+      selectorNumber: 42,
+      repositoryId,
+      workspaceId,
+      changedFiles,
+      changedLines,
+    }),
+  ).cohort_key;
+
+  const fileBuckets = [
+    [0],
+    [1],
+    [2, 3, 4],
+    [5, 9],
+    [10, 19],
+    [20, 49],
+    [50, 1_000],
+  ] as const;
+  const fileBucketKeys = fileBuckets.map((bucket) => {
+    const keys = bucket.map((files) => cohortKey(files, 199));
+    assert.equal(new Set(keys).size, 1);
+    return keys[0];
+  });
+  assert.equal(new Set(fileBucketKeys).size, fileBuckets.length);
+
+  const lineBuckets = [
+    [0],
+    [1, 9],
+    [10, 49],
+    [50, 199],
+    [200, 999],
+    [1_000, 10_000],
+  ] as const;
+  const lineBucketKeys = lineBuckets.map((bucket) => {
+    const keys = bucket.map((lines) => cohortKey(4, lines));
+    assert.equal(new Set(keys).size, 1);
+    return keys[0];
+  });
+  assert.equal(new Set(lineBucketKeys).size, lineBuckets.length);
+
+  const base = projectStatsAggregationInput(comparableHistoryEntry({
+    id: "exact-cohort-base",
+    createdAtMs: 1,
+    metric: 1,
+    changedFiles: 4,
+    changedLines: 199,
+  }));
+  assert.equal(base.repository_key, "1".repeat(64));
+  assert.equal(base.workspace_key, "2".repeat(64));
+  assert.equal(
+    cohortKey(2, 50),
+    base.cohort_key,
+    "exact counts inside the same fixed buckets remain comparable",
+  );
+  const changedDimensions = [
+    cohortKey(4, 199, "6".repeat(64), "2".repeat(64)),
+    cohortKey(4, 199, "1".repeat(64), "7".repeat(64)),
+    cohortKey(5, 199),
+    cohortKey(4, 200),
+  ];
+  for (const changed of changedDimensions) {
+    assert.ok(changed !== undefined);
+    assert.notEqual(changed, base.cohort_key);
+  }
+
+  const missingLines = projectStatsAggregationInput(comparableHistoryEntry({
+    id: "missing-lines",
+    createdAtMs: 2,
+    metric: 1,
+    changedLines: null,
+  }));
+  assert.equal(missingLines.cohort_key, undefined);
+  assert.ok(missingLines.reason_codes.includes("missing_changed_lines"));
+});
+
+test("terminal aggregation rejects forged cohort keys before minimum-size grouping", () => {
+  const changedFiles = [0, 1, 2, 5, 10] as const;
+  const projected = changedFiles.map((files, index) =>
+    projectStatsAggregationInput(comparableHistoryEntry({
+      id: `forged-cohort-${index.toString(10)}`,
+      createdAtMs: 9_000 + index,
+      metric: index + 1,
+      selectorNumber: 200 + index,
+      changedFiles: files,
+      changedLines: 199,
+    }))
+  );
+  const tupleKeys = projected.map((entry) => {
+    assert.ok(entry.repository_key !== undefined);
+    assert.ok(entry.workspace_key !== undefined);
+    assert.ok(entry.changed_files_bucket !== undefined);
+    assert.ok(entry.changed_lines_bucket !== undefined);
+    assert.ok(entry.cohort_key !== undefined);
+    return JSON.stringify([
+      entry.repository_key,
+      entry.workspace_key,
+      entry.changed_files_bucket,
+      entry.changed_lines_bucket,
+    ]);
+  });
+  assert.equal(new Set(tupleKeys).size, projected.length);
+
+  const forgedCohortKey = exactCohortKey({
+    repository_key: "e".repeat(64),
+    workspace_key: "f".repeat(64),
+    changed_files_bucket: "files_50_plus",
+    changed_lines_bucket: "lines_1000_plus",
+  });
+  for (const entry of projected) {
+    assert.notEqual(entry.cohort_key, forgedCohortKey);
+    entry.cohort_key = forgedCohortKey;
+  }
+
+  for (const input of [[projected[0]!], projected]) {
+    assert.throws(
+      () => aggregateTerminalStats(
+        input,
+        { mode: "stats_all_groups" },
+        5,
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof TypeError);
+        assert.equal(error.message, "invalid stats aggregation input");
+        return true;
+      },
+    );
+  }
+});
+
+test("baseline selects terminal exact cohorts before opaque self exclusion", () => {
+  const currentEntries = [
+    comparableHistoryEntry({
+      id: "current-state-a",
+      createdAtMs: 1_000,
+      metric: 900,
+      selectorNumber: 99,
+      displayRef: "shared-display-label",
+      gitState: "state-a",
+      analysisVariant: "a-original",
+    }),
+    comparableHistoryEntry({
+      id: "current-state-b",
+      createdAtMs: 2_000,
+      metric: 800,
+      selectorNumber: 99,
+      displayRef: "shared-display-label",
+      gitState: "state-b",
+      analysisVariant: "b",
+    }),
+    comparableHistoryEntry({
+      id: "current-state-a-variant",
+      createdAtMs: 3_000,
+      metric: 700,
+      selectorNumber: 99,
+      displayRef: "shared-display-label",
+      gitState: "state-a",
+      analysisVariant: "a-rerun",
+    }),
+  ];
+  const projectedCurrent = projectComparableHistory(currentEntries);
+  const selectedCurrent = selectTerminalSnapshots(projectedCurrent);
+  assert.deepEqual(
+    selectedCurrent.terminals.map(({ snapshot_id }) => snapshot_id),
+    [currentEntries[1]!.snapshot_id],
+    "state A keeps its first-seen time, so a later A variant cannot supersede B",
+  );
+  assert.equal(selectedCurrent.metadata.superseded_snapshot_count, 2);
+  const currentWorkUnitKey = projectedCurrent[0]?.work_unit_key;
+  const currentCohortKey = projectedCurrent[0]?.cohort_key;
+  assert.ok(currentWorkUnitKey !== undefined);
+  assert.ok(currentCohortKey !== undefined);
+  assert.ok(projectedCurrent.every(
+    ({ work_unit_key }) => work_unit_key === currentWorkUnitKey,
+  ));
+
+  const firstComparableStates = [
+    comparableHistoryEntry({
+      id: "comparable-one-old",
+      createdAtMs: 100,
+      metric: 1_000,
+      selectorNumber: 10,
+      gitState: "comparable-old",
+    }),
+    comparableHistoryEntry({
+      id: "comparable-one-terminal",
+      createdAtMs: 200,
+      metric: 1,
+      selectorNumber: 10,
+      gitState: "comparable-new",
+    }),
+  ];
+  const comparableEntries = [
+    ...firstComparableStates,
+    ...[2, 3, 4].map((metric, index) => comparableHistoryEntry({
+      id: `comparable-${metric}`,
+      createdAtMs: 300 + index,
+      metric,
+      selectorNumber: 11 + index,
+    })),
+    comparableHistoryEntry({
+      id: "same-display-different-selector",
+      createdAtMs: 400,
+      metric: 100,
+      displayRef: "shared-display-label",
+      selector: {
+        kind: "explicit_range",
+        range: "double_dot",
+        base_ref_digest: selectorRefDigest(
+          "explicit_range",
+          "base",
+          "main",
+        ),
+        head_ref_digest: selectorRefDigest(
+          "explicit_range",
+          "head",
+          "feature",
+        ),
+      },
+    }),
+  ];
+  const ineligibleComparables = [
+    comparableHistoryEntry({
+      id: "neighboring-file-bucket",
+      createdAtMs: 500,
+      metric: 5_000,
+      selectorNumber: 20,
+      changedFiles: 5,
+    }),
+    comparableHistoryEntry({
+      id: "neighboring-line-bucket",
+      createdAtMs: 501,
+      metric: 6_000,
+      selectorNumber: 21,
+      changedLines: 200,
+    }),
+    comparableHistoryEntry({
+      id: "different-repository",
+      createdAtMs: 502,
+      metric: 7_000,
+      selectorNumber: 22,
+      repositoryId: "6".repeat(64),
+    }),
+    comparableHistoryEntry({
+      id: "different-workspace",
+      createdAtMs: 503,
+      metric: 8_000,
+      selectorNumber: 23,
+      workspaceId: "7".repeat(64),
+    }),
+  ];
+  const currentMetrics = [{
+    metric: "human_wait_ratio",
+    value: 50,
+  }] as const;
+  const mode = {
+    mode: "analysis_current",
+    current_work_unit_key: currentWorkUnitKey,
+    current_cohort_key: currentCohortKey,
+  } as const;
+  const fourComparableWorkUnits = projectComparableHistory([
+    ...currentEntries,
+    ...comparableEntries.slice(0, -1),
+  ]);
+  assert.equal(
+    computeBaseline(currentMetrics, fourComparableWorkUnits, mode, 5),
+    null,
+  );
+
+  const projectedHistory = projectComparableHistory([
+    ...currentEntries,
+    ...comparableEntries,
+    ...ineligibleComparables,
+  ]);
+  const expected = {
+    prs: 5,
+    notable: [{
+      metric: "human_wait_ratio",
+      value: 50,
+      baseline: 3,
+      median: 3,
+      p50: 3,
+      p75: 4,
+      mad: 1,
+      sample_count: 5,
+    }],
+  };
+  assert.deepEqual(
+    computeBaseline(currentMetrics, projectedHistory, mode, 5),
+    expected,
+  );
+  assert.deepEqual(
+    computeBaseline(currentMetrics, [...projectedHistory].reverse(), mode, 5),
+    expected,
+  );
+  assert.equal(
+    computeBaseline(currentMetrics, projectedHistory, mode, 20),
+    null,
+  );
+
+  const twenty = Array.from({ length: 20 }, (_, index) =>
+    comparableHistoryEntry({
+      id: `floor-twenty-${index + 1}`,
+      createdAtMs: 10_000 + index,
+      metric: index + 1,
+      selectorNumber: 100 + index,
+    })
+  );
+  assert.deepEqual(
+    computeBaseline(currentMetrics, projectComparableHistory(twenty), mode, 20),
+    {
+      prs: 20,
+      notable: [{
+        metric: "human_wait_ratio",
+        value: 50,
+        baseline: 10.5,
+        median: 10.5,
+        p50: 10.5,
+        p75: 15.25,
+        mad: 5,
+        sample_count: 20,
+      }],
+    },
+  );
+});
+
+test("legacy mean-only baselines remain readable without robust labels", () => {
+  const legacy = record("legacy-mean-baseline", 900);
+  const normalized = makeAnalysisRecord({
+    ...legacy,
+    summary: {
+      ...legacy.summary,
+      baseline: {
+        prs: 3,
+        notable: [{
+          metric: "human_wait_ratio",
+          value: 0.5,
+          baseline: 0.25,
+        }],
+      },
+    },
+  });
+  assert.deepEqual(normalized.summary.baseline, {
+    prs: 3,
+    notable: [{
+      metric: "human_wait_ratio",
+      value: 0.5,
+      baseline: 0.25,
+    }],
+  });
+  assert.equal(
+    "median" in (normalized.summary.baseline?.notable[0] ?? {}),
+    false,
+  );
+});
 
 test("analysis records clone and persist optional terminal stats snapshots", async () => {
   const source = storedTerminalStatsSnapshot();

@@ -38,12 +38,24 @@ import type {
   FindingConfidence,
   ImpactEstimate,
   ReportV2,
+  RuleId,
 } from "../src/core/model.js";
 import {
   findingScoringRationale,
   findingSeverity,
 } from "../src/core/model.js";
 import { commandIdentityKey } from "../src/analysis/command-identity.js";
+import {
+  aggregateTerminalStats,
+  exactCohortKey,
+  selectTerminalSnapshots,
+  statsOpaqueDigest,
+} from "../src/analysis/stats-aggregation.js";
+import {
+  boundTerminalHistory,
+  projectStatsAggregationInput,
+  type StatsAggregationInput,
+} from "../src/analysis/stats-input.js";
 import {
   InvalidAnalysisWindowError,
   NoAnalyzableTimestampsError,
@@ -63,6 +75,7 @@ import {
   renderStatsJson,
   renderStatsTty,
   summarizeStats,
+  summarizeTerminalStats,
   type StatsReport,
 } from "../src/reporters/stats.js";
 import {
@@ -70,8 +83,11 @@ import {
   TTY_MAX_LINES,
 } from "../src/reporters/tty.js";
 import {
+  analysisDigest,
   makeAnalysisRecord,
   type AnalysisRecord,
+  type AnalysisHistoryEntry,
+  type AnalysisSnapshotIdentity,
 } from "../src/store/analyses.js";
 import type { AdoptionRecord } from "../src/store/adoptions.js";
 import { runStatsCommand } from "../src/commands/stats.js";
@@ -79,6 +95,8 @@ import {
   resolveEffectivePolicy,
   type PolicyRequest,
 } from "../src/policy/organization-policy.js";
+import { buildChronicCostAggregates } from "../src/rules/chronic-cost.js";
+import { listRuleManifests } from "../src/rules/manifest.js";
 import type { StorePaths } from "../src/store/paths.js";
 
 function finding(
@@ -1023,6 +1041,74 @@ test("stats TTY removes stored control strings while stats JSON preserves values
   assert.equal(json.chronic_commands[0]?.command, command);
   assert.equal("command_identity" in json.chronic_commands[0]!, false);
   assert.equal(json.baseline_metrics[0]?.metric, metric);
+});
+
+test("stats JSON, privacy, and TTY expose bounded R006 v2 command-cohort rows", () => {
+  const commandIdentity = {
+    repo_relative_cwd: "packages/api",
+    normalized_argv: ["npm", "test"],
+    executor: "shell",
+  } satisfies CommandIdentity;
+  const stats: StatsReport = {
+    history_count: 6,
+    baseline_metrics: [],
+    chronic_commands: [{
+      command: "npm test",
+      command_identity: commandIdentity,
+      cache_state: "cold",
+      history_count: 6,
+      presence_count: 5,
+      sample_count: 5,
+      ratio: 0.4167,
+      resource_upper_ms: 833.3333,
+      median: 1_000,
+      p50: 1_000,
+      p75: 1_000,
+      mad: 0,
+      cost_ratio: 0.4167,
+      estimated_min: 0.0139,
+    }],
+    rule_minutes: [],
+    recurring_findings: [],
+    adoptions: [],
+    adoption_coverage: { detectable: 0, undetectable: 0 },
+  };
+  const expectedRow = {
+    command: "npm test",
+    command_identity: commandIdentity,
+    cache_state: "cold",
+    history_count: 6,
+    presence_count: 5,
+    sample_count: 5,
+    ratio: 0.4167,
+    resource_upper_ms: 833.3333,
+    median: 1_000,
+    p50: 1_000,
+    p75: 1_000,
+    mad: 0,
+    cost_ratio: 0.4167,
+    estimated_min: 0.0139,
+  };
+
+  assert.deepEqual(
+    (JSON.parse(renderStatsJson(stats)) as StatsReport).chronic_commands,
+    [expectedRow],
+  );
+  const projected = projectStatsPrivacy(stats, "balanced", "/repo");
+  const { command_identity: ignoredIdentity, ...privacySafeRow } = expectedRow;
+  void ignoredIdentity;
+  assert.deepEqual(projected.chronic_commands[0], privacySafeRow);
+  const tty = renderStatsTty(stats);
+  assert.match(tty, /packages\/api :: npm test/u);
+  assert.match(tty, /cold/u);
+  assert.match(tty, /5\/6/u);
+  assert.match(tty, /41\.67%/u);
+  assert.match(tty, /833\.3333/u);
+  assert.match(tty, /median 1000/u);
+  assert.match(tty, /p50 1000/u);
+  assert.match(tty, /p75 1000/u);
+  assert.match(tty, /MAD 0/u);
+  assert.doesNotMatch(tty, /session_refs|command_key|cohort_key/u);
 });
 
 test("CLI parser accepts direct analyze, optional PR selectors, durations, stats, and dismiss", () => {
@@ -2143,13 +2229,63 @@ test("report privacy clones budget facts without changing their values", () => {
   }
 });
 
-test("stats raw privacy returns the report and keeps JSON and TTY bytes unchanged", () => {
+test("stats raw privacy clones the report and keeps JSON and TTY bytes unchanged", () => {
   const raw = statsPrivacyReport();
   const projected = projectStatsPrivacy(raw, "raw", PRIVACY_REPO);
 
-  assert.equal(projected, raw);
+  assert.notEqual(projected, raw);
+  assert.deepEqual(projected, raw);
+  assert.notEqual(projected.baseline_metrics, raw.baseline_metrics);
+  assert.notEqual(projected.chronic_commands, raw.chronic_commands);
+  assert.notEqual(
+    projected.chronic_commands[0]?.command_identity,
+    raw.chronic_commands[0]?.command_identity,
+  );
+  assert.notEqual(projected.recurring_findings, raw.recurring_findings);
+  assert.notEqual(projected.adoptions, raw.adoptions);
   assert.equal(renderStatsJson(projected), renderStatsJson(raw));
   assert.equal(renderStatsTty(projected), renderStatsTty(raw));
+});
+
+test("stats privacy preserves robust baselines while redacting identity", () => {
+  const raw = statsPrivacyReport();
+  raw.baseline_metrics = [{
+    ...raw.baseline_metrics[0]!,
+    median: 0.31,
+    p50: 0.32,
+    p75: 0.33,
+    mad: 0.34,
+    sample_count: 35,
+  }];
+  const expectedReference = findingPrivacyReference(
+    PRIVACY_REPO,
+    STATS_PRIVACY_KEY,
+  );
+
+  for (const profile of ["strict", "balanced"] as const) {
+    const projected = projectStatsPrivacy(raw, profile, PRIVACY_REPO);
+    const baseline = projected.baseline_metrics[0];
+    assert.ok(baseline !== undefined);
+    const { metric, ...numeric } = baseline;
+    assert.notEqual(metric, raw.baseline_metrics[0]?.metric);
+    assert.deepEqual(numeric, {
+      value: 0.42,
+      baseline: 0.17,
+      median: 0.31,
+      p50: 0.32,
+      p75: 0.33,
+      mad: 0.34,
+      sample_count: 35,
+    });
+    assert.equal(
+      projected.recurring_findings[0]?.finding_key,
+      expectedReference,
+    );
+    const output = renderStatsJson(projected);
+    for (const canary of STATS_PRIVACY_CANARIES) {
+      assert.equal(output.includes(canary), false, `${profile} leaked ${canary}`);
+    }
+  }
 });
 
 test("privacy keeps ordinary session-prefixed prose", () => {
@@ -3117,6 +3253,1007 @@ function adoptionRecordFixture(
     ...overrides,
   };
 }
+
+const TASK6_REPOSITORY_KEY = "a".repeat(64);
+const TASK6_WORKSPACE_KEY = "b".repeat(64);
+const TASK6_AXIS_VALUES = {
+  confirmed_critical_path_ms: 60_000,
+  estimated_critical_path_upper_ms: 120_000,
+  resource_cost_ms: 180_000,
+  human_wait_ms: 240_000,
+  unexplained_ms: 300_000,
+} as const;
+type Task6Axis = keyof typeof TASK6_AXIS_VALUES;
+
+interface Task6AggregateMetadata {
+  stored_snapshot_count: number;
+  distinct_work_unit_count: number;
+  terminal_snapshot_count: number;
+  superseded_snapshot_count: number;
+  ineligible_snapshot_count: number;
+  sample_count: number;
+  minimum_cohort_size: number;
+  status: "available" | "suppressed";
+  reason_codes: Array<"below_minimum">;
+}
+
+interface Task6AggregateResult {
+  selected_snapshot_ids: string[];
+  metadata: Task6AggregateMetadata;
+  terminal_metrics?: Record<Task6Axis, number>;
+  rule_minutes: Array<{ rule_id: RuleId; minutes: number }>;
+  cohorts: Array<{
+    cohort_key: string;
+    metadata: Pick<
+      Task6AggregateMetadata,
+      "sample_count" | "minimum_cohort_size" | "status" | "reason_codes"
+    >;
+    distributions?: Record<Task6Axis, {
+      median: number;
+      p50: number;
+      p75: number;
+      mad: number;
+      sample_count: number;
+    }>;
+  }>;
+}
+
+function task6TerminalInput(options: {
+  id: string;
+  createdAtMs: number;
+  workUnit?: string;
+  gitState?: string;
+  changedFilesBucket?: NonNullable<
+    StatsAggregationInput["changed_files_bucket"]
+  >;
+  changedLinesBucket?: NonNullable<
+    StatsAggregationInput["changed_lines_bucket"]
+  >;
+}): StatsAggregationInput {
+  const workUnit = options.workUnit ?? options.id;
+  const gitState = options.gitState ?? options.id;
+  const changedFilesBucket = options.changedFilesBucket ?? "files_2_4";
+  const changedLinesBucket = options.changedLinesBucket ?? "lines_50_199";
+  const cohortKey = exactCohortKey({
+    repository_key: TASK6_REPOSITORY_KEY,
+    workspace_key: TASK6_WORKSPACE_KEY,
+    changed_files_bucket: changedFilesBucket,
+    changed_lines_bucket: changedLinesBucket,
+  });
+  return {
+    schema_version: 1,
+    snapshot_id: statsOpaqueDigest("task6-snapshot-v1", options.id),
+    created_at_ms: options.createdAtMs,
+    work_unit_key: statsOpaqueDigest("task6-work-unit-v1", workUnit),
+    git_state_key: statsOpaqueDigest("task6-git-state-v1", [
+      workUnit,
+      gitState,
+    ]),
+    repository_key: TASK6_REPOSITORY_KEY,
+    workspace_key: TASK6_WORKSPACE_KEY,
+    changed_files_bucket: changedFilesBucket,
+    changed_lines_bucket: changedLinesBucket,
+    cohort_key: cohortKey,
+    terminal_metrics: {
+      measured_wall_ms: 900_000,
+      ...TASK6_AXIS_VALUES,
+      rules: listRuleManifests().map((manifest) => ({
+        rule_id: manifest.id,
+        rule_version: manifest.version,
+        compatibility_epoch: manifest.compatibility_epoch,
+        confirmed_critical_path_ms:
+          manifest.id === "R001"
+            ? TASK6_AXIS_VALUES.confirmed_critical_path_ms
+            : 0,
+        estimated_critical_path_upper_ms:
+          manifest.id === "R001"
+            ? TASK6_AXIS_VALUES.estimated_critical_path_upper_ms
+            : 0,
+        resource_cost_ms:
+          manifest.id === "R005" ? TASK6_AXIS_VALUES.resource_cost_ms : 0,
+      })),
+    },
+    baseline_metrics: [],
+    command_costs: [],
+    reason_codes: [],
+  };
+}
+
+function task6Aggregate(
+  input: readonly StatsAggregationInput[],
+  minimumCohortSize = 5,
+): Task6AggregateResult {
+  return aggregateTerminalStats(
+    input,
+    { mode: "stats_all_groups" },
+    minimumCohortSize,
+  ) as Task6AggregateResult;
+}
+
+function task6OverflowTerminal(
+  axis: Task6Axis,
+  index: number,
+): StatsAggregationInput {
+  const input = task6TerminalInput({
+    id: `overflow-${axis}-${index.toString(10)}`,
+    createdAtMs: index,
+  });
+  const metrics = input.terminal_metrics!;
+  metrics.measured_wall_ms = 1e308;
+  metrics.confirmed_critical_path_ms = 0;
+  metrics.estimated_critical_path_upper_ms = 0;
+  metrics.resource_cost_ms = 0;
+  metrics.human_wait_ms = 0;
+  metrics.unexplained_ms = 0;
+  metrics.rules = metrics.rules.map((row) => ({
+    ...row,
+    confirmed_critical_path_ms: 0,
+    estimated_critical_path_upper_ms: 0,
+    resource_cost_ms: 0,
+  }));
+  metrics[axis] = 1e308;
+
+  const r001 = metrics.rules.find(({ rule_id }) => rule_id === "R001");
+  const r005 = metrics.rules.find(({ rule_id }) => rule_id === "R005");
+  assert.ok(r001 !== undefined);
+  assert.ok(r005 !== undefined);
+  if (axis === "confirmed_critical_path_ms") {
+    metrics.estimated_critical_path_upper_ms = 1e308;
+    r001.confirmed_critical_path_ms = 1e308;
+    r001.estimated_critical_path_upper_ms = 1e308;
+  } else if (axis === "estimated_critical_path_upper_ms") {
+    r001.estimated_critical_path_upper_ms = 1e308;
+  } else if (axis === "resource_cost_ms") {
+    r005.resource_cost_ms = 1e308;
+  }
+  return input;
+}
+
+test("terminal stats reject finite aggregate overflow before JSON can encode null", () => {
+  const axes = Object.keys(TASK6_AXIS_VALUES) as Task6Axis[];
+  for (const axis of axes) {
+    assert.throws(
+      () => task6Aggregate(Array.from(
+        { length: 5 },
+        (_, index) => task6OverflowTerminal(axis, index + 1),
+      )),
+      (error: unknown) => {
+        assert.ok(error instanceof TypeError);
+        assert.equal(error.message, "invalid stats aggregation input");
+        return true;
+      },
+      axis,
+    );
+  }
+
+  const control = summarizeTerminalStats(
+    task6Aggregate(Array.from(
+      { length: 5 },
+      (_, index) => task6TerminalInput({
+        id: `finite-json-control-${index + 1}`,
+        createdAtMs: index + 1,
+      }),
+    )),
+    [],
+  );
+  assert.doesNotMatch(renderStatsJson(control), /:\s*null(?:,|\n)/u);
+});
+
+test("terminal stats gate five axes and confirmed-only rule minutes at the effective floor", () => {
+  const input = Array.from({ length: 5 }, (_, index) =>
+    task6TerminalInput({
+      id: `floor-${index + 1}`,
+      createdAtMs: index + 1,
+    })
+  );
+  const four = task6Aggregate(input.slice(0, 4));
+  assert.equal("terminal_metrics" in four, false);
+  assert.equal(four.metadata.sample_count, 4);
+  assert.equal(four.metadata.minimum_cohort_size, 5);
+  assert.equal(four.metadata.status, "suppressed");
+  assert.deepEqual(four.metadata.reason_codes, ["below_minimum"]);
+  assert.deepEqual(four.rule_minutes, []);
+
+  const five = task6Aggregate(input);
+  assert.deepEqual(five.terminal_metrics, {
+    confirmed_critical_path_ms: 300_000,
+    estimated_critical_path_upper_ms: 600_000,
+    resource_cost_ms: 900_000,
+    human_wait_ms: 1_200_000,
+    unexplained_ms: 1_500_000,
+  });
+  assert.equal(five.metadata.sample_count, 5);
+  assert.equal(five.metadata.status, "available");
+  assert.deepEqual(five.metadata.reason_codes, []);
+  assert.deepEqual(five.rule_minutes, [{ rule_id: "R001", minutes: 5 }]);
+  assert.equal(
+    five.rule_minutes.some(({ rule_id }) => rule_id === "R005"),
+    false,
+    "resource upper estimates never enter confirmed rule minutes",
+  );
+});
+
+test("stats keeps exact cohort distributions independently policy-sized", () => {
+  const cohortA = (count: number) => Array.from({ length: count }, (_, index) =>
+    task6TerminalInput({
+      id: `cohort-a-${index + 1}`,
+      createdAtMs: 100 + index,
+      changedFilesBucket: "files_2_4",
+    })
+  );
+  const cohortB = (count: number) => Array.from({ length: count }, (_, index) =>
+    task6TerminalInput({
+      id: `cohort-b-${index + 1}`,
+      createdAtMs: 200 + index,
+      changedFilesBucket: "files_5_9",
+    })
+  );
+  const cohortAKey = cohortA(1)[0]!.cohort_key!;
+  const cohortBKey = cohortB(1)[0]!.cohort_key!;
+  assert.notEqual(cohortAKey, cohortBKey);
+
+  const individuallySmall = task6Aggregate([
+    ...cohortA(3),
+    ...cohortB(2),
+  ]);
+  assert.equal(
+    individuallySmall.metadata.status,
+    "available",
+    "the top-level terminal population reaches five",
+  );
+  assert.equal(individuallySmall.cohorts.length, 2);
+  const smallByKey = new Map(
+    individuallySmall.cohorts.map((cohort) => [cohort.cohort_key, cohort]),
+  );
+  assert.equal(smallByKey.get(cohortAKey)?.metadata.sample_count, 3);
+  assert.equal(smallByKey.get(cohortBKey)?.metadata.sample_count, 2);
+  for (const cohort of individuallySmall.cohorts) {
+    assert.equal(cohort.metadata.status, "suppressed");
+    assert.deepEqual(cohort.metadata.reason_codes, ["below_minimum"]);
+    assert.equal("distributions" in cohort, false);
+  }
+
+  const independentlyReady = task6Aggregate([
+    ...cohortA(5),
+    ...cohortB(5),
+  ]);
+  assert.deepEqual(
+    independentlyReady.cohorts.map(({ cohort_key }) => cohort_key),
+    [cohortAKey, cohortBKey].sort((left, right) =>
+      left.localeCompare(right)),
+  );
+  assert.equal(independentlyReady.selected_snapshot_ids.length, 10);
+  const expectedDistributions = Object.fromEntries(
+    Object.entries(TASK6_AXIS_VALUES).map(([metric, value]) => [metric, {
+      median: value,
+      p50: value,
+      p75: value,
+      mad: 0,
+      sample_count: 5,
+    }]),
+  ) as Task6AggregateResult["cohorts"][number]["distributions"];
+  for (const cohort of independentlyReady.cohorts) {
+    assert.equal(cohort.metadata.sample_count, 5);
+    assert.equal(cohort.metadata.status, "available");
+    assert.deepEqual(cohort.metadata.reason_codes, []);
+    assert.deepEqual(cohort.distributions, expectedDistributions);
+  }
+  assert.deepEqual(
+    task6Aggregate([
+      ...cohortB(5).reverse(),
+      ...cohortA(5).reverse(),
+    ]),
+    independentlyReady,
+  );
+});
+
+test("terminal history window keeps deterministic recent ties and reports truncated work units", () => {
+  const projected = Array.from({ length: 10_002 }, (_, index) =>
+    task6TerminalInput({
+      id: `window-tie-${index.toString(10).padStart(5, "0")}`,
+      createdAtMs: 1_000,
+    })
+  );
+  const ordered = [...projected]
+    .sort((left, right) =>
+      left.created_at_ms - right.created_at_ms ||
+      left.snapshot_id.localeCompare(right.snapshot_id));
+  const firstDroppedWorkUnit = ordered[0]?.work_unit_key;
+  const secondDroppedWorkUnit = ordered[1]?.work_unit_key;
+  assert.ok(firstDroppedWorkUnit !== undefined);
+  assert.ok(secondDroppedWorkUnit !== undefined);
+  ordered.at(-2)!.work_unit_key = firstDroppedWorkUnit;
+  ordered.at(-1)!.work_unit_key = secondDroppedWorkUnit;
+  const dropped = ordered.slice(0, 2);
+  const droppedWorkUnitKeys = new Set(dropped.map(({ work_unit_key }) =>
+    work_unit_key!));
+  const expected = ordered.slice(2).filter(({ work_unit_key }) =>
+    !droppedWorkUnitKeys.has(work_unit_key!));
+
+  for (const input of [projected, [...projected].reverse()]) {
+    const window = boundTerminalHistory(input);
+    assert.deepEqual(
+      window.entries.map(({ snapshot_id }) => snapshot_id),
+      expected.map(({ snapshot_id }) => snapshot_id),
+    );
+    assert.deepEqual(window.metadata, {
+      total_snapshot_count: 10_002,
+      window_snapshot_count: 9_998,
+      truncated_snapshot_count: 4,
+    });
+    assert.deepEqual(
+      [...window.truncated_work_unit_keys].sort(),
+      dropped.map(({ work_unit_key }) => work_unit_key!).sort(),
+    );
+  }
+});
+
+test("terminal history window does not weaken the aggregation collection guard", () => {
+  const entry = task6TerminalInput({ id: "nested-guard", createdAtMs: 1 });
+  entry.command_costs = Array.from({ length: 10_001 }, (_, index) => ({
+    command_key: statsOpaqueDigest(
+      "nested-guard-command-v1",
+      index.toString(10),
+    ),
+    cache_state: "cold" as const,
+    duration_ms: index,
+  }));
+  assert.throws(
+    () => selectTerminalSnapshots([entry]),
+    /invalid stats aggregation input/u,
+  );
+});
+
+test("terminal snapshot IDs bound recurrence adoption and the history label", () => {
+  const projected = [
+    task6TerminalInput({
+      id: "observational-a-original",
+      createdAtMs: 1_000,
+      workUnit: "observational-work-one",
+      gitState: "state-a",
+    }),
+    task6TerminalInput({
+      id: "observational-b-terminal",
+      createdAtMs: 2_000,
+      workUnit: "observational-work-one",
+      gitState: "state-b",
+    }),
+    task6TerminalInput({
+      id: "observational-a-rerun",
+      createdAtMs: 3_000,
+      workUnit: "observational-work-one",
+      gitState: "state-a",
+    }),
+    ...Array.from({ length: 4 }, (_, index) => task6TerminalInput({
+      id: `observational-independent-${index + 1}`,
+      createdAtMs: 2_100 + index,
+    })),
+  ];
+  const aggregate = task6Aggregate(projected);
+  const originalId = projected[0]!.snapshot_id;
+  const terminalId = projected[1]!.snapshot_id;
+  const rerunId = projected[2]!.snapshot_id;
+  assert.ok(aggregate.selected_snapshot_ids.includes(terminalId));
+  assert.equal(aggregate.selected_snapshot_ids.includes(originalId), false);
+  assert.equal(aggregate.selected_snapshot_ids.includes(rerunId), false);
+  assert.equal(aggregate.metadata.stored_snapshot_count, 7);
+  assert.equal(aggregate.metadata.terminal_snapshot_count, 5);
+  assert.equal(aggregate.metadata.superseded_snapshot_count, 2);
+
+  const terminalOnlyFinding = adoptionFinding("terminal-only-key", {
+    rule_id: "R002",
+    title: "Only terminal work units count",
+    recoverable: { min: 6, bound: "point" },
+  });
+  const findingsById = new Map<string, Finding[]>([
+    ["observational-a-original", [structuredClone(terminalOnlyFinding)]],
+    ["observational-a-rerun", [structuredClone(terminalOnlyFinding)]],
+    ["observational-independent-1", [
+      structuredClone(terminalOnlyFinding),
+    ]],
+  ]);
+  const recordsBySnapshot = new Map<string, AnalysisRecord>();
+  const allRecords = projected.map((entry, index) => {
+    const id = index < 3
+      ? [
+          "observational-a-original",
+          "observational-b-terminal",
+          "observational-a-rerun",
+        ][index]!
+      : `observational-independent-${index - 2}`;
+    const record = adoptionAnalysisRecord(
+      `terminal-record-${index}`,
+      entry.created_at_ms,
+      findingsById.get(id) ?? [],
+      index < 3 ? "shared-observational-pr" : `terminal-pr-${index}`,
+    );
+    recordsBySnapshot.set(entry.snapshot_id, record);
+    return record;
+  });
+  assert.equal(
+    summarizeStats(allRecords).recurring_findings[0]?.occurrence_count,
+    3,
+    "the fixture would recur if superseded records leaked into stats",
+  );
+  const terminalRecords = aggregate.selected_snapshot_ids.map((snapshotId) => {
+    const record = recordsBySnapshot.get(snapshotId);
+    assert.ok(record !== undefined);
+    return record;
+  });
+  const stats = summarizeTerminalStats(
+    aggregate,
+    terminalRecords,
+    [adoptionRecordFixture({
+      finding_key: "terminal-only-key",
+      rule_id: "R002",
+      detected_at_ms: 1_500,
+    })],
+  ) as StatsReport;
+
+  assert.equal(stats.history_count, 5);
+  assert.deepEqual(stats.recurring_findings, []);
+  assert.equal(stats.adoptions[0]?.minutes_before, 0);
+  assert.equal(stats.adoptions[0]?.analyses_after, 5);
+  assert.equal(stats.adoptions[0]?.recurrences_after, 1);
+  assert.equal(stats.adoptions[0]?.minutes_after, 6);
+  assert.equal(stats.adoptions[0]?.status, "recurred");
+  assert.deepEqual(stats.rule_minutes, [{ rule_id: "R001", minutes: 5 }]);
+  assert.match(renderStatsTty(stats), /^History: 5 terminal work units$/mu);
+});
+
+test("an incomplete terminal counts as history without entering KPI statistics", () => {
+  const incomplete = task6TerminalInput({
+    id: "incomplete-only-terminal",
+    createdAtMs: 1_000,
+  });
+  delete incomplete.terminal_metrics;
+
+  const aggregate = task6Aggregate([incomplete]);
+  assert.deepEqual(aggregate.selected_snapshot_ids, [incomplete.snapshot_id]);
+  assert.deepEqual(aggregate.metadata, {
+    stored_snapshot_count: 1,
+    distinct_work_unit_count: 1,
+    terminal_snapshot_count: 1,
+    superseded_snapshot_count: 0,
+    ineligible_snapshot_count: 1,
+    sample_count: 0,
+    minimum_cohort_size: 5,
+    status: "suppressed",
+    reason_codes: ["below_minimum"],
+  });
+  assert.equal("terminal_metrics" in aggregate, false);
+  assert.deepEqual(aggregate.rule_minutes, []);
+  assert.deepEqual(aggregate.cohorts, []);
+
+  const recordsBySnapshot = new Map<string, AnalysisRecord>([[
+    incomplete.snapshot_id,
+    adoptionAnalysisRecord(
+      "incomplete-only-record",
+      incomplete.created_at_ms,
+      [],
+      "incomplete-only-pr",
+    ),
+  ]]);
+  const terminalRecords = aggregate.selected_snapshot_ids.map((snapshotId) => {
+    const record = recordsBySnapshot.get(snapshotId);
+    assert.ok(record !== undefined);
+    return record;
+  });
+  const stats = summarizeTerminalStats(aggregate, terminalRecords);
+  assert.equal(stats.history_count, 1);
+  assert.match(renderStatsTty(stats), /^History: 1 terminal work units$/mu);
+});
+
+test("incomplete selected terminals remain in recurrence and adoption history", () => {
+  const incomplete = task6TerminalInput({
+    id: "observational-incomplete",
+    createdAtMs: 1_000,
+  });
+  delete incomplete.terminal_metrics;
+  const complete = task6TerminalInput({
+    id: "observational-complete",
+    createdAtMs: 2_000,
+  });
+  const aggregate = task6Aggregate([incomplete, complete]);
+  assert.deepEqual(
+    [...aggregate.selected_snapshot_ids].sort(),
+    [incomplete.snapshot_id, complete.snapshot_id].sort(),
+  );
+  assert.equal(aggregate.metadata.distinct_work_unit_count, 2);
+  assert.equal(aggregate.metadata.sample_count, 1);
+  assert.equal(aggregate.metadata.ineligible_snapshot_count, 1);
+  assert.equal(aggregate.cohorts.length, 1);
+  assert.equal(aggregate.cohorts[0]?.metadata.sample_count, 1);
+
+  const findingKey = "incomplete-observational-key";
+  const before = adoptionFinding(findingKey, {
+    rule_id: "R002",
+    title: "Observe every terminal work unit",
+    recoverable: { min: 6, bound: "point" },
+    impact: {
+      lower_ms: 360_000,
+      upper_ms: 360_000,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "high",
+      source_completeness: 1,
+    },
+    severity: "high",
+    scoring_rationale: ["observed_lower_bound"],
+  });
+  const after = adoptionFinding(findingKey, {
+    rule_id: "R002",
+    title: "Observe every terminal work unit",
+    recoverable: { min: 2, bound: "point" },
+    impact: {
+      lower_ms: 120_000,
+      upper_ms: 120_000,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "high",
+      source_completeness: 1,
+    },
+    severity: "high",
+    scoring_rationale: ["observed_lower_bound"],
+  });
+  const recordsBySnapshot = new Map<string, AnalysisRecord>([
+    [incomplete.snapshot_id, adoptionAnalysisRecord(
+      "incomplete-observational-record",
+      incomplete.created_at_ms,
+      [before],
+      "incomplete-origin-pr",
+    )],
+    [complete.snapshot_id, adoptionAnalysisRecord(
+      "complete-observational-record",
+      complete.created_at_ms,
+      [after],
+      "complete-followup-pr",
+    )],
+  ]);
+  const terminalRecords = aggregate.selected_snapshot_ids.map((snapshotId) => {
+    const record = recordsBySnapshot.get(snapshotId);
+    assert.ok(record !== undefined);
+    return record;
+  });
+  const stats = summarizeTerminalStats(aggregate, terminalRecords, [
+    adoptionRecordFixture({
+      finding_key: findingKey,
+      rule_id: "R002",
+      detected_at_ms: 1_500,
+    }),
+  ]);
+
+  assert.equal(stats.history_count, 2);
+  assert.deepEqual(stats.recurring_findings, [{
+    finding_key: findingKey,
+    rule_id: "R002",
+    title: "Observe every terminal work unit",
+    occurrence_count: 2,
+    first_min: 6,
+    first_bound: "point",
+    last_min: 2,
+    last_bound: "point",
+    trend: "improved",
+  }]);
+  assert.deepEqual(stats.adoptions, [{
+    finding_key: findingKey,
+    rule_id: "R002",
+    title: "Observe every terminal work unit",
+    method: "claude_md_edit",
+    detected_at_ms: 1_500,
+    analyses_after: 1,
+    recurrences_after: 1,
+    minutes_before: 6,
+    minutes_after: 2,
+    status: "recurred",
+  }]);
+});
+
+const TASK8_PRIVACY_CANARY = "TASK8_PRIVATE_STATS_CANARY";
+
+function task8HistoryEntry(options: {
+  id: string;
+  createdAtMs: number;
+  selectorNumber: number;
+  gitState: string;
+  complete?: boolean;
+  cacheState?: "cold" | "warm";
+  includeFinding?: boolean;
+}): AnalysisHistoryEntry {
+  const repositoryId = "7".repeat(64);
+  const commandIdentity: CommandIdentity = {
+    repo_relative_cwd: `packages/${TASK8_PRIVACY_CANARY}`,
+    normalized_argv: ["npm", "test"],
+    executor: "shell",
+  };
+  const identity: AnalysisSnapshotIdentity = {
+    repo_id: repositoryId,
+    base_oid: "1".repeat(40),
+    head_oid: analysisDigest(
+      "task8-stats-git-state-v1",
+      options.gitState,
+    ).slice(0, 40),
+    merge_base_oid: "1".repeat(40),
+    window: {
+      started_at_ms: 1,
+      start_source: "commit_anchor_lookback",
+      end_source: "analysis_time",
+      completeness: "complete",
+    },
+    source_digest: "2".repeat(64),
+    config_digest: "3".repeat(64),
+    policy_digest: "4".repeat(64),
+    history_digest: "5".repeat(64),
+    selector: { kind: "github_pr", number: options.selectorNumber },
+  };
+  const repeated = finding(1, {
+    finding_key: `${TASK8_PRIVACY_CANARY}-finding-key`,
+    title: `Review https://example.invalid/${TASK8_PRIVACY_CANARY}`,
+    evidence: {
+      session_refs: [`${TASK8_PRIVACY_CANARY}-finding-session`],
+      interval_ids: [`${TASK8_PRIVACY_CANARY}-interval`],
+      url: `https://example.invalid/${TASK8_PRIVACY_CANARY}`,
+      prompt: `${TASK8_PRIVACY_CANARY}-prompt`,
+      intervals: [{ start_ms: 1, end_ms: 2, token: TASK8_PRIVACY_CANARY }],
+    },
+    fix_recipe: {
+      suggestion: `${TASK8_PRIVACY_CANARY}-suggestion`,
+      verify: `${TASK8_PRIVACY_CANARY}-verify`,
+    },
+  });
+  const record = makeAnalysisRecord({
+    analysis_id: `task8-${options.id}`,
+    created_at_ms: options.createdAtMs,
+    unit: {
+      repo: `/private/${TASK8_PRIVACY_CANARY}/repository`,
+      pr_ref: `${TASK8_PRIVACY_CANARY}-selector-${options.selectorNumber}`,
+      sessions: [`${TASK8_PRIVACY_CANARY}-session-${options.id}`],
+    },
+    summary: { ...summary, measured_min: 15, baseline: null },
+    findings: options.includeFinding === false ? [] : [repeated],
+    metrics: {
+      human_wait_ratio: 0.2,
+      [`https://example.invalid/${TASK8_PRIVACY_CANARY}/malformed-metadata`]: 1,
+    },
+    command_costs: [{
+      command: "npm test",
+      command_identity: commandIdentity,
+      ...(options.cacheState === undefined
+        ? {}
+        : { cache_state: options.cacheState }),
+      duration_min: 5,
+      session_refs: [`${TASK8_PRIVACY_CANARY}-command-session-${options.id}`],
+    }],
+    ...(options.complete === false ? {} : {
+      terminal_stats_snapshot: {
+        schema_version: 1,
+        measured_wall_ms: 900_000,
+        confirmed_critical_path_ms: 60_000,
+        estimated_critical_path_upper_ms: 120_000,
+        resource_cost_ms: 180_000,
+        human_wait_ms: 240_000,
+        unexplained_ms: 300_000,
+        cohort: {
+          repository_id: repositoryId,
+          workspace_id: "8".repeat(64),
+          changed_files: 4,
+          changed_lines: 199,
+        },
+        rules: listRuleManifests().map((manifest) => ({
+          rule_id: manifest.id,
+          rule_version: manifest.version,
+          compatibility_epoch: manifest.compatibility_epoch,
+          confirmed_critical_path_ms: manifest.id === "R001" ? 60_000 : 0,
+          estimated_critical_path_upper_ms:
+            manifest.id === "R001" ? 120_000 : 0,
+          resource_cost_ms: manifest.id === "R005" ? 180_000 : 0,
+        })),
+        incomplete_interval_findings: 0,
+      },
+    }),
+  });
+  return {
+    snapshot_id: statsOpaqueDigest("task8-history-snapshot-v1", options.id),
+    identity,
+    record,
+  };
+}
+
+test("stats CLI aggregates opaque terminal history before privacy rendering", async () => {
+  const entries = [
+    task8HistoryEntry({
+      id: "superseded-a",
+      createdAtMs: 1,
+      selectorNumber: 1,
+      gitState: "a",
+      cacheState: "cold",
+    }),
+    task8HistoryEntry({
+      id: "terminal-b",
+      createdAtMs: 2,
+      selectorNumber: 1,
+      gitState: "b",
+      cacheState: "cold",
+    }),
+    ...Array.from({ length: 4 }, (_, index) => task8HistoryEntry({
+      id: `independent-${index + 1}`,
+      createdAtMs: 10 + index,
+      selectorNumber: index + 2,
+      gitState: `independent-${index + 1}`,
+      cacheState: "cold",
+    })),
+    task8HistoryEntry({
+      id: "incomplete-metadata",
+      createdAtMs: 20,
+      selectorNumber: 6,
+      gitState: "incomplete",
+      complete: false,
+      includeFinding: false,
+    }),
+  ];
+  const projected = entries.map(projectStatsAggregationInput);
+  const serializedProjection = JSON.stringify(projected);
+  assert.equal(serializedProjection.includes(TASK8_PRIVACY_CANARY), false);
+  for (const rawField of [
+    "unit", "selector", "findings", "evidence", "intervals", "url",
+    "prompt", "session_refs", "repo_relative_cwd", "normalized_argv",
+    "executor",
+  ]) {
+    assert.equal(serializedProjection.includes(`\"${rawField}\"`), false);
+  }
+  const before = structuredClone(entries);
+  const dependencies = {
+    resolveRepoRoot: async () => "/private/task8-repository",
+    resolveStorePaths: async () => storePaths,
+    resolvePolicy: async (_repoRoot: string, request: PolicyRequest) =>
+      resolveEffectivePolicy({ request }),
+    loadAnalyses: async () => ({
+      records: entries.map(({ record }) => record),
+      entries,
+      warnings: [],
+    }),
+    loadAdoptions: async () => ({ records: [], warnings: [] }),
+  };
+  const metricNames = [
+    "confirmed_critical_path_ms",
+    "estimated_critical_path_upper_ms",
+    "human_wait_ms",
+    "resource_cost_ms",
+    "unexplained_ms",
+  ];
+
+  for (const profile of ["strict", "balanced"] as const) {
+    const jsonResult = await runStatsCommand(
+      { cwd: "/private/task8-repository", json: true, privacy: profile },
+      dependencies,
+    );
+    const json = JSON.parse(jsonResult.stdout) as StatsReport & {
+      metadata: NonNullable<StatsReport["metadata"]> & {
+        privacy_profile: string;
+        projection: string;
+      };
+    };
+    assert.deepEqual(json.metadata, {
+      privacy_profile: profile,
+      projection: "numeric_bounded_opaque_v1",
+      stored_snapshot_count: 7,
+      total_snapshot_count: 7,
+      window_snapshot_count: 7,
+      truncated_snapshot_count: 0,
+      distinct_work_unit_count: 6,
+      terminal_snapshot_count: 6,
+      superseded_snapshot_count: 1,
+      ineligible_snapshot_count: 1,
+      sample_count: 5,
+      minimum_cohort_size: 5,
+      status: "available",
+      reason_codes: [],
+    });
+    assert.deepEqual(Object.keys(json.terminal_metrics ?? {}).sort(), metricNames);
+    assert.deepEqual(
+      Object.keys(json.cohorts?.[0]?.distributions ?? {}).sort(),
+      metricNames,
+    );
+    assert.deepEqual(json.rule_minutes, [{ rule_id: "R001", minutes: 5 }]);
+    assert.equal(json.recurring_findings[0]?.occurrence_count, 5);
+    assert.deepEqual(json.chronic_commands.map((row) => ({
+      command: row.command,
+      cache_state: row.cache_state,
+      history_count: row.history_count,
+      presence_count: row.presence_count,
+      sample_count: row.sample_count,
+      ratio: row.ratio,
+      resource_upper_ms: row.resource_upper_ms,
+    })), [{
+      command: "npm test",
+      cache_state: "cold",
+      history_count: 5,
+      presence_count: 5,
+      sample_count: 5,
+      ratio: 0.3333,
+      resource_upper_ms: 300_000,
+    }]);
+    assert.equal(jsonResult.stdout.includes(TASK8_PRIVACY_CANARY), false);
+    assert.doesNotMatch(jsonResult.stdout, /cohort_key|command_key/u);
+
+    const ttyResult = await runStatsCommand(
+      { cwd: "/private/task8-repository", json: false, privacy: profile },
+      dependencies,
+    );
+    assert.match(ttyResult.stdout, /Confirmed critical-path minutes by rule/u);
+    assert.match(ttyResult.stdout, /median/u);
+    assert.match(ttyResult.stdout, /p50/u);
+    assert.match(ttyResult.stdout, /p75/u);
+    assert.match(ttyResult.stdout, /MAD/u);
+    assert.equal(ttyResult.stdout.includes(TASK8_PRIVACY_CANARY), false);
+  }
+  assert.deepEqual(entries, before);
+});
+
+test("stats CLI bounds ordinary terminal history before aggregation", async () => {
+  const entries = Array.from({ length: 10_001 }, (_, index) =>
+    task8HistoryEntry({
+      id: `bounded-history-${index.toString(10).padStart(5, "0")}`,
+      createdAtMs: index + 1,
+      selectorNumber: index + 1,
+      gitState: `bounded-history-${index.toString(10).padStart(5, "0")}`,
+      includeFinding: false,
+    })
+  );
+
+  const result = await runStatsCommand(
+    { cwd: "/private/task8-repository", json: true, privacy: "strict" },
+    {
+      resolveRepoRoot: async () => "/private/task8-repository",
+      resolveStorePaths: async () => storePaths,
+      resolvePolicy: async (_repoRoot: string, request: PolicyRequest) =>
+        resolveEffectivePolicy({ request }),
+      loadAnalyses: async () => ({
+        records: entries.map(({ record }) => record),
+        entries,
+        warnings: [],
+      }),
+      loadAdoptions: async () => ({ records: [], warnings: [] }),
+    },
+  );
+
+  const stats = JSON.parse(result.stdout) as StatsReport;
+  assert.equal(stats.metadata?.stored_snapshot_count, 10_000);
+  assert.equal(stats.metadata?.total_snapshot_count, 10_001);
+  assert.equal(stats.metadata?.window_snapshot_count, 10_000);
+  assert.equal(stats.metadata?.truncated_snapshot_count, 1);
+  assert.ok(result.warnings.some((warning) =>
+    warning.includes("terminal_history_truncated")
+  ));
+});
+
+test("stats CLI preserves duplicate exact chronic command observations", async () => {
+  const rawCanary = "TASK8_DUPLICATE_RAW_CANARY";
+  const sessionCanary = "TASK8_DUPLICATE_SESSION_CANARY";
+  const commandIdentity: CommandIdentity = {
+    repo_relative_cwd: `packages/${rawCanary}`,
+    normalized_argv: ["npm", "test"],
+    executor: "shell",
+  };
+  const entries = Array.from({ length: 5 }, (_, index) => task8HistoryEntry({
+    id: `duplicate-command-${index + 1}`,
+    createdAtMs: index + 1,
+    selectorNumber: index + 40,
+    gitState: `duplicate-command-${index + 1}`,
+    cacheState: "cold",
+  }));
+  for (const [index, entry] of entries.entries()) {
+    entry.record.command_costs = [{
+      command: "npm test",
+      command_identity: structuredClone(commandIdentity),
+      cache_state: "cold",
+      duration_min: index === 0 ? 2 : 5,
+      session_refs: [`${sessionCanary}-${index + 1}-a`],
+    }, ...(index === 0 ? [{
+      command: "npm test",
+      command_identity: structuredClone(commandIdentity),
+      cache_state: "cold" as const,
+      duration_min: 3,
+      session_refs: [`${sessionCanary}-${index + 1}-b`],
+    }] : [])];
+  }
+
+  const projected = entries.map(projectStatsAggregationInput);
+  const aggregates = buildChronicCostAggregates(
+    projected,
+    { mode: "stats_all_groups" },
+    5,
+  );
+  assert.equal(aggregates.length, 1);
+  assert.deepEqual(aggregates[0], {
+    cohort_key: projected[0]!.cohort_key!,
+    command_key: projected[0]!.command_costs[0]!.command_key,
+    cache_state: "cold",
+    history_count: 5,
+    presence_count: 5,
+    distribution: {
+      median: 300_000,
+      p50: 300_000,
+      p75: 300_000,
+      mad: 0,
+      sample_count: 5,
+    },
+    ratio: 0.3333,
+    resource_upper_ms: 300_000,
+  });
+
+  const result = await runStatsCommand(
+    { cwd: "/private/task8-duplicate-repository", json: true, privacy: "strict" },
+    {
+      resolveRepoRoot: async () => "/private/task8-duplicate-repository",
+      resolveStorePaths: async () => storePaths,
+      resolvePolicy: async (_repoRoot: string, request: PolicyRequest) =>
+        resolveEffectivePolicy({ request }),
+      loadAnalyses: async () => ({
+        records: entries.map(({ record }) => record),
+        entries,
+        warnings: [],
+      }),
+      loadAdoptions: async () => ({ records: [], warnings: [] }),
+    },
+  );
+  const stats = JSON.parse(result.stdout) as StatsReport;
+  assert.deepEqual(stats.chronic_commands, [{
+    command: "npm test",
+    cache_state: "cold",
+    history_count: 5,
+    presence_count: 5,
+    sample_count: 5,
+    ratio: 0.3333,
+    resource_upper_ms: 300_000,
+    median: 300_000,
+    p50: 300_000,
+    p75: 300_000,
+    mad: 0,
+    cost_ratio: 0.3333,
+    estimated_min: 5,
+  }]);
+  for (const canary of [rawCanary, sessionCanary]) {
+    assert.equal(result.stdout.includes(canary), false);
+  }
+  assert.doesNotMatch(
+    result.stdout,
+    /cohort_key|command_key|session_refs|repo_relative_cwd/u,
+  );
+});
+
+test("stats CLI suppresses ordinary command rows without observed cache state", async () => {
+  const entries = Array.from({ length: 5 }, (_, index) => task8HistoryEntry({
+    id: `unknown-cache-${index + 1}`,
+    createdAtMs: index + 1,
+    selectorNumber: index + 20,
+    gitState: `unknown-cache-${index + 1}`,
+  }));
+  const result = await runStatsCommand(
+    { cwd: "/private/task8-repository", json: true, privacy: "strict" },
+    {
+      resolveRepoRoot: async () => "/private/task8-repository",
+      resolveStorePaths: async () => storePaths,
+      resolvePolicy: async (_repoRoot: string, request: PolicyRequest) =>
+        resolveEffectivePolicy({ request }),
+      loadAnalyses: async () => ({
+        records: entries.map(({ record }) => record),
+        entries,
+        warnings: [],
+      }),
+      loadAdoptions: async () => ({ records: [], warnings: [] }),
+    },
+  );
+
+  assert.deepEqual(
+    (JSON.parse(result.stdout) as StatsReport).chronic_commands,
+    [],
+  );
+});
 
 const ADOPTION_DAY0_MS = Date.UTC(2026, 7, 1, 12, 0, 0);
 

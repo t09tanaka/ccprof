@@ -8,7 +8,7 @@ import type {
   JsonValue,
   ReportV2,
 } from "../core/model.js";
-import type { StatsReport } from "./stats.js";
+import { STATS_PROJECTION, type StatsReport } from "./stats.js";
 import { findingForDisplay } from "./tty.js";
 export type PrivacyProfile = "strict" | "balanced" | "raw";
 type DisplayProfile = Exclude<PrivacyProfile, "raw">;
@@ -359,15 +359,44 @@ export function projectStatsPrivacy(
   profile: PrivacyProfile,
   repoRoot: string,
 ): StatsReport {
-  if (profile === "raw") return stats;
+  if (profile === "raw") return structuredClone(stats);
   const projectText = (value: string): string =>
     safeText(value, profile, repoRoot, []);
   return {
     history_count: stats.history_count,
+    ...(stats.metadata === undefined ? {} : {
+      metadata: {
+        ...stats.metadata,
+        privacy_profile: profile,
+        projection: STATS_PROJECTION,
+        reason_codes: [...stats.metadata.reason_codes],
+      },
+    }),
+    ...(stats.terminal_metrics === undefined ? {} : {
+      terminal_metrics: { ...stats.terminal_metrics },
+    }),
+    ...(stats.cohorts === undefined ? {} : {
+      cohorts: stats.cohorts.map((cohort) => ({
+        metadata: {
+          ...cohort.metadata,
+          reason_codes: [...cohort.metadata.reason_codes],
+        },
+        ...(cohort.distributions === undefined ? {} : {
+          distributions: structuredClone(cohort.distributions),
+        }),
+      })),
+    }),
     baseline_metrics: stats.baseline_metrics.map((entry) => ({
       metric: projectText(entry.metric),
       value: entry.value,
       baseline: entry.baseline,
+      ...(entry.median === undefined ? {} : { median: entry.median }),
+      ...(entry.p50 === undefined ? {} : { p50: entry.p50 }),
+      ...(entry.p75 === undefined ? {} : { p75: entry.p75 }),
+      ...(entry.mad === undefined ? {} : { mad: entry.mad }),
+      ...(entry.sample_count === undefined
+        ? {}
+        : { sample_count: entry.sample_count }),
     })),
     chronic_commands: stats.chronic_commands.map((entry) => {
       const command = safeCommand(entry.command, profile, repoRoot, []) ??
@@ -383,7 +412,24 @@ export function projectStatsPrivacy(
       return {
         command,
         ...(identity === undefined ? {} : { command_identity: identity }),
+        ...(entry.cache_state === undefined
+          ? {}
+          : { cache_state: entry.cache_state }),
+        ...(entry.history_count === undefined
+          ? {}
+          : { history_count: entry.history_count }),
         presence_count: entry.presence_count,
+        ...(entry.sample_count === undefined
+          ? {}
+          : { sample_count: entry.sample_count }),
+        ...(entry.ratio === undefined ? {} : { ratio: entry.ratio }),
+        ...(entry.resource_upper_ms === undefined
+          ? {}
+          : { resource_upper_ms: entry.resource_upper_ms }),
+        ...(entry.median === undefined ? {} : { median: entry.median }),
+        ...(entry.p50 === undefined ? {} : { p50: entry.p50 }),
+        ...(entry.p75 === undefined ? {} : { p75: entry.p75 }),
+        ...(entry.mad === undefined ? {} : { mad: entry.mad }),
         cost_ratio: entry.cost_ratio,
         estimated_min: entry.estimated_min,
       };

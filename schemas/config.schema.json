@@ -72,6 +72,11 @@
           "minimum": 0,
           "maximum": 1
         },
+        "minimum_cohort_size": {
+          "type": "integer",
+          "minimum": 3,
+          "maximum": 1000
+        },
         "approval_policy": {
           "type": "object",
           "additionalProperties": false,

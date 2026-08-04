@@ -16,9 +16,13 @@ import {
   type AnalysisBudgetResult,
 } from "../analysis/budgets.js";
 import {
+  cohortDistribution,
   normalizeTerminalStatsSnapshot,
+  selectComparableTerminalSnapshots,
+  type CohortEvaluationMode,
   type TerminalStatsSnapshotV1,
 } from "../analysis/stats-aggregation.js";
+import type { StatsAggregationInput } from "../analysis/stats-input.js";
 import { normalizeRepoPath } from "../analysis/test-map.js";
 import {
   findingCompatibilityMetadata,
@@ -43,6 +47,11 @@ import type {
 import { canonicalJson, readLegacyJson } from "./legacy-json.js";
 import type { StorePaths } from "./paths.js";
 import { openStoreDatabase, storeDatabasePath } from "./sqlite.js";
+import {
+  DEFAULT_MINIMUM_COHORT_SIZE,
+  MAXIMUM_COHORT_SIZE,
+  MINIMUM_COHORT_SIZE,
+} from "../policy/organization-policy.js";
 
 export interface StoreWarning {
   code: string;
@@ -53,6 +62,7 @@ export interface StoreWarning {
 export interface StoredCommandCost {
   command: string;
   command_identity?: CommandIdentity;
+  cache_state?: "cold" | "warm";
   duration_min: number;
   session_refs: string[];
 }
@@ -527,33 +537,72 @@ function normalizedCommandCosts(
   costs: readonly StoredCommandCost[],
 ): StoredCommandCost[] {
   const byKey = new Map<string, StoredCommandCost & { durations: number[] }>();
-  for (const cost of costs) {
-    const identity = cost.command_identity === undefined
+  for (const value of costs) {
+    if (
+      value === null || typeof value !== "object" || Array.isArray(value) ||
+      utilTypes.isProxy(value) || Object.getPrototypeOf(value) !== Object.prototype
+    ) throw new TypeError("invalid command cost");
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const keys = Reflect.ownKeys(descriptors);
+    const allowed = new Set<PropertyKey>([
+      "command", "command_identity", "cache_state", "duration_min",
+      "session_refs",
+    ]);
+    if (
+      keys.some((key) => !allowed.has(key)) ||
+      ["command", "duration_min", "session_refs"].some(
+        (key) => descriptors[key] === undefined,
+      ) ||
+      keys.some((key) => {
+        const descriptor = typeof key === "string"
+          ? descriptors[key]
+          : undefined;
+        return descriptor === undefined || descriptor.enumerable !== true ||
+          !("value" in descriptor);
+      })
+    ) throw new TypeError("invalid command cost");
+    const read = (key: string): unknown => descriptors[key]?.value;
+    const rawIdentity = read("command_identity");
+    const identity = rawIdentity === undefined
       ? undefined
-      : normalizeCommandIdentity(cost.command_identity);
-    if (!finiteNonnegative(cost.duration_min) || cost.duration_min <= 0) {
+      : normalizeCommandIdentity(rawIdentity);
+    const duration = read("duration_min");
+    if (!finiteNonnegative(duration) || duration <= 0) {
       continue;
     }
-    const command = normalizeCommand(cost.command);
+    const rawCommand = read("command");
+    if (typeof rawCommand !== "string") continue;
+    const command = normalizeCommand(rawCommand);
     if (command === null) continue;
+    const cacheState = read("cache_state");
+    if (
+      cacheState !== undefined && cacheState !== "cold" &&
+      cacheState !== "warm"
+    ) continue;
+    const rawSessionRefs = read("session_refs");
+    if (!isStringArray(rawSessionRefs)) {
+      throw new TypeError("invalid command cost");
+    }
+    const lane = cacheState ?? "absent";
     const key = identity === undefined
-      ? `legacy\0${command}`
-      : `identity\0${commandIdentityKey(identity)}`;
+      ? `legacy\0${command}\0${lane}`
+      : `identity\0${commandIdentityKey(identity)}\0${lane}`;
     const existing = byKey.get(key);
     if (existing === undefined) {
       byKey.set(key, {
         command,
         ...(identity === undefined ? {} : { command_identity: identity }),
+        ...(cacheState === undefined ? {} : { cache_state: cacheState }),
         duration_min: 0,
-        durations: [cost.duration_min],
-        session_refs: sortedUnique(cost.session_refs),
+        durations: [duration],
+        session_refs: sortedUnique(rawSessionRefs),
       });
     } else {
       if (command < existing.command) existing.command = command;
-      existing.durations.push(cost.duration_min);
+      existing.durations.push(duration);
       existing.session_refs = sortedUnique([
         ...existing.session_refs,
-        ...cost.session_refs,
+        ...rawSessionRefs,
       ]);
     }
   }
@@ -777,7 +826,9 @@ function isRecord(value: unknown): value is AnalysisRecord {
       Array.isArray(cost.session_refs) &&
       cost.session_refs.every((entry) => typeof entry === "string") &&
       (cost.command_identity === undefined ||
-        isCommandIdentity(cost.command_identity))
+        isCommandIdentity(cost.command_identity)) &&
+      (cost.cache_state === undefined || cost.cache_state === "cold" ||
+        cost.cache_state === "warm")
     );
 }
 
@@ -1404,39 +1455,37 @@ function roundedMetric(value: number): number {
 }
 
 export function computeBaseline(
-  current: AnalysisRecord,
-  history: readonly AnalysisRecord[],
-  windowSize = 10,
+  current: StatsAggregationInput["baseline_metrics"],
+  history: readonly StatsAggregationInput[],
+  mode: CohortEvaluationMode,
+  minimumCohortSize = DEFAULT_MINIMUM_COHORT_SIZE,
 ): BaselineComparison | null {
-  if (!Number.isSafeInteger(windowSize) || windowSize <= 0) {
-    throw new TypeError("baseline window must be a positive safe integer");
+  if (
+    !Number.isSafeInteger(minimumCohortSize) ||
+    minimumCohortSize < MINIMUM_COHORT_SIZE ||
+    minimumCohortSize > MAXIMUM_COHORT_SIZE
+  ) {
+    throw new TypeError("invalid minimum cohort size");
   }
-  const prior = history
-    .filter(
-      (record) =>
-        record.analysis_id !== current.analysis_id &&
-        record.created_at_ms < current.created_at_ms,
-    )
-    .sort(recordOrder)
-    .slice(-windowSize);
-  if (prior.length < 3) return null;
+  const prior = selectComparableTerminalSnapshots(history, mode);
+  if (prior.length < minimumCohortSize) return null;
 
-  const notable = Object.entries(current.metrics)
-    .sort(([left], [right]) => left.localeCompare(right))
-    .flatMap(([metric, value]) => {
+  const notable = [...current]
+    .sort((left, right) => left.metric.localeCompare(right.metric))
+    .flatMap(({ metric, value }) => {
       if (!Number.isFinite(value)) return [];
       const historical = prior.flatMap((record) => {
-        const entry = record.metrics[metric];
+        const entry = record.baseline_metrics.find((candidate) =>
+          candidate.metric === metric)?.value;
         return entry !== undefined && Number.isFinite(entry) ? [entry] : [];
       });
-      if (historical.length < 3) return [];
+      if (historical.length < minimumCohortSize) return [];
+      const distribution = cohortDistribution(historical);
       return [{
         metric,
         value: roundedMetric(value),
-        baseline: roundedMetric(
-          historical.reduce((total, entry) => total + entry, 0) /
-            historical.length,
-        ),
+        baseline: distribution.median,
+        ...distribution,
       }];
     });
   return { prs: prior.length, notable };
