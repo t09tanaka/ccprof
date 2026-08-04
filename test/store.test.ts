@@ -39,6 +39,10 @@ import { findingKey } from "../src/rules/shared.js";
 import { ruleManifest } from "../src/rules/manifest.js";
 import { selectorRefDigest } from "../src/git/pr-context.js";
 import {
+  canonicalRuleSafetySnapshot,
+  resolveRuleSafetyPolicy,
+} from "../src/policy/rule-safety.js";
+import {
   loadAdoptions,
   saveAdoptions,
   type AdoptionRecord,
@@ -1420,6 +1424,145 @@ test("rich snapshot input and normalized-result changes create distinct snapshot
       assert.equal(database.prepare(
         "SELECT count(*) FROM analysis_executions",
       ).pluck().get(), 3);
+    } finally {
+      database.close();
+    }
+  });
+});
+
+test("snapshot envelopes retain authorized evidence but no rule policy material", async () => {
+  await temporaryStore(async (paths) => {
+    const approvalCanary = "STORE_UNMATCHED_APPROVAL_CANARY";
+    const domainPatternCanary = "STORE_UNUSED_DOMAIN_PATTERN_CANARY";
+    const domainNameCanary = "store-unused-domain-canary";
+    const effective = resolveRuleSafetyPolicy(
+      {
+        safe_patterns: ["npm *", approvalCanary],
+        allow_rule_recommendation: true,
+      },
+      [
+        {
+          match: ["npm *"],
+          domain: "node-workspace",
+          parallel_safe: true,
+        },
+        {
+          match: [domainPatternCanary],
+          domain: domainNameCanary,
+          parallel_safe: false,
+        },
+      ],
+    );
+    const innerRuleSafetyDigest = analysisDigest(
+      "effective-rule-safety-v1",
+      canonicalRuleSafetySnapshot(effective),
+    );
+    const outerPolicyDigest = analysisDigest("analysis-policy-v1", {
+      fingerprint: "ccprof-rule-policy-2026-08-04-v2",
+      rule_safety_digest: innerRuleSafetyDigest,
+    });
+    const {
+      impact: _r004Impact,
+      finding_confidence: _r004Confidence,
+      severity: _r004Severity,
+      scoring_rationale: _r004Rationale,
+      ...r004Base
+    } = finding("authorized-r004");
+    const {
+      impact: _r005Impact,
+      finding_confidence: _r005Confidence,
+      severity: _r005Severity,
+      scoring_rationale: _r005Rationale,
+      ...r005Base
+    } = finding("authorized-r005");
+    const authorizedR004: Finding = {
+      ...r004Base,
+      rule_id: "R004",
+      title: "Repeated safe approval latency",
+      confidence: "medium",
+      evidence: {
+        session_refs: ["session#authorized-r004"],
+        interval_ids: ["R004:authorized-r004"],
+        latency_classification: "repeated_safe_approval_latency",
+        canonical_commands: ["npm test"],
+      },
+      recoverable: { min: 10, bound: "upper" },
+    };
+    const authorizedR005: Finding = {
+      ...r005Base,
+      rule_id: "R005",
+      title: "Path-disjoint tool calls ran serially",
+      confidence: "medium",
+      evidence: {
+        session_refs: ["session#authorized-r005"],
+        interval_ids: ["R005:authorized-r005"],
+        parallelization_classification: "parallel_safe",
+        resource_domain: "node-workspace",
+      },
+      recoverable: { min: 10, bound: "upper" },
+    };
+    const source = record("policy-envelope", 100);
+    const storedRecord = makeAnalysisRecord({
+      analysis_id: source.analysis_id,
+      created_at_ms: source.created_at_ms,
+      unit: source.unit,
+      summary: source.summary,
+      findings: [authorizedR004, authorizedR005],
+      metrics: source.metrics,
+      command_costs: [],
+    });
+    const snapshot = {
+      ...snapshotOptions().snapshot,
+      policy_digest: outerPolicyDigest,
+    };
+
+    assert.deepEqual(
+      (await saveAnalysis(paths, storedRecord, { snapshot })).warnings,
+      [],
+    );
+    const database = openStoreDatabase(paths);
+    try {
+      const serialized = String(database.prepare(
+        "SELECT record_json FROM analysis_snapshots",
+      ).pluck().get());
+      const envelope = JSON.parse(serialized) as {
+        identity: Record<string, unknown>;
+        payload: { findings: Finding[] };
+      };
+      assert.deepEqual(Object.keys(envelope.identity).sort(), [
+        "base_oid",
+        "config_digest",
+        "head_oid",
+        "history_digest",
+        "merge_base_oid",
+        "policy_digest",
+        "repo_id",
+        "source_digest",
+        "window",
+      ]);
+      assert.equal(envelope.identity.policy_digest, outerPolicyDigest);
+      assert.deepEqual(
+        envelope.payload.findings.find(({ rule_id }) => rule_id === "R004")
+          ?.evidence.canonical_commands,
+        ["npm test"],
+      );
+      assert.equal(
+        envelope.payload.findings.find(({ rule_id }) => rule_id === "R005")
+          ?.evidence.resource_domain,
+        "node-workspace",
+      );
+      for (const secret of [
+        approvalCanary,
+        domainPatternCanary,
+        domainNameCanary,
+        innerRuleSafetyDigest,
+        "rule_safety_digest",
+        "organization_safe_patterns",
+        "organization_resource_domains",
+        "repository_resource_domains",
+      ]) {
+        assert.equal(serialized.includes(secret), false, secret);
+      }
     } finally {
       database.close();
     }

@@ -33,6 +33,10 @@ import { parseClaudeTranscript } from "../src/sources/claude/parser.js";
 import { loadAnalyses } from "../src/store/analyses.js";
 import { resolveStorePaths } from "../src/store/paths.js";
 import { openStoreDatabase } from "../src/store/sqlite.js";
+import {
+  resolveRuleSafetyPolicy,
+  type EffectiveRuleSafetyPolicy,
+} from "../src/policy/rule-safety.js";
 import "./rule-manifest.cases.js";
 
 const NOW_MS = Date.parse("2026-01-01T01:00:00.000Z");
@@ -691,22 +695,45 @@ test("legacy stored analysis without coverage remains readable", async () => {
   }
 });
 
-async function persistedPolicyDigest(
+async function persistedPolicyEnvelope(
   root: string,
   repo: string,
   sourceSession: Session,
   dataDirectory: string,
-): Promise<string> {
+  options: {
+    ruleSafety?: EffectiveRuleSafetyPolicy;
+    afterResolution?: () => void;
+  } = {},
+): Promise<{
+  policyDigest: string;
+  serialized: string;
+  resolverCalls: number;
+}> {
   const storePaths = await resolveStorePaths(repo, {
     env: { CCPROF_DATA_DIR: join(root, dataDirectory) },
   });
+  let resolverCalls = 0;
   const result = await analyze({
     cwd: repo,
     pr: "main...feature",
     sinceMs: NOW_MS - 2 * 60 * 60_000,
     nowMs: NOW_MS,
-    sessionSource: { discover: async () => [sourceSession] },
+    sessionSource: {
+      discover: async () => {
+        options.afterResolution?.();
+        return [sourceSession];
+      },
+    },
     storePaths,
+    ...(options.ruleSafety === undefined
+      ? {}
+      : {
+        resolveRuleSafetyPolicy: async (resolvedRepo: string) => {
+          resolverCalls += 1;
+          assert.equal(resolvedRepo, repo);
+          return options.ruleSafety;
+        },
+      }),
   });
   const database = openStoreDatabase(storePaths);
   try {
@@ -719,10 +746,28 @@ async function persistedPolicyDigest(
       identity: { policy_digest?: unknown };
     };
     assert.match(String(envelope.identity.policy_digest), /^[0-9a-f]{64}$/u);
-    return String(envelope.identity.policy_digest);
+    return {
+      policyDigest: String(envelope.identity.policy_digest),
+      serialized: row.record_json,
+      resolverCalls,
+    };
   } finally {
     database.close();
   }
+}
+
+async function persistedPolicyDigest(
+  root: string,
+  repo: string,
+  sourceSession: Session,
+  dataDirectory: string,
+): Promise<string> {
+  return (await persistedPolicyEnvelope(
+    root,
+    repo,
+    sourceSession,
+    dataDirectory,
+  )).policyDigest;
 }
 
 test("snapshot policy digest changes with capability coverage and truncation", async () => {
@@ -753,6 +798,165 @@ test("snapshot policy digest changes with capability coverage and truncation", a
     assert.notEqual(partialDigest, fullDigest);
     assert.notEqual(truncatedDigest, fullDigest);
     assert.notEqual(truncatedDigest, partialDigest);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("effective rule policy identity is canonical explicit and mutation-safe", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-rule-policy-snapshot-"));
+  try {
+    const repo = await repository(root);
+    const sourceSession = await fixtureSession(root, repo);
+    const approval = {
+      safe_patterns: ["npm *", "cargo *"],
+      allow_rule_recommendation: true,
+    };
+    const domains = [
+      {
+        match: ["npm *"],
+        domain: "node-workspace",
+        parallel_safe: true,
+      },
+      {
+        match: ["cargo *"],
+        domain: "rust-workspace",
+        parallel_safe: true,
+      },
+    ];
+    const originalPolicy = resolveRuleSafetyPolicy(approval, domains);
+    const reorderedPolicy = resolveRuleSafetyPolicy(
+      {
+        ...approval,
+        safe_patterns: [...approval.safe_patterns].reverse(),
+      },
+      [...domains].reverse(),
+    );
+    const changedPolicy = resolveRuleSafetyPolicy(approval, [
+      domains[0]!,
+      { ...domains[1]!, parallel_safe: false },
+    ]);
+    const emptyPolicy = resolveRuleSafetyPolicy(undefined, []);
+    const mutablePolicy = resolveRuleSafetyPolicy(approval, domains);
+    const mutableApproval = mutablePolicy.approval;
+    const mutableDomain = mutablePolicy.organization_resource_domains[0];
+    assert.ok(mutableApproval !== undefined);
+    assert.ok(mutableDomain !== undefined);
+
+    const absent = await persistedPolicyEnvelope(
+      root,
+      repo,
+      sourceSession,
+      "policy-absent",
+    );
+    const original = await persistedPolicyEnvelope(
+      root,
+      repo,
+      sourceSession,
+      "policy-original",
+      { ruleSafety: originalPolicy },
+    );
+    const reordered = await persistedPolicyEnvelope(
+      root,
+      repo,
+      sourceSession,
+      "policy-reordered",
+      { ruleSafety: reorderedPolicy },
+    );
+    const changed = await persistedPolicyEnvelope(
+      root,
+      repo,
+      sourceSession,
+      "policy-changed",
+      { ruleSafety: changedPolicy },
+    );
+    const empty = await persistedPolicyEnvelope(
+      root,
+      repo,
+      sourceSession,
+      "policy-empty",
+      { ruleSafety: emptyPolicy },
+    );
+    const mutated = await persistedPolicyEnvelope(
+      root,
+      repo,
+      sourceSession,
+      "policy-mutated-after-resolution",
+      {
+        ruleSafety: mutablePolicy,
+        afterResolution: () => {
+          mutableApproval.organization_safe_patterns.splice(
+            0,
+            mutableApproval.organization_safe_patterns.length,
+            "pnpm *",
+          );
+          mutableDomain.match[0] = "pnpm *";
+          mutableDomain.parallel_safe = false;
+        },
+      },
+    );
+
+    assert.equal(absent.resolverCalls, 0);
+    for (const entry of [original, reordered, changed, empty, mutated]) {
+      assert.equal(entry.resolverCalls, 1);
+    }
+    assert.equal(reordered.policyDigest, original.policyDigest);
+    assert.equal(mutated.policyDigest, original.policyDigest);
+    assert.notEqual(changed.policyDigest, original.policyDigest);
+    assert.notEqual(absent.policyDigest, empty.policyDigest);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rule policy resolution precedes the first active-budget return", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-rule-policy-budget-"));
+  try {
+    const repo = await repository(root);
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "budget-data") },
+    });
+    let resolverCalls = 0;
+    let discoveryCalls = 0;
+    let wallReads = 0;
+    const result = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      sinceMs: NOW_MS - 2 * 60 * 60_000,
+      nowMs: NOW_MS,
+      storePaths,
+      persist: false,
+      resolveRuleSafetyPolicy: async (resolvedRepo: string) => {
+        resolverCalls += 1;
+        assert.equal(resolvedRepo, repo);
+        return resolveRuleSafetyPolicy(undefined, []);
+      },
+      sessionSource: {
+        discover: async () => {
+          discoveryCalls += 1;
+          return [];
+        },
+      },
+      budgets: {
+        max_input_bytes: 1_000_000,
+        max_input_events: 1_000,
+        max_wall_ms: 0,
+        max_cpu_ms: 1_000_000,
+        max_output_bytes: 1_000_000,
+        max_source_items: 1_000,
+      },
+      budgetClock: {
+        wall_ms: () => wallReads++,
+        cpu_ms: () => 0,
+      },
+    });
+
+    assert.equal(resolverCalls, 1);
+    assert.equal(discoveryCalls, 0);
+    assert.equal(
+      result.report.analysis_budget?.truncation_reason,
+      "max_wall_ms",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -42,6 +42,11 @@ import { loadAdoptions } from "../src/store/adoptions.js";
 import { saveDismissal } from "../src/store/dismissals.js";
 import { resolveStorePaths } from "../src/store/paths.js";
 import { openStoreDatabase } from "../src/store/sqlite.js";
+import {
+  resolveRuleSafetyPolicy,
+  RuleSafetyPolicyValidationError,
+  type EffectiveRuleSafetyPolicy,
+} from "../src/policy/rule-safety.js";
 
 const NOW_MS = Date.parse("2026-01-01T01:00:00.000Z");
 const FEATURE_COMMIT_DATE = "2026-01-01T00:00:00.000Z";
@@ -238,6 +243,319 @@ function seedSummary() {
     baseline: null,
   } as const;
 }
+
+function policySensitiveRuleSafety(): EffectiveRuleSafetyPolicy {
+  return resolveRuleSafetyPolicy(
+    {
+      safe_patterns: ["npm *"],
+      allow_rule_recommendation: true,
+    },
+    [{
+      match: ["npm *"],
+      domain: "node-workspace",
+      parallel_safe: true,
+    }],
+  );
+}
+
+function policySensitiveSession(sessionId: string, repo: string): Session {
+  const t0 = NOW_MS - 600_000;
+  const shared = {
+    session_id: sessionId,
+    agent_id: "main",
+    is_sidechain: false,
+    confidence: "high" as const,
+  };
+  const approvalTurn = (
+    index: number,
+    offsetMs: number,
+    path: string,
+  ): Session["events"] => {
+    const toolUseId = `policy-read-${index}`;
+    return [
+      {
+        ...shared,
+        kind: "assistant" as const,
+        timestamp_ms: t0 + offsetMs,
+        entry_uuid: `approval-prompt-${index}`,
+        session_ref: `${sessionId}#approval-prompt-${index}`,
+        source_index: index * 4,
+        text: "Approval required for this validation.",
+      },
+      {
+        ...shared,
+        kind: "tool_use" as const,
+        timestamp_ms: t0 + offsetMs,
+        entry_uuid: `approval-use-${index}`,
+        session_ref: `${sessionId}#approval-use-${index}`,
+        source_index: index * 4 + 1,
+        tool_use_id: toolUseId,
+        tool_name: "Read",
+        input: {},
+        paths: [path],
+        edit_fragments: [],
+        command: "npm test",
+        cwd: repo,
+        approval: {
+          required: true,
+          reason: "validation requires approval",
+        },
+      },
+      {
+        ...shared,
+        kind: "genuine_user" as const,
+        timestamp_ms: t0 + offsetMs + 100,
+        entry_uuid: `approval-answer-${index}`,
+        session_ref: `${sessionId}#approval-answer-${index}`,
+        source_index: index * 4 + 2,
+        text: "Approved.",
+      },
+      {
+        ...shared,
+        kind: "tool_result" as const,
+        timestamp_ms: t0 + offsetMs + 110,
+        entry_uuid: `approval-result-${index}`,
+        session_ref: `${sessionId}#approval-result-${index}`,
+        source_index: index * 4 + 3,
+        tool_use_id: toolUseId,
+        status: "success" as const,
+        output: "ok",
+        output_bytes: 2,
+        estimated_tokens: 1,
+      },
+    ];
+  };
+  const serialRead = (
+    index: number,
+    offsetMs: number,
+    path: string,
+  ): Session["events"] => {
+    const toolUseId = `serial-read-${index}`;
+    return [
+      {
+        ...shared,
+        kind: "tool_use",
+        timestamp_ms: t0 + offsetMs,
+        entry_uuid: `serial-use-${index}`,
+        session_ref: `${sessionId}#serial-use-${index}`,
+        source_index: 10 + index * 2,
+        tool_use_id: toolUseId,
+        tool_name: "Read",
+        input: {},
+        paths: [path],
+        edit_fragments: [],
+        command: "npm test",
+        cwd: repo,
+      },
+      {
+        ...shared,
+        kind: "tool_result",
+        timestamp_ms: t0 + offsetMs + 100,
+        entry_uuid: `serial-result-${index}`,
+        session_ref: `${sessionId}#serial-result-${index}`,
+        source_index: 11 + index * 2,
+        tool_use_id: toolUseId,
+        status: "success",
+        output: "ok",
+        output_bytes: 2,
+        estimated_tokens: 1,
+      },
+    ];
+  };
+  return {
+    session_id: sessionId,
+    source: "claude",
+    source_path: join(repo, `${sessionId}.jsonl`),
+    observed_cwds: [repo],
+    observed_branches: ["feature"],
+    started_at_ms: t0,
+    ended_at_ms: t0 + 610,
+    confidence: "high",
+    events: [
+      ...approvalTurn(0, 0, "package.json"),
+      ...approvalTurn(1, 200, "src/value.ts"),
+      {
+        ...shared,
+        kind: "tool_use",
+        timestamp_ms: t0 + 350,
+        entry_uuid: "group-boundary-use",
+        session_ref: `${sessionId}#group-boundary-use`,
+        source_index: 8,
+        tool_use_id: "group-boundary",
+        tool_name: "CustomUnknownTool",
+        input: {},
+        paths: [],
+        edit_fragments: [],
+      },
+      {
+        ...shared,
+        kind: "tool_result",
+        timestamp_ms: t0 + 360,
+        entry_uuid: "group-boundary-result",
+        session_ref: `${sessionId}#group-boundary-result`,
+        source_index: 9,
+        tool_use_id: "group-boundary",
+        status: "success",
+        output: "ok",
+        output_bytes: 2,
+        estimated_tokens: 1,
+      },
+      ...serialRead(0, 400, "package.json"),
+      ...serialRead(1, 510, "src/value.ts"),
+    ],
+    warnings: [],
+  };
+}
+
+test("core snapshots one injected rule policy for both R004 and R005", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-rule-policy-core-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const mutablePolicy = policySensitiveRuleSafety();
+    const approval = mutablePolicy.approval;
+    const domain = mutablePolicy.organization_resource_domains[0];
+    assert.ok(approval !== undefined);
+    assert.ok(domain !== undefined);
+    let resolverCalls = 0;
+
+    const authorized = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      persist: false,
+      resolveRuleSafetyPolicy: async (resolvedRepo: string) => {
+        resolverCalls += 1;
+        assert.equal(resolvedRepo, repo);
+        return mutablePolicy;
+      },
+      sessionSource: {
+        discover: async () => {
+          approval.organization_safe_patterns[0] = "cargo *";
+          domain.match[0] = "cargo *";
+          domain.parallel_safe = false;
+          return [policySensitiveSession("authorized-policy", repo)];
+        },
+      },
+    });
+
+    assert.equal(resolverCalls, 1);
+    const repeatedApproval = authorized.allFindings.find(
+      ({ rule_id, evidence }) =>
+        rule_id === "R004" &&
+        evidence.latency_classification ===
+          "repeated_safe_approval_latency",
+    );
+    const parallelSafe = authorized.allFindings.find(
+      ({ rule_id }) => rule_id === "R005",
+    );
+    assert.ok(repeatedApproval !== undefined);
+    assert.deepEqual(repeatedApproval.evidence.canonical_commands, [
+      "npm test",
+    ]);
+    assert.match(repeatedApproval.fix_recipe.suggestion, /allowlist/iu);
+    assert.ok(parallelSafe !== undefined);
+    assert.equal(
+      parallelSafe.evidence.parallelization_classification,
+      "parallel_safe",
+    );
+    assert.equal(parallelSafe.evidence.resource_domain, "node-workspace");
+    assert.match(
+      parallelSafe.fix_recipe.suggestion,
+      /parallel tool invocation/iu,
+    );
+
+    const unconfigured = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      persist: false,
+      sessionSource: {
+        discover: async () => [policySensitiveSession("absent-policy", repo)],
+      },
+    });
+    const genericApproval = unconfigured.allFindings.find(
+      ({ rule_id }) => rule_id === "R004",
+    );
+    const investigation = unconfigured.allFindings.find(
+      ({ rule_id }) => rule_id === "R005",
+    );
+    assert.ok(genericApproval !== undefined);
+    assert.equal(
+      genericApproval.evidence.latency_classification,
+      "approval_policy_latency",
+    );
+    assert.equal(
+      Object.hasOwn(genericApproval.evidence, "canonical_commands"),
+      false,
+    );
+    assert.ok(investigation !== undefined);
+    assert.equal(
+      investigation.evidence.parallelization_classification,
+      "investigation_candidate",
+    );
+    assert.equal(
+      Object.hasOwn(investigation.evidence, "resource_domain"),
+      false,
+    );
+    assert.doesNotMatch(
+      investigation.fix_recipe.suggestion,
+      /parallel tool invocation/iu,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("core rejects an invalid rule policy before discovery or persistence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-invalid-rule-policy-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const canary = "RULE_POLICY_RESOLVER_CANARY";
+    const hostile = new Proxy(
+      { organization_resource_domains: [] },
+      {
+        ownKeys: () => {
+          throw new Error(canary);
+        },
+      },
+    ) as EffectiveRuleSafetyPolicy;
+    let discoveryCalls = 0;
+
+    await assert.rejects(
+      analyze({
+        cwd: repo,
+        pr: "main...feature",
+        nowMs: NOW_MS,
+        storePaths,
+        resolveRuleSafetyPolicy: async () => hostile,
+        sessionSource: {
+          discover: async () => {
+            discoveryCalls += 1;
+            return [policySensitiveSession("must-not-run", repo)];
+          },
+        },
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof RuleSafetyPolicyValidationError);
+        assert.equal(error.message, "invalid rule safety policy");
+        assert.equal(error.message.includes(canary), false);
+        return true;
+      },
+    );
+    assert.equal(discoveryCalls, 0);
+    assert.deepEqual((await loadAnalyses(storePaths)).records, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("orchestrates a deterministic PR analysis, stores all findings, and applies dismissal only to display", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-analyze-"));
