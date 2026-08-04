@@ -2261,6 +2261,90 @@ test("stats applies the same effective privacy floor before warning projection",
   assert.doesNotMatch(output.warnings.join("\n"), /private\/stats/u);
 });
 
+test("stats CLI keeps CI strict and renders the signed organization cohort floor", async () => {
+  let ciPrivacy: PrivacyProfile | undefined;
+  const quiet = (_value: string): void => undefined;
+  assert.equal(await runCli(
+    ["stats", "--json", "--privacy=raw"],
+    {
+      ci: true,
+      handlers: cliHandlers({
+        stats: async (options) => {
+          ciPrivacy = options.privacy;
+          return { stdout: "{}\n", warnings: [] };
+        },
+      }),
+      loadOrganizationPolicy: async () => policy({
+        minimum_privacy: "raw",
+        allow_raw: true,
+      }),
+      stdout: quiet,
+      stderr: quiet,
+    },
+  ), 0);
+  assert.equal(ciPrivacy, "strict");
+
+  const repoRoot = "/private/task8-policy-repository";
+  const paths: StorePaths = {
+    canonical_repo: repoRoot,
+    repo_hash: "task8-policy-hash",
+    root_dir: `${repoRoot}/.ccprof`,
+    repo_dir: `${repoRoot}/.ccprof/task8-policy-hash`,
+    analyses_dir: `${repoRoot}/.ccprof/task8-policy-hash/analyses`,
+    history_index_path: `${repoRoot}/.ccprof/task8-policy-hash/history.json`,
+    dismissals_path: `${repoRoot}/.ccprof/task8-policy-hash/dismissals.json`,
+    adoptions_path: `${repoRoot}/.ccprof/task8-policy-hash/adoptions.json`,
+    hook_events_path: `${repoRoot}/.ccprof/task8-policy-hash/hooks.jsonl`,
+  };
+  const dependencies = {
+    resolveRepoRoot: async () => repoRoot,
+    resolveStorePaths: async () => paths,
+    resolvePolicy: async (_resolved: string, request: PolicyRequest) =>
+      resolveEffectivePolicy({
+        organization: policyWithMinimumCohort(20),
+        repository: {
+          minimum_cohort_size: 5,
+        } as RepositoryPolicyWithMinimumCohort,
+        request,
+      }),
+    loadAnalyses: async () => ({ records: [], entries: [], warnings: [] }),
+    loadAdoptions: async () => ({ records: [], warnings: [] }),
+  };
+  const json = await runStatsCommand(
+    { cwd: repoRoot, json: true, privacy: "raw" },
+    dependencies,
+  );
+  const parsed = JSON.parse(json.stdout) as {
+    metadata: {
+      privacy_profile: PrivacyProfile;
+      projection: string;
+      minimum_cohort_size: number;
+      sample_count: number;
+      status: string;
+      reason_codes: string[];
+    };
+  };
+  assert.deepEqual(parsed.metadata, {
+    privacy_profile: "strict",
+    projection: "numeric_bounded_opaque_v1",
+    stored_snapshot_count: 0,
+    distinct_work_unit_count: 0,
+    terminal_snapshot_count: 0,
+    superseded_snapshot_count: 0,
+    ineligible_snapshot_count: 0,
+    sample_count: 0,
+    minimum_cohort_size: 20,
+    status: "suppressed",
+    reason_codes: ["below_minimum"],
+  });
+
+  const tty = await runStatsCommand(
+    { cwd: repoRoot, json: false, privacy: "raw" },
+    dependencies,
+  );
+  assert.match(tty.stdout, /suppressed \(0\/20 comparable samples\)/u);
+});
+
 test("CLI preloads the signed privacy floor before analyze parsing", async (t) => {
   const repoRoot = await temporaryRepository(t);
   const privatePath = "/private/parser/organization-policy-canary";

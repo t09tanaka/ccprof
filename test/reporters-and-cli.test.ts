@@ -50,7 +50,10 @@ import {
   exactCohortKey,
   statsOpaqueDigest,
 } from "../src/analysis/stats-aggregation.js";
-import type { StatsAggregationInput } from "../src/analysis/stats-input.js";
+import {
+  projectStatsAggregationInput,
+  type StatsAggregationInput,
+} from "../src/analysis/stats-input.js";
 import {
   InvalidAnalysisWindowError,
   NoAnalyzableTimestampsError,
@@ -78,8 +81,11 @@ import {
   TTY_MAX_LINES,
 } from "../src/reporters/tty.js";
 import {
+  analysisDigest,
   makeAnalysisRecord,
   type AnalysisRecord,
+  type AnalysisHistoryEntry,
+  type AnalysisSnapshotIdentity,
 } from "../src/store/analyses.js";
 import type { AdoptionRecord } from "../src/store/adoptions.js";
 import { runStatsCommand } from "../src/commands/stats.js";
@@ -2220,11 +2226,20 @@ test("report privacy clones budget facts without changing their values", () => {
   }
 });
 
-test("stats raw privacy returns the report and keeps JSON and TTY bytes unchanged", () => {
+test("stats raw privacy clones the report and keeps JSON and TTY bytes unchanged", () => {
   const raw = statsPrivacyReport();
   const projected = projectStatsPrivacy(raw, "raw", PRIVACY_REPO);
 
-  assert.equal(projected, raw);
+  assert.notEqual(projected, raw);
+  assert.deepEqual(projected, raw);
+  assert.notEqual(projected.baseline_metrics, raw.baseline_metrics);
+  assert.notEqual(projected.chronic_commands, raw.chronic_commands);
+  assert.notEqual(
+    projected.chronic_commands[0]?.command_identity,
+    raw.chronic_commands[0]?.command_identity,
+  );
+  assert.notEqual(projected.recurring_findings, raw.recurring_findings);
+  assert.notEqual(projected.adoptions, raw.adoptions);
   assert.equal(renderStatsJson(projected), renderStatsJson(raw));
   assert.equal(renderStatsTty(projected), renderStatsTty(raw));
 });
@@ -3735,6 +3750,273 @@ test("incomplete selected terminals remain in recurrence and adoption history", 
     minutes_after: 2,
     status: "recurred",
   }]);
+});
+
+const TASK8_PRIVACY_CANARY = "TASK8_PRIVATE_STATS_CANARY";
+
+function task8HistoryEntry(options: {
+  id: string;
+  createdAtMs: number;
+  selectorNumber: number;
+  gitState: string;
+  complete?: boolean;
+  cacheState?: "cold" | "warm";
+  includeFinding?: boolean;
+}): AnalysisHistoryEntry {
+  const repositoryId = "7".repeat(64);
+  const commandIdentity: CommandIdentity = {
+    repo_relative_cwd: `packages/${TASK8_PRIVACY_CANARY}`,
+    normalized_argv: ["npm", "test"],
+    executor: "shell",
+  };
+  const identity: AnalysisSnapshotIdentity = {
+    repo_id: repositoryId,
+    base_oid: "1".repeat(40),
+    head_oid: analysisDigest(
+      "task8-stats-git-state-v1",
+      options.gitState,
+    ).slice(0, 40),
+    merge_base_oid: "1".repeat(40),
+    window: {
+      started_at_ms: 1,
+      start_source: "commit_anchor_lookback",
+      end_source: "analysis_time",
+      completeness: "complete",
+    },
+    source_digest: "2".repeat(64),
+    config_digest: "3".repeat(64),
+    policy_digest: "4".repeat(64),
+    history_digest: "5".repeat(64),
+    selector: { kind: "github_pr", number: options.selectorNumber },
+  };
+  const repeated = finding(1, {
+    finding_key: `${TASK8_PRIVACY_CANARY}-finding-key`,
+    title: `Review https://example.invalid/${TASK8_PRIVACY_CANARY}`,
+    evidence: {
+      session_refs: [`${TASK8_PRIVACY_CANARY}-finding-session`],
+      interval_ids: [`${TASK8_PRIVACY_CANARY}-interval`],
+      url: `https://example.invalid/${TASK8_PRIVACY_CANARY}`,
+      prompt: `${TASK8_PRIVACY_CANARY}-prompt`,
+      intervals: [{ start_ms: 1, end_ms: 2, token: TASK8_PRIVACY_CANARY }],
+    },
+    fix_recipe: {
+      suggestion: `${TASK8_PRIVACY_CANARY}-suggestion`,
+      verify: `${TASK8_PRIVACY_CANARY}-verify`,
+    },
+  });
+  const record = makeAnalysisRecord({
+    analysis_id: `task8-${options.id}`,
+    created_at_ms: options.createdAtMs,
+    unit: {
+      repo: `/private/${TASK8_PRIVACY_CANARY}/repository`,
+      pr_ref: `${TASK8_PRIVACY_CANARY}-selector-${options.selectorNumber}`,
+      sessions: [`${TASK8_PRIVACY_CANARY}-session-${options.id}`],
+    },
+    summary: { ...summary, measured_min: 15, baseline: null },
+    findings: options.includeFinding === false ? [] : [repeated],
+    metrics: {
+      human_wait_ratio: 0.2,
+      [`https://example.invalid/${TASK8_PRIVACY_CANARY}/malformed-metadata`]: 1,
+    },
+    command_costs: [{
+      command: "npm test",
+      command_identity: commandIdentity,
+      ...(options.cacheState === undefined
+        ? {}
+        : { cache_state: options.cacheState }),
+      duration_min: 5,
+      session_refs: [`${TASK8_PRIVACY_CANARY}-command-session-${options.id}`],
+    }],
+    ...(options.complete === false ? {} : {
+      terminal_stats_snapshot: {
+        schema_version: 1,
+        measured_wall_ms: 900_000,
+        confirmed_critical_path_ms: 60_000,
+        estimated_critical_path_upper_ms: 120_000,
+        resource_cost_ms: 180_000,
+        human_wait_ms: 240_000,
+        unexplained_ms: 300_000,
+        cohort: {
+          repository_id: repositoryId,
+          workspace_id: "8".repeat(64),
+          changed_files: 4,
+          changed_lines: 199,
+        },
+        rules: listRuleManifests().map((manifest) => ({
+          rule_id: manifest.id,
+          rule_version: manifest.version,
+          compatibility_epoch: manifest.compatibility_epoch,
+          confirmed_critical_path_ms: manifest.id === "R001" ? 60_000 : 0,
+          estimated_critical_path_upper_ms:
+            manifest.id === "R001" ? 120_000 : 0,
+          resource_cost_ms: manifest.id === "R005" ? 180_000 : 0,
+        })),
+        incomplete_interval_findings: 0,
+      },
+    }),
+  });
+  return {
+    snapshot_id: statsOpaqueDigest("task8-history-snapshot-v1", options.id),
+    identity,
+    record,
+  };
+}
+
+test("stats CLI aggregates opaque terminal history before privacy rendering", async () => {
+  const entries = [
+    task8HistoryEntry({
+      id: "superseded-a",
+      createdAtMs: 1,
+      selectorNumber: 1,
+      gitState: "a",
+      cacheState: "cold",
+    }),
+    task8HistoryEntry({
+      id: "terminal-b",
+      createdAtMs: 2,
+      selectorNumber: 1,
+      gitState: "b",
+      cacheState: "cold",
+    }),
+    ...Array.from({ length: 4 }, (_, index) => task8HistoryEntry({
+      id: `independent-${index + 1}`,
+      createdAtMs: 10 + index,
+      selectorNumber: index + 2,
+      gitState: `independent-${index + 1}`,
+      cacheState: "cold",
+    })),
+    task8HistoryEntry({
+      id: "incomplete-metadata",
+      createdAtMs: 20,
+      selectorNumber: 6,
+      gitState: "incomplete",
+      complete: false,
+      includeFinding: false,
+    }),
+  ];
+  const projected = entries.map(projectStatsAggregationInput);
+  const serializedProjection = JSON.stringify(projected);
+  assert.equal(serializedProjection.includes(TASK8_PRIVACY_CANARY), false);
+  for (const rawField of [
+    "unit", "selector", "findings", "evidence", "intervals", "url",
+    "prompt", "session_refs", "repo_relative_cwd", "normalized_argv",
+    "executor",
+  ]) {
+    assert.equal(serializedProjection.includes(`\"${rawField}\"`), false);
+  }
+  const before = structuredClone(entries);
+  const dependencies = {
+    resolveRepoRoot: async () => "/private/task8-repository",
+    resolveStorePaths: async () => storePaths,
+    resolvePolicy: async (_repoRoot: string, request: PolicyRequest) =>
+      resolveEffectivePolicy({ request }),
+    loadAnalyses: async () => ({
+      records: entries.map(({ record }) => record),
+      entries,
+      warnings: [],
+    }),
+    loadAdoptions: async () => ({ records: [], warnings: [] }),
+  };
+  const metricNames = [
+    "confirmed_critical_path_ms",
+    "estimated_critical_path_upper_ms",
+    "human_wait_ms",
+    "resource_cost_ms",
+    "unexplained_ms",
+  ];
+
+  for (const profile of ["strict", "balanced"] as const) {
+    const jsonResult = await runStatsCommand(
+      { cwd: "/private/task8-repository", json: true, privacy: profile },
+      dependencies,
+    );
+    const json = JSON.parse(jsonResult.stdout) as StatsReport & {
+      metadata: NonNullable<StatsReport["metadata"]> & {
+        privacy_profile: string;
+        projection: string;
+      };
+    };
+    assert.deepEqual(json.metadata, {
+      privacy_profile: profile,
+      projection: "numeric_bounded_opaque_v1",
+      stored_snapshot_count: 7,
+      distinct_work_unit_count: 6,
+      terminal_snapshot_count: 6,
+      superseded_snapshot_count: 1,
+      ineligible_snapshot_count: 1,
+      sample_count: 5,
+      minimum_cohort_size: 5,
+      status: "available",
+      reason_codes: [],
+    });
+    assert.deepEqual(Object.keys(json.terminal_metrics ?? {}).sort(), metricNames);
+    assert.deepEqual(
+      Object.keys(json.cohorts?.[0]?.distributions ?? {}).sort(),
+      metricNames,
+    );
+    assert.deepEqual(json.rule_minutes, [{ rule_id: "R001", minutes: 5 }]);
+    assert.equal(json.recurring_findings[0]?.occurrence_count, 5);
+    assert.deepEqual(json.chronic_commands.map((row) => ({
+      command: row.command,
+      cache_state: row.cache_state,
+      history_count: row.history_count,
+      presence_count: row.presence_count,
+      sample_count: row.sample_count,
+      ratio: row.ratio,
+      resource_upper_ms: row.resource_upper_ms,
+    })), [{
+      command: "npm test",
+      cache_state: "cold",
+      history_count: 5,
+      presence_count: 5,
+      sample_count: 5,
+      ratio: 0.3333,
+      resource_upper_ms: 300_000,
+    }]);
+    assert.equal(jsonResult.stdout.includes(TASK8_PRIVACY_CANARY), false);
+    assert.doesNotMatch(jsonResult.stdout, /cohort_key|command_key/u);
+
+    const ttyResult = await runStatsCommand(
+      { cwd: "/private/task8-repository", json: false, privacy: profile },
+      dependencies,
+    );
+    assert.match(ttyResult.stdout, /Confirmed critical-path minutes by rule/u);
+    assert.match(ttyResult.stdout, /median/u);
+    assert.match(ttyResult.stdout, /p50/u);
+    assert.match(ttyResult.stdout, /p75/u);
+    assert.match(ttyResult.stdout, /MAD/u);
+    assert.equal(ttyResult.stdout.includes(TASK8_PRIVACY_CANARY), false);
+  }
+  assert.deepEqual(entries, before);
+});
+
+test("stats CLI suppresses ordinary command rows without observed cache state", async () => {
+  const entries = Array.from({ length: 5 }, (_, index) => task8HistoryEntry({
+    id: `unknown-cache-${index + 1}`,
+    createdAtMs: index + 1,
+    selectorNumber: index + 20,
+    gitState: `unknown-cache-${index + 1}`,
+  }));
+  const result = await runStatsCommand(
+    { cwd: "/private/task8-repository", json: true, privacy: "strict" },
+    {
+      resolveRepoRoot: async () => "/private/task8-repository",
+      resolveStorePaths: async () => storePaths,
+      resolvePolicy: async (_repoRoot: string, request: PolicyRequest) =>
+        resolveEffectivePolicy({ request }),
+      loadAnalyses: async () => ({
+        records: entries.map(({ record }) => record),
+        entries,
+        warnings: [],
+      }),
+      loadAdoptions: async () => ({ records: [], warnings: [] }),
+    },
+  );
+
+  assert.deepEqual(
+    (JSON.parse(result.stdout) as StatsReport).chronic_commands,
+    [],
+  );
 });
 
 const ADOPTION_DAY0_MS = Date.UTC(2026, 7, 1, 12, 0, 0);
