@@ -4032,6 +4032,40 @@ test("stats CLI aggregates opaque terminal history before privacy rendering", as
   assert.deepEqual(entries, before);
 });
 
+test("stats CLI bounds ordinary terminal history before aggregation", async () => {
+  const entries = Array.from({ length: 10_001 }, (_, index) =>
+    task8HistoryEntry({
+      id: `bounded-history-${index.toString(10).padStart(5, "0")}`,
+      createdAtMs: index + 1,
+      selectorNumber: index + 1,
+      gitState: `bounded-history-${index.toString(10).padStart(5, "0")}`,
+      includeFinding: false,
+    })
+  );
+
+  const result = await runStatsCommand(
+    { cwd: "/private/task8-repository", json: true, privacy: "strict" },
+    {
+      resolveRepoRoot: async () => "/private/task8-repository",
+      resolveStorePaths: async () => storePaths,
+      resolvePolicy: async (_repoRoot: string, request: PolicyRequest) =>
+        resolveEffectivePolicy({ request }),
+      loadAnalyses: async () => ({
+        records: entries.map(({ record }) => record),
+        entries,
+        warnings: [],
+      }),
+      loadAdoptions: async () => ({ records: [], warnings: [] }),
+    },
+  );
+
+  const stats = JSON.parse(result.stdout) as StatsReport;
+  assert.equal(stats.metadata?.stored_snapshot_count, 10_000);
+  assert.ok(result.warnings.some((warning) =>
+    warning.includes("terminal_history_truncated")
+  ));
+});
+
 test("stats CLI preserves duplicate exact chronic command observations", async () => {
   const rawCanary = "TASK8_DUPLICATE_RAW_CANARY";
   const sessionCanary = "TASK8_DUPLICATE_SESSION_CANARY";
