@@ -4,7 +4,7 @@
 
 **Goal:** Keep R004/R005 measurements while emitting concrete allowlist or parallel-invocation recommendations only under bounded, signed, monotonically tightened safety contracts.
 
-**Architecture:** A focused `rule-safety` policy module validates and snapshots command patterns, performs a non-regex wildcard match over existing canonical commands, and resolves signed organization plus repository-tightening layers. R004 and R005 receive only the defensive effective snapshot through an optional core-analysis callback; new semantics stay inside Finding evidence and epoch-2 manifests, preserving Report v2 and Store compatibility.
+**Architecture:** A focused `rule-safety` policy module validates and snapshots command patterns, safely canonicalizes raw action commands, performs bounded non-regex wildcard decisions, and resolves signed organization plus repository-tightening layers. R004 and R005 receive only one closed effective snapshot through an optional core-analysis callback; its canonical digest participates in snapshot identity while only the outer digest is stored. New semantics stay inside Finding evidence and epoch-2 manifests, preserving Report v2 and Store compatibility.
 
 **Tech Stack:** TypeScript 5.9, Node.js 22/24, Ed25519 `node:crypto`, Node test runner, JSON Schema draft 2020-12, existing Rule Manifest/Store/privacy pipeline.
 
@@ -34,7 +34,8 @@
   canonical bytes, effective rule-safety snapshot.
 - Modify `src/analysis/repository-config.ts`: repository tightening contracts.
 - Modify `schemas/organization-policy.schema.json` and
-  `schemas/config.schema.json`: exact published shapes and bounds.
+  `schemas/config.schema.json`: published structural shapes/bounds plus explicit
+  vendor annotations for runtime-only semantic constraints.
 - Modify `src/analysis/timeline.ts`: carry an approved tool command into the
   causally corresponding human-wait action.
 - Modify `src/rules/human-wait.ts`: R004 split evidence and observe-only impact.
@@ -45,7 +46,8 @@
 - Modify focused tests in `test/organization-policy.test.ts`,
   `test/rules-primary.test.ts`, `test/rules-secondary.test.ts`,
   `test/analyze-integration.test.ts`, `test/rule-manifest.cases.ts`,
-  `test/store.test.ts`, and `test/reporters-and-cli.test.ts`.
+  `test/capability-coverage.test.ts`, `test/store.test.ts`, and
+  `test/reporters-and-cli.test.ts`.
 - Create `test/rule-policy-safety.test.ts`: matcher, snapshot, and decision
   boundary tests.
 - Modify `README.md`: operator policy format and recommendation semantics.
@@ -61,25 +63,36 @@
 Import the wished-for API and cover normalized literals/wildcards, bounds,
 whole-string anchoring, regex punctuation as literals, command safety, defensive
 copies, repository intersection, absent organization denial, ambiguity, false,
-and cross-domain groups:
+cross-domain groups, and one whole-decision work budget:
 
 ```ts
 import {
   approvalRecommendationDecision,
+  canonicalRuleSafetySnapshot,
   commandPatternMatches,
+  compareUtf8,
+  createDecisionBudget,
   normalizeCommandPattern,
   resolveRuleSafetyPolicy,
   resourceDomainDecision,
+  safeCanonicalCommand,
   snapshotApprovalRulePolicy,
+  snapshotEffectiveRuleSafetyPolicy,
   snapshotRepositoryApprovalRulePolicy,
   snapshotResourceDomains,
 } from "../src/policy/rule-safety.js";
 
 assert.equal(normalizeCommandPattern("  npm\t test  "), "npm test");
 assert.equal(normalizeCommandPattern("rg *** src"), "rg * src");
-assert.equal(commandPatternMatches("npm test", "npm *"), true);
-assert.equal(commandPatternMatches("npm test extra", "npm test"), false);
-assert.equal(commandPatternMatches("rg [a]", "rg [a]"), true);
+assert.equal(commandPatternMatches(
+  "npm test", "npm *", createDecisionBudget()), true);
+assert.equal(commandPatternMatches(
+  "npm test extra", "npm test", createDecisionBudget()), false);
+assert.equal(commandPatternMatches(
+  "rg [a]", "rg [a]", createDecisionBudget()), true);
+assert.equal(safeCanonicalCommand("npm test"), "npm test");
+assert.equal(safeCanonicalCommand("CI=1 npm test"), undefined);
+assert.ok(compareUtf8("z", "ä") < 0);
 
 const effective = resolveRuleSafetyPolicy(
   {
@@ -91,8 +104,11 @@ const effective = resolveRuleSafetyPolicy(
   [{ match: ["npm test"], domain: "node-workspace", parallel_safe: false }],
 );
 assert.deepEqual(
-  approvalRecommendationDecision("npm test", effective),
-  { allowed: true, canonical_command: "npm test" },
+  approvalRecommendationDecision(["npm test"], effective),
+  {
+    kind: "evaluated",
+    commands: [{ allowed: true, canonical_command: "npm test" }],
+  },
 );
 assert.deepEqual(
   resourceDomainDecision(["npm test", "npm test"], effective),
@@ -104,13 +120,36 @@ assert.deepEqual(resourceDomainDecision([undefined], effective), {
 ```
 
 Use proxies, revoked proxies, accessors, sparse arrays, symbols, normalization
-duplicates, 65-entry arrays, 257-byte patterns, 17 wildcards, invalid domains,
-and canary strings. Assert validation throws only `invalid rule safety policy`
-and never invokes a getter or includes a canary. Assert `rm -rf .`, unknown
-commands, assignments/wrappers, redirects, and composites remain denied even
-under `*`; known test/build/check/inspect and conservative `git show` commands
-may pass. Mutate every returned nested array and prove a fresh resolution is
-unchanged.
+duplicates, 65-entry arrays, 257-byte raw and normalized patterns, 17
+wildcards, invalid domains, and canary strings. Assert validation throws only
+`invalid rule safety policy` and never invokes a getter or includes a canary.
+Check 256 UTF-8-byte patterns pass and 257-byte patterns fail on both sides of
+normalization; an O(1) code-unit length guard must precede the raw byte preflight,
+which itself must reject before normalization work.
+
+Treat `safeCanonicalCommand(raw)` as the sole safety entrance for both rule
+decisions. Assert `rm -rf .`, unknown commands, assignments, `env`/`command`
+wrappers, redirects, composites, opaque commands, and mutating Git commands
+remain denied even under `*`; known test/build/check/inspect and conservative
+read-only Git commands may pass. On Windows, admit only the fixed bare-basename
+map (`npm.cmd`, `pnpm.cmd`, `yarn.cmd`, `bun.exe`, `cargo.exe`, `git.exe`,
+`node.exe`, `rg.exe`) with ASCII case-insensitive suffixes. Reject `.bat`, paths,
+and every unlisted `.cmd`/`.exe` name.
+
+Prove normalization and policy ordering use an explicit UTF-8 byte comparator,
+never `localeCompare`, over the full resource-domain tuple `(domain, normalized
+match array, parallel_safe)` with `false` before `true`. Exact duplicate tuples
+and duplicate normalized patterns are invalid. Different tuples with the same
+domain may load, but if more than one entry matches an action the decision is
+ambiguous and returns `investigation_candidate`.
+
+Exercise the closed effective-policy snapshot and mutate every source and
+returned nested array; the snapshot and fresh resolution must remain unchanged.
+Exercise the fixed whole-decision limits: 64 actions accepted/65 denied, 32
+distinct raw commands accepted/33 denied, repeated commands canonicalized once,
+and 65,536 matcher/decision steps accepted while the next required step makes
+the result deny/investigate. A decision must never authorize an actionable
+prefix after exhausting its budget.
 
 - [ ] **Step 2: Delegate RED verification**
 
@@ -166,6 +205,15 @@ export interface EffectiveRuleSafetyPolicy {
 export type ResourceDomainDecision =
   | { kind: "parallel_safe" | "parallel_unsafe"; domain: string }
   | { kind: "investigation_candidate" };
+export type ApprovalRecommendationDecision =
+  | {
+      kind: "evaluated";
+      commands: Array<
+        | { allowed: true; canonical_command: string }
+        | { allowed: false }
+      >;
+    }
+  | { kind: "denied" };
 
 const MAX_PATTERNS = 64;
 const MAX_DOMAINS = 64;
@@ -173,6 +221,9 @@ const MAX_DOMAIN_PATTERNS = 32;
 const MAX_PATTERN_BYTES = 256;
 const MAX_WILDCARDS = 16;
 const MAX_COMMAND_BYTES = 4_096;
+const MAX_DECISION_ACTIONS = 64;
+const MAX_UNIQUE_COMMANDS = 32;
+const MAX_DECISION_STEPS = 65_536;
 const DOMAIN = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 ```
 
@@ -181,14 +232,25 @@ every object/array snapshot. Reject non-plain prototypes, accessors, holes,
 symbols, unknown keys, normalized duplicates, and all bounds with one fixed
 `RuleSafetyPolicyValidationError("invalid rule safety policy")`.
 
+Before normalization, apply UTF-8 byte preflights to raw patterns and raw
+commands. Re-check normalized pattern bytes after NFC/whitespace normalization.
 Implement normalization without input-derived regex matching. A static
 whitespace expression may normalize whitespace; the wildcard matcher itself is
-the greedy index algorithm below:
+a greedy index algorithm that spends from the caller's shared budget for every
+loop/character comparison:
 
 ```ts
+export interface DecisionBudget {
+  remaining: number;
+  exhausted: boolean;
+}
+
+export function createDecisionBudget(): DecisionBudget;
+
 export function commandPatternMatches(
   canonicalCommand: string,
   normalizedPattern: string,
+  budget: DecisionBudget,
 ): boolean {
   if (Buffer.byteLength(canonicalCommand, "utf8") > MAX_COMMAND_BYTES) {
     return false;
@@ -198,6 +260,7 @@ export function commandPatternMatches(
   let starIndex = -1;
   let retryCommandIndex = 0;
   while (commandIndex < canonicalCommand.length) {
+    if (!spend(budget)) return false;
     if (
       patternIndex < normalizedPattern.length &&
       normalizedPattern[patternIndex] === canonicalCommand[commandIndex]
@@ -216,18 +279,39 @@ export function commandPatternMatches(
       return false;
     }
   }
-  while (normalizedPattern[patternIndex] === "*") patternIndex += 1;
+  while (normalizedPattern[patternIndex] === "*") {
+    if (!spend(budget)) return false;
+    patternIndex += 1;
+  }
   return patternIndex === normalizedPattern.length;
 }
 ```
 
-Canonicalize commands with `classifyCommand`/`tokenizeCommand`, reject stripped
-wrappers/assignments, opaque/composite/redirected values, and admit only
-test/build/check/inspect plus conservative read-only Git subcommands. Resolve
-approval by matching the organization patterns and, when present, the
-repository patterns. Resolve domains independently per layer; require exactly
-one organization match, exactly one same-domain repository match when that
-layer exists, one domain across the whole action group, and logical-AND safety.
+`safeCanonicalCommand(raw)` performs an O(1) code-unit length guard and then the
+byte preflight before `classifyCommand`/`tokenizeCommand`; when called by a
+decision it charges raw code-unit length plus fixed classifier stages to the
+shared budget before invoking those bounded helpers. It rejects stripped wrappers/assignments,
+opaque/composite/redirected values, unsafe or unknown executables, and admits
+only test/build/check/inspect plus conservative read-only Git subcommands and
+the fixed Windows mapping above. Neither R004 nor R005 may pass an already
+canonicalized string around this function.
+
+Create one budget and one raw-command memo cache per whole decision. Reject an
+over-limit action set before scanning; count all policy elements, entry visits,
+raw-command canonicalization charges, and matcher character comparisons against
+the same 65,536-step budget.
+`approvalRecommendationDecision` accepts the complete ordered raw-command list
+and returns either one allow/deny item per input or `{ kind: "denied" }`. The
+latter applies to action, distinct-command, or step overflow, so no actionable
+prefix survives. `resourceDomainDecision` likewise returns
+`investigation_candidate` on overflow. Resolve approval against organization
+patterns and, when present, repository patterns. Resolve domains independently
+per layer; require exactly one matching entry per command (including
+same-domain entries), exactly one same domain in the repository layer when
+present, one domain across the whole action group, and logical-AND safety.
+`snapshotEffectiveRuleSafetyPolicy` copies the fully resolved object once and
+is the only detector-facing policy. `canonicalRuleSafetySnapshot` produces the
+same sorted, closed value for identity hashing without exposing raw inputs.
 
 - [ ] **Step 4: Delegate GREEN verification and commit**
 
@@ -278,11 +362,25 @@ required_source_coverage, approval_policy, resource_domains, kill_switches
 
 Add genuine Ed25519 verification for the new payload. Add repository tests for
 optional nested approval fields and domain arrays. Add organization/repository
-unknown fields, hostile getters/proxies, every bound, and secret canaries.
+unknown fields, hostile getters/proxies, every bound, and secret canaries. Lock
+the existing signed-file raw byte limit: exactly 65,536 bytes reaches parsing
+and 65,537 bytes returns the content-free unreadable result. Independently
+construct programmatic policy values whose canonical signed payload is exactly
+65,536 bytes (accepted) and 65,537 bytes (rejected content-free). Cover 256/257
+UTF-8-byte raw and normalized patterns and prove multibyte boundaries are
+measured as bytes, not JavaScript string length.
 Extend precedence assertions so the effective result contains a
 `rule_safety` snapshot only when a signed organization policy exists; repository
 false/pattern/domain constraints narrow it, while repository-only true values
 cannot authorize anything.
+
+Treat the JSON Schemas as a structural interoperability contract, not an exact
+copy of runtime semantics. Schema tests cover common object/array/type/declared
+bounds and require an `x-ccprof-runtime-constraints` annotation plus README
+cross-reference for UTF-8 byte limits, NFC/whitespace duplicate detection,
+descriptor/proxy rejection, canonical-payload bytes, tuple ordering, and
+monotonic merge rules. Test schema/runtime agreement only on that shared
+structural surface; test runtime-only semantics separately.
 
 - [ ] **Step 2: Delegate RED verification and commit**
 
@@ -295,8 +393,8 @@ node --test .test-dist/test/organization-policy.test.js \
 ```
 
 Expected: build or focused assertions fail because both closed schemas and
-runtime snapshots reject the new fields. Commit verified RED tests/schema
-expectations:
+runtime snapshots reject the new fields and the new boundary/annotation
+contracts are missing. Commit verified RED tests/schema expectations:
 
 ```bash
 git add test/organization-policy.test.ts
@@ -323,8 +421,11 @@ Use the Task 1 snapshot helpers inside both parsers and translate their fixed
 validation error into the existing content-free `invalid_policy` or
 `RepositoryConfigError("policy contains invalid values")`. Snapshot repository
 preferences before merge instead of reading nested getters. Append optional
-canonical fields without changing bytes when absent. Extend `EffectivePolicy`
-with:
+canonical fields without changing bytes when absent. Before signature parsing,
+retain the existing 65,536-byte raw signed-file cap. After deterministic
+canonicalization, enforce a separate 65,536-byte canonical signed-payload cap,
+including for programmatic inputs. Neither failure may echo policy content.
+Extend `EffectivePolicy` with:
 
 ```ts
 rule_safety?: EffectiveRuleSafetyPolicy;
@@ -332,7 +433,10 @@ rule_safety?: EffectiveRuleSafetyPolicy;
 
 and populate it only via `resolveRuleSafetyPolicy` when the signed organization
 argument exists. Update both JSON Schemas with closed nested objects and the
-exact numeric/item/string bounds from Task 1.
+structural item/string bounds representable in JSON Schema. Add
+`x-ccprof-runtime-constraints` annotations naming the runtime-only UTF-8/NFC,
+duplicate, hostile-descriptor, canonical-payload, ordering, and merge checks;
+do not claim exact schema/runtime parity.
 
 - [ ] **Step 4: Delegate GREEN verification and commit**
 
@@ -348,10 +452,13 @@ git commit -m "feat: extend signed rule safety policy"
 
 - [ ] **Step 5: Run specification then quality/security review**
 
-Require exact approval/domain schema agreement, old canonical-byte stability,
-genuine signature coverage, absent/invalid denial, repository-only denial, and
-logical-AND tightening. Then separately review descriptor safety, error
-privacy, mutation isolation, and canonical ordering.
+Require shared structural schema/runtime agreement, explicit annotation of all
+runtime-only constraints, old canonical-byte stability, signed raw/canonical
+64KiB boundary coverage, genuine signature coverage, absent/invalid denial,
+repository-only denial, and logical-AND tightening. Then separately review
+descriptor safety, content-free errors, UTF-8 byte accounting, mutation
+isolation, and full-tuple canonical ordering via the locale-independent
+comparator.
 
 ### Task 3: Split R004 into observe-only policy-latency evidence
 
@@ -387,10 +494,21 @@ Cover one occurrence, phrase-only/missing command, organization absent,
 organization deny, repository deny/intersection, unsafe wildcard `*` with
 `rm -rf .`, unknown, assignment, redirect, and composite commands. Assert two
 authorized occurrences classify repeated-safe; three occurrences remain one
-deterministically aggregated candidate. Assert no-approval human wait produces
-one zero-impact generic observation. In ledger tests, prove every R004
-candidate is upper-only, attributes zero recoverable milliseconds, and cannot
-reduce `estimated_floor_min`.
+deterministically aggregated candidate. Add timeline fixtures with one
+approval-bearing tool use at the pending assistant timestamp (bound normally)
+and two or more such uses at the same timestamp. The latter must set a fixed
+ambiguous sentinel, omit the command, and remain generic under every tool-event
+permutation; a later event may never overwrite that ambiguity.
+
+Assert no-approval human wait produces one zero-impact generic observation.
+For a positive observed duration, R004 uses the upper bound shown above. For a
+zero observation it must project to `{ lower_ms: 0, upper_ms: 0 }`, a point-zero
+harmless candidate rather than an `upper_only` candidate. In ledger tests,
+prove positive R004 candidates are upper-only, every R004 candidate attributes
+zero recoverable milliseconds, and none can reduce `estimated_floor_min`.
+Exercise the whole-decision action/distinct-command/step limits and require a
+generic result on every overflow. The exact generic sentence must not contain
+the token `allowlist`, including in a negated sentence.
 
 - [ ] **Step 2: Delegate RED verification and commit**
 
@@ -402,9 +520,9 @@ node --test .test-dist/test/rules-primary.test.js \
   .test-dist/test/ledger.test.js
 ```
 
-Expected: focused failures show the command is missing from human wait, R004 is
-not split, uses a point lower bound, and still emits an unconditional allowlist
-recipe. Commit:
+Expected: focused failures show the command is missing/ambiguously overwritten
+in human wait, R004 is not split, uses a point lower bound for positive waits,
+and still emits an unconditional allowlist recipe. Commit:
 
 ```bash
 git add test/rules-primary.test.ts test/ledger.test.ts
@@ -413,17 +531,24 @@ git commit -m "test: define policy-safe R004 behavior"
 
 - [ ] **Step 3: Carry causal commands and implement the R004 split**
 
-Extend internal `PendingAssistant` with `use?: ToolUseEvent`. When an approval
-tool use shares the pending assistant timestamp, store a defensive `use`
-reference and pass both `use` and the cloned approval to `causalAction` on the
-following genuine-user event. Existing `AttributedTimelineAction` command/tool
-fields require no public signature change.
+Extend internal `PendingAssistant` with a tri-state approval binding:
+`none | one defensive ToolUseEvent | ambiguous`. When the first approval-bearing
+tool use shares the pending assistant timestamp, bind it. A second
+approval-bearing use at that timestamp irreversibly switches to `ambiguous`,
+regardless of arrival order; later uses cannot replace it. On the following
+genuine-user event, pass the command only for `one`. For `ambiguous`, omit the
+command and set a fixed `approval_command_ambiguous: true` sentinel on the
+internal `AttributedTimelineAction`. Keep tool-event permutations byte-stable.
 
-Extend `HumanWaitOptions` with optional `ruleSafety`. For each approval action,
-call `approvalRecommendationDecision`; group allowed canonical commands, and
-mark a canonical command repeated only when its allowed group has at least two
-actions. Partition approvals into repeated-safe and generic arrays. A small
-candidate builder must use:
+Extend `HumanWaitOptions` with optional `ruleSafety`. Pass the complete ordered
+list of approval-action raw commands to `approvalRecommendationDecision` once.
+If it returns `{ kind: "denied" }`, classify the complete group as generic. If
+it returns per-action decisions, group allowed canonical commands and mark a
+canonical command repeated only when its allowed group has at least two
+actions; all denied items stay generic. Partition approvals into repeated-safe
+and generic arrays. A small
+candidate builder must use the positive-duration interval below and point zero
+when `recoverable.estimated_ms === 0`:
 
 ```ts
 impact: {
@@ -436,9 +561,12 @@ impact: {
 Use fixed targets `approval-policy-latency` and
 `repeated-safe-approval-latency`, fixed evidence classification strings, sorted
 canonical commands only on the authorized candidate, `policy_dependent: true`,
-and `ccprof --json` verification. Generic text must say the governing policy
-needs review and that no allowlist change is recommended; repeated-safe text may
-name sorted canonical commands and propose administrator review.
+and `ccprof --json` verification. Use a generic sentence such as `Review whether
+the measured approval latency is required by policy before changing
+permissions.` It must not contain the word `allowlist` at all. Repeated-safe
+text may name sorted canonical commands and propose an allowlist change for
+administrator review. Any ambiguous binding or decision-budget overflow must
+remain generic and omit canonical commands.
 
 - [ ] **Step 4: Delegate GREEN verification and commit**
 
@@ -454,8 +582,10 @@ git commit -m "feat: classify approval policy latency safely"
 - [ ] **Step 5: Run specification then quality/security review**
 
 First verify the exact two classifications, repeat threshold, signed gating,
-no unconditional allowlist text, and zero ledger attribution. Then separately
-review causal association, command lifetime/aliasing, deterministic partitions,
+no generic `allowlist` token, positive upper-only versus zero point-zero impact,
+and zero ledger attribution. Then separately review causal association,
+irreversible same-timestamp ambiguity, permutation invariance, command
+lifetime/aliasing, deterministic partitions, shared-budget overflow denial,
 unsafe-command denial, and evidence privacy.
 
 ### Task 4: Gate R005 parallel recipes on one explicit resource domain
@@ -473,16 +603,27 @@ Keep existing upper-estimate assertions and add these policy matrices:
 - signed `false` -> `parallel_unsafe`, same upper estimate, recipe explicitly
   says no parallel invocation is recommended;
 - no signed policy, no match, one command matching two domains, commands in two
-  domains, repository missing/different/ambiguous domain, native tool with no
-  command, unsafe/unknown raw command -> `investigation_candidate` and no
-  concrete parallel recipe;
+  domains, two matching entries with the same domain, repository
+  missing/different/ambiguous domain, native tool with no command,
+  unsafe/unknown raw command -> `investigation_candidate` and no concrete
+  parallel recipe;
 - signed `true` plus repository same-domain `false` -> `parallel_unsafe`;
 - signed `false` plus repository `true` stays `parallel_unsafe`;
+- assignments, `env`/`command` wrappers, redirects, composites, opaque
+  commands, unknown executables, `.bat`, and arbitrary `.cmd`/`.exe` names stay
+  investigation candidates even when a signed `*` pattern matches; the fixed
+  Windows bare-basename map has explicit positive cases;
+- 64 actions and 32 distinct raw commands stay within their independent test
+  fixtures, while 65 actions, 33 distinct commands, or the first step beyond
+  the 65,536 shared budget always yields `investigation_candidate`;
 - input action order does not change classification, domain, evidence arrays,
   finding key, or upper estimate.
 
 Assert every case remains `impact.kind === "resource_cost"`, `lower_ms === 0`,
-and `upper_ms === serial_duration_ms - longest_action_ms`.
+and `upper_ms === serial_duration_ms - longest_action_ms`. Give every R005
+candidate the neutral title `Path-disjoint tool calls ran serially`. For
+`parallel_unsafe` and `investigation_candidate`, assert title/summary/recipe do
+not say the actions are independent, parallelizable, or safe.
 
 - [ ] **Step 2: Delegate RED verification and commit**
 
@@ -504,8 +645,11 @@ git commit -m "test: define resource-domain R005 behavior"
 - [ ] **Step 3: Implement domain decisions without changing detection/estimate**
 
 Extend `SerialSlackOptions` with optional `ruleSafety`. After the existing group
-and upper-claim calculation, obtain one canonical command per action using the
-Task 1 safe canonicalizer and call `resourceDomainDecision`. Add:
+and upper-claim calculation, pass the action raw commands directly to
+`resourceDomainDecision`. That shared decision function is the only place that
+may call `safeCanonicalCommand`, and it owns one memo cache and one bounded work
+budget for the whole group. Do not pre-canonicalize or bypass its reject paths.
+Add:
 
 ```ts
 parallelization_classification: decision.kind,
@@ -514,11 +658,13 @@ parallelization_classification: decision.kind,
   : { resource_domain: decision.domain }),
 ```
 
-to evidence. Select one of three fixed recipes. Only `parallel_safe` may contain
-the phrase `parallel tool invocation`; false and investigation text must not
-imply achievable speedup. Do not change `eligibleAction`, `groupsForAgent`,
-`upperClaim`, target construction, or sorting except for importing the shared
-safety helper.
+to evidence. Use `Path-disjoint tool calls ran serially` as the common neutral
+title and select one of three fixed summaries/recipes. Only `parallel_safe` may
+say the actions are independent or parallelizable or contain the phrase
+`parallel tool invocation`; unsafe and investigation text must not assert
+independence, parallelizability, safety, or achievable speedup. Do not change
+`eligibleAction`, `groupsForAgent`, `upperClaim`, target construction, or
+sorting except for importing the shared safety helper.
 
 - [ ] **Step 4: Delegate GREEN verification and commit**
 
@@ -534,9 +680,11 @@ git commit -m "feat: gate parallel recipes by resource domain"
 - [ ] **Step 5: Run specification then quality/security review**
 
 The first reviewer verifies exact true/false/unknown/ambiguous/multiple-domain
-semantics and unchanged upper math. The second checks that no path-disjointness
-shortcut or input order can produce a concrete recipe, and that no policy
-pattern is serialized.
+semantics, including multiple matches with the same domain, shared-budget
+overflow denial, and unchanged upper math. The second checks raw-command-only
+safety entry, fixed Windows normalization, neutral unsafe/investigation text,
+that no path-disjointness shortcut or input order can produce a concrete
+recipe, and that no policy pattern is serialized.
 
 ### Task 5: Plumb one cached effective policy into core analysis
 
@@ -545,6 +693,8 @@ pattern is serialized.
 - Modify: `src/commands/analyze.ts`
 - Modify: `test/analyze-integration.test.ts`
 - Modify: `test/organization-policy.test.ts`
+- Modify: `test/capability-coverage.test.ts`
+- Modify: `test/store.test.ts`
 
 - [ ] **Step 1: Write failing command/core integration tests**
 
@@ -557,6 +707,20 @@ showing an injected signed rule-safety snapshot reaches R004 and R005; omitting
 the callback yields generic/investigation output. Assert an invalid configured
 resolver rejects before any policy-sensitive recipe can be persisted.
 
+Add snapshot-identity coverage using the existing persisted-policy-digest
+helpers. Immediately after PR-context resolution, the callback must resolve and
+`snapshotEffectiveRuleSafetyPolicy` exactly once, before an active-budget early
+return. Equivalent reordered policy inputs produce the same digest; changing a
+normalized effective value changes it; an absent policy uses an explicit
+canonical `{ mode: "absent" }` marker. Mutating the callback's source object
+after resolution must change neither detector behavior nor identity.
+
+Persist an analysis through the Store with secret canaries in raw policy
+patterns and source objects. Assert the serialized envelope contains only the
+outer 64-hex `SnapshotIdentity.policy_digest` and contains none of the canary,
+raw patterns, domains, raw commands, canonical snapshot, or nested policy
+object.
+
 - [ ] **Step 2: Delegate RED verification and commit**
 
 Delegate:
@@ -564,7 +728,9 @@ Delegate:
 ```bash
 npm run build:test
 node --test .test-dist/test/analyze-integration.test.js \
-  .test-dist/test/organization-policy.test.js
+  .test-dist/test/organization-policy.test.js \
+  .test-dist/test/capability-coverage.test.js \
+  .test-dist/test/store.test.js
 ```
 
 Expected: compilation/assertion failure because `AnalyzeOptions` has no
@@ -586,7 +752,12 @@ resolveRuleSafetyPolicy?: (
 ```
 
 Immediately after canonical PR context resolution, invoke the callback once
-when present. Pass the result through `ruleCandidates` to both detector options:
+when present, before the first budget-based early return. Pass the returned
+value through `snapshotEffectiveRuleSafetyPolicy`; this one closed clone is the
+sole object used by detectors and digest construction. Reject malformed,
+over-limit, proxy, accessor, or otherwise non-snapshotable results with the
+fixed content-free validation error. Pass the snapshot through `ruleCandidates`
+to both detector options:
 
 ```ts
 ...(ruleSafety === undefined ? {} : { ruleSafety }),
@@ -604,6 +775,24 @@ dependency compatibility and exact optional-property behavior. The callback
 must run before an active-budget early return so a configured trust failure
 cannot fall back to an ungoverned partial report.
 
+Derive a private rule-safety digest from canonical effective values, never raw
+input order or raw strings:
+
+```ts
+const ruleSafetyDigest = analysisDigest(
+  "effective-rule-safety-v1",
+  ruleSafety === undefined
+    ? { mode: "absent" }
+    : canonicalRuleSafetySnapshot(ruleSafety),
+);
+```
+
+Add only `{ rule_safety_digest: ruleSafetyDigest }` to the object already hashed
+by `snapshotIdentity(...)` into its outer `policy_digest`. Do not add a public
+`AnalysisSnapshotIdentity` field. Never place raw/canonical patterns, domains,
+commands, the effective snapshot, or the inner digest elsewhere in the report
+or Store.
+
 - [ ] **Step 4: Delegate GREEN verification and commit**
 
 Delegate the Task 5 focused commands. Expected: exit 0, resolver count exactly
@@ -612,16 +801,18 @@ and existing advisory/privacy behavior unchanged. Commit:
 
 ```bash
 git add src/core/analyze.ts src/commands/analyze.ts \
-  test/analyze-integration.test.ts test/organization-policy.test.ts
+  test/analyze-integration.test.ts test/organization-policy.test.ts \
+  test/capability-coverage.test.ts test/store.test.ts
 git commit -m "feat: apply effective policy to rule recommendations"
 ```
 
 - [ ] **Step 5: Run specification then quality review**
 
-Check trust failure ordering, cache identity, direct-core deny defaults,
-analysis-budget behavior, and no policy serialization. Then review dependency
-direction, exact optional properties, callback lifetime, and custom dependency
-compatibility.
+Check trust failure ordering, one closed snapshot, cache identity, direct-core
+deny defaults, absent marker, normalized/reordered digest equivalence, mutation
+isolation, analysis-budget behavior, and Store canary absence. Then review
+dependency direction, exact optional properties, callback lifetime, custom
+dependency compatibility, and that only the outer digest is persisted.
 
 ### Task 6: Publish epoch-2 manifests and prove all compatibility boundaries
 
@@ -666,8 +857,11 @@ classifications through JSON, TTY, and Markdown. Strict output must contain no
 canonical command, domain-policy pattern, or policy field; balanced output must
 sanitize command canaries; raw output retains permitted evidence. README tests
 must require the new signed/repository JSON examples, observe-only warning,
-resource-domain ambiguity rules, no-shell/non-regex statement, and legacy
-compatibility.
+resource-domain ambiguity rules (including multiple matching entries with one
+domain), structural-schema versus runtime-semantics contract and vendor
+annotation, UTF-8/raw/canonical/budget limits, fixed Windows launcher mapping,
+no-shell/non-regex statement, R004 point-zero behavior, neutral R005 unsafe
+language, digest-only persistence, and legacy compatibility.
 
 - [ ] **Step 2: Delegate RED verification and commit**
 
@@ -719,8 +913,24 @@ Extend the signed policy README example with:
 ```
 
 Document repository values as intersections, signed-policy absence as deny,
-R004 upper-only policy latency, R005 investigation candidates, every matcher
-bound, and that patterns are matched without regex/shell/glob execution.
+positive-duration R004 as upper-only policy latency and zero duration as a
+point-zero harmless observation, and R005 unknown/ambiguous cases as
+investigation candidates with a neutral title. State that policy lists use the
+locale-independent UTF-8 byte comparator over the full tuple and that exact
+duplicates are rejected. List the 65,536-byte raw signed-file and canonical
+payload limits separately, 256-byte pattern/4,096-byte raw command preflights,
+64-action/32-distinct-command/65,536-step decision limits, and the fixed Windows
+bare-basename `.cmd`/`.exe` map; `.bat` and arbitrary suffix normalization are
+unsupported. Explain that budget exhaustion denies/investigates without prefix
+authorization and that patterns are matched without regex/shell/glob execution.
+
+Document JSON Schema as the structural contract and the
+`x-ccprof-runtime-constraints`/README material as the authoritative runtime
+semantic supplement for UTF-8 byte counts, normalization duplicates, hostile
+descriptors, canonical-payload limits, ordering, and monotonic resolution. Do
+not claim exact schema/runtime parity. State that Store/report identity persists
+only the outer policy digest, never patterns, domains, raw commands, or the
+effective policy snapshot.
 
 - [ ] **Step 4: Delegate focused GREEN and impacted-suite verification**
 
@@ -734,6 +944,7 @@ node --test \
   .test-dist/test/rules-secondary.test.js \
   .test-dist/test/ledger.test.js \
   .test-dist/test/analyze-integration.test.js \
+  .test-dist/test/capability-coverage.test.js \
   .test-dist/test/rule-manifest.cases.js \
   .test-dist/test/store.test.js \
   .test-dist/test/reporters-and-cli.test.js \
@@ -757,8 +968,10 @@ git commit -m "docs: publish policy-safe rule contracts"
 First review the entire branch against every design section and audit P0-6/P0-7.
 Only after specification approval, use a different reviewer for matcher
 complexity, hostile objects, signed merge monotonicity, R004 ledger isolation,
-R005 ambiguity, privacy, legacy reads, determinism, and scope. Resolve all P0-P2
-findings with new commits and repeat both reviews.
+R005 same-domain ambiguity, raw-command safety, bounded-work exhaustion,
+UTF-8/canonical size boundaries, identity digest/persistence privacy, legacy
+reads, determinism, and scope. Resolve all P0-P2 findings with new commits and
+repeat both reviews.
 
 ### Task 7: Rebase, run local CI, create and complete the PR
 
