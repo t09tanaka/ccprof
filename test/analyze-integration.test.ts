@@ -16,7 +16,8 @@ import {
   NoAnalyzableTimestampsError,
   NoMatchingSessionsError,
 } from "../src/core/analyze.js";
-import type { Interval, Session } from "../src/core/model.js";
+import { runAnalyzeCommand } from "../src/commands/analyze.js";
+import type { Interval, ReportV2, Session } from "../src/core/model.js";
 import {
   discoverManifestTestMap,
   parseExplicitTestMap,
@@ -42,6 +43,12 @@ import { loadAdoptions } from "../src/store/adoptions.js";
 import { saveDismissal } from "../src/store/dismissals.js";
 import { resolveStorePaths } from "../src/store/paths.js";
 import { openStoreDatabase } from "../src/store/sqlite.js";
+import {
+  resolveRuleSafetyPolicy,
+  RuleSafetyPolicyValidationError,
+  type EffectiveRuleSafetyPolicy,
+} from "../src/policy/rule-safety.js";
+import type { EffectivePolicy } from "../src/policy/organization-policy.js";
 
 const NOW_MS = Date.parse("2026-01-01T01:00:00.000Z");
 const FEATURE_COMMIT_DATE = "2026-01-01T00:00:00.000Z";
@@ -238,6 +245,752 @@ function seedSummary() {
     baseline: null,
   } as const;
 }
+
+function policySensitiveRuleSafety(): EffectiveRuleSafetyPolicy {
+  return resolveRuleSafetyPolicy(
+    {
+      safe_patterns: ["npm *"],
+      allow_rule_recommendation: true,
+    },
+    [{
+      match: ["npm *"],
+      domain: "node-workspace",
+      parallel_safe: true,
+    }],
+  );
+}
+
+function commandPolicy(
+  overrides: Partial<EffectivePolicy> = {},
+): EffectivePolicy {
+  return {
+    governed: false,
+    privacy: "raw",
+    allow_raw: true,
+    allow_advisory: true,
+    advisory_enabled: true,
+    allow_export: true,
+    required_source_coverage: 0,
+    ...overrides,
+  };
+}
+
+function storedPolicyDigest(
+  history: Awaited<ReturnType<typeof loadAnalyses>>,
+): string {
+  assert.deepEqual(history.warnings, []);
+  const entry = history.entries?.[0];
+  assert.ok(entry !== undefined);
+  assert.equal("mode" in entry.identity, false);
+  if ("mode" in entry.identity) {
+    assert.fail("expected a rich analysis snapshot identity");
+  }
+  return entry.identity.policy_digest;
+}
+
+function policySensitiveSession(sessionId: string, repo: string): Session {
+  const t0 = NOW_MS - 600_000;
+  const shared = {
+    session_id: sessionId,
+    agent_id: "main",
+    is_sidechain: false,
+    confidence: "high" as const,
+  };
+  const approvalTurn = (
+    index: number,
+    offsetMs: number,
+    path: string,
+  ): Session["events"] => {
+    const toolUseId = `policy-read-${index}`;
+    return [
+      {
+        ...shared,
+        kind: "assistant" as const,
+        timestamp_ms: t0 + offsetMs,
+        entry_uuid: `approval-prompt-${index}`,
+        session_ref: `${sessionId}#approval-prompt-${index}`,
+        source_index: index * 4,
+        text: "Approval required for this validation.",
+      },
+      {
+        ...shared,
+        kind: "tool_use" as const,
+        timestamp_ms: t0 + offsetMs,
+        entry_uuid: `approval-use-${index}`,
+        session_ref: `${sessionId}#approval-use-${index}`,
+        source_index: index * 4 + 1,
+        tool_use_id: toolUseId,
+        tool_name: "Read",
+        input: {},
+        paths: [path],
+        edit_fragments: [],
+        command: "npm test",
+        cwd: repo,
+        approval: {
+          required: true,
+          reason: "validation requires approval",
+        },
+      },
+      {
+        ...shared,
+        kind: "genuine_user" as const,
+        timestamp_ms: t0 + offsetMs + 100,
+        entry_uuid: `approval-answer-${index}`,
+        session_ref: `${sessionId}#approval-answer-${index}`,
+        source_index: index * 4 + 2,
+        text: "Approved.",
+      },
+      {
+        ...shared,
+        kind: "tool_result" as const,
+        timestamp_ms: t0 + offsetMs + 110,
+        entry_uuid: `approval-result-${index}`,
+        session_ref: `${sessionId}#approval-result-${index}`,
+        source_index: index * 4 + 3,
+        tool_use_id: toolUseId,
+        status: "success" as const,
+        output: "ok",
+        output_bytes: 2,
+        estimated_tokens: 1,
+      },
+    ];
+  };
+  const serialRead = (
+    index: number,
+    offsetMs: number,
+    path: string,
+  ): Session["events"] => {
+    const toolUseId = `serial-read-${index}`;
+    return [
+      {
+        ...shared,
+        kind: "tool_use",
+        timestamp_ms: t0 + offsetMs,
+        entry_uuid: `serial-use-${index}`,
+        session_ref: `${sessionId}#serial-use-${index}`,
+        source_index: 10 + index * 2,
+        tool_use_id: toolUseId,
+        tool_name: "Read",
+        input: {},
+        paths: [path],
+        edit_fragments: [],
+        command: "npm test",
+        cwd: repo,
+      },
+      {
+        ...shared,
+        kind: "tool_result",
+        timestamp_ms: t0 + offsetMs + 100,
+        entry_uuid: `serial-result-${index}`,
+        session_ref: `${sessionId}#serial-result-${index}`,
+        source_index: 11 + index * 2,
+        tool_use_id: toolUseId,
+        status: "success",
+        output: "ok",
+        output_bytes: 2,
+        estimated_tokens: 1,
+      },
+    ];
+  };
+  return {
+    session_id: sessionId,
+    source: "claude",
+    source_path: join(repo, `${sessionId}.jsonl`),
+    observed_cwds: [repo],
+    observed_branches: ["feature"],
+    started_at_ms: t0,
+    ended_at_ms: t0 + 610,
+    confidence: "high",
+    events: [
+      ...approvalTurn(0, 0, "package.json"),
+      ...approvalTurn(1, 200, "src/value.ts"),
+      {
+        ...shared,
+        kind: "tool_use",
+        timestamp_ms: t0 + 350,
+        entry_uuid: "group-boundary-use",
+        session_ref: `${sessionId}#group-boundary-use`,
+        source_index: 8,
+        tool_use_id: "group-boundary",
+        tool_name: "CustomUnknownTool",
+        input: {},
+        paths: [],
+        edit_fragments: [],
+      },
+      {
+        ...shared,
+        kind: "tool_result",
+        timestamp_ms: t0 + 360,
+        entry_uuid: "group-boundary-result",
+        session_ref: `${sessionId}#group-boundary-result`,
+        source_index: 9,
+        tool_use_id: "group-boundary",
+        status: "success",
+        output: "ok",
+        output_bytes: 2,
+        estimated_tokens: 1,
+      },
+      ...serialRead(0, 400, "package.json"),
+      ...serialRead(1, 510, "src/value.ts"),
+    ],
+    warnings: [],
+  };
+}
+
+test("core snapshots one injected rule policy for both R004 and R005", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-rule-policy-core-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const mutablePolicy = policySensitiveRuleSafety();
+    const approval = mutablePolicy.approval;
+    const domain = mutablePolicy.organization_resource_domains[0];
+    assert.ok(approval !== undefined);
+    assert.ok(domain !== undefined);
+    let resolverCalls = 0;
+
+    const authorized = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      persist: false,
+      resolveRuleSafetyPolicy: async (resolvedRepo: string) => {
+        resolverCalls += 1;
+        assert.equal(resolvedRepo, repo);
+        return mutablePolicy;
+      },
+      sessionSource: {
+        discover: async () => {
+          approval.organization_safe_patterns[0] = "cargo *";
+          domain.match[0] = "cargo *";
+          domain.parallel_safe = false;
+          return [policySensitiveSession("authorized-policy", repo)];
+        },
+      },
+    });
+
+    assert.equal(resolverCalls, 1);
+    const repeatedApproval = authorized.allFindings.find(
+      ({ rule_id, evidence }) =>
+        rule_id === "R004" &&
+        evidence.latency_classification ===
+          "repeated_safe_approval_latency",
+    );
+    const parallelSafe = authorized.allFindings.find(
+      ({ rule_id }) => rule_id === "R005",
+    );
+    assert.ok(repeatedApproval !== undefined);
+    assert.deepEqual(repeatedApproval.evidence.canonical_commands, [
+      "npm test",
+    ]);
+    assert.match(repeatedApproval.fix_recipe.suggestion, /allowlist/iu);
+    assert.ok(parallelSafe !== undefined);
+    assert.equal(
+      parallelSafe.evidence.parallelization_classification,
+      "parallel_safe",
+    );
+    assert.equal(parallelSafe.evidence.resource_domain, "node-workspace");
+    assert.match(
+      parallelSafe.fix_recipe.suggestion,
+      /parallel tool invocation/iu,
+    );
+
+    const unconfigured = await analyze({
+      cwd: repo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths,
+      persist: false,
+      sessionSource: {
+        discover: async () => [policySensitiveSession("absent-policy", repo)],
+      },
+    });
+    const genericApproval = unconfigured.allFindings.find(
+      ({ rule_id }) => rule_id === "R004",
+    );
+    const investigation = unconfigured.allFindings.find(
+      ({ rule_id }) => rule_id === "R005",
+    );
+    assert.ok(genericApproval !== undefined);
+    assert.equal(
+      genericApproval.evidence.latency_classification,
+      "approval_policy_latency",
+    );
+    assert.equal(
+      Object.hasOwn(genericApproval.evidence, "canonical_commands"),
+      false,
+    );
+    assert.ok(investigation !== undefined);
+    assert.equal(
+      investigation.evidence.parallelization_classification,
+      "investigation_candidate",
+    );
+    assert.equal(
+      Object.hasOwn(investigation.evidence, "resource_domain"),
+      false,
+    );
+    assert.doesNotMatch(
+      investigation.fix_recipe.suggestion,
+      /parallel tool invocation/iu,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("core rejects an invalid rule policy before discovery or persistence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-invalid-rule-policy-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const canary = "RULE_POLICY_RESOLVER_CANARY";
+    const hostile = new Proxy(
+      { organization_resource_domains: [] },
+      {
+        ownKeys: () => {
+          throw new Error(canary);
+        },
+      },
+    ) as EffectiveRuleSafetyPolicy;
+    let discoveryCalls = 0;
+
+    await assert.rejects(
+      analyze({
+        cwd: repo,
+        pr: "main...feature",
+        nowMs: NOW_MS,
+        storePaths,
+        resolveRuleSafetyPolicy: async () => hostile,
+        sessionSource: {
+          discover: async () => {
+            discoveryCalls += 1;
+            return [policySensitiveSession("must-not-run", repo)];
+          },
+        },
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof RuleSafetyPolicyValidationError);
+        assert.equal(error.message, "invalid rule safety policy");
+        assert.equal(error.message.includes(canary), false);
+        return true;
+      },
+    );
+    assert.equal(discoveryCalls, 0);
+    assert.deepEqual((await loadAnalyses(storePaths)).records, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("linked-worktree analyze uses one canonical effective policy for core identity and rendering", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-linked-rule-policy-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const linkedRepoPath = join(repo, ".test-worktrees", "policy-linked");
+    await mkdir(dirname(linkedRepoPath), { recursive: true });
+    await git(repo, ["worktree", "add", "--detach", linkedRepoPath, "feature"]);
+    const linkedRepo = await realpath(linkedRepoPath);
+    const commandStorePaths = await resolveStorePaths(linkedRepo, {
+      env: { CCPROF_DATA_DIR: join(root, "command-data") },
+    });
+    const referenceStorePaths = await resolveStorePaths(linkedRepo, {
+      env: { CCPROF_DATA_DIR: join(root, "reference-data") },
+    });
+    assert.notEqual(linkedRepo, commandStorePaths.canonical_repo);
+    assert.equal(commandStorePaths.canonical_repo, repo);
+
+    const ruleSafety = policySensitiveRuleSafety();
+    const canonicalPolicy = commandPolicy({
+      governed: true,
+      organization: "example-corp",
+      privacy: "strict",
+      allow_raw: false,
+      allow_advisory: false,
+      advisory_enabled: false,
+      rule_safety: ruleSafety,
+    });
+    const unauthorizedPatternCanary = "pnpm test --linked-policy-canary";
+    const unauthorizedDomainCanary = "linked-policy-canary";
+    const linkedPathPolicy = commandPolicy({
+      rule_safety: resolveRuleSafetyPolicy(
+        {
+          safe_patterns: [unauthorizedPatternCanary],
+          allow_rule_recommendation: true,
+        },
+        [{
+          match: [unauthorizedPatternCanary],
+          domain: unauthorizedDomainCanary,
+          parallel_safe: true,
+        }],
+      ),
+    });
+    const source = {
+      discover: async () => [
+        policySensitiveSession("linked-policy-session", linkedRepo),
+      ],
+    };
+
+    await analyze({
+      cwd: linkedRepo,
+      pr: "main...feature",
+      nowMs: NOW_MS,
+      storePaths: referenceStorePaths,
+      sessionSource: source,
+      resolveRuleSafetyPolicy: async () => ruleSafety,
+    });
+    const referenceHistory = await loadAnalyses(referenceStorePaths);
+
+    const resolvedRepos: string[] = [];
+    let advisoryCalls = 0;
+    const output = await runAnalyzeCommand({
+      cwd: linkedRepo,
+      pr: "main...feature",
+      format: "json",
+      color: false,
+      privacy: "raw",
+      advisory: true,
+    }, {
+      analyze: async (options) => await analyze({
+        ...options,
+        nowMs: NOW_MS,
+        storePaths: commandStorePaths,
+        sessionSource: source,
+      }),
+      resolvePolicy: async (resolvedRepo) => {
+        resolvedRepos.push(resolvedRepo);
+        return resolvedRepo === commandStorePaths.canonical_repo
+          ? canonicalPolicy
+          : linkedPathPolicy;
+      },
+      runCommand: async () => {
+        advisoryCalls += 1;
+        throw new Error("advisory must remain disabled by canonical policy");
+      },
+    });
+
+    assert.deepEqual(resolvedRepos, [commandStorePaths.canonical_repo]);
+    assert.equal(advisoryCalls, 0);
+    assert.ok(output.warnings.some((warning) =>
+      warning.includes("[policy_advisory_disabled]")
+    ));
+    const strictReport = JSON.parse(output.stdout) as ReportV2;
+    const strictApproval = strictReport.findings.find(
+      ({ rule_id }) => rule_id === "R004",
+    );
+    assert.ok(strictApproval !== undefined);
+    assert.equal(strictApproval.fix_recipe.suggestion, "[redacted-command]");
+    assert.equal(output.stdout.includes("npm test"), false);
+    for (const finding of strictReport.findings) {
+      assert.deepEqual(Object.keys(finding.evidence).sort(), [
+        "interval_ids",
+        "session_refs",
+      ]);
+      assert.equal(Object.hasOwn(finding.evidence, "canonical_commands"), false);
+      assert.equal(Object.hasOwn(finding.evidence, "resource_domain"), false);
+    }
+    assert.equal(output.stdout.includes(unauthorizedPatternCanary), false);
+    assert.equal(output.stdout.includes(unauthorizedDomainCanary), false);
+
+    const commandHistory = await loadAnalyses(commandStorePaths);
+    assert.equal(commandHistory.records.length, 1);
+    const findings = commandHistory.records[0]?.findings ?? [];
+    const approval = findings.find(({ rule_id, evidence }) =>
+      rule_id === "R004" &&
+      evidence.latency_classification === "repeated_safe_approval_latency"
+    );
+    const serial = findings.find(({ rule_id }) => rule_id === "R005");
+    assert.deepEqual(approval?.evidence.canonical_commands, ["npm test"]);
+    assert.equal(
+      serial?.evidence.parallelization_classification,
+      "parallel_safe",
+    );
+    assert.equal(serial?.evidence.resource_domain, "node-workspace");
+    assert.equal(
+      storedPolicyDigest(commandHistory),
+      storedPolicyDigest(referenceHistory),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("linked-worktree canonical rule-safety denial persists no authorized recipe", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-linked-policy-denial-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const linkedRepoPath = join(repo, ".test-worktrees", "policy-denial");
+    await mkdir(dirname(linkedRepoPath), { recursive: true });
+    await git(repo, ["worktree", "add", "--detach", linkedRepoPath, "feature"]);
+    const linkedRepo = await realpath(linkedRepoPath);
+    const storePaths = await resolveStorePaths(linkedRepo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    assert.notEqual(linkedRepo, storePaths.canonical_repo);
+    assert.equal(storePaths.canonical_repo, repo);
+
+    const linkedPathPolicy = commandPolicy({
+      rule_safety: policySensitiveRuleSafety(),
+    });
+    const canonicalPolicy = commandPolicy({
+      governed: true,
+      organization: "example-corp",
+      privacy: "balanced",
+      rule_safety: resolveRuleSafetyPolicy(
+        {
+          safe_patterns: ["cargo *"],
+          allow_rule_recommendation: true,
+        },
+        [{
+          match: ["cargo *"],
+          domain: "rust-workspace",
+          parallel_safe: false,
+        }],
+      ),
+    });
+    const resolvedRepos: string[] = [];
+
+    await runAnalyzeCommand({
+      cwd: linkedRepo,
+      pr: "main...feature",
+      format: "json",
+      color: false,
+      privacy: "raw",
+    }, {
+      analyze: async (options) => await analyze({
+        ...options,
+        nowMs: NOW_MS,
+        storePaths,
+        sessionSource: {
+          discover: async () => [
+            policySensitiveSession("canonical-denial", linkedRepo),
+          ],
+        },
+      }),
+      resolvePolicy: async (resolvedRepo) => {
+        resolvedRepos.push(resolvedRepo);
+        return resolvedRepo === storePaths.canonical_repo
+          ? canonicalPolicy
+          : linkedPathPolicy;
+      },
+    });
+
+    assert.deepEqual(resolvedRepos, [storePaths.canonical_repo]);
+    const history = await loadAnalyses(storePaths);
+    assert.equal(history.records.length, 1);
+    const findings = history.records[0]?.findings ?? [];
+    const approval = findings.find(({ rule_id }) => rule_id === "R004");
+    const serial = findings.find(({ rule_id }) => rule_id === "R005");
+    assert.equal(
+      approval?.evidence.latency_classification,
+      "approval_policy_latency",
+    );
+    assert.equal(
+      Object.hasOwn(approval?.evidence ?? {}, "canonical_commands"),
+      false,
+    );
+    assert.equal(
+      serial?.evidence.parallelization_classification,
+      "investigation_candidate",
+    );
+    assert.equal(
+      Object.hasOwn(serial?.evidence ?? {}, "resource_domain"),
+      false,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("linked-worktree canonical policy failure precedes discovery and persistence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-linked-policy-failure-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const linkedRepoPath = join(repo, ".test-worktrees", "policy-failure");
+    await mkdir(dirname(linkedRepoPath), { recursive: true });
+    await git(repo, ["worktree", "add", "--detach", linkedRepoPath, "feature"]);
+    const linkedRepo = await realpath(linkedRepoPath);
+    const storePaths = await resolveStorePaths(linkedRepo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    assert.notEqual(linkedRepo, storePaths.canonical_repo);
+    assert.equal(storePaths.canonical_repo, repo);
+
+    const invalidCanonicalPolicy = new Error("canonical policy invalid");
+    const linkedPathPolicy = commandPolicy({
+      rule_safety: policySensitiveRuleSafety(),
+    });
+    const resolvedRepos: string[] = [];
+    let discoveryCalls = 0;
+
+    await assert.rejects(
+      runAnalyzeCommand({
+        cwd: linkedRepo,
+        pr: "main...feature",
+        format: "json",
+        color: false,
+        privacy: "raw",
+      }, {
+        analyze: async (options) => await analyze({
+          ...options,
+          nowMs: NOW_MS,
+          storePaths,
+          sessionSource: {
+            discover: async () => {
+              discoveryCalls += 1;
+              return [policySensitiveSession("must-not-persist", linkedRepo)];
+            },
+          },
+        }),
+        resolvePolicy: async (resolvedRepo) => {
+          resolvedRepos.push(resolvedRepo);
+          if (resolvedRepo === storePaths.canonical_repo) {
+            throw invalidCanonicalPolicy;
+          }
+          return linkedPathPolicy;
+        },
+      }),
+      (error: unknown) => error === invalidCanonicalPolicy,
+    );
+
+    assert.deepEqual(resolvedRepos, [storePaths.canonical_repo]);
+    assert.equal(discoveryCalls, 0);
+    assert.deepEqual((await loadAnalyses(storePaths)).records, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("linked-worktree budget partial keeps canonical policy identity without Store paths", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-linked-budget-policy-"));
+  try {
+    const repo = await realpath(await makeRepository(root));
+    const linkedRepoPath = join(repo, ".test-worktrees", "policy-budget");
+    await mkdir(dirname(linkedRepoPath), { recursive: true });
+    await git(repo, ["worktree", "add", "--detach", linkedRepoPath, "feature"]);
+    const linkedRepo = await realpath(linkedRepoPath);
+    assert.notEqual(linkedRepo, repo);
+
+    const canonicalPolicy = commandPolicy({
+      governed: true,
+      organization: "canonical-policy",
+      privacy: "strict",
+      allow_raw: false,
+      allow_advisory: false,
+      advisory_enabled: false,
+      rule_safety: policySensitiveRuleSafety(),
+    });
+    const linkedPatternCanary = "npm test --linked-budget-policy-canary";
+    const linkedDomainCanary = "linked-budget-policy-canary";
+    const linkedPathPolicy = commandPolicy({
+      privacy: "raw",
+      allow_advisory: true,
+      advisory_enabled: true,
+      rule_safety: resolveRuleSafetyPolicy(
+        {
+          safe_patterns: [linkedPatternCanary],
+          allow_rule_recommendation: true,
+        },
+        [{
+          match: [linkedPatternCanary],
+          domain: linkedDomainCanary,
+          parallel_safe: true,
+        }],
+      ),
+    });
+    const advisoryCanary = "LINKED_BUDGET_ADVISORY_CANARY";
+    const resolvedRepos: string[] = [];
+    let discoveryCalls = 0;
+    let projectorCalls = 0;
+    let advisoryCalls = 0;
+    let wallReads = 0;
+    let partialReport: ReportV2 | undefined;
+    let preparedOutput: string | undefined;
+
+    const output = await runAnalyzeCommand({
+      cwd: linkedRepo,
+      pr: "main...feature",
+      format: "json",
+      color: false,
+      privacy: "raw",
+      advisory: true,
+      budgets: {
+        max_input_bytes: 1_000_000,
+        max_input_events: 1_000,
+        max_wall_ms: 0,
+        max_cpu_ms: 1_000_000,
+        max_output_bytes: 1_000_000,
+        max_source_items: 1_000,
+      },
+      budgetClock: {
+        wall_ms: () => wallReads++,
+        cpu_ms: () => 0,
+      },
+    }, {
+      analyze: async (options) => {
+        assert.equal(Object.hasOwn(options, "storePaths"), false);
+        const outputProjector = options.outputProjector;
+        assert.ok(outputProjector !== undefined);
+        const result = await analyze({
+          ...options,
+          nowMs: NOW_MS,
+          persist: false,
+          sessionSource: {
+            discover: async () => {
+              discoveryCalls += 1;
+              return [policySensitiveSession("must-not-discover", linkedRepo)];
+            },
+          },
+          outputProjector: async (report) => {
+            projectorCalls += 1;
+            return await outputProjector(report);
+          },
+        });
+        partialReport = result.report;
+        preparedOutput = result.preparedOutput;
+        return result;
+      },
+      resolvePolicy: async (resolvedRepo) => {
+        resolvedRepos.push(resolvedRepo);
+        return resolvedRepo === repo ? canonicalPolicy : linkedPathPolicy;
+      },
+      runCommand: async () => {
+        advisoryCalls += 1;
+        throw new Error(advisoryCanary);
+      },
+    });
+
+    assert.deepEqual(resolvedRepos, [repo]);
+    assert.equal(discoveryCalls, 0);
+    assert.equal(projectorCalls, 1);
+    assert.equal(advisoryCalls, 0);
+    assert.ok(partialReport !== undefined);
+    assert.equal(partialReport.unit.repo, repo);
+    assert.equal(
+      partialReport.analysis_budget?.truncation_reason,
+      "max_wall_ms",
+    );
+    assert.equal(preparedOutput, output.stdout);
+    assert.ok(output.warnings.some((warning) =>
+      warning.includes("[policy_advisory_disabled]")
+    ));
+    const strictReport = JSON.parse(output.stdout) as ReportV2;
+    assert.notEqual(strictReport.unit.repo, repo);
+    assert.notEqual(strictReport.unit.repo, linkedRepo);
+    const visibleOutput = `${output.stdout}\n${output.warnings.join("\n")}`;
+    assert.equal(visibleOutput.includes(repo), false);
+    assert.equal(visibleOutput.includes(linkedRepo), false);
+    assert.equal(visibleOutput.includes(linkedPatternCanary), false);
+    assert.equal(visibleOutput.includes(linkedDomainCanary), false);
+    assert.equal(visibleOutput.includes(advisoryCanary), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("orchestrates a deterministic PR analysis, stores all findings, and applies dismissal only to display", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-analyze-"));

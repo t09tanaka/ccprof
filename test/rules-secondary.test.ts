@@ -45,6 +45,11 @@ import {
 import { findingKey } from "../src/rules/shared.js";
 import { ruleManifest, type RuleManifest } from "../src/rules/manifest.js";
 import { detectSerialSlack } from "../src/rules/serial-slack.js";
+import {
+  resolveRuleSafetyPolicy,
+  type EffectiveRuleSafetyPolicy,
+  type ResourceDomainPolicy,
+} from "../src/policy/rule-safety.js";
 
 function assertCanonicalCandidate(
   finding: FindingCandidate,
@@ -130,6 +135,134 @@ function matchedAction(
   if (command === undefined) return action;
   const identity = buildCommandIdentity("/repo", "/repo", classifyCommand(command));
   return identity === undefined ? action : { ...action, command_identity: identity };
+}
+
+function r005RuleSafety(
+  organizationDomains: ResourceDomainPolicy[],
+  repositoryDomains?: ResourceDomainPolicy[],
+): EffectiveRuleSafetyPolicy {
+  return resolveRuleSafetyPolicy(
+    undefined,
+    organizationDomains,
+    undefined,
+    repositoryDomains,
+  );
+}
+
+function r005ValidationActions(
+  commands: readonly (string | undefined)[],
+): MatchedAction[] {
+  return commands.map((command, index) => {
+    const actionId = `policy-action-${index.toString().padStart(2, "0")}`;
+    const startMs = index * 20;
+    const common = {
+      tool_name: "Bash",
+      tool_use_id: actionId,
+      relevance_paths: [`scope/${actionId}.ts`],
+    };
+    if (command === undefined) {
+      return matchedAction(
+        actionId,
+        startMs,
+        startMs + 10,
+        "safe_read",
+        {
+          ...common,
+          tool_name: "Read",
+          paths: [`scope/${actionId}.ts`],
+        },
+      );
+    }
+    return matchedAction(
+      actionId,
+      startMs,
+      startMs + 10,
+      "contributing_run",
+      {
+        ...common,
+        command,
+        normalized_command: classifyCommand(command).normalized,
+      },
+    );
+  });
+}
+
+function r005NativeReadActions(commands: readonly string[]): MatchedAction[] {
+  return commands.map((command, index) => {
+    const actionId = `raw-action-${index.toString().padStart(2, "0")}`;
+    const startMs = index * 20;
+    return matchedAction(
+      actionId,
+      startMs,
+      startMs + 10,
+      "safe_read",
+      {
+        tool_name: "Read",
+        tool_use_id: actionId,
+        command,
+        paths: [`raw/${actionId}.ts`],
+      },
+    );
+  });
+}
+
+function onlyR005(
+  actions: readonly MatchedAction[],
+  ruleSafety?: EffectiveRuleSafetyPolicy,
+): FindingCandidate {
+  const findings = ruleSafety === undefined
+    ? detectSerialSlack(actions)
+    : detectSerialSlack(actions, { ruleSafety });
+  assert.equal(findings.length, 1);
+  const finding = findings[0];
+  assert.ok(finding !== undefined);
+  return finding;
+}
+
+function assertR005Decision(
+  finding: FindingCandidate,
+  classification:
+    | "parallel_safe"
+    | "parallel_unsafe"
+    | "investigation_candidate",
+  domain?: string,
+): void {
+  assert.equal(finding.title, "Path-disjoint tool calls ran serially");
+  assert.equal(
+    finding.evidence.parallelization_classification,
+    classification,
+  );
+  if (domain === undefined) {
+    assert.equal(Object.hasOwn(finding.evidence, "resource_domain"), false);
+  } else {
+    assert.equal(finding.evidence.resource_domain, domain);
+  }
+  assert.equal(finding.impact.kind, "resource_cost");
+  assert.equal(finding.impact.lower_ms, 0);
+  assert.equal(
+    finding.impact.upper_ms,
+    Number(finding.evidence.serial_duration_ms) -
+      Number(finding.evidence.longest_action_ms),
+  );
+  assert.equal(finding.recoverable.estimated_ms, finding.impact.upper_ms);
+
+  if (classification === "parallel_safe") {
+    assert.match(finding.fix_recipe.suggestion, /parallel tool invocation/iu);
+    return;
+  }
+  const nonActionableText = [
+    finding.title,
+    finding.fix_recipe.suggestion,
+    ...finding.caveats,
+  ].join(" ");
+  assert.doesNotMatch(
+    nonActionableText,
+    /\b(?:independent|parallelizable|safe)\b/iu,
+  );
+  assert.doesNotMatch(
+    finding.fix_recipe.suggestion,
+    /parallel tool invocation/iu,
+  );
 }
 
 function eventBase(
@@ -309,6 +442,360 @@ test("R005 detects adjacent independent reads and estimates only sum minus max",
   );
   assert.notEqual(finding.fix_recipe.suggestion, "");
   assert.notEqual(finding.fix_recipe.verify, "");
+});
+
+test("R005 gates concrete parallel recipes on one signed safe domain", () => {
+  const actions = r005ValidationActions(["npm test", "npm run build"]);
+  const organizationSafe = [{
+    match: ["npm *"],
+    domain: "node-workspace",
+    parallel_safe: true,
+  }];
+  const safe = onlyR005(actions, r005RuleSafety(organizationSafe));
+  assertR005Decision(safe, "parallel_safe", "node-workspace");
+
+  const organizationUnsafe = [{
+    match: ["npm *"],
+    domain: "node-workspace",
+    parallel_safe: false,
+  }];
+  const unsafe = onlyR005(actions, r005RuleSafety(organizationUnsafe));
+  assertR005Decision(unsafe, "parallel_unsafe", "node-workspace");
+  assert.equal(unsafe.impact.upper_ms, safe.impact.upper_ms);
+  assert.match(
+    unsafe.fix_recipe.suggestion,
+    /no parallel invocation is recommended/iu,
+  );
+
+  const repositoryUnsafe = onlyR005(
+    actions,
+    r005RuleSafety(organizationSafe, [{
+      match: ["npm *"],
+      domain: "node-workspace",
+      parallel_safe: false,
+    }]),
+  );
+  assertR005Decision(
+    repositoryUnsafe,
+    "parallel_unsafe",
+    "node-workspace",
+  );
+  assert.match(
+    repositoryUnsafe.fix_recipe.suggestion,
+    /effective resource-domain policy/iu,
+  );
+  assert.doesNotMatch(
+    repositoryUnsafe.fix_recipe.suggestion,
+    /signed (?:organization|resource-domain) policy/iu,
+  );
+
+  const repositoryCannotWiden = onlyR005(
+    actions,
+    r005RuleSafety(organizationUnsafe, [{
+      match: ["npm *"],
+      domain: "node-workspace",
+      parallel_safe: true,
+    }]),
+  );
+  assertR005Decision(
+    repositoryCannotWiden,
+    "parallel_unsafe",
+    "node-workspace",
+  );
+});
+
+test("R005 investigates absent ambiguous and cross-domain contracts", () => {
+  const npmActions = r005ValidationActions(["npm test", "npm run build"]);
+  const cases: Array<{
+    label: string;
+    actions: MatchedAction[];
+    ruleSafety?: EffectiveRuleSafetyPolicy;
+  }> = [
+    {
+      label: "no signed policy",
+      actions: npmActions,
+    },
+    {
+      label: "no organization match",
+      actions: npmActions,
+      ruleSafety: r005RuleSafety([{
+        match: ["cargo *"],
+        domain: "rust-workspace",
+        parallel_safe: true,
+      }]),
+    },
+    {
+      label: "one command matches two domains",
+      actions: npmActions,
+      ruleSafety: r005RuleSafety([
+        {
+          match: ["npm *"],
+          domain: "node-workspace",
+          parallel_safe: true,
+        },
+        {
+          match: ["npm test"],
+          domain: "test-runner",
+          parallel_safe: true,
+        },
+      ]),
+    },
+    {
+      label: "two matching entries have the same domain",
+      actions: npmActions,
+      ruleSafety: r005RuleSafety([
+        {
+          match: ["npm *"],
+          domain: "node-workspace",
+          parallel_safe: true,
+        },
+        {
+          match: ["npm test"],
+          domain: "node-workspace",
+          parallel_safe: true,
+        },
+      ]),
+    },
+    {
+      label: "actions span domains",
+      actions: r005ValidationActions(["npm test", "cargo test"]),
+      ruleSafety: r005RuleSafety([
+        {
+          match: ["npm *"],
+          domain: "node-workspace",
+          parallel_safe: true,
+        },
+        {
+          match: ["cargo *"],
+          domain: "rust-workspace",
+          parallel_safe: true,
+        },
+      ]),
+    },
+    {
+      label: "repository has no matching domain",
+      actions: npmActions,
+      ruleSafety: r005RuleSafety(
+        [{
+          match: ["npm *"],
+          domain: "node-workspace",
+          parallel_safe: true,
+        }],
+        [{
+          match: ["cargo *"],
+          domain: "rust-workspace",
+          parallel_safe: true,
+        }],
+      ),
+    },
+    {
+      label: "repository selects a different domain",
+      actions: npmActions,
+      ruleSafety: r005RuleSafety(
+        [{
+          match: ["npm *"],
+          domain: "node-workspace",
+          parallel_safe: true,
+        }],
+        [{
+          match: ["npm *"],
+          domain: "other-workspace",
+          parallel_safe: true,
+        }],
+      ),
+    },
+    {
+      label: "repository match is ambiguous",
+      actions: npmActions,
+      ruleSafety: r005RuleSafety(
+        [{
+          match: ["npm *"],
+          domain: "node-workspace",
+          parallel_safe: true,
+        }],
+        [
+          {
+            match: ["npm *"],
+            domain: "node-workspace",
+            parallel_safe: true,
+          },
+          {
+            match: ["npm test"],
+            domain: "node-workspace",
+            parallel_safe: true,
+          },
+        ],
+      ),
+    },
+    {
+      label: "native tools have no raw command",
+      actions: r005ValidationActions([undefined, undefined]),
+      ruleSafety: r005RuleSafety([{
+        match: ["*"],
+        domain: "read-only",
+        parallel_safe: true,
+      }]),
+    },
+  ];
+
+  for (const entry of cases) {
+    assertR005Decision(
+      onlyR005(entry.actions, entry.ruleSafety),
+      "investigation_candidate",
+    );
+  }
+});
+
+test("R005 rejects unsafe raw commands even under a signed wildcard", () => {
+  const wildcard = r005RuleSafety([{
+    match: ["*"],
+    domain: "validation",
+    parallel_safe: true,
+  }]);
+  const rejected = [
+    "FOO=1 npm test",
+    "env npm test",
+    "command npm test",
+    "npm test > result.txt",
+    "npm test && unknown-tool",
+    "npm test 'unterminated",
+    "unknown-tool inspect",
+    "npm.bat test",
+    "unknown.cmd test",
+    "unknown.exe test",
+    "/tmp/npm test",
+    "./cargo test",
+    "C:\\tools\\npm.cmd test",
+    "node script.js",
+    "node -e console.log(1)",
+    "node.exe script.js",
+    "node.exe -e console.log(1)",
+  ];
+
+  for (const command of rejected) {
+    const finding = onlyR005(
+      r005NativeReadActions([command, "npm test"]),
+      wildcard,
+    );
+    assertR005Decision(finding, "investigation_candidate");
+  }
+});
+
+test("R005 accepts only fixed bare Windows launchers and node test mode", () => {
+  const wildcard = r005RuleSafety([{
+    match: ["*"],
+    domain: "validation",
+    parallel_safe: true,
+  }]);
+  const accepted = [
+    "NPM.CMD test",
+    "pnpm.cmd run check",
+    "YARN.CMD build",
+    "BUN.EXE test",
+    "cargo.exe check",
+    "GIT.EXE show HEAD",
+    "RG.EXE TODO src",
+    "node --test",
+    "NODE.EXE --test",
+    "node.exe --test test/a.test.js",
+  ];
+
+  for (const command of accepted) {
+    const finding = onlyR005(
+      r005ValidationActions([command, "npm test"]),
+      wildcard,
+    );
+    assertR005Decision(finding, "parallel_safe", "validation");
+  }
+});
+
+test("R005 applies action and distinct-command limits to the whole group", () => {
+  const policy = r005RuleSafety([{
+    match: ["npm *"],
+    domain: "node-workspace",
+    parallel_safe: true,
+  }]);
+  const repeated = Array.from({ length: 64 }, () => "npm test");
+  assertR005Decision(
+    onlyR005(r005ValidationActions(repeated), policy),
+    "parallel_safe",
+    "node-workspace",
+  );
+  assertR005Decision(
+    onlyR005(r005ValidationActions([...repeated, "npm test"]), policy),
+    "investigation_candidate",
+  );
+
+  const thirtyTwo = Array.from(
+    { length: 32 },
+    (_, index) => `npm test -- case-${index}`,
+  );
+  assertR005Decision(
+    onlyR005(r005ValidationActions(thirtyTwo), policy),
+    "parallel_safe",
+    "node-workspace",
+  );
+  assertR005Decision(
+    onlyR005(
+      r005ValidationActions([...thirtyTwo, "npm test -- case-32"]),
+      policy,
+    ),
+    "investigation_candidate",
+  );
+});
+
+test("R005 discards an authorized prefix when shared work is exhausted", () => {
+  const prefix = "npm test -- z";
+  const expensive = `${prefix}${"a".repeat(
+    4_096 - Buffer.byteLength(prefix),
+  )}`;
+  const expensiveMisses = Array.from(
+    { length: 16 },
+    (_, index) => `npm *never-${index.toString().padStart(2, "0")}`,
+  );
+  const policy = r005RuleSafety([
+    {
+      match: ["cargo test"],
+      domain: "validation",
+      parallel_safe: true,
+    },
+    ...expensiveMisses.map((pattern) => ({
+      match: [pattern],
+      domain: "validation",
+      parallel_safe: true,
+    })),
+    {
+      match: ["npm test -- z*"],
+      domain: "validation",
+      parallel_safe: true,
+    },
+  ]);
+
+  assertR005Decision(
+    onlyR005(r005ValidationActions(["cargo test", expensive]), policy),
+    "investigation_candidate",
+  );
+});
+
+test("R005 policy evidence is invariant under input action order", () => {
+  const policy = r005RuleSafety([{
+    match: ["npm *"],
+    domain: "node-workspace",
+    parallel_safe: true,
+  }]);
+  const actions = r005ValidationActions([
+    "npm test -- a",
+    "npm run build",
+    "npm test -- b",
+  ]);
+  const forward = onlyR005(actions, policy);
+  const reversed = onlyR005([...actions].reverse(), policy);
+
+  assertR005Decision(forward, "parallel_safe", "node-workspace");
+  assertR005Decision(reversed, "parallel_safe", "node-workspace");
+  assert.equal(reversed.finding_key, forward.finding_key);
+  assert.equal(reversed.impact.upper_ms, forward.impact.upper_ms);
+  assert.deepEqual(reversed.evidence, forward.evidence);
 });
 
 test("R005 accepts conservative read-only commands but rejects overlap and mutations", () => {

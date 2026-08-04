@@ -112,6 +112,8 @@ export async function runAnalyzeCommand(
   let projectorInvoked = false;
   const analyzeOptions: AnalyzeOptions = {
     cwd: options.cwd,
+    resolveRuleSafetyPolicy: async (repoRoot) =>
+      (await policyFor(repoRoot)).rule_safety,
     ...(options.pr === undefined ? {} : { pr: options.pr }),
     ...(options.sinceMs === undefined ? {} : { sinceMs: options.sinceMs }),
     ...(options.commitAnchorLookbackMs === undefined

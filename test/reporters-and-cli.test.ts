@@ -1650,6 +1650,454 @@ test("raw privacy preserves report and warning values without mutating input", a
   }
 });
 
+test("rule-safety classifications preserve permitted evidence across formats and privacy", () => {
+  const approvedCanonicalPrefix = "npm test";
+  const readOnlyCanonicalCommands = [
+    "rg secret-canary",
+    "cat secret",
+    "grep secret-canary README.md",
+    "head README.md",
+    "ls src",
+    "pwd",
+    "stat README.md",
+    "tail README.md",
+    "wc README.md",
+  ];
+  const canonicalCommandCanary =
+    "npm test -- /Users/alice/PolicyCanary/private.test.ts";
+  const domainCommandCanary =
+    "npm run build -- /Users/alice/DomainPolicyCanary/private.ts";
+  const secretCommandCanary =
+    "npm test --token=RULE_SAFETY_SECRET_CANARY";
+  const domainPolicyPatternCanary = "npm run build *";
+  const resourceDomainCanary = "private-policy-domain";
+  const forbiddenPolicyFields = [
+    "approval_policy",
+    "resource_domains",
+    "rule_safety_digest",
+    "policy_digest",
+  ] as const;
+  const policyFinding = (
+    index: number,
+    ruleId: "R004" | "R005",
+    title: string,
+    evidence: Finding["evidence"],
+    suggestion: string,
+  ): Finding => finding(index, {
+    finding_key: `policy-finding-${index}`,
+    rule_id: ruleId,
+    title,
+    classification: ruleId === "R004" ? "config" : "behavior",
+    scope: ruleId === "R004" ? "separate_issue" : "claude_md",
+    confidence: "medium",
+    evidence,
+    recoverable: { min: 1, bound: "upper" },
+    fix_recipe: { suggestion, verify: "ccprof --json" },
+    caveats: [],
+  });
+  const r004Evidence = (
+    classification:
+      | "approval_policy_latency"
+      | "repeated_safe_approval_latency",
+    canonicalCommands?: string[],
+  ): Finding["evidence"] => ({
+    session_refs: [`session#${classification}`],
+    interval_ids: [`R004:${classification}`],
+    latency_classification: classification,
+    count: classification === "approval_policy_latency" ? 1 : 2,
+    approval_count: classification === "approval_policy_latency" ? 1 : 2,
+    total_wait_ms: classification === "approval_policy_latency" ? 1_000 : 2_000,
+    approval_wait_ms:
+      classification === "approval_policy_latency" ? 1_000 : 2_000,
+    non_approval_wait_ms: 0,
+    approval_detection: ["explicit"],
+    approval_reasons: ["test execution"],
+    ...(canonicalCommands === undefined
+      ? {}
+      : { canonical_commands: canonicalCommands }),
+  });
+  const r005Evidence = (
+    classification:
+      | "parallel_safe"
+      | "parallel_unsafe"
+      | "investigation_candidate",
+    resourceDomain?: string,
+  ): Finding["evidence"] => ({
+    session_refs: [`session#${classification}`],
+    interval_ids: [`R005:${classification}`],
+    paths: ["packages/api", "packages/web"],
+    action_count: 2,
+    serial_duration_ms: 2_000,
+    longest_action_ms: 1_200,
+    commands: [domainCommandCanary, secretCommandCanary],
+    tool_names: ["Bash"],
+    parallelization_classification: classification,
+    ...(resourceDomain === undefined
+      ? {}
+      : { resource_domain: resourceDomain }),
+  });
+  interface RenderFixture {
+    name: string;
+    finding: Finding;
+    classificationKey:
+      | "latency_classification"
+      | "parallelization_classification";
+    classification: string;
+    domain?: string;
+    expectedEvidenceKeys: string[];
+  }
+  const r005Fixtures: Array<{
+    classification:
+      | "parallel_safe"
+      | "parallel_unsafe"
+      | "investigation_candidate";
+    domain?: string;
+    suggestion: string;
+  }> = [
+    {
+      classification: "parallel_safe",
+      domain: "node-workspace",
+      suggestion:
+        "Batch the independent read or validation calls into one parallel tool invocation.",
+    },
+    {
+      classification: "parallel_unsafe",
+      domain: "release-workspace",
+      suggestion:
+        "The signed resource-domain policy prohibits concurrent execution; no parallel invocation is recommended.",
+    },
+    {
+      classification: "investigation_candidate",
+      suggestion:
+        "Review shared resources for the path-disjoint calls before changing execution.",
+    },
+  ];
+  const fixtures: RenderFixture[] = [
+    {
+      name: "generic R004",
+      finding: policyFinding(
+        101,
+        "R004",
+        "Approval policy latency",
+        r004Evidence("approval_policy_latency"),
+        "Review whether the measured approval latency is required by policy before changing permissions.",
+      ),
+      classificationKey: "latency_classification",
+      classification: "approval_policy_latency",
+      expectedEvidenceKeys: [
+        "approval_count",
+        "approval_detection",
+        "approval_reasons",
+        "approval_wait_ms",
+        "count",
+        "interval_ids",
+        "latency_classification",
+        "non_approval_wait_ms",
+        "session_refs",
+        "total_wait_ms",
+      ],
+    },
+    {
+      name: "repeated-safe R004",
+      finding: policyFinding(
+        102,
+        "R004",
+        "Repeated safe approval latency",
+        r004Evidence(
+          "repeated_safe_approval_latency",
+          [canonicalCommandCanary],
+        ),
+        `Ask an administrator to review an allowlist change for these repeated safe approval commands: \`${canonicalCommandCanary}\`.`,
+      ),
+      classificationKey: "latency_classification",
+      classification: "repeated_safe_approval_latency",
+      expectedEvidenceKeys: [
+        "approval_count",
+        "approval_detection",
+        "approval_reasons",
+        "approval_wait_ms",
+        "canonical_commands",
+        "count",
+        "interval_ids",
+        "latency_classification",
+        "non_approval_wait_ms",
+        "session_refs",
+        "total_wait_ms",
+      ],
+    },
+    ...r005Fixtures.map((entry, index): RenderFixture => ({
+      name: `${entry.classification} R005`,
+      finding: policyFinding(
+        103 + index,
+        "R005",
+        "Path-disjoint tool calls ran serially",
+        r005Evidence(entry.classification, entry.domain),
+        entry.suggestion,
+      ),
+      classificationKey: "parallelization_classification",
+      classification: entry.classification,
+      ...(entry.domain === undefined ? {} : { domain: entry.domain }),
+      expectedEvidenceKeys: [
+        "action_count",
+        "commands",
+        "interval_ids",
+        "longest_action_ms",
+        "parallelization_classification",
+        "paths",
+        ...(entry.domain === undefined ? [] : ["resource_domain"]),
+        "serial_duration_ms",
+        "session_refs",
+        "tool_names",
+      ],
+    })),
+  ];
+  const commandValues = (evidence: Finding["evidence"]): string[] =>
+    ["canonical_commands", "commands"].flatMap((key) => {
+      const value = evidence[key];
+      return Array.isArray(value)
+        ? value.filter((entry): entry is string => typeof entry === "string")
+        : [];
+    });
+
+  for (const fixture of fixtures) {
+    const rawReport: ReportV2 = {
+      ...report(),
+      findings: [fixture.finding],
+      caveats: [],
+    };
+    const rawJson = JSON.parse(renderJsonReport(rawReport)) as ReportV2;
+    const rawEvidence = rawJson.findings[0]?.evidence;
+    assert.ok(rawEvidence !== undefined, fixture.name);
+    assert.equal(
+      rawEvidence[fixture.classificationKey],
+      fixture.classification,
+      fixture.name,
+    );
+    assert.deepEqual(
+      Object.keys(rawEvidence).sort(),
+      [...fixture.expectedEvidenceKeys].sort(),
+      fixture.name,
+    );
+    if (fixture.domain !== undefined) {
+      assert.equal(rawEvidence.resource_domain, fixture.domain, fixture.name);
+    } else {
+      assert.equal(Object.hasOwn(rawEvidence, "resource_domain"), false);
+    }
+    assert.deepEqual(
+      commandValues(rawEvidence),
+      fixture.finding.rule_id === "R005"
+        ? [domainCommandCanary, secretCommandCanary]
+        : fixture.classification === "repeated_safe_approval_latency"
+          ? [canonicalCommandCanary]
+          : [],
+      fixture.name,
+    );
+    for (const field of forbiddenPolicyFields) {
+      assert.equal(Object.hasOwn(rawEvidence, field), false, fixture.name);
+    }
+    for (const output of [
+      renderJsonReport(rawReport),
+      renderTtyReport(rawReport, { color: false }),
+      renderMarkdownReport(rawReport),
+    ]) {
+      assert.ok(output.includes(fixture.finding.title), fixture.name);
+    }
+
+    const strict = projectReportPrivacy(rawReport, "strict");
+    const strictEvidence = strict.findings[0]?.evidence ?? {};
+    const strictRecipe = strict.findings[0]?.fix_recipe;
+    assert.deepEqual(
+      Object.keys(strictEvidence).sort(),
+      ["interval_ids", "session_refs"],
+      fixture.name,
+    );
+    assert.ok(strictRecipe !== undefined, fixture.name);
+    for (const forbidden of [
+      approvedCanonicalPrefix,
+      "npm run build",
+      fixture.domain ?? "",
+      domainPolicyPatternCanary,
+      resourceDomainCanary,
+      ...forbiddenPolicyFields,
+    ]) {
+      if (forbidden === "") continue;
+      assert.equal(
+        JSON.stringify(strictEvidence).includes(forbidden),
+        false,
+        fixture.name,
+      );
+      assert.equal(
+        JSON.stringify(strictRecipe).includes(forbidden),
+        false,
+        fixture.name,
+      );
+    }
+    for (const output of [
+      renderJsonReport(strict),
+      renderTtyReport(strict, { color: false }),
+      renderMarkdownReport(strict),
+    ]) {
+      for (const canary of [
+        approvedCanonicalPrefix,
+        "npm run build",
+        canonicalCommandCanary,
+        domainCommandCanary,
+        secretCommandCanary,
+        domainPolicyPatternCanary,
+        resourceDomainCanary,
+        fixture.domain ?? "",
+        ...forbiddenPolicyFields,
+      ]) {
+        if (canary !== "") {
+          assert.equal(output.includes(canary), false, fixture.name);
+        }
+      }
+    }
+
+    const balanced = projectReportPrivacy(rawReport, "balanced");
+    const balancedJson = JSON.parse(renderJsonReport(balanced)) as ReportV2;
+    const balancedEvidence = balancedJson.findings[0]?.evidence;
+    assert.ok(balancedEvidence !== undefined, fixture.name);
+    assert.equal(
+      balancedEvidence[fixture.classificationKey],
+      fixture.classification,
+      fixture.name,
+    );
+    assert.deepEqual(
+      commandValues(balancedEvidence),
+      fixture.finding.rule_id === "R005"
+        ? ["npm run build -- [path]", "[redacted-command]"]
+        : fixture.classification === "repeated_safe_approval_latency"
+          ? ["npm test -- [path]"]
+          : [],
+      fixture.name,
+    );
+    for (const output of [
+      renderJsonReport(balanced),
+      renderTtyReport(balanced, { color: false }),
+      renderMarkdownReport(balanced),
+    ]) {
+      assert.equal(output.includes("/Users/alice"), false, fixture.name);
+      assert.equal(output.includes("RULE_SAFETY_SECRET_CANARY"), false);
+      assert.ok(output.includes(fixture.finding.title), fixture.name);
+    }
+    assert.equal(projectReportPrivacy(rawReport, "raw"), rawReport);
+  }
+
+  const readOnlySuggestion =
+    `Ask an administrator to review an allowlist change for these repeated safe approval commands: ${
+      readOnlyCanonicalCommands.map((command) => `\`${command}\``).join(", ")
+    }.`;
+  const readOnlyReport: ReportV2 = {
+    ...report(),
+    caveats: [],
+    findings: [policyFinding(
+      106,
+      "R004",
+      "Repeated safe read-only approval latency",
+      r004Evidence(
+        "repeated_safe_approval_latency",
+        readOnlyCanonicalCommands,
+      ),
+      readOnlySuggestion,
+    )],
+  };
+  const strictReadOnly = projectReportPrivacy(readOnlyReport, "strict");
+  const strictReadOnlyRecipe = strictReadOnly.findings[0]?.fix_recipe;
+  assert.ok(strictReadOnlyRecipe !== undefined);
+  assert.equal(strictReadOnlyRecipe.suggestion, "[redacted-command]");
+  const strictReadOnlyOutputs = [
+    renderJsonReport(strictReadOnly),
+    renderTtyReport(strictReadOnly, { color: false }),
+    renderMarkdownReport(strictReadOnly),
+  ];
+  for (const command of readOnlyCanonicalCommands) {
+    assert.equal(JSON.stringify(strictReadOnlyRecipe).includes(command), false);
+    for (const output of strictReadOnlyOutputs) {
+      assert.equal(output.includes(command), false);
+    }
+  }
+
+  for (const profile of ["balanced", "raw"] as const) {
+    const projected = projectReportPrivacy(readOnlyReport, profile);
+    assert.deepEqual(
+      projected.findings[0]?.evidence.canonical_commands,
+      readOnlyCanonicalCommands,
+      profile,
+    );
+    assert.equal(
+      projected.findings[0]?.fix_recipe.suggestion,
+      readOnlySuggestion,
+      profile,
+    );
+    for (const output of [
+      renderJsonReport(projected),
+      renderTtyReport(projected, { color: false }),
+      renderMarkdownReport(projected),
+    ]) {
+      for (const command of readOnlyCanonicalCommands) {
+        assert.equal(output.includes(command), true, profile);
+      }
+    }
+  }
+  assert.equal(projectReportPrivacy(readOnlyReport, "raw"), readOnlyReport);
+
+  const repeated = fixtures.find(({ classification }) =>
+    classification === "repeated_safe_approval_latency"
+  );
+  assert.ok(repeated !== undefined);
+  const strictLeakProbe = projectReportPrivacy({
+    ...report(),
+    caveats: [],
+    findings: [{
+      ...repeated.finding,
+      evidence: {
+        ...repeated.finding.evidence,
+        resource_domain: resourceDomainCanary,
+        domain_policy_pattern: domainPolicyPatternCanary,
+        approval_policy: {
+          safe_patterns: [domainPolicyPatternCanary],
+        },
+      },
+      fix_recipe: {
+        suggestion: approvedCanonicalPrefix,
+        verify: "ccprof --json",
+      },
+    }],
+  }, "strict");
+  const strictProbeFinding = strictLeakProbe.findings[0];
+  assert.ok(strictProbeFinding !== undefined);
+  assert.deepEqual(
+    Object.keys(strictProbeFinding.evidence).sort(),
+    ["interval_ids", "session_refs"],
+  );
+  for (const forbidden of [
+    approvedCanonicalPrefix,
+    resourceDomainCanary,
+    domainPolicyPatternCanary,
+    "domain_policy_pattern",
+    "resource_domain",
+    "approval_policy",
+    "safe_patterns",
+  ]) {
+    assert.equal(
+      JSON.stringify(strictProbeFinding.evidence).includes(forbidden),
+      false,
+    );
+    assert.equal(
+      JSON.stringify(strictProbeFinding.fix_recipe).includes(forbidden),
+      false,
+    );
+    for (const output of [
+      renderJsonReport(strictLeakProbe),
+      renderTtyReport(strictLeakProbe, { color: false }),
+      renderMarkdownReport(strictLeakProbe),
+    ]) {
+      assert.equal(output.includes(forbidden), false);
+    }
+  }
+});
+
 test("shared privacy uses stable finding references and redacts untrusted verification", () => {
   const raw = privacyReport();
   const changed = structuredClone(raw);

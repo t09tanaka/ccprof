@@ -25,6 +25,7 @@ import {
 import { runCli, type CliHandlers } from "../src/cli.js";
 import { runAnalyzeCommand } from "../src/commands/analyze.js";
 import { runStatsCommand } from "../src/commands/stats.js";
+import type { AnalyzeOptions } from "../src/core/analyze.js";
 import type { ReportV2 } from "../src/core/model.js";
 import {
   canonicalOrganizationPolicy,
@@ -38,11 +39,12 @@ import {
   type PolicyRequest,
   type RepositoryPolicyPreferences,
 } from "../src/policy/organization-policy.js";
-import type {
-  ApprovalRulePolicy,
-  EffectiveRuleSafetyPolicy,
-  RepositoryApprovalRulePolicy,
-  ResourceDomainPolicy,
+import {
+  resolveRuleSafetyPolicy,
+  type ApprovalRulePolicy,
+  type EffectiveRuleSafetyPolicy,
+  type RepositoryApprovalRulePolicy,
+  type ResourceDomainPolicy,
 } from "../src/policy/rule-safety.js";
 import { renderJsonReport } from "../src/reporters/json.js";
 import type { PrivacyProfile } from "../src/reporters/privacy.js";
@@ -1822,6 +1824,53 @@ test("repository policy resolver composes signed and repository layers", async (
     required_source_coverage: 0.9,
     rule_safety: { organization_resource_domains: [] },
   });
+});
+
+test("analyze shares one cached effective rule policy with core and rendering", async (t) => {
+  const repoRoot = await temporaryRepository(t);
+  const canonicalRepo = join(repoRoot, "canonical-report-repository");
+  const ruleSafety = resolveRuleSafetyPolicy(
+    {
+      safe_patterns: ["npm *"],
+      allow_rule_recommendation: true,
+    },
+    [{
+      match: ["npm *"],
+      domain: "node-workspace",
+      parallel_safe: true,
+    }],
+  );
+  const resolved = effectivePolicy({
+    privacy: "balanced",
+    rule_safety: ruleSafety,
+  });
+  let resolverCalls = 0;
+  let capturedOptions: AnalyzeOptions | undefined;
+  let resolvedRepo = "";
+
+  await runAnalyzeCommand({
+    cwd: repoRoot,
+    format: "json",
+    color: false,
+    privacy: "raw",
+  }, {
+    analyze: async (options) => {
+      capturedOptions = options;
+      const callback = options.resolveRuleSafetyPolicy;
+      assert.ok(callback !== undefined);
+      assert.strictEqual(await callback(canonicalRepo), ruleSafety);
+      return { report: report(canonicalRepo), warnings: [] };
+    },
+    resolvePolicy: async (repo) => {
+      resolverCalls += 1;
+      resolvedRepo = repo;
+      return resolved;
+    },
+  });
+
+  assert.equal(capturedOptions?.cwd, repoRoot);
+  assert.equal(resolvedRepo, canonicalRepo);
+  assert.equal(resolverCalls, 1);
 });
 
 test("analyze applies effective privacy and denies advisory before spawning", async (t) => {

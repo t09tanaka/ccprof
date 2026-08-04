@@ -12,6 +12,10 @@ import {
   evidenceEventIdentity,
 } from "../core/event-identity.js";
 import {
+  resourceDomainDecision,
+  type EffectiveRuleSafetyPolicy,
+} from "../policy/rule-safety.js";
+import {
   createFindingCandidate,
   impactFromClaim,
   minimumConfidence,
@@ -22,6 +26,7 @@ import {
 
 export interface SerialSlackOptions {
   sourceCompleteness?: number;
+  ruleSafety?: EffectiveRuleSafetyPolicy;
 }
 
 const READ_TOOL_NAMES = new Set([
@@ -242,6 +247,10 @@ export function detectSerialSlack(
         serialDurationMs,
         longestActionMs,
       } = upperClaim(target, groupActions);
+      const decision = resourceDomainDecision(
+        groupActions.map((action) => action.command),
+        options.ruleSafety,
+      );
       const evidenceConfidence = minimumConfidence(
         groupActions.flatMap((action) => [
           action.confidence,
@@ -250,7 +259,7 @@ export function detectSerialSlack(
       );
       return createFindingCandidate({
         rule_id: "R005",
-        title: "Independent tool calls ran serially",
+        title: "Path-disjoint tool calls ran serially",
         classification: "behavior",
         cause: null,
         scope: "claude_md",
@@ -282,11 +291,18 @@ export function detectSerialSlack(
               action.tool_name === undefined ? [] : [action.tool_name]
             ),
           ),
+          parallelization_classification: decision.kind,
+          ...(decision.kind === "investigation_candidate"
+            ? {}
+            : { resource_domain: decision.domain }),
         },
         intervals: claim.intervals,
         fix_recipe: {
-          suggestion:
-            `Batch the independent read or validation calls for ${target} into one parallel tool invocation.`,
+          suggestion: decision.kind === "parallel_safe"
+            ? `Batch the independent read or validation calls for ${target} into one parallel tool invocation.`
+            : decision.kind === "parallel_unsafe"
+              ? `The effective resource-domain policy prohibits concurrent execution for ${target}; no parallel invocation is recommended.`
+              : `Review shared resources for the path-disjoint read or validation calls affecting ${target} before changing execution.`,
           verify: "ccprof --json",
         },
         caveats: sortedUnique([

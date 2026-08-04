@@ -86,6 +86,11 @@ import {
 import { renderJsonReport } from "../reporters/json.js";
 import { projectReportPrivacy } from "../reporters/privacy.js";
 import {
+  canonicalRuleSafetySnapshot,
+  snapshotEffectiveRuleSafetyPolicy,
+  type EffectiveRuleSafetyPolicy,
+} from "../policy/rule-safety.js";
+import {
   ruleCoverage,
   sessionSupportsRule,
 } from "../rules/capabilities.js";
@@ -141,6 +146,7 @@ import {
   type AdoptionRecord,
 } from "../store/adoptions.js";
 import {
+  canonicalRepoPath,
   resolveStorePaths,
   type StorePaths,
 } from "../store/paths.js";
@@ -165,6 +171,9 @@ export interface AnalyzeOptions {
   runner?: CommandRunner;
   nowMs?: number;
   externalToolNames?: ReadonlySet<string>;
+  resolveRuleSafetyPolicy?: (
+    repoRoot: string,
+  ) => Promise<EffectiveRuleSafetyPolicy | undefined>;
   /**
    * When `false`, skips persisting this analysis: neither `saveAnalysis`
    * nor `saveAdoptions` is called. Adoption detection itself is skipped
@@ -1003,6 +1012,7 @@ function ruleCandidates(
   crossPrEligibleReadKeys: ReadonlySet<string>,
   testMap: TestMap,
   externalToolNames: ReadonlySet<string> | undefined,
+  ruleSafety: EffectiveRuleSafetyPolicy | undefined,
 ): FindingCandidate[] {
   const completenessByRule = new Map(
     coverage.map((entry) => [
@@ -1039,9 +1049,11 @@ function ruleCandidates(
     }),
     ...detectHumanWait(lanes.R004.timeline.actions, {
       assistantEvents,
+      ...(ruleSafety === undefined ? {} : { ruleSafety }),
       sourceCompleteness: completeness("R004"),
     }),
     ...detectSerialSlack(lanes.R005.matched, {
+      ...(ruleSafety === undefined ? {} : { ruleSafety }),
       sourceCompleteness: completeness("R005"),
     }),
     ...detectChronicCost(history, {
@@ -1104,7 +1116,8 @@ function sourceSnapshot(sessions: readonly Session[], repoRoot: string): unknown
 function snapshotIdentity(paths: StorePaths, context: PrContext, window: AnalysisWindow,
   sessions: readonly Session[], testMap: TestMap, options: AnalyzeOptions,
   history: readonly AnalysisRecord[], coverage: readonly RuleCoverage[],
-  inapplicable: readonly SkippedRule[], sourceErrors: readonly unknown[],
+  inapplicable: readonly SkippedRule[], ruleSafetyDigest: string,
+  sourceErrors: readonly unknown[],
   hookWarnings: readonly StoreWarning[]): AnalysisSnapshotIdentity {
   const mappings = testMap.mappings.map((mapping) => ({ source: uniqueSorted(mapping.source),
     tests: uniqueSorted(mapping.tests),
@@ -1134,7 +1147,8 @@ function snapshotIdentity(paths: StorePaths, context: PrContext, window: Analysi
     policy_digest: analysisDigest("analysis-policy-v1", {
       fingerprint: "ccprof-rule-policy-2026-08-04-v2",
       rule_coverage: coverage, skipped_rules: inapplicable,
-      rule_manifest: listRuleManifests() }),
+      rule_manifest: listRuleManifests(),
+      rule_safety_digest: ruleSafetyDigest }),
     history_digest: analysisDigest("analysis-history-v1", sortedHistory),
   };
 }
@@ -1205,6 +1219,7 @@ async function finishBudgetedPartialAnalysis(
   window: AnalysisWindow,
   sessions: readonly Session[],
   inputWarnings: readonly AnalyzeWarning[],
+  canonicalRepoRoot?: string,
   resolvedPaths?: StorePaths,
 ): Promise<AnalyzeResult> {
   meter.checkpoint();
@@ -1231,7 +1246,7 @@ async function finishBudgetedPartialAnalysis(
   const paths = resolvedPaths ?? options.storePaths ??
     (persist ? await resolveStorePaths(context.repoRoot) : undefined);
   const unit = {
-    repo: paths?.canonical_repo ?? context.repoRoot,
+    repo: paths?.canonical_repo ?? canonicalRepoRoot ?? context.repoRoot,
     pr_ref: context.prRef,
     sessions: uniqueSorted(sessions.map(({ session_id }) => session_id)),
   };
@@ -1300,6 +1315,23 @@ export async function analyze(
     ...(options.nowMs === undefined ? {} : { nowMs: options.nowMs }),
     includeBranchReflog: options.sinceMs === undefined,
   });
+  const resolveRuleSafety = options.resolveRuleSafetyPolicy;
+  let ruleSafetyRepoRoot: string | undefined;
+  let resolvedRuleSafety: EffectiveRuleSafetyPolicy | undefined;
+  if (resolveRuleSafety !== undefined) {
+    ruleSafetyRepoRoot = options.storePaths?.canonical_repo ??
+      await canonicalRepoPath(context.repoRoot);
+    resolvedRuleSafety = await resolveRuleSafety(ruleSafetyRepoRoot);
+  }
+  const ruleSafety = resolvedRuleSafety === undefined
+    ? undefined
+    : snapshotEffectiveRuleSafetyPolicy(resolvedRuleSafety);
+  const ruleSafetyDigest = analysisDigest(
+    "effective-rule-safety-v1",
+    ruleSafety === undefined
+      ? { mode: "absent" }
+      : canonicalRuleSafetySnapshot(ruleSafety),
+  );
   const warnings: AnalyzeWarning[] = context.warnings.map((message) =>
     textWarning("pr_context", message)
   );
@@ -1312,6 +1344,7 @@ export async function analyze(
       provisionalWindow,
       [],
       warnings,
+      ruleSafetyRepoRoot,
     );
   }
   // Only the default (Claude + Codex combined) source reports per-source
@@ -1387,6 +1420,7 @@ export async function analyze(
       window,
       sessions,
       warnings,
+      ruleSafetyRepoRoot,
     );
   }
   if (sessions.length === 0) {
@@ -1423,6 +1457,7 @@ export async function analyze(
       window,
       sessions,
       warnings,
+      ruleSafetyRepoRoot,
       paths,
     );
   }
@@ -1444,6 +1479,7 @@ export async function analyze(
       window,
       sessions,
       warnings,
+      ruleSafetyRepoRoot,
       paths,
     );
   }
@@ -1465,6 +1501,7 @@ export async function analyze(
       window,
       sessions,
       warnings,
+      ruleSafetyRepoRoot,
       paths,
     );
   }
@@ -1496,6 +1533,7 @@ export async function analyze(
       window,
       sessions,
       warnings,
+      ruleSafetyRepoRoot,
       paths,
     );
   }
@@ -1525,6 +1563,7 @@ export async function analyze(
       window,
       sessions,
       warnings,
+      ruleSafetyRepoRoot,
       paths,
     );
   }
@@ -1550,6 +1589,7 @@ export async function analyze(
         window,
         sessions,
         warnings,
+        ruleSafetyRepoRoot,
         paths,
       );
     }
@@ -1567,6 +1607,7 @@ export async function analyze(
           window,
           sessions,
           warnings,
+          ruleSafetyRepoRoot,
           paths,
         );
       }
@@ -1645,6 +1686,7 @@ export async function analyze(
       window,
       sessions,
       warnings,
+      ruleSafetyRepoRoot,
       paths,
     );
   }
@@ -1657,6 +1699,7 @@ export async function analyze(
       window,
       sessions,
       warnings,
+      ruleSafetyRepoRoot,
       paths,
     );
   }
@@ -1668,6 +1711,7 @@ export async function analyze(
     reads.eligibleReadKeys,
     testMap,
     options.externalToolNames,
+    ruleSafety,
   );
   const unit = {
     repo: paths.canonical_repo,
@@ -1745,6 +1789,7 @@ export async function analyze(
       ? await saveAnalysis(paths, record, { snapshot: snapshotIdentity(
           paths, context, window, sessions, testMap, options, history, coverage,
           inapplicableRules,
+          ruleSafetyDigest,
           sourceErrors, hookEvents.warnings,
         ) })
       : { record, warnings: [] as StoreWarning[] };
@@ -1774,6 +1819,7 @@ export async function analyze(
     ? await saveAnalysis(paths, record, { snapshot: snapshotIdentity(
         paths, context, window, sessions, testMap, options, history, coverage,
         inapplicableRules,
+        ruleSafetyDigest,
         sourceErrors, hookEvents.warnings,
       ) })
     : { record, warnings: [] as StoreWarning[] };

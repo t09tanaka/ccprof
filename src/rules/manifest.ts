@@ -123,22 +123,24 @@ function enumValue<T extends string>(
     ? value as T : fail(code, index, field);
 }
 const ROWS = [
-  ["R001", ["edit_fragments"], "critical_path_latency", "enabled", "union", "medium"],
-  ["R002", [], "critical_path_latency", "enabled", "union", "low"],
-  ["R003", [], "critical_path_latency", "enabled", "union", "low"],
-  ["R004", [], "policy_latency", "observe_only", "never_aggregate", "high"],
-  ["R005", ["tool_timestamps"], "resource_cost", "enabled", "max", "medium"],
-  ["R006", [], "resource_cost", "enabled", "max", "medium"],
-  ["R007", ["token_usage"], "critical_path_latency", "enabled", "max", "low"],
-  ["R008", [], "critical_path_latency", "enabled", "union", "medium"],
+  ["R001", "1.0.0", 1, ["edit_fragments"], "critical_path_latency", "enabled", "union", "medium"],
+  ["R002", "1.0.0", 1, [], "critical_path_latency", "enabled", "union", "low"],
+  ["R003", "1.0.0", 1, [], "critical_path_latency", "enabled", "union", "low"],
+  ["R004", "2.0.0", 2, [], "policy_latency", "observe_only", "never_aggregate", "high"],
+  ["R005", "2.0.0", 2, ["tool_timestamps"], "resource_cost", "enabled", "max", "medium"],
+  ["R006", "1.0.0", 1, [], "resource_cost", "enabled", "max", "medium"],
+  ["R007", "1.0.0", 1, ["token_usage"], "critical_path_latency", "enabled", "max", "low"],
+  ["R008", "1.0.0", 1, [], "critical_path_latency", "enabled", "union", "medium"],
 ] as const;
 const RAW_CATALOG: RuleManifest[] = ROWS.map(([
-  id, capabilities, impact, mode, aggregation, risk,
+  id, version, compatibilityEpoch, capabilities, impact, mode, aggregation,
+  risk,
 ]) => ({
-  id, version: "1.0.0", compatibility_epoch: 1,
+  id, version, compatibility_epoch: compatibilityEpoch,
   required_capabilities: [...capabilities], supported_sources: [...SOURCE_IDS],
   impact_kind: impact, default_mode: mode, aggregation_policy: aggregation,
-  evidence_schema: `ccprof://rules/${id}/evidence/v1`, policy_risk: risk,
+  evidence_schema: `ccprof://rules/${id}/evidence/v${compatibilityEpoch}`,
+  policy_risk: risk,
 }));
 export function validateRuleManifestCatalog(value: unknown): RuleManifest[] {
   const catalog = snapshotArrayValues(

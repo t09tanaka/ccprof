@@ -153,10 +153,39 @@ function commandCopies(finding: Finding, profile: DisplayProfile,
     ] as Copy]),
   ];
 }
+function suggestionContainsEvidenceText(
+  suggestion: string,
+  value: JsonValue | undefined,
+): boolean {
+  if (typeof value === "string") {
+    return value !== "" && suggestion.includes(value);
+  }
+  return Array.isArray(value) && value.some((entry) =>
+    typeof entry === "string" && entry !== "" && suggestion.includes(entry)
+  );
+}
+function hasEvidenceTextArray(value: JsonValue | undefined): boolean {
+  return Array.isArray(value) && value.some((entry) =>
+    typeof entry === "string" && entry !== ""
+  );
+}
 function projectedFinding(finding: Finding, profile: DisplayProfile,
   scope: string, repoRoot: string, sessions: readonly string[]): Finding {
   const compatibility = findingCompatibilityMetadata(finding);
   const copies = commandCopies(finding, profile, repoRoot, sessions);
+  const rawSuggestion = finding.fix_recipe.suggestion;
+  const projectedSuggestion = profile === "strict" &&
+      (
+        (finding.rule_id === "R004" && hasEvidenceTextArray(
+          finding.evidence.canonical_commands,
+        )) ||
+        (finding.rule_id === "R005" && suggestionContainsEvidenceText(
+          rawSuggestion,
+          finding.evidence.resource_domain,
+        ))
+      )
+    ? REDACTED_COMMAND
+    : safeText(rawSuggestion, profile, repoRoot, sessions, copies);
   const evidence: FindingEvidence = profile === "strict" ? {
     session_refs: finding.evidence.session_refs.map((ref) => opaque(scope, "session-ref", ref)),
     interval_ids: finding.evidence.interval_ids.map((id) => opaque(scope, "interval", id)),
@@ -193,7 +222,7 @@ function projectedFinding(finding: Finding, profile: DisplayProfile,
       ? {}
       : { scoring_rationale: [...finding.scoring_rationale] }),
     fix_recipe: {
-      suggestion: safeText(finding.fix_recipe.suggestion, profile, repoRoot, sessions, copies),
+      suggestion: projectedSuggestion,
       verify: trustedVerificationCommand(finding) ?? REDACTED_COMMAND,
     },
     caveats: profile === "strict" ? [] : finding.caveats.map((value) =>
