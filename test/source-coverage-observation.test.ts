@@ -244,6 +244,38 @@ test("cold parser coverage marks a dropped unknown Codex subtype partial", async
   assert.equal(observed.observation.completeness, "partial");
 });
 
+test("cold parser coverage counts events before analysis-window filtering", async (t) => {
+  const root = await tempRoot(t, "ccprof-coverage-window-");
+  const repo = join(root, "repo"); await mkdir(repo);
+  const claudePath = join(root, "claude-window.jsonl");
+  const claudeEarly = JSON.parse(claudeRow(repo)) as Record<string, unknown>;
+  const claudeLate = { ...claudeEarly, uuid: "coverage-late",
+    timestamp: "2026-07-31T05:00:00.000Z" };
+  await writeFile(claudePath,
+    `${JSON.stringify(claudeEarly)}\n${JSON.stringify(claudeLate)}\n`);
+  const claude = await parseClaudeTranscriptObserved(claudePath, {
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z"),
+  });
+  assert.equal(claude.result.sessions[0]?.events.length, 1);
+  assert.equal(claude.observation.events_emitted, 2);
+
+  const codexPath = join(root, "rollout-window.jsonl");
+  const timed = (timestamp: string, type: string, payload: object) =>
+    JSON.stringify({ timestamp, type, payload });
+  await writeFile(codexPath, `${[
+    timed("2026-07-31T02:00:00.000Z", "session_meta",
+      { id: "coverage-window", cwd: repo }),
+    timed("2026-07-31T03:00:00.000Z", "response_item",
+      { type: "message", role: "user", content: "early" }),
+    timed("2026-07-31T05:00:00.000Z", "response_item",
+      { type: "message", role: "user", content: "late" }),
+  ].join("\n")}\n`);
+  const codex = await parseCodexSessionObserved({ sourcePath: codexPath,
+    endedAtMs: Date.parse("2026-07-31T04:00:00.000Z") });
+  assert.equal(codex.result?.events.length, 1);
+  assert.equal(codex.observation.events_emitted, 2);
+});
+
 test("cold parser coverage reports bounded reads as partial", async (t) => {
   const root = await tempRoot(t, "ccprof-coverage-budget-");
   const repo = join(root, "repo"); await mkdir(repo);

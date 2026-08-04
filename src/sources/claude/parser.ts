@@ -2994,9 +2994,14 @@ export async function parseClaudeTranscriptObserved(
       });
       const warned = read.state.warnings.length > 0 || result.warnings.length > 0 ||
         result.sessions.some((session) => session.warnings.length > 0);
+      const emitted = instrumentation.endedAtMs === undefined ? result :
+        projectClaudeParserState(read.state, {
+          ...(instrumentation.budgets === undefined ? {} : { budgets: instrumentation.budgets }),
+          ...(instrumentation.signal === undefined ? {} : { signal: instrumentation.signal }),
+        });
       return { result, observation: { rows_seen: read.state.line_count,
         rows_accepted: read.state.rows.length,
-        events_emitted: result.sessions.reduce((count, session) =>
+        events_emitted: emitted.sessions.reduce((count, session) =>
           count + session.events.length, 0),
         completeness: read.completeness === "complete" && !warned
           ? "complete" : "partial" } };

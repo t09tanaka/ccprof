@@ -1694,8 +1694,13 @@ export async function parseCodexSessionObserved(
         ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
+      const emitted = options.endedAtMs === undefined ? result :
+        projectCodexParserState(read.state, {
+          ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        });
       return { result, observation: { rows_seen: read.state.line_count,
-        rows_accepted: read.state.rows.length, events_emitted: result?.events.length ?? 0,
+        rows_accepted: read.state.rows.length, events_emitted: emitted?.events.length ?? 0,
         completeness: read.completeness === "complete" &&
           read.state.warnings.length === 0 && read.state.seen_subtypes.length === 0 &&
           (result?.warnings.length ?? 0) === 0
