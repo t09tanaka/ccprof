@@ -14,6 +14,16 @@ import { types as utilTypes } from "node:util";
 import { loadRepositoryPolicyPreferences } from
   "../analysis/repository-config.js";
 import type { PrivacyProfile } from "../reporters/privacy.js";
+import {
+  resolveRuleSafetyPolicy,
+  snapshotApprovalRulePolicy,
+  snapshotRepositoryApprovalRulePolicy,
+  snapshotResourceDomains,
+  type ApprovalRulePolicy,
+  type EffectiveRuleSafetyPolicy,
+  type RepositoryApprovalRulePolicy,
+  type ResourceDomainPolicy,
+} from "./rule-safety.js";
 
 const POLICY_MAX_BYTES = 64 * 1024;
 const SIGNATURE_MAX_BYTES = 1024;
@@ -29,7 +39,19 @@ const POLICY_KEYS = new Set([
   "allow_export",
   "raw_retention_days_max",
   "required_source_coverage",
+  "approval_policy",
+  "resource_domains",
   "kill_switches",
+]);
+const REPOSITORY_POLICY_KEYS = new Set([
+  "minimum_privacy",
+  "allow_raw",
+  "allow_advisory",
+  "allow_export",
+  "raw_retention_days_max",
+  "required_source_coverage",
+  "approval_policy",
+  "resource_domains",
 ]);
 const KILL_SWITCH_KEYS = new Set(["raw", "advisory", "export"]);
 const ORGANIZATION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
@@ -57,6 +79,8 @@ export interface OrganizationPolicy {
   allow_export: boolean;
   raw_retention_days_max: number;
   required_source_coverage: number;
+  approval_policy?: ApprovalRulePolicy;
+  resource_domains?: ResourceDomainPolicy[];
   kill_switches?: OrganizationPolicyKillSwitches;
 }
 
@@ -67,6 +91,8 @@ export interface RepositoryPolicyPreferences {
   allow_export?: boolean;
   raw_retention_days_max?: number;
   required_source_coverage?: number;
+  approval_policy?: RepositoryApprovalRulePolicy;
+  resource_domains?: ResourceDomainPolicy[];
 }
 
 export interface PolicyRequest {
@@ -89,6 +115,7 @@ export interface EffectivePolicy {
   allow_export: boolean;
   raw_retention_days_max?: number;
   required_source_coverage: number;
+  rule_safety?: EffectiveRuleSafetyPolicy;
 }
 
 export type OrganizationPolicyErrorCode =
@@ -180,6 +207,14 @@ function snapshotKillSwitches(
   };
 }
 
+function captureRuleSafety<T>(action: () => T): T {
+  try {
+    return action();
+  } catch {
+    invalid();
+  }
+}
+
 function snapshotPolicy(value: unknown): OrganizationPolicy {
   const captured = captureClosedObject(value, POLICY_KEYS);
   const schema = captured.$schema;
@@ -208,6 +243,16 @@ function snapshotPolicy(value: unknown): OrganizationPolicy {
   ) {
     invalid();
   }
+  const approvalPolicy = captured.approval_policy === undefined
+    ? undefined
+    : captureRuleSafety(() =>
+      snapshotApprovalRulePolicy(captured.approval_policy)
+    );
+  const resourceDomains = captured.resource_domains === undefined
+    ? undefined
+    : captureRuleSafety(() => snapshotResourceDomains(
+      captured.resource_domains,
+    ));
   const killSwitches = snapshotKillSwitches(captured.kill_switches);
   return {
     policy_schema_version: 1,
@@ -218,6 +263,12 @@ function snapshotPolicy(value: unknown): OrganizationPolicy {
     allow_export: allowExport,
     raw_retention_days_max: rawRetentionDaysMax,
     required_source_coverage: requiredSourceCoverage,
+    ...(approvalPolicy === undefined
+      ? {}
+      : { approval_policy: approvalPolicy }),
+    ...(resourceDomains === undefined
+      ? {}
+      : { resource_domains: resourceDomains }),
     ...(killSwitches === undefined
       ? {}
       : { kill_switches: killSwitches }),
@@ -238,7 +289,9 @@ export function canonicalOrganizationPolicy(
   policy: OrganizationPolicy,
 ): Buffer {
   const value = snapshotPolicy(policy);
-  return Buffer.from(JSON.stringify(value), "utf8");
+  const canonical = Buffer.from(JSON.stringify(value), "utf8");
+  if (canonical.byteLength > POLICY_MAX_BYTES) invalid();
+  return canonical;
 }
 
 function sameSnapshot(left: Stats, right: Stats): boolean {
@@ -456,6 +509,66 @@ function strongestPrivacy(
   );
 }
 
+function snapshotRepositoryPolicy(
+  value: unknown,
+): RepositoryPolicyPreferences {
+  const captured = captureClosedObject(value, REPOSITORY_POLICY_KEYS);
+  const minimumPrivacy = captured.minimum_privacy;
+  const allowRaw = captured.allow_raw;
+  const allowAdvisory = captured.allow_advisory;
+  const allowExport = captured.allow_export;
+  const rawRetentionDaysMax = captured.raw_retention_days_max;
+  const requiredSourceCoverage = captured.required_source_coverage;
+  if (
+    (minimumPrivacy !== undefined && !privacyProfile(minimumPrivacy)) ||
+    (allowRaw !== undefined && typeof allowRaw !== "boolean") ||
+    (allowAdvisory !== undefined && typeof allowAdvisory !== "boolean") ||
+    (allowExport !== undefined && typeof allowExport !== "boolean") ||
+    (rawRetentionDaysMax !== undefined &&
+      (typeof rawRetentionDaysMax !== "number" ||
+        !Number.isSafeInteger(rawRetentionDaysMax) ||
+        rawRetentionDaysMax < 0)) ||
+    (requiredSourceCoverage !== undefined &&
+      (typeof requiredSourceCoverage !== "number" ||
+        !Number.isFinite(requiredSourceCoverage) ||
+        requiredSourceCoverage < 0 || requiredSourceCoverage > 1))
+  ) {
+    invalid();
+  }
+  const approvalPolicy = captured.approval_policy === undefined
+    ? undefined
+    : captureRuleSafety(() =>
+      snapshotRepositoryApprovalRulePolicy(captured.approval_policy)
+    );
+  const resourceDomains = captured.resource_domains === undefined
+    ? undefined
+    : captureRuleSafety(() => snapshotResourceDomains(
+      captured.resource_domains,
+    ));
+  return {
+    ...(minimumPrivacy === undefined
+      ? {}
+      : { minimum_privacy: minimumPrivacy }),
+    ...(allowRaw === undefined ? {} : { allow_raw: allowRaw }),
+    ...(allowAdvisory === undefined
+      ? {}
+      : { allow_advisory: allowAdvisory }),
+    ...(allowExport === undefined ? {} : { allow_export: allowExport }),
+    ...(rawRetentionDaysMax === undefined
+      ? {}
+      : { raw_retention_days_max: rawRetentionDaysMax }),
+    ...(requiredSourceCoverage === undefined
+      ? {}
+      : { required_source_coverage: requiredSourceCoverage }),
+    ...(approvalPolicy === undefined
+      ? {}
+      : { approval_policy: approvalPolicy }),
+    ...(resourceDomains === undefined
+      ? {}
+      : { resource_domains: resourceDomains }),
+  };
+}
+
 export function resolveEffectivePolicy(input: {
   organization?: OrganizationPolicy;
   repository?: RepositoryPolicyPreferences;
@@ -464,7 +577,9 @@ export function resolveEffectivePolicy(input: {
   const organization = input.organization === undefined
     ? undefined
     : snapshotPolicy(input.organization);
-  const repository = input.repository;
+  const repository = input.repository === undefined
+    ? undefined
+    : snapshotRepositoryPolicy(input.repository);
   const rawKilled = organization?.kill_switches?.raw === true;
   const advisoryKilled = organization?.kill_switches?.advisory === true;
   const exportKilled = organization?.kill_switches?.export === true;
@@ -487,6 +602,14 @@ export function resolveEffectivePolicy(input: {
   const rawRetentionDaysMax = retentionValues.length === 0
     ? undefined
     : Math.min(...retentionValues);
+  const ruleSafety = organization === undefined
+    ? undefined
+    : captureRuleSafety(() => resolveRuleSafetyPolicy(
+      organization.approval_policy,
+      organization.resource_domains ?? [],
+      repository?.approval_policy,
+      repository?.resource_domains,
+    ));
   return {
     governed: organization !== undefined,
     ...(organization === undefined
@@ -504,6 +627,7 @@ export function resolveEffectivePolicy(input: {
       organization?.required_source_coverage ?? 0,
       repository?.required_source_coverage ?? 0,
     ),
+    ...(ruleSafety === undefined ? {} : { rule_safety: ruleSafety }),
   };
 }
 

@@ -666,12 +666,15 @@ configuration, unreadable or unsafe files, invalid JSON or fields, an
 organization mismatch, a non-Ed25519 key, or a failed signature fails closed
 with a fixed error that does not echo paths or untrusted contents. Policy,
 signature, and public-key inputs must be stable, non-symlink regular files and
-are limited to 64 KiB, 1 KiB, and 16 KiB respectively.
+are limited to 64 KiB, 1 KiB, and 16 KiB respectively. The canonical signed
+policy payload has its own 65,536-byte ceiling in addition to the raw policy
+file's 65,536-byte ceiling.
 
 The v1 document is closed and is described by the packaged
-`schemas/organization-policy.schema.json`. Every field below except `$schema`
-and `kill_switches` is required; when `kill_switches` is present, all three of
-its booleans are required.
+`schemas/organization-policy.schema.json`. The core fields remain required;
+`$schema`, `approval_policy`, `resource_domains`, and `kill_switches` are
+optional. When present, the nested objects are closed and their documented
+members are required.
 
 ```json
 {
@@ -684,6 +687,17 @@ its booleans are required.
   "allow_export": false,
   "raw_retention_days_max": 14,
   "required_source_coverage": 0.9,
+  "approval_policy": {
+    "safe_patterns": ["npm test", "npm run build"],
+    "allow_rule_recommendation": true
+  },
+  "resource_domains": [
+    {
+      "match": ["npm test"],
+      "domain": "node-tests",
+      "parallel_safe": true
+    }
+  ],
   "kill_switches": {
     "raw": false,
     "advisory": false,
@@ -691,6 +705,20 @@ its booleans are required.
   }
 }
 ```
+
+Rule patterns are whole-command literal patterns where only `*` is special.
+An approval policy contains at most 64 safe patterns. Resource policy contains
+at most 64 domains with at most 32 non-empty match patterns per domain. Each
+raw and normalized pattern is limited to 256 UTF-8 bytes and 16 wildcards;
+domain identifiers are at most 64 ASCII characters and use lowercase letters,
+digits, `.`, `_`, and `-`.
+
+The schemas describe the shared structural surface. Their
+`x-ccprof-runtime-constraints` annotations cross-reference checks that JSON
+Schema cannot express: UTF-8 byte limits, NFC and whitespace normalization,
+normalized duplicate rejection, data-descriptor and proxy rejection, the
+canonical payload byte limit, deterministic full-tuple ordering, and monotonic
+merge rules.
 
 Sign the canonical semantic JSON, not the policy file's original whitespace or
 key order. Canonical JSON omits `$schema`, uses the field order shown below, has
@@ -702,6 +730,27 @@ no insignificant whitespace or trailing newline, and orders kill switches as
 import { readFile, writeFile } from "node:fs/promises";
 
 const input = JSON.parse(await readFile(process.argv[2], "utf8"));
+const compareUtf8 = (left, right) =>
+  Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+const normalizePatterns = (patterns) => patterns
+  .map((pattern) => pattern.normalize("NFC").trim()
+    .replace(/\s+/gu, " ").replace(/\*+/gu, "*"))
+  .sort(compareUtf8);
+const comparePatternArrays = (left, right) => {
+  for (let index = 0; index < Math.min(left.length, right.length); index += 1) {
+    const compared = compareUtf8(left[index], right[index]);
+    if (compared !== 0) return compared;
+  }
+  return left.length - right.length;
+};
+const normalizeDomains = (domains) => domains.map((entry) => ({
+  match: normalizePatterns(entry.match),
+  domain: entry.domain,
+  parallel_safe: entry.parallel_safe,
+})).sort((left, right) =>
+  compareUtf8(left.domain, right.domain) ||
+  comparePatternArrays(left.match, right.match) ||
+  Number(left.parallel_safe) - Number(right.parallel_safe));
 const canonical = {
   policy_schema_version: input.policy_schema_version,
   organization: input.organization,
@@ -711,6 +760,18 @@ const canonical = {
   allow_export: input.allow_export,
   raw_retention_days_max: input.raw_retention_days_max,
   required_source_coverage: input.required_source_coverage,
+  ...(input.approval_policy === undefined
+    ? {}
+    : {
+        approval_policy: {
+          safe_patterns: normalizePatterns(input.approval_policy.safe_patterns),
+          allow_rule_recommendation:
+            input.approval_policy.allow_rule_recommendation,
+        },
+      }),
+  ...(input.resource_domains === undefined
+    ? {}
+    : { resource_domains: normalizeDomains(input.resource_domains) }),
   ...(input.kill_switches === undefined
     ? {}
     : {
@@ -754,6 +815,12 @@ requirement wins. A signed `kill_switches` value of `true` disables raw,
 advisory, or export regardless of lower layers. When raw is disabled, a `raw`
 request is raised to `balanced`; when advisory is disabled, ccprof never starts
 the advisory child process.
+
+Repository `approval_policy` fields and `resource_domains` only tighten signed
+rule safety: approval booleans combine with logical AND, repository patterns
+form an additional intersection, and repository domains must agree with the
+signed organization domain. Repository rule settings alone never authorize a
+recommendation.
 
 Today `analyze` and `stats` consume the effective privacy policy, and `analyze`
 also consumes advisory permission. The following resolved values are not yet consumed
