@@ -1101,6 +1101,25 @@ function normalizeSnapshotIdentity(value: AnalysisSnapshotIdentity): AnalysisSna
     ...(selector === undefined ? {} : { selector }),
   };
 }
+function captureSnapshotOption(
+  options: AnalysisSaveOptions,
+): AnalysisSnapshotIdentity | undefined {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    if (utilTypes.isProxy(options)) throw new TypeError();
+    descriptor = Object.getOwnPropertyDescriptor(options, "snapshot");
+    if (descriptor === undefined && "snapshot" in options) throw new TypeError();
+  } catch {
+    throw new TypeError("invalid analysis save options");
+  }
+  if (descriptor === undefined) return undefined;
+  if (descriptor.enumerable !== true || !("value" in descriptor)) {
+    throw new TypeError("invalid analysis save options");
+  }
+  return descriptor.value === undefined
+    ? undefined
+    : normalizeSnapshotIdentity(descriptor.value);
+}
 function snapshotEnvelope(record: AnalysisRecord, identity?: AnalysisSnapshotIdentity): SnapshotEnvelope {
   const { analysis_id: _id, created_at_ms: _time, ...payload } = record;
   return { schema_version: 1, identity: identity === undefined
@@ -1134,9 +1153,7 @@ export function analysisAuditIdentity(
   options: AnalysisSaveOptions = {},
 ): AnalysisAuditIdentity {
   const record = asRecord(input);
-  const snapshot = options.snapshot === undefined
-    ? undefined
-    : normalizeSnapshotIdentity(options.snapshot);
+  const snapshot = captureSnapshotOption(options);
   return auditIdentity(prepareAnalysis(record, snapshot));
 }
 class StoreConflict extends Error {
@@ -1478,9 +1495,7 @@ export async function saveAnalysis(
   options: AnalysisSaveOptions = {},
 ): Promise<AnalysisSaveResult> {
   const record = asRecord(input);
-  const snapshot = options.snapshot === undefined
-    ? undefined
-    : normalizeSnapshotIdentity(options.snapshot);
+  const snapshot = captureSnapshotOption(options);
   const prepared = prepareAnalysis(record, snapshot);
   const audit = auditIdentity(prepared);
   const warnings: StoreWarning[] = [];

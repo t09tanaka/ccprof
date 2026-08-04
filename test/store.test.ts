@@ -74,6 +74,7 @@ import {
   saveAnalysis,
   type AnalysisHistoryEntry,
   type AnalysisRecord,
+  type AnalysisSaveOptions,
   type AnalysisSnapshotIdentity,
 } from "../src/store/analyses.js";
 import {
@@ -2014,6 +2015,42 @@ test("analysis audit identities reject hostile records without evaluating them",
     });
   }
   assert.deepEqual({ getterReads, proxyReads }, { getterReads: 0, proxyReads: 0 });
+});
+
+test("analysis audit identities reject hostile snapshot options without evaluating them", async () => {
+  await temporaryStore(async (paths) => {
+    const canary = "AUDIT_OPTIONS_CANARY";
+    const input = record("audit-options-hostile", 100);
+    let getterReads = 0;
+    const accessor = Object.defineProperty({}, "snapshot", {
+      enumerable: true,
+      get() {
+        getterReads += 1;
+        throw new Error(canary);
+      },
+    }) as AnalysisSaveOptions;
+    let proxyReads = 0;
+    const proxy = new Proxy({} as AnalysisSaveOptions, {
+      get(target, property, receiver) {
+        if (property === "snapshot") {
+          proxyReads += 1;
+          throw new Error(canary);
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    const rejectsSafely = (error: unknown): boolean => {
+      assert.ok(error instanceof TypeError);
+      assert.equal(error.message.includes(canary), false);
+      return true;
+    };
+    for (const options of [accessor, proxy]) {
+      assert.throws(() => analysisAuditIdentity(input, options), rejectsSafely);
+      await assert.rejects(() => saveAnalysis(paths, input, options), rejectsSafely);
+    }
+    assert.deepEqual({ getterReads, proxyReads }, { getterReads: 0, proxyReads: 0 });
+  });
 });
 
 test("saved analysis audit identity matches its execution snapshot and replay", async () => {
