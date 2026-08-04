@@ -882,6 +882,10 @@ export async function runCli(
   if (args[0] === "doctor") {
     try {
       const command = parseCliArgs(args);
+      if (command.kind === "help") {
+        stdout(USAGE);
+        return 0;
+      }
       if (command.kind !== "doctor") {
         throw new CliUsageError("doctor accepts only --json");
       }

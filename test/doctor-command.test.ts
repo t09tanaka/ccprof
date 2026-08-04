@@ -7,7 +7,7 @@ import test, { type TestContext } from "node:test";
 import Database from "better-sqlite3";
 
 import {
-  CliUsageError, parseCliArgs, runCli,
+  CliUsageError, parseCliArgs, runCli, USAGE,
 } from "../src/cli.js";
 import { runDoctorCommand } from "../src/commands/doctor.js";
 import { resolveStorePaths } from "../src/store/paths.js";
@@ -95,6 +95,15 @@ test("doctor parses its exact public command shapes", () => {
     ["doctor", "--json", "extra"],
     ["doctor", "--json", "--json"],
   ]) assert.throws(() => parseCliArgs(args), CliUsageError);
+});
+
+test("doctor preserves global help precedence", async (t) => {
+  assert.deepEqual(parseCliArgs(["doctor", "--help"]), { kind: "help" });
+  const { repo, dataRoot } = await fixture(t);
+
+  const result = await capture(["doctor", "--help"], repo, dataRoot);
+
+  assert.deepEqual(result, { code: 0, stdout: USAGE, stderr: "" });
 });
 
 test("doctor command exposes an empty warnings collection", async (t) => {
