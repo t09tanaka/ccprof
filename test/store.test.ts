@@ -1421,6 +1421,33 @@ test("rich snapshot input and normalized-result changes create distinct snapshot
   });
 });
 
+test("snapshot selector validation rejects own __proto__ field attacks", async () => {
+  await temporaryStore(async (paths) => {
+    const selector = JSON.parse(
+      '{"kind":"github_pr","extra":true,"__proto__":{"number":42}}',
+    ) as AnalysisSnapshotIdentity["selector"];
+    const snapshot = {
+      ...snapshotOptions().snapshot,
+      selector,
+    } as AnalysisSnapshotIdentity;
+
+    await assert.rejects(
+      () => saveAnalysis(paths, record("selector-proto-attack", 100), { snapshot }),
+      /invalid snapshot selector/u,
+    );
+
+    const database = openStoreDatabase(paths);
+    try {
+      assert.equal(
+        database.prepare("SELECT count(*) FROM analysis_executions").pluck().get(),
+        0,
+      );
+    } finally {
+      database.close();
+    }
+  });
+});
+
 test("snapshot-aware history preserves records and exposes exact normalized entries", async () => {
   await temporaryStore(async (paths) => {
     const selector = {

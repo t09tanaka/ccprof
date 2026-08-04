@@ -527,6 +527,15 @@ test("selector ref digests preserve exact NFC tokens before label stripping", as
   }
 });
 
+test("selector ref digests reject unpaired UTF-16 surrogates", () => {
+  for (const malformedRef of ["\uD800", "\uD801"]) {
+    assert.throws(
+      () => selectorRefDigest("explicit_range", "base", malformedRef),
+      /unpaired UTF-16 surrogate/u,
+    );
+  }
+});
+
 test("PR URL uses exact gh metadata, disables prompts, and preserves creation", async () => {
   const url = "https://github.example/acme/widget/pull/42";
   const fixture = fakeRunner(({ command, args }) => {
