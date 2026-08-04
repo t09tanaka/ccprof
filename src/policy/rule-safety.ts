@@ -537,10 +537,16 @@ function mappedCommandTokens(raw: string): string[] | undefined {
   return [mapped, ...tokenized.tokens.slice(1)];
 }
 
-function unsafeGitOption(value: string): boolean {
+function unsafeGitOption(value: string, subcommand: string): boolean {
   return UNSAFE_GIT_OPTIONS.some(
     (option) => value === option || value.startsWith(`${option}=`),
-  );
+  ) ||
+    (subcommand === "grep" && value.startsWith("-O"));
+}
+
+function unsafeInspectOption(executable: string, value: string): boolean {
+  return executable === "rg" &&
+    (value === "--pre" || value.startsWith("--pre="));
 }
 
 export function safeCanonicalCommand(
@@ -588,7 +594,8 @@ export function safeCanonicalCommand(
   }
   if (
     descriptor.family === "inspect" &&
-    READ_ONLY_EXECUTABLES.has(executable)
+    READ_ONLY_EXECUTABLES.has(executable) &&
+    !tokens.slice(1).some((value) => unsafeInspectOption(executable, value))
   ) {
     return canonical;
   }
@@ -596,7 +603,7 @@ export function safeCanonicalCommand(
   const subcommand = tokens[1];
   if (
     subcommand === undefined || !READ_ONLY_GIT_SUBCOMMANDS.has(subcommand) ||
-    tokens.slice(2).some(unsafeGitOption)
+    tokens.slice(2).some((value) => unsafeGitOption(value, subcommand))
   ) {
     return undefined;
   }
