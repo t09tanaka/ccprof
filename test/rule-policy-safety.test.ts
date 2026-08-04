@@ -507,6 +507,71 @@ test("rejects shell and environment expansion regardless of quote provenance", (
   }
 });
 
+test("rejects Windows expansion and composite syntax through every decision path", () => {
+  const dangerous = [
+    "npm test -- !foo",
+    "npm test -- !!",
+    "npm test -- %0",
+    "npm test -- %*",
+    "npm test -- %%A",
+    "npm.cmd test 'x&calc'",
+    "npm.cmd test x\\&calc",
+  ];
+  const wildcard = resolvedPolicy(
+    { safe_patterns: ["*"], allow_rule_recommendation: true },
+    [{ match: ["*"], domain: "validation", parallel_safe: true }],
+  );
+  for (const raw of dangerous) {
+    assert.equal(safeCanonicalCommand(raw), undefined, raw);
+    assert.deepEqual(approvalRecommendationDecision([raw], wildcard), {
+      kind: "evaluated",
+      commands: [{ allowed: false }],
+    }, raw);
+    assert.deepEqual(resourceDomainDecision([raw], wildcard), {
+      kind: "investigation_candidate",
+    }, raw);
+  }
+});
+
+test("rejects active ripgrep decompressor flags without consuming literals", () => {
+  const dangerous = [
+    "rg -z TODO src",
+    "rg -nz TODO src",
+    "rg -nzi TODO src",
+    "rg --search-zip TODO src",
+  ];
+  const safe = [
+    "rg --no-search-zip TODO src",
+    "rg -- -z src",
+    "rg -- --search-zip src",
+  ];
+  const wildcard = resolvedPolicy(
+    { safe_patterns: ["*"], allow_rule_recommendation: true },
+    [{ match: ["*"], domain: "read-only", parallel_safe: true }],
+  );
+  for (const raw of dangerous) {
+    assert.equal(safeCanonicalCommand(raw), undefined, raw);
+    assert.deepEqual(approvalRecommendationDecision([raw], wildcard), {
+      kind: "evaluated",
+      commands: [{ allowed: false }],
+    }, raw);
+    assert.deepEqual(resourceDomainDecision([raw], wildcard), {
+      kind: "investigation_candidate",
+    }, raw);
+  }
+  for (const raw of safe) {
+    assert.equal(safeCanonicalCommand(raw), raw, raw);
+    assert.deepEqual(approvalRecommendationDecision([raw], wildcard), {
+      kind: "evaluated",
+      commands: [{ allowed: true, canonical_command: raw }],
+    }, raw);
+    assert.deepEqual(resourceDomainDecision([raw], wildcard), {
+      kind: "parallel_safe",
+      domain: "read-only",
+    }, raw);
+  }
+});
+
 test("rejects every bounded external-helper option abbreviation", () => {
   const textconv = "--textconv";
   const extGrep = "--ext-grep";
