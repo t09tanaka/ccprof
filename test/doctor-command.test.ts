@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -248,6 +252,58 @@ test("doctor leaves a supported old store pending and unmodified", async (t) => 
   const readonly = new Database(path, { readonly: true, fileMustExist: true });
   assert.equal(Number(readonly.pragma("user_version", { simple: true })), 4);
   readonly.close();
+});
+
+test("doctor reads WAL state without creating Store sidecars", async (t) => {
+  const { repo, dataRoot } = await fixture(t);
+  const paths = await resolveStorePaths(repo, {
+    env: { CCPROF_DATA_DIR: dataRoot },
+  });
+  openStoreDatabase(paths).close();
+  const path = storeDatabasePath(paths);
+  const writer = `
+    import Database from "better-sqlite3";
+    const database = new Database(process.argv[1]);
+    database.pragma("wal_autocheckpoint = 0");
+    database.prepare("DELETE FROM store_migrations WHERE name = ?")
+      .run(process.argv[2]);
+    database.pragma("user_version = 4");
+    process.kill(process.pid, "SIGKILL");
+  `;
+  const child = spawnSync(process.execPath, [
+    "--input-type=module", "-e", writer, path,
+    INCREMENTAL_SOURCES_MIGRATION,
+  ], { cwd: process.cwd() });
+  assert.equal(child.signal, "SIGKILL");
+  await rm(`${path}-shm`, { force: true });
+  const snapshot = async () => Object.fromEntries(await Promise.all(
+    (await readdir(paths.repo_dir)).sort().map(async (name) => {
+      const file = join(paths.repo_dir, name);
+      const [bytes, status] = await Promise.all([
+        readFile(file), stat(file, { bigint: true }),
+      ]);
+      return [name, {
+        size: bytes.length,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+        mtimeNs: status.mtimeNs,
+      }];
+    }),
+  ));
+  const before = await snapshot();
+
+  const result = await capture(["doctor", "--json"], repo, dataRoot);
+
+  assert.equal(result.code, 0);
+  assert.deepEqual(
+    storeChecks(JSON.parse(result.stdout) as DoctorJson)
+      .map(({ id, status }) => ({ id, status })),
+    [
+      { id: "store_schema", status: "warn" },
+      { id: "store_migrations", status: "warn" },
+      { id: "store_open", status: "pass" },
+    ],
+  );
+  assert.deepEqual(await snapshot(), before);
 });
 
 test("doctor recognizes an empty v0 store without initializing it", async (t) => {

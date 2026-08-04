@@ -1,93 +1,94 @@
 import Database from "better-sqlite3";
 import type { Stats } from "node:fs";
-import { lstat } from "node:fs/promises";
+import { copyFile, lstat, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { loadRepositoryConfig, loadRepositoryPolicyPreferences } from
   "../analysis/repository-config.js";
-import {
-  loadConfiguredOrganizationPolicy,
-  resolveEffectivePolicy,
-} from "../policy/organization-policy.js";
-import {
-  CLAUDE_SESSION_SOURCE_CONTRACT,
-  CODEX_SESSION_SOURCE_CONTRACT,
-} from "../sources/session-source.js";
+import { loadConfiguredOrganizationPolicy, resolveEffectivePolicy } from
+  "../policy/organization-policy.js";
+import { CLAUDE_SESSION_SOURCE_CONTRACT, CODEX_SESSION_SOURCE_CONTRACT } from
+  "../sources/session-source.js";
 import { resolveStorePaths } from "../store/paths.js";
-import {
-  ANALYSIS_BUDGETS_MIGRATION,
-  INCREMENTAL_SOURCES_MIGRATION,
-  SOURCE_CATALOG_MIGRATION,
-  STORE_SCHEMA_VERSION,
-  storeDatabasePath,
-} from "../store/sqlite.js";
+import { ANALYSIS_BUDGETS_MIGRATION, INCREMENTAL_SOURCES_MIGRATION,
+  SOURCE_CATALOG_MIGRATION, STORE_SCHEMA_VERSION, storeDatabasePath } from
+  "../store/sqlite.js";
 
 export type DoctorStatus = "pass" | "warn" | "fail";
 export type DoctorCheckId = "configuration" | "organization_policy" |
   "source_capabilities" | "parser_budgets" | "store_schema" |
   "store_migrations" | "store_open" | "encryption";
 
-export interface DoctorCheck {
-  id: DoctorCheckId; status: DoctorStatus; code: string; message: string;
-}
-
+export interface DoctorCheck { id: DoctorCheckId; status: DoctorStatus;
+  code: string; message: string; }
 export interface DoctorReport {
   schema_version: 1; command: "doctor"; status: DoctorStatus;
-  checks: DoctorCheck[];
-}
-
-export interface DoctorOptions {
-  cwd: string; json: boolean; env?: NodeJS.ProcessEnv;
-}
-
-interface StoreChecks {
-  schema: DoctorCheck; migrations: DoctorCheck; open: DoctorCheck;
-}
+  checks: DoctorCheck[]; }
+export interface DoctorOptions { cwd: string; json: boolean;
+  env?: NodeJS.ProcessEnv; }
+interface StoreChecks { schema: DoctorCheck; migrations: DoctorCheck;
+  open: DoctorCheck; }
 
 const SUPPORTED_OLD_SCHEMAS = new Set([0, 2, 3, 4]);
-const REQUIRED_MIGRATIONS = [
-  SOURCE_CATALOG_MIGRATION,
-  ANALYSIS_BUDGETS_MIGRATION,
-  INCREMENTAL_SOURCES_MIGRATION,
-] as const;
+const REQUIRED_MIGRATIONS = [SOURCE_CATALOG_MIGRATION,
+  ANALYSIS_BUDGETS_MIGRATION, INCREMENTAL_SOURCES_MIGRATION] as const;
 
 function check(id: DoctorCheckId, status: DoctorStatus, code: string,
   message: string): DoctorCheck {
   return { id, status, code, message };
 }
 
-function missingStore(): StoreChecks {
-  return {
+function missingStore(): StoreChecks { return {
     schema: check("store_schema", "warn", "store_not_initialized",
       "Store is not initialized."),
     migrations: check("store_migrations", "warn", "store_not_initialized",
       "Store is not initialized."),
     open: check("store_open", "pass", "store_open_not_required",
       "No Store database is present to open."),
-  };
-}
+  }; }
 
-function failedStore(): StoreChecks {
-  return {
+function failedStore(): StoreChecks { return {
     schema: check("store_schema", "fail", "store_unavailable",
       "Store could not be inspected safely."),
     migrations: check("store_migrations", "fail", "store_unavailable",
       "Store could not be inspected safely."),
     open: check("store_open", "fail", "store_unavailable",
       "Store could not be inspected safely."),
-  };
-}
+  }; }
 
 async function pathStatus(path: string): Promise<Stats | undefined> {
-  try {
-    return await lstat(path);
-  } catch (error) {
+  try { return await lstat(path); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
   }
 }
 
-function sameIdentity(left: Stats, right: Stats): boolean {
-  return left.dev === right.dev && left.ino === right.ino;
+function sameFile(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino &&
+    left.size === right.size && left.mtimeMs === right.mtimeMs;
+}
+
+async function copyStore(path: string):
+Promise<{ directory: string; databasePath: string }> {
+  const directory = await mkdtemp(join(tmpdir(), "ccprof-doctor-"));
+  const databasePath = join(directory, "store.sqlite3");
+  try {
+    await copyFile(path, databasePath);
+    const walPath = `${path}-wal`;
+    const before = await pathStatus(walPath);
+    if (before !== undefined) {
+      if (before.isSymbolicLink() || !before.isFile()) throw new Error();
+      await copyFile(walPath, `${databasePath}-wal`);
+    }
+    const after = await pathStatus(walPath);
+    if (before === undefined ? after !== undefined :
+      after === undefined || !sameFile(before, after)) throw new Error();
+    return { directory, databasePath };
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 async function inspectStore(cwd: string, env: NodeJS.ProcessEnv):
@@ -95,16 +96,14 @@ Promise<StoreChecks> {
   const paths = await resolveStorePaths(cwd, { env });
   const repositoryStatus = await pathStatus(paths.repo_dir);
   if (repositoryStatus === undefined) return missingStore();
-  if (repositoryStatus.isSymbolicLink() || !repositoryStatus.isDirectory()) {
+  if (repositoryStatus.isSymbolicLink() || !repositoryStatus.isDirectory())
     return failedStore();
-  }
 
   const databasePath = storeDatabasePath(paths);
   const databaseStatus = await pathStatus(databasePath);
   if (databaseStatus === undefined) return missingStore();
-  if (databaseStatus.isSymbolicLink() || !databaseStatus.isFile()) {
+  if (databaseStatus.isSymbolicLink() || !databaseStatus.isFile())
     return failedStore();
-  }
 
   let database: Database.Database | undefined;
   let version: number | undefined;
@@ -112,16 +111,18 @@ Promise<StoreChecks> {
   let healthy = false;
   let closeFailed = false;
   let stablePath = false;
+  let temporaryDirectory: string | undefined;
   try {
-    database = new Database(databasePath,
+    const copy = await copyStore(databasePath);
+    temporaryDirectory = copy.directory;
+    database = new Database(copy.databasePath,
       { readonly: true, fileMustExist: true });
     version = Number(database.pragma("user_version", { simple: true }));
     const quickCheck = database.pragma("quick_check(1)") as
       { quick_check?: unknown }[];
     healthy = quickCheck.length === 1 && quickCheck[0]?.quick_check === "ok";
-    if (version === 0) {
-      markers = new Set();
-    } else {
+    if (version === 0) markers = new Set();
+    else {
       const rows = database.prepare(`
         SELECT name FROM store_migrations
         WHERE name IN (?, ?, ?)
@@ -131,14 +132,14 @@ Promise<StoreChecks> {
     }
     const after = await lstat(databasePath);
     stablePath = !after.isSymbolicLink() && after.isFile() &&
-      sameIdentity(databaseStatus, after);
+      sameFile(databaseStatus, after);
   } catch {
     return failedStore();
   } finally {
-    try {
-      database?.close();
-    } catch {
-      closeFailed = true;
+    try { database?.close(); } catch { closeFailed = true; }
+    if (temporaryDirectory !== undefined) {
+      try { await rm(temporaryDirectory, { recursive: true, force: true }); }
+      catch { closeFailed = true; }
     }
   }
 
