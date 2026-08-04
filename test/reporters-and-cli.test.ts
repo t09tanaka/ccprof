@@ -772,6 +772,27 @@ test("renderers and privacy reject partial or hostile canonical finding fields",
       "legacy_projection",
     ],
   });
+  const mismatchedLegacyCompatibility = finding(2, {
+    rule_id: "R002",
+    confidence: "low",
+    recoverable: { min: 999, bound: "point" },
+    impact: {
+      lower_ms: 0,
+      upper_ms: 120_000,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "medium",
+      source_completeness: 0.5,
+    },
+    severity: "medium",
+    scoring_rationale: [
+      "estimated_upper_only",
+      "partial_source",
+      "legacy_projection",
+    ],
+  });
 
   const renderers = [
     (value: Finding) => renderTtyReport({ ...report(), findings: [value] }),
@@ -790,6 +811,7 @@ test("renderers and privacy reject partial or hostile canonical finding fields",
     hostileCaveats,
     hostileSerializer,
     mismatchedLegacyDomain,
+    mismatchedLegacyCompatibility,
   ]) {
     for (const render of renderers) {
       assert.throws(() => render(value), (error: unknown) => {

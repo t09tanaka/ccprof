@@ -401,13 +401,14 @@ function rebuildDisplayFinding(
 }
 
 function validLegacyProjection(
-  ruleId: Finding["rule_id"],
+  base: Finding,
   impact: ImpactEstimate,
   confidence: FindingConfidence,
 ): boolean {
-  const expectedKind = ruleId === "R005" || ruleId === "R006"
+  const expectedKind = base.rule_id === "R005" || base.rule_id === "R006"
     ? "resource_cost"
     : "critical_path_latency";
+  const projectedRecoverable = projectFindingRecoverable(impact);
   return impact.kind === expectedKind &&
     impact.lower_ms === 0 &&
     !("expected_ms" in impact) &&
@@ -416,7 +417,10 @@ function validLegacyProjection(
       confidence.source_completeness === 0) ||
       ((confidence.evidence === "medium" || confidence.evidence === "high") &&
         confidence.causal === "medium" &&
-        confidence.source_completeness === 0.5));
+        confidence.source_completeness === 0.5)) &&
+    base.confidence === projectFindingConfidence(confidence) &&
+    base.recoverable.min === projectedRecoverable.min &&
+    base.recoverable.bound === projectedRecoverable.bound;
 }
 
 export function findingForDisplay(finding: Finding): Finding {
@@ -493,7 +497,7 @@ export function findingForDisplay(finding: Finding): Finding {
     if (
       !exactRationale(rationale, expectedRationale) ||
       (legacyProjection &&
-        !validLegacyProjection(base.rule_id, impact, confidence))
+        !validLegacyProjection(base, impact, confidence))
     ) throw new TypeError();
     return rebuildDisplayFinding(
       descriptors,
