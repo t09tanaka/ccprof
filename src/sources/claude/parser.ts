@@ -1713,156 +1713,173 @@ export async function readClaudeParserState(options: {
     starting_line: startingLine,
   });
   let receipt: SourceReadReceipt | undefined;
-  while (true) {
-    const next = await iterator.next();
-    pushReadStops();
-    if (next.done) {
-      receipt = next.value;
-      break;
-    }
-    const inputLine = next.value;
-    const { text: rawLine, bytes: rawBytes, line } = inputLine;
-    lastLine = line;
-    const pushWarning = (pending: PendingWarning, timestampMs?: number): void => {
-      pushStateWarning(warningFact(pending, warningOrder, timestampMs));
-      warningOrder += 1;
-    };
-    if (rawLine.trim().length === 0) {
-      pushWarning(warning(
-        options.sourcePath,
-        "empty_line",
-        "Ignored an empty JSONL row.",
-        { line },
-      ));
-      continue;
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(rawLine) as unknown;
-    } catch {
-      pushWarning(warning(
-        options.sourcePath,
-        "invalid_json",
-        "Ignored malformed JSON.",
-        { line },
-      ));
-      continue;
-    }
-    if (!isRecord(parsed)) {
-      pushWarning(warning(
-        options.sourcePath,
-        "invalid_row",
-        "JSONL row is not an object.",
-        { line },
-      ));
-      continue;
-    }
-    const timestampMs = parseTimestamp(parsed.timestamp);
-    try {
-      tracker.assertNodes(parsed, line);
-    } catch (error) {
-      tracker.throwIfAborted();
-      if (!(error instanceof ParserBudgetExceededError)) throw error;
-      pushWarning(parserBudgetWarning(options.sourcePath, error), timestampMs);
-      continue;
-    }
-    if (timestampMs === undefined) {
+  let iterationFailed = false;
+  try {
+    while (true) {
+      const next = await iterator.next();
+      pushReadStops();
+      if (next.done) {
+        receipt = next.value;
+        break;
+      }
+      const inputLine = next.value;
+      const { text: rawLine, bytes: rawBytes, line } = inputLine;
+      lastLine = line;
+      const pushWarning = (
+        pending: PendingWarning,
+        timestampMs?: number,
+      ): void => {
+        pushStateWarning(warningFact(pending, warningOrder, timestampMs));
+        warningOrder += 1;
+      };
+      if (rawLine.trim().length === 0) {
+        pushWarning(warning(
+          options.sourcePath,
+          "empty_line",
+          "Ignored an empty JSONL row.",
+          { line },
+        ));
+        continue;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(rawLine) as unknown;
+      } catch {
+        pushWarning(warning(
+          options.sourcePath,
+          "invalid_json",
+          "Ignored malformed JSON.",
+          { line },
+        ));
+        continue;
+      }
+      if (!isRecord(parsed)) {
+        pushWarning(warning(
+          options.sourcePath,
+          "invalid_row",
+          "JSONL row is not an object.",
+          { line },
+        ));
+        continue;
+      }
+      const timestampMs = parseTimestamp(parsed.timestamp);
+      try {
+        tracker.assertNodes(parsed, line);
+      } catch (error) {
+        tracker.throwIfAborted();
+        if (!(error instanceof ParserBudgetExceededError)) throw error;
+        pushWarning(parserBudgetWarning(options.sourcePath, error), timestampMs);
+        continue;
+      }
+      if (timestampMs === undefined) {
+        const sessionId = nonEmptyString(parsed.sessionId);
+        const rowType = nonEmptyString(parsed.type);
+        const isKnownAuxiliaryRow =
+          rowType !== undefined && KNOWN_AUXILIARY_ROW_TYPES.has(rowType);
+        if (sessionId === undefined) {
+          pushWarning(warning(
+            options.sourcePath,
+            "missing_session_id",
+            "Ignored a row without a sessionId.",
+            { line },
+          ));
+        } else if (!isKnownAuxiliaryRow) {
+          pushWarning(warning(
+            options.sourcePath,
+            "invalid_timestamp",
+            "Ignored a row with an invalid timestamp.",
+            { line, sessionId },
+          ));
+        }
+        continue;
+      }
       const sessionId = nonEmptyString(parsed.sessionId);
-      const rowType = nonEmptyString(parsed.type);
-      const isKnownAuxiliaryRow =
-        rowType !== undefined && KNOWN_AUXILIARY_ROW_TYPES.has(rowType);
       if (sessionId === undefined) {
         pushWarning(warning(
           options.sourcePath,
           "missing_session_id",
           "Ignored a row without a sessionId.",
           { line },
-        ));
-      } else if (!isKnownAuxiliaryRow) {
+        ), timestampMs);
+        continue;
+      }
+      const rowType = nonEmptyString(parsed.type);
+      const isKnownAuxiliaryRow =
+        rowType !== undefined && KNOWN_AUXILIARY_ROW_TYPES.has(rowType);
+      const sourceIndex = line - 1;
+      const observedUuid = nonEmptyString(parsed.uuid);
+      const entryUuid = observedUuid ??
+        `${sessionId}:source-${sourceIndex.toString(10)}`;
+      const cwd = nonEmptyString(parsed.cwd);
+      const branch = nonEmptyString(parsed.gitBranch);
+      const parentUuid = nonEmptyString(parsed.parentUuid);
+      const agentId = nonEmptyString(parsed.agentId);
+      const toolResults = ingestToolResults(parsed);
+      const compacted = compactRowValue(parsed, toolResults);
+      const range = jsonlLinePhysicalRange(inputLine);
+      const stateRow: ClaudeStateRowV1 = {
+        kind: "claude-row-v1",
+        original_bytes: rawBytes,
+        byte_start: range.byte_start,
+        byte_end: range.byte_end,
+        line,
+        timestamp_ms: timestampMs,
+        source_index: sourceIndex,
+        session_id: sessionId,
+        entry_uuid: entryUuid,
+        has_synthetic_uuid: observedUuid === undefined,
+        cwd: cwd ?? null,
+        branch: branch ?? null,
+        parent_uuid: parentUuid ?? null,
+        agent_id: agentId ?? null,
+        is_sidechain: parsed.isSidechain === true,
+        value: compacted.value,
+        tool_results: toolResults.map(stateToolResult),
+      };
+      stateCapacity.addArrayItem(stateRow, rows.length);
+      rows.push(stateRow);
+      const parsedRow: ParsedRow = {
+        value: compacted.value as unknown as UnknownRecord,
+        toolResults,
+        sessionId,
+        timestampMs,
+        entryUuid,
+        hasSyntheticUuid: observedUuid === undefined,
+        sourceIndex,
+        line,
+        isSidechain: parsed.isSidechain === true,
+        ...(cwd === undefined ? {} : { cwd }),
+        ...(branch === undefined ? {} : { branch }),
+        ...(parentUuid === undefined ? {} : { parentUuid }),
+        ...(agentId === undefined ? {} : { agentId }),
+      };
+      if (compacted.discardedPayload) {
         pushWarning(warning(
           options.sourcePath,
-          "invalid_timestamp",
-          "Ignored a row with an invalid timestamp.",
-          { line, sessionId },
-        ));
+          "content_payload_compacted",
+          `Discarded ${compacted.discardedPayloadBytes.toString(10)} UTF-8 bytes from an unrecognized message content payload.`,
+          { line, row: parsedRow },
+        ), timestampMs);
       }
-      continue;
+      if (observedUuid === undefined && !isKnownAuxiliaryRow) {
+        pushWarning(warning(
+          options.sourcePath,
+          "missing_entry_uuid",
+          "Used a deterministic entry UUID fallback.",
+          { row: parsedRow },
+        ), timestampMs);
+      }
     }
-    const sessionId = nonEmptyString(parsed.sessionId);
-    if (sessionId === undefined) {
-      pushWarning(warning(
-        options.sourcePath,
-        "missing_session_id",
-        "Ignored a row without a sessionId.",
-        { line },
-      ), timestampMs);
-      continue;
-    }
-    const rowType = nonEmptyString(parsed.type);
-    const isKnownAuxiliaryRow =
-      rowType !== undefined && KNOWN_AUXILIARY_ROW_TYPES.has(rowType);
-    const sourceIndex = line - 1;
-    const observedUuid = nonEmptyString(parsed.uuid);
-    const entryUuid = observedUuid ??
-      `${sessionId}:source-${sourceIndex.toString(10)}`;
-    const cwd = nonEmptyString(parsed.cwd);
-    const branch = nonEmptyString(parsed.gitBranch);
-    const parentUuid = nonEmptyString(parsed.parentUuid);
-    const agentId = nonEmptyString(parsed.agentId);
-    const toolResults = ingestToolResults(parsed);
-    const compacted = compactRowValue(parsed, toolResults);
-    const range = jsonlLinePhysicalRange(inputLine);
-    const stateRow: ClaudeStateRowV1 = {
-      kind: "claude-row-v1",
-      original_bytes: rawBytes,
-      byte_start: range.byte_start,
-      byte_end: range.byte_end,
-      line,
-      timestamp_ms: timestampMs,
-      source_index: sourceIndex,
-      session_id: sessionId,
-      entry_uuid: entryUuid,
-      has_synthetic_uuid: observedUuid === undefined,
-      cwd: cwd ?? null,
-      branch: branch ?? null,
-      parent_uuid: parentUuid ?? null,
-      agent_id: agentId ?? null,
-      is_sidechain: parsed.isSidechain === true,
-      value: compacted.value,
-      tool_results: toolResults.map(stateToolResult),
-    };
-    stateCapacity.addArrayItem(stateRow, rows.length);
-    rows.push(stateRow);
-    const parsedRow: ParsedRow = {
-      value: compacted.value as unknown as UnknownRecord,
-      toolResults,
-      sessionId,
-      timestampMs,
-      entryUuid,
-      hasSyntheticUuid: observedUuid === undefined,
-      sourceIndex,
-      line,
-      isSidechain: parsed.isSidechain === true,
-      ...(cwd === undefined ? {} : { cwd }),
-      ...(branch === undefined ? {} : { branch }),
-      ...(parentUuid === undefined ? {} : { parentUuid }),
-      ...(agentId === undefined ? {} : { agentId }),
-    };
-    if (compacted.discardedPayload) {
-      pushWarning(warning(
-        options.sourcePath,
-        "content_payload_compacted",
-        `Discarded ${compacted.discardedPayloadBytes.toString(10)} UTF-8 bytes from an unrecognized message content payload.`,
-        { line, row: parsedRow },
-      ), timestampMs);
-    }
-    if (observedUuid === undefined && !isKnownAuxiliaryRow) {
-      pushWarning(warning(
-        options.sourcePath,
-        "missing_entry_uuid",
-        "Used a deterministic entry UUID fallback.",
-        { row: parsedRow },
-      ), timestampMs);
+  } catch (error) {
+    iterationFailed = true;
+    throw error;
+  } finally {
+    if (receipt === undefined) {
+      try {
+        await iterator.return(undefined as never);
+      } catch (error) {
+        if (!iterationFailed) throw error;
+      }
     }
   }
   if (receipt === undefined) throw new TypeError("Missing Claude read receipt.");

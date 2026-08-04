@@ -791,124 +791,138 @@ export async function readCodexParserState(options: {
     starting_line: startingLine,
   });
   let receipt: SourceReadReceipt | undefined;
-  while (true) {
-    const next = await iterator.next();
-    pushReadStops();
-    if (next.done) {
-      receipt = next.value;
-      break;
-    }
-    const inputLine = next.value;
-    const { text: rawLine, bytes: rawBytes, line } = inputLine;
-    lastLine = line;
-    const pushWarning = (value: SourceWarning, timestampMs?: number): void => {
-      pushStateWarning(codexWarningFact(value, warningOrder, timestampMs));
-      warningOrder += 1;
-    };
-    if (rawLine.trim().length === 0) continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(rawLine) as unknown;
-    } catch {
-      pushWarning(warn(
-        options.sourcePath,
-        line,
-        "codex_row_invalid",
-        "Ignored malformed JSON row.",
-      ));
-      continue;
-    }
-    if (!isRecord(parsed)) {
-      pushWarning(warn(
-        options.sourcePath,
-        line,
-        "codex_row_invalid",
-        "Ignored a non-object JSON row.",
-      ));
-      continue;
-    }
-    const timestampMs = parseTimestamp(parsed.timestamp);
-    try {
-      tracker.assertNodes(parsed, line);
-    } catch (error) {
-      tracker.throwIfAborted();
-      if (!(error instanceof ParserBudgetExceededError)) throw error;
-      pushWarning(warn(
-        options.sourcePath,
-        error.line,
-        budgetWarningCode(error),
-        error.message,
-      ), timestampMs);
-      continue;
-    }
-    if (timestampMs === undefined) {
-      pushWarning(warn(
-        options.sourcePath,
-        line,
-        "codex_row_invalid",
-        "Ignored a row with an invalid or missing timestamp.",
-      ));
-      continue;
-    }
-    const type = nonEmptyString(parsed.type);
-    if (type === undefined) {
-      pushWarning(warn(
-        options.sourcePath,
-        line,
-        "codex_row_invalid",
-        "Ignored a row without a type.",
-      ), timestampMs);
-      continue;
-    }
-    if (!isRecord(parsed.payload)) {
-      pushWarning(warn(
-        options.sourcePath,
-        line,
-        "codex_row_invalid",
-        "Ignored a row without a payload object.",
-      ), timestampMs);
-      continue;
-    }
-    let argumentBudget: Extract<ParserBudget, "node" | "depth"> | null = null;
-    if (
-      type === "response_item" &&
-      parsed.payload.type === "function_call" &&
-      typeof parsed.payload.arguments === "string"
-    ) {
+  let iterationFailed = false;
+  try {
+    while (true) {
+      const next = await iterator.next();
+      pushReadStops();
+      if (next.done) {
+        receipt = next.value;
+        break;
+      }
+      const inputLine = next.value;
+      const { text: rawLine, bytes: rawBytes, line } = inputLine;
+      lastLine = line;
+      const pushWarning = (value: SourceWarning, timestampMs?: number): void => {
+        pushStateWarning(codexWarningFact(value, warningOrder, timestampMs));
+        warningOrder += 1;
+      };
+      if (rawLine.trim().length === 0) continue;
+      let parsed: unknown;
       try {
-        const args: unknown = JSON.parse(parsed.payload.arguments);
-        tracker.assertNodes(args, line);
+        parsed = JSON.parse(rawLine) as unknown;
+      } catch {
+        pushWarning(warn(
+          options.sourcePath,
+          line,
+          "codex_row_invalid",
+          "Ignored malformed JSON row.",
+        ));
+        continue;
+      }
+      if (!isRecord(parsed)) {
+        pushWarning(warn(
+          options.sourcePath,
+          line,
+          "codex_row_invalid",
+          "Ignored a non-object JSON row.",
+        ));
+        continue;
+      }
+      const timestampMs = parseTimestamp(parsed.timestamp);
+      try {
+        tracker.assertNodes(parsed, line);
       } catch (error) {
         tracker.throwIfAborted();
-        if (error instanceof ParserBudgetExceededError) {
-          if (error.budget === "node" || error.budget === "depth") {
-            argumentBudget = error.budget;
+        if (!(error instanceof ParserBudgetExceededError)) throw error;
+        pushWarning(warn(
+          options.sourcePath,
+          error.line,
+          budgetWarningCode(error),
+          error.message,
+        ), timestampMs);
+        continue;
+      }
+      if (timestampMs === undefined) {
+        pushWarning(warn(
+          options.sourcePath,
+          line,
+          "codex_row_invalid",
+          "Ignored a row with an invalid or missing timestamp.",
+        ));
+        continue;
+      }
+      const type = nonEmptyString(parsed.type);
+      if (type === undefined) {
+        pushWarning(warn(
+          options.sourcePath,
+          line,
+          "codex_row_invalid",
+          "Ignored a row without a type.",
+        ), timestampMs);
+        continue;
+      }
+      if (!isRecord(parsed.payload)) {
+        pushWarning(warn(
+          options.sourcePath,
+          line,
+          "codex_row_invalid",
+          "Ignored a row without a payload object.",
+        ), timestampMs);
+        continue;
+      }
+      let argumentBudget: Extract<ParserBudget, "node" | "depth"> | null = null;
+      if (
+        type === "response_item" &&
+        parsed.payload.type === "function_call" &&
+        typeof parsed.payload.arguments === "string"
+      ) {
+        try {
+          const args: unknown = JSON.parse(parsed.payload.arguments);
+          tracker.assertNodes(args, line);
+        } catch (error) {
+          tracker.throwIfAborted();
+          if (error instanceof ParserBudgetExceededError) {
+            if (error.budget === "node" || error.budget === "depth") {
+              argumentBudget = error.budget;
+            }
+            pushWarning(warn(
+              options.sourcePath,
+              error.line,
+              budgetWarningCode(error),
+              error.message,
+            ), timestampMs);
           }
-          pushWarning(warn(
-            options.sourcePath,
-            error.line,
-            budgetWarningCode(error),
-            error.message,
-          ), timestampMs);
         }
       }
+      const range = jsonlLinePhysicalRange(inputLine);
+      const stateRow = {
+        kind: "codex-row-v1",
+        original_bytes: rawBytes,
+        byte_start: range.byte_start,
+        byte_end: range.byte_end,
+        line,
+        timestamp_ms: timestampMs,
+        type: type === "session_meta" || type === "response_item"
+          ? type
+          : "auxiliary",
+        payload: compactCodexStatePayload(type, parsed.payload),
+        argument_budget: argumentBudget,
+      } as CodexStateRowV1;
+      stateCapacity.addArrayItem(stateRow, rows.length);
+      rows.push(stateRow);
     }
-    const range = jsonlLinePhysicalRange(inputLine);
-    const stateRow = {
-      kind: "codex-row-v1",
-      original_bytes: rawBytes,
-      byte_start: range.byte_start,
-      byte_end: range.byte_end,
-      line,
-      timestamp_ms: timestampMs,
-      type: type === "session_meta" || type === "response_item"
-        ? type
-        : "auxiliary",
-      payload: compactCodexStatePayload(type, parsed.payload),
-      argument_budget: argumentBudget,
-    } as CodexStateRowV1;
-    stateCapacity.addArrayItem(stateRow, rows.length);
-    rows.push(stateRow);
+  } catch (error) {
+    iterationFailed = true;
+    throw error;
+  } finally {
+    if (receipt === undefined) {
+      try {
+        await iterator.return(undefined as never);
+      } catch (error) {
+        if (!iterationFailed) throw error;
+      }
+    }
   }
   if (receipt === undefined) throw new TypeError("Missing Codex read receipt.");
   lastLine = Math.max(lastLine, tracker.lastPhysicalLine);
