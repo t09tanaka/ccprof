@@ -773,3 +773,48 @@ test("confirmed floor rounds once, clamps, and handles zero measured time", () =
   assert.equal(zero.summary.measured_min, 0);
   assert.equal(zero.summary.estimated_floor_min, 0);
 });
+
+test("confirmed lower bounds retain fractional milliseconds until final rounding", () => {
+  const result = reconcileLedger({
+    rawIntervals: [{ start_ms: 0, end_ms: 600 }],
+    activeIntervals: [{ start_ms: 0, end_ms: 600 }],
+    contributingIntervals: [],
+    candidates: [
+      candidate(
+        "R002",
+        "fractional-lower-bound-a",
+        "upper",
+        [{ start_ms: 0, end_ms: 200 }],
+        200,
+        {
+          impact: {
+            lower_ms: 149.8,
+            upper_ms: 200,
+            kind: "critical_path_latency",
+          },
+        },
+      ),
+      candidate(
+        "R003",
+        "fractional-lower-bound-b",
+        "upper",
+        [{ start_ms: 300, end_ms: 500 }],
+        200,
+        {
+          impact: {
+            lower_ms: 150.3,
+            upper_ms: 200,
+            kind: "critical_path_latency",
+          },
+        },
+      ),
+    ],
+  });
+
+  assert.deepEqual(result.highConfidenceLowerBoundIntervals, [
+    { start_ms: 0, end_ms: 149.8 },
+    { start_ms: 300, end_ms: 450.3 },
+  ]);
+  assert.equal(result.summary.measured_min, 0.01);
+  assert.equal(result.summary.estimated_floor_min, 0);
+});

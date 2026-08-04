@@ -85,7 +85,7 @@ function takeIntervalDuration(
   maximumMs: number,
 ): Interval[] {
   let remainingMs = Number.isFinite(maximumMs) && maximumMs > 0
-    ? Math.floor(maximumMs)
+    ? maximumMs
     : 0;
   const result: Interval[] = [];
   for (const interval of unionIntervals(intervals)) {
@@ -103,11 +103,35 @@ function takeIntervalDuration(
   return result;
 }
 
+function unionLowerBoundIntervals(
+  intervals: readonly Interval[],
+): Interval[] {
+  const sorted = [...intervals].sort(
+    (left, right) =>
+      left.start_ms - right.start_ms || left.end_ms - right.end_ms,
+  );
+  const result: Interval[] = [];
+  for (const interval of sorted) {
+    if (
+      !Number.isFinite(interval.start_ms) ||
+      !Number.isFinite(interval.end_ms) ||
+      interval.start_ms >= interval.end_ms
+    ) continue;
+    const previous = result.at(-1);
+    if (previous !== undefined && interval.start_ms <= previous.end_ms) {
+      previous.end_ms = Math.max(previous.end_ms, interval.end_ms);
+    } else {
+      result.push({ ...interval });
+    }
+  }
+  return result;
+}
+
 function confirmedLowerBoundIntervals(
   candidates: readonly FindingCandidate[],
   activeIntervals: readonly Interval[],
 ): Interval[] {
-  return unionIntervals(candidates.flatMap((candidate) => {
+  return unionLowerBoundIntervals(candidates.flatMap((candidate) => {
     if (
       candidate.impact.kind !== "critical_path_latency" ||
       !(candidate.impact.lower_ms > 0) ||
@@ -322,7 +346,10 @@ export function reconcileLedger(input: LedgerInput): LedgerResult {
   const recoverableHundredths = partitionHundredths.recoverable;
   const confirmedHundredths = Math.min(
     measuredHundredths,
-    roundedHundredths(durationMs(highConfidenceLowerBoundIntervals)),
+    roundedHundredths(highConfidenceLowerBoundIntervals.reduce(
+      (total, interval) => total + interval.end_ms - interval.start_ms,
+      0,
+    )),
   );
 
   const attributions = indexed.map(({ candidate, index }) =>

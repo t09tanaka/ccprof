@@ -9,6 +9,7 @@ import type {
   ReportV2,
 } from "../core/model.js";
 import type { StatsReport } from "./stats.js";
+import { findingForDisplay } from "./tty.js";
 export type PrivacyProfile = "strict" | "balanced" | "raw";
 type DisplayProfile = Exclude<PrivacyProfile, "raw">;
 type Copy = readonly [raw: string, replacement: string];
@@ -240,6 +241,7 @@ function projectedAnalysisBudget(
 
 export function projectReportPrivacy(report: ReportV2, profile: PrivacyProfile): ReportV2 {
   if (profile === "raw") return report;
+  const findings = report.findings.map(findingForDisplay);
   const scope = createHash("sha256").update(JSON.stringify(report)).digest("hex");
   const repoRoot = report.unit.repo;
   const sessions = report.unit.sessions;
@@ -257,7 +259,7 @@ export function projectReportPrivacy(report: ReportV2, profile: PrivacyProfile):
       ? {}
       : { sources: structuredClone(report.sources) }),
     summary: structuredClone(report.summary),
-    findings: report.findings.map((finding) => projectedFinding(
+    findings: findings.map((finding) => projectedFinding(
       finding, profile, scope, repoRoot, sessions,
     )),
     caveats: reportCaveats(report, profile, repoRoot, sessions),

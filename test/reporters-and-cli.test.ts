@@ -687,6 +687,59 @@ test("all report formats conservatively normalize legacy findings", () => {
   assert.deepEqual(legacyReport, before);
 });
 
+test("renderers and privacy reject partial or hostile canonical finding fields", () => {
+  const canonical = finding(1, {
+    impact: {
+      lower_ms: 60_000,
+      upper_ms: 120_000,
+      kind: "critical_path_latency",
+    },
+    finding_confidence: {
+      evidence: "high",
+      causal: "high",
+      source_completeness: 1,
+    },
+    severity: "high",
+    scoring_rationale: ["observed_lower_bound"],
+  });
+  const partial = { ...canonical };
+  delete partial.finding_confidence;
+  delete partial.severity;
+  delete partial.scoring_rationale;
+
+  const canary = "DISPLAY_CANONICAL_CANARY";
+  let getterCalled = false;
+  const hostile = { ...canonical };
+  Object.defineProperty(hostile, "impact", {
+    enumerable: true,
+    get() {
+      getterCalled = true;
+      throw new Error(canary);
+    },
+  });
+
+  const renderers = [
+    (value: Finding) => renderTtyReport({ ...report(), findings: [value] }),
+    (value: Finding) => renderMarkdownReport({ ...report(), findings: [value] }),
+    (value: Finding) => renderJsonReport({ ...report(), findings: [value] }),
+    (value: Finding) => projectReportPrivacy(
+      { ...report(), findings: [value] },
+      "strict",
+    ),
+  ];
+  for (const value of [partial, hostile]) {
+    for (const render of renderers) {
+      assert.throws(() => render(value), (error: unknown) => {
+        assert.ok(error instanceof TypeError);
+        assert.equal(error.message, "invalid finding");
+        assert.equal(error.message.includes(canary), false);
+        return true;
+      });
+    }
+  }
+  assert.equal(getterCalled, false);
+});
+
 test("human report renderers remove terminal control strings without changing JSON values", () => {
   const oscTitle =
     "\u001b]0;OSC_TITLE_ATTACK\u0007Visible title";

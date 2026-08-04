@@ -1,13 +1,18 @@
+import { types as utilTypes } from "node:util";
+
 import type { AdvisoryText } from "../advisory/advisory.js";
 import {
   findingScoringRationale,
   findingSeverity,
   projectFindingConfidence,
   projectFindingRecoverable,
+  snapshotFindingConfidence,
+  snapshotImpactEstimate,
 } from "../core/model.js";
 import type {
   Finding,
   FindingConfidence,
+  FindingScoringRationale,
   ImpactEstimate,
   ReportV2,
 } from "../core/model.js";
@@ -52,39 +57,153 @@ export function formatMinutes(value: number): string {
   return remainder === 0 ? `${hours}h` : `${hours}h ${remainder}m`;
 }
 
-export function findingForDisplay(finding: Finding): Finding {
+const DISPLAY_CANONICAL_FIELDS = [
+  "impact",
+  "finding_confidence",
+  "severity",
+  "scoring_rationale",
+] as const;
+
+function displayDataValue(
+  descriptor: PropertyDescriptor | undefined,
+): unknown {
   if (
-    finding.impact !== undefined &&
-    finding.finding_confidence !== undefined &&
-    finding.severity !== undefined &&
-    finding.scoring_rationale !== undefined
-  ) return finding;
-  const impact: ImpactEstimate = {
-    lower_ms: 0,
-    upper_ms: finding.recoverable.min * 60_000,
-    kind: finding.rule_id === "R005" || finding.rule_id === "R006"
-      ? "resource_cost"
-      : "critical_path_latency",
-  };
-  const confidence: FindingConfidence = finding.confidence === "low"
-    ? { evidence: "low", causal: "low", source_completeness: 0 }
-    : {
-      evidence: finding.confidence,
-      causal: "medium",
-      source_completeness: 0.5,
-    };
-  return {
-    ...finding,
-    confidence: projectFindingConfidence(confidence),
-    impact,
-    finding_confidence: confidence,
-    severity: findingSeverity(impact, confidence),
-    scoring_rationale: findingScoringRationale(impact, confidence, {
+    descriptor === undefined ||
+    descriptor.enumerable !== true ||
+    !("value" in descriptor)
+  ) throw new TypeError();
+  return descriptor.value;
+}
+
+function snapshotDisplayRationale(value: unknown): FindingScoringRationale[] {
+  if (
+    !Array.isArray(value) ||
+    utilTypes.isProxy(value) ||
+    Object.getPrototypeOf(value) !== Array.prototype
+  ) throw new TypeError();
+  const ownKeys = Reflect.ownKeys(value);
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (
+    lengthDescriptor === undefined ||
+    !("value" in lengthDescriptor) ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0 ||
+    ownKeys.length !== lengthDescriptor.value + 1
+  ) throw new TypeError();
+  const snapshot: FindingScoringRationale[] = [];
+  for (let index = 0; index < lengthDescriptor.value; index += 1) {
+    const entry = displayDataValue(
+      Object.getOwnPropertyDescriptor(value, String(index)),
+    );
+    if (typeof entry !== "string") throw new TypeError();
+    snapshot.push(entry as FindingScoringRationale);
+  }
+  return snapshot;
+}
+
+function exactRationale(
+  actual: readonly FindingScoringRationale[],
+  expected: readonly FindingScoringRationale[],
+): boolean {
+  return actual.length === expected.length &&
+    actual.every((entry, index) => entry === expected[index]);
+}
+
+function validLegacyProjection(
+  impact: ImpactEstimate,
+  confidence: FindingConfidence,
+): boolean {
+  return impact.lower_ms === 0 &&
+    !("expected_ms" in impact) &&
+    ((confidence.evidence === "low" &&
+      confidence.causal === "low" &&
+      confidence.source_completeness === 0) ||
+      ((confidence.evidence === "medium" || confidence.evidence === "high") &&
+        confidence.causal === "medium" &&
+        confidence.source_completeness === 0.5));
+}
+
+export function findingForDisplay(finding: Finding): Finding {
+  try {
+    if (
+      finding === null ||
+      typeof finding !== "object" ||
+      Array.isArray(finding) ||
+      utilTypes.isProxy(finding) ||
+      Object.getPrototypeOf(finding) !== Object.prototype
+    ) throw new TypeError();
+    const descriptors = Object.getOwnPropertyDescriptors(finding);
+    const presentCanonicalFields = DISPLAY_CANONICAL_FIELDS.filter(
+      (field) => descriptors[field] !== undefined,
+    );
+    if (
+      presentCanonicalFields.length !== 0 &&
+      presentCanonicalFields.length !== DISPLAY_CANONICAL_FIELDS.length
+    ) throw new TypeError();
+
+    if (presentCanonicalFields.length === 0) {
+      const impact: ImpactEstimate = {
+        lower_ms: 0,
+        upper_ms: finding.recoverable.min * 60_000,
+        kind: finding.rule_id === "R005" || finding.rule_id === "R006"
+          ? "resource_cost"
+          : "critical_path_latency",
+      };
+      const confidence: FindingConfidence = finding.confidence === "low"
+        ? { evidence: "low", causal: "low", source_completeness: 0 }
+        : {
+          evidence: finding.confidence,
+          causal: "medium",
+          source_completeness: 0.5,
+        };
+      return {
+        ...finding,
+        confidence: projectFindingConfidence(confidence),
+        impact,
+        finding_confidence: confidence,
+        severity: findingSeverity(impact, confidence),
+        scoring_rationale: findingScoringRationale(impact, confidence, {
+          ...(finding.rule_id === "R004" ? { policy_dependent: true } : {}),
+          legacy_projection: true,
+        }),
+        recoverable: projectFindingRecoverable(impact),
+      };
+    }
+
+    const impact = snapshotImpactEstimate(
+      displayDataValue(descriptors.impact),
+    );
+    const confidence = snapshotFindingConfidence(
+      displayDataValue(descriptors.finding_confidence),
+    );
+    const severity = findingSeverity(impact, confidence);
+    if (displayDataValue(descriptors.severity) !== severity) {
+      throw new TypeError();
+    }
+    const rationale = snapshotDisplayRationale(
+      displayDataValue(descriptors.scoring_rationale),
+    );
+    const legacyProjection = rationale.includes("legacy_projection");
+    const expectedRationale = findingScoringRationale(impact, confidence, {
       ...(finding.rule_id === "R004" ? { policy_dependent: true } : {}),
-      legacy_projection: true,
-    }),
-    recoverable: projectFindingRecoverable(impact),
-  };
+      ...(legacyProjection ? { legacy_projection: true } : {}),
+    });
+    if (
+      !exactRationale(rationale, expectedRationale) ||
+      (legacyProjection && !validLegacyProjection(impact, confidence))
+    ) throw new TypeError();
+    return {
+      ...finding,
+      confidence: projectFindingConfidence(confidence),
+      impact,
+      finding_confidence: confidence,
+      severity,
+      scoring_rationale: rationale,
+      recoverable: projectFindingRecoverable(impact),
+    };
+  } catch {
+    throw new TypeError("invalid finding");
+  }
 }
 
 export function formatFindingImpact(finding: Finding): string {
