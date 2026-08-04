@@ -78,6 +78,8 @@ import {
   UnsupportedStoreSchemaError,
 } from "../src/store/sqlite.js";
 
+const INCREMENTAL_SOURCES_MIGRATION = "schema-v5-incremental-sources";
+
 const summary: AnalysisSummary = {
   measured_min: 100,
   idle_excluded_min: 10,
@@ -380,7 +382,7 @@ async function temporaryStore(
 
 interface ConcurrentStoreWrite {
   moduleUrl: string;
-  exportName: "saveDismissal" | "saveAdoptions";
+  exportName: "saveDismissal" | "saveAdoptions" | "openStoreDatabase";
   args: unknown[];
 }
 
@@ -406,7 +408,17 @@ const { parentPort, workerData } = require("node:worker_threads");
     parentPort.postMessage({ type: "ready" });
     Atomics.wait(startGate, 0, 0);
 
-    const value = await write(workerData.paths, ...workerData.args);
+    let value;
+    if (workerData.exportName === "openStoreDatabase") {
+      const database = write(workerData.paths, ...workerData.args);
+      try {
+        value = Number(database.pragma("user_version", { simple: true }));
+      } finally {
+        database.close();
+      }
+    } else {
+      value = await write(workerData.paths, ...workerData.args);
+    }
     parentPort.postMessage({ type: "result", value });
   } catch (error) {
     if (parentPort !== null) {
@@ -573,9 +585,19 @@ function assertConnectionPragmas(database: StoreDatabase): void {
   assert.ok(busyTimeout > 0 && busyTimeout <= 60_000);
 }
 
+function removeIncrementalSourceSchema(database: StoreDatabase): void {
+  database.exec(`
+    DROP TABLE IF EXISTS source_evidence_cache;
+    DROP TABLE IF EXISTS source_discovery_roots;
+  `);
+  database.prepare("DELETE FROM store_migrations WHERE name = ?")
+    .run(INCREMENTAL_SOURCES_MIGRATION);
+}
+
 function populatedV2Store(paths: StorePaths): StoreDatabase {
   const database = openStoreDatabase(paths);
   const downgrade = database.transaction(() => {
+    removeIncrementalSourceSchema(database);
     database.exec("DROP TABLE IF EXISTS analysis_budget_runs");
     database.prepare("DELETE FROM store_migrations WHERE name = ?")
       .run("schema-v4-analysis-budgets");
@@ -603,6 +625,7 @@ function populatedV2Store(paths: StorePaths): StoreDatabase {
 function populatedV3Store(paths: StorePaths): StoreDatabase {
   const database = openStoreDatabase(paths);
   const downgrade = database.transaction(() => {
+    removeIncrementalSourceSchema(database);
     database.exec("DROP TABLE IF EXISTS analysis_budget_runs");
     database.prepare("DELETE FROM store_migrations WHERE name = ?")
       .run("schema-v4-analysis-budgets");
@@ -627,6 +650,75 @@ function populatedV3Store(paths: StorePaths): StoreDatabase {
     );
   `);
   return database;
+}
+
+function populatedV4Store(paths: StorePaths): StoreDatabase {
+  const database = openStoreDatabase(paths);
+  const downgrade = database.transaction(() => {
+    removeIncrementalSourceSchema(database);
+    database.pragma("user_version = 4");
+  });
+  downgrade.immediate();
+  database.exec(`
+    INSERT INTO store_migrations(name, completed_at_ms)
+      VALUES ('legacy-sentinel-v4', 31);
+    INSERT INTO analysis_snapshots(snapshot_id, created_at_ms, record_json)
+      VALUES ('snapshot-v4', 32, '{"schema":"v4"}');
+    INSERT INTO analysis_executions(execution_id, snapshot_id, executed_at_ms)
+      VALUES ('execution-v4', 'snapshot-v4', 33);
+    INSERT INTO source_catalog(
+      adapter_id, adapter_version, source_identity, canonical_path,
+      device, inode, mtime_ms, size_bytes, prefix_hash, suffix_hash,
+      content_revision, discovery_cursor, last_parsed_offset,
+      last_normalized_event_index, parser_version, schema_fingerprint,
+      observed_at_ms, completeness
+    ) VALUES (
+      'codex', '1.0.0', 'source-' || lower(hex(zeroblob(32))), '/repo/v4.jsonl',
+      4, 5, 6, 8, 'sha256:' || lower(hex(zeroblob(32))),
+      'sha256:' || lower(hex(zeroblob(32))),
+      'sha256:' || lower(hex(zeroblob(32))), 9, 8, 10,
+      'parser-v4', 'sha256:' || lower(hex(zeroblob(32))), 11, 'complete'
+    );
+  `);
+  insertBudgetRow(database, "execution-v4", budgetResult());
+  return database;
+}
+
+function assertPopulatedV4Rows(database: StoreDatabase): void {
+  assert.deepEqual(database.prepare(
+    "SELECT name, completed_at_ms FROM store_migrations WHERE name = ?",
+  ).get("legacy-sentinel-v4"), {
+    name: "legacy-sentinel-v4",
+    completed_at_ms: 31,
+  });
+  assert.deepEqual(database.prepare(
+    "SELECT snapshot_id, created_at_ms, record_json FROM analysis_snapshots",
+  ).get(), {
+    snapshot_id: "snapshot-v4",
+    created_at_ms: 32,
+    record_json: '{"schema":"v4"}',
+  });
+  assert.deepEqual(database.prepare(
+    "SELECT execution_id, snapshot_id, executed_at_ms FROM analysis_executions",
+  ).get(), {
+    execution_id: "execution-v4",
+    snapshot_id: "snapshot-v4",
+    executed_at_ms: 33,
+  });
+  assert.deepEqual(database.prepare(`SELECT adapter_id, canonical_path,
+    size_bytes, last_parsed_offset, parser_version, observed_at_ms,
+    completeness FROM source_catalog`).get(), {
+    adapter_id: "codex",
+    canonical_path: "/repo/v4.jsonl",
+    size_bytes: 8,
+    last_parsed_offset: 8,
+    parser_version: "parser-v4",
+    observed_at_ms: 11,
+    completeness: "complete",
+  });
+  assert.deepEqual(database.prepare(`SELECT ${BUDGET_ROW_COLUMNS.join(", ")}
+    FROM analysis_budget_runs WHERE execution_id = ?`).get("execution-v4"),
+  storedBudgetRow("execution-v4", budgetResult()));
 }
 
 test("canonicalRepoPath resolves a linked git worktree to the main worktree's repository root", async () => {
@@ -748,17 +840,17 @@ test("SQLite paths are deterministic and shared by linked worktrees", async () =
   }
 });
 
-test("SQLite bootstrap is private, idempotent, and creates the Store v4 schema", async () => {
+test("SQLite bootstrap is private, idempotent, and creates the exact Store v5 schema", async () => {
   await temporaryStore(async (paths) => {
-    assert.equal(STORE_SCHEMA_VERSION, 4);
+    assert.equal(STORE_SCHEMA_VERSION, 5);
     const databasePath = storeDatabasePath(paths);
     const first = openStoreDatabase(paths);
     const second = openStoreDatabase(paths);
     try {
       assertConnectionPragmas(first);
       assertConnectionPragmas(second);
-      assert.equal(Number(first.pragma("user_version", { simple: true })), 4);
-      assert.equal(Number(second.pragma("user_version", { simple: true })), 4);
+      assert.equal(Number(first.pragma("user_version", { simple: true })), 5);
+      assert.equal(Number(second.pragma("user_version", { simple: true })), 5);
 
       if (process.platform !== "win32") {
         assert.equal((await stat(paths.repo_dir)).mode & 0o777, 0o700);
@@ -775,6 +867,8 @@ test("SQLite bootstrap is private, idempotent, and creates the Store v4 schema",
         "analysis_snapshots",
         "dismissals",
         "source_catalog",
+        "source_discovery_roots",
+        "source_evidence_cache",
         "store_migrations",
       ]);
 
@@ -855,6 +949,38 @@ test("SQLite bootstrap is private, idempotent, and creates the Store v4 schema",
           ["observed_at_ms", "INTEGER", 0],
           ["completeness", "TEXT", 0],
         ],
+        source_discovery_roots: [
+          ["root_identity", "TEXT", 1],
+          ["adapter_id", "TEXT", 0],
+          ["canonical_root", "TEXT", 0],
+          ["cursor", "INTEGER", 0],
+          ["capability", "TEXT", 0],
+          ["tree_json", "TEXT", 0],
+          ["tree_digest", "TEXT", 0],
+          ["observed_at_ms", "INTEGER", 0],
+          ["completeness", "TEXT", 0],
+          ["sensitivity", "TEXT", 0],
+          ["retention_class", "TEXT", 0],
+        ],
+        source_evidence_cache: [
+          ["source_identity", "TEXT", 1],
+          ["repository_identity", "TEXT", 0],
+          ["eligibility_identity", "TEXT", 2],
+          ["adapter_id", "TEXT", 0],
+          ["canonical_path", "TEXT", 0],
+          ["content_revision", "TEXT", 0],
+          ["parser_version", "TEXT", 0],
+          ["schema_fingerprint", "TEXT", 0],
+          ["last_parsed_offset", "INTEGER", 0],
+          ["line_count", "INTEGER", 0],
+          ["ends_with_newline", "INTEGER", 0],
+          ["payload_json", "TEXT", 0],
+          ["payload_digest", "TEXT", 0],
+          ["descriptor_digest", "TEXT", 0],
+          ["sensitivity", "TEXT", 0],
+          ["retention_class", "TEXT", 0],
+          ["updated_at_ms", "INTEGER", 0],
+        ],
       };
       for (const [table, expected] of Object.entries(expectedColumns)) {
         const columns = tableColumns(first, table);
@@ -873,12 +999,17 @@ test("SQLite bootstrap is private, idempotent, and creates the Store v4 schema",
       }
 
       assert.deepEqual(userIndexColumns(first, "source_catalog"), []);
+      assert.deepEqual(userIndexColumns(first, "source_evidence_cache"), []);
+      assert.deepEqual(userIndexColumns(first, "source_discovery_roots"), []);
       assert.equal(first.prepare(
         "SELECT count(*) FROM store_migrations WHERE name = ?",
       ).pluck().get("schema-v3-source-catalog"), 1);
       assert.equal(first.prepare(
         "SELECT count(*) FROM store_migrations WHERE name = ?",
       ).pluck().get("schema-v4-analysis-budgets"), 1);
+      assert.equal(first.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get(INCREMENTAL_SOURCES_MIGRATION), 1);
 
       const foreignKeys = first
         .prepare("PRAGMA foreign_key_list(analysis_executions)")
@@ -903,9 +1034,144 @@ test("SQLite bootstrap is private, idempotent, and creates the Store v4 schema",
         to: "execution_id",
         on_delete: "CASCADE",
       }]);
+
+      const evidenceForeignKeys = first
+        .prepare("PRAGMA foreign_key_list(source_evidence_cache)")
+        .all() as { table: string; from: string; to: string; on_delete: string }[];
+      assert.deepEqual(evidenceForeignKeys.map(({ table, from, to, on_delete }) => ({
+        table, from, to, on_delete,
+      })), [{
+        table: "source_catalog",
+        from: "source_identity",
+        to: "source_identity",
+        on_delete: "CASCADE",
+      }]);
+      assert.deepEqual(
+        first.prepare("PRAGMA foreign_key_list(source_discovery_roots)").all(),
+        [],
+      );
     } finally {
       second.close();
       first.close();
+    }
+  });
+});
+
+test("Store v5 incremental source rows enforce identities, bounds, labels, and catalog ownership", async () => {
+  await temporaryStore(async (paths) => {
+    const database = openStoreDatabase(paths);
+    const sourceIdentity = `source-${"0".repeat(64)}`;
+    try {
+      database.prepare(`INSERT INTO source_catalog(
+        adapter_id, adapter_version, source_identity, canonical_path,
+        device, inode, mtime_ms, size_bytes, prefix_hash, suffix_hash,
+        content_revision, discovery_cursor, last_parsed_offset,
+        last_normalized_event_index, parser_version, schema_fingerprint,
+        observed_at_ms, completeness
+      ) VALUES (
+        'claude', '1.0.0', ?, '/repo/source.jsonl', 1, 2, 3, 0,
+        'sha256:' || lower(hex(zeroblob(32))),
+        'sha256:' || lower(hex(zeroblob(32))),
+        'sha256:' || lower(hex(zeroblob(32))), 1, 0, 0, '2.0.0',
+        'sha256:' || lower(hex(zeroblob(32))), 4, 'complete'
+      )`).run(sourceIdentity);
+      database.prepare(`INSERT INTO source_evidence_cache(
+        source_identity, repository_identity, eligibility_identity,
+        adapter_id, canonical_path, content_revision, parser_version,
+        schema_fingerprint, last_parsed_offset, line_count, ends_with_newline,
+        payload_json, payload_digest, descriptor_digest, sensitivity,
+        retention_class, updated_at_ms
+      ) VALUES (
+        @source_identity, @repository_identity, @eligibility_identity,
+        'claude', '/repo/source.jsonl', 'sha256:' || lower(hex(zeroblob(32))),
+        '2.0.0', 'sha256:' || lower(hex(zeroblob(32))), 0, 0, 1,
+        '{"schema_version":1}', 'sha256:' || lower(hex(zeroblob(32))),
+        'sha256:' || lower(hex(zeroblob(32))), 'sensitive', 'raw_evidence', 4
+      )`).run({
+        source_identity: sourceIdentity,
+        repository_identity: "1".repeat(64),
+        eligibility_identity: "2".repeat(64),
+      });
+      database.prepare(`INSERT INTO source_discovery_roots(
+        root_identity, adapter_id, canonical_root, cursor, capability,
+        tree_json, tree_digest, observed_at_ms, completeness, sensitivity,
+        retention_class
+      ) VALUES (
+        @root_identity, 'claude', '/repo/.claude', 1, 'full_scan_required',
+        '{"schema_version":1}', 'sha256:' || lower(hex(zeroblob(32))), 4,
+        'complete', 'sensitive', 'source_metadata'
+      )`).run({ root_identity: `root-${"3".repeat(64)}` });
+
+      for (const [column, value] of [
+        ["repository_identity", "A".repeat(64)],
+        ["eligibility_identity", "2".repeat(63)],
+        ["adapter_id", "other"],
+        ["canonical_path", ""],
+        ["canonical_path", "/repo/secret\0path"],
+        ["content_revision", `sha256:${"A".repeat(64)}`],
+        ["parser_version", ""],
+        ["schema_fingerprint", `sha256:${"a".repeat(63)}`],
+        ["last_parsed_offset", -1],
+        ["line_count", 0.5],
+        ["ends_with_newline", 2],
+        ["payload_json", ""],
+        ["payload_digest", `sha256:${"A".repeat(64)}`],
+        ["descriptor_digest", `sha256:${"b".repeat(63)}`],
+        ["sensitivity", "public"],
+        ["retention_class", "metadata"],
+        ["updated_at_ms", -1],
+      ] as const) {
+        assert.throws(
+          () => database.prepare(`UPDATE source_evidence_cache
+            SET ${column} = ?`).run(value),
+          /constraint/iu,
+          `source_evidence_cache.${column}`,
+        );
+      }
+
+      for (const [column, value] of [
+        ["root_identity", `root-${"A".repeat(64)}`],
+        ["adapter_id", "other"],
+        ["canonical_root", ""],
+        ["canonical_root", "/repo/secret\0root"],
+        ["cursor", -1],
+        ["capability", "unknown"],
+        ["tree_json", ""],
+        ["tree_digest", `sha256:${"A".repeat(64)}`],
+        ["observed_at_ms", 0.5],
+        ["completeness", "unknown"],
+        ["sensitivity", "public"],
+        ["retention_class", "raw_evidence"],
+      ] as const) {
+        assert.throws(
+          () => database.prepare(`UPDATE source_discovery_roots
+            SET ${column} = ?`).run(value),
+          /constraint/iu,
+          `source_discovery_roots.${column}`,
+        );
+      }
+
+      assert.throws(() => database.prepare(`INSERT INTO source_evidence_cache(
+        source_identity, repository_identity, eligibility_identity,
+        adapter_id, canonical_path, content_revision, parser_version,
+        schema_fingerprint, last_parsed_offset, line_count, ends_with_newline,
+        payload_json, payload_digest, descriptor_digest, sensitivity,
+        retention_class, updated_at_ms
+      ) SELECT
+        ?, repository_identity, '4' || substr(eligibility_identity, 2),
+        adapter_id, canonical_path, content_revision, parser_version,
+        schema_fingerprint, last_parsed_offset, line_count, ends_with_newline,
+        payload_json, payload_digest, descriptor_digest, sensitivity,
+        retention_class, updated_at_ms
+      FROM source_evidence_cache`).run(`source-${"f".repeat(64)}`), /constraint/iu);
+
+      database.prepare("DELETE FROM source_catalog WHERE source_identity = ?")
+        .run(sourceIdentity);
+      assert.equal(database.prepare(
+        "SELECT count(*) FROM source_evidence_cache",
+      ).pluck().get(), 0);
+    } finally {
+      database.close();
     }
   });
 });
@@ -989,11 +1255,12 @@ test("SQLite connections share commits and immediate transactions roll back comp
   });
 });
 
-test("opening an existing v4 schema does not contend with an active writer", async () => {
+test("opening an existing v5 schema does not contend with an active writer", async () => {
   await temporaryStore(async (paths) => {
     const writer = openStoreDatabase(paths);
     let reader: StoreDatabase | undefined;
     try {
+      assert.equal(Number(writer.pragma("user_version", { simple: true })), 5);
       writer.exec("BEGIN IMMEDIATE");
       reader = openStoreDatabase(paths);
       reader.close();
@@ -1006,15 +1273,45 @@ test("opening an existing v4 schema does not contend with an active writer", asy
   });
 });
 
-test("a populated Store v2 migrates transactionally through v3 to v4 without data loss", async () => {
+test("two simultaneous Store v4 opens serialize one exact v5 migration", async () => {
+  await temporaryStore(async (paths) => {
+    const v4 = populatedV4Store(paths);
+    v4.close();
+
+    const moduleUrl = new URL("../src/store/sqlite.js", import.meta.url).href;
+    const versions = await runConcurrentStoreWrites<number>(paths, [
+      { moduleUrl, exportName: "openStoreDatabase", args: [] },
+      { moduleUrl, exportName: "openStoreDatabase", args: [] },
+    ]);
+    assert.deepEqual(versions, [5, 5]);
+
+    const migrated = openStoreDatabase(paths);
+    try {
+      assert.equal(Number(migrated.pragma("user_version", { simple: true })), 5);
+      assert.equal(migrated.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get(INCREMENTAL_SOURCES_MIGRATION), 1);
+      assert.equal(migrated.prepare(
+        "SELECT count(*) FROM source_catalog WHERE canonical_path = ?",
+      ).pluck().get("/repo/v4.jsonl"), 1);
+      assert.equal(migrated.prepare(
+        "SELECT count(*) FROM analysis_budget_runs WHERE execution_id = ?",
+      ).pluck().get("execution-v4"), 1);
+    } finally {
+      migrated.close();
+    }
+  });
+});
+
+test("a populated Store v2 migrates transactionally through v3 and v4 to v5 without data loss", async () => {
   await temporaryStore(async (paths) => {
     populatedV2Store(paths).close();
 
     const migrated = openStoreDatabase(paths);
     const reopened = openStoreDatabase(paths);
     try {
-      assert.equal(Number(migrated.pragma("user_version", { simple: true })), 4);
-      assert.equal(Number(reopened.pragma("user_version", { simple: true })), 4);
+      assert.equal(Number(migrated.pragma("user_version", { simple: true })), 5);
+      assert.equal(Number(reopened.pragma("user_version", { simple: true })), 5);
       assert.equal(migrated.prepare(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'source_catalog'",
       ).pluck().get(), 1);
@@ -1025,12 +1322,15 @@ test("a populated Store v2 migrates transactionally through v3 to v4 without dat
         "legacy-sentinel",
         "schema-v3-source-catalog",
         "schema-v4-analysis-budgets",
+        INCREMENTAL_SOURCES_MIGRATION,
       ]);
       assert.equal(migrations[0]?.completed_at_ms, 11);
       assert.ok(Number.isSafeInteger(migrations[1]?.completed_at_ms));
       assert.ok((migrations[1]?.completed_at_ms ?? -1) >= 0);
       assert.ok(Number.isSafeInteger(migrations[2]?.completed_at_ms));
       assert.ok((migrations[2]?.completed_at_ms ?? -1) >= 0);
+      assert.ok(Number.isSafeInteger(migrations[3]?.completed_at_ms));
+      assert.ok((migrations[3]?.completed_at_ms ?? -1) >= 0);
       assert.deepEqual(migrated.prepare(
         "SELECT snapshot_id, created_at_ms, record_json FROM analysis_snapshots",
       ).get(), {
@@ -1056,6 +1356,12 @@ test("a populated Store v2 migrates transactionally through v3 to v4 without dat
       assert.equal(migrated.prepare(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'analysis_budget_runs'",
       ).pluck().get(), 1);
+      assert.equal(migrated.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get(INCREMENTAL_SOURCES_MIGRATION), 1);
+      assert.equal(migrated.prepare(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('source_evidence_cache', 'source_discovery_roots')",
+      ).pluck().get(), 2);
     } finally {
       reopened.close();
       migrated.close();
@@ -1094,6 +1400,12 @@ test("Store v2 migration failure rolls back both new tables, markers, version, a
         "SELECT count(*) FROM store_migrations WHERE name = ?",
       ).pluck().get("schema-v4-analysis-budgets"), 0);
       assert.equal(v2.prepare(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('source_evidence_cache', 'source_discovery_roots')",
+      ).pluck().get(), 0);
+      assert.equal(v2.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get(INCREMENTAL_SOURCES_MIGRATION), 0);
+      assert.equal(v2.prepare(
         "SELECT record_json FROM analysis_snapshots WHERE snapshot_id = ?",
       ).pluck().get("snapshot-v2"), '{"schema":"v2"}');
 
@@ -1104,13 +1416,16 @@ test("Store v2 migration failure rolls back both new tables, markers, version, a
 
     const retried = openStoreDatabase(paths);
     try {
-      assert.equal(Number(retried.pragma("user_version", { simple: true })), 4);
+      assert.equal(Number(retried.pragma("user_version", { simple: true })), 5);
       assert.equal(retried.prepare(
         "SELECT count(*) FROM store_migrations WHERE name = ?",
       ).pluck().get("schema-v3-source-catalog"), 1);
       assert.equal(retried.prepare(
         "SELECT count(*) FROM store_migrations WHERE name = ?",
       ).pluck().get("schema-v4-analysis-budgets"), 1);
+      assert.equal(retried.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get(INCREMENTAL_SOURCES_MIGRATION), 1);
       assert.equal(retried.prepare("SELECT count(*) FROM analysis_snapshots").pluck().get(), 1);
     } finally {
       retried.close();
@@ -1118,15 +1433,15 @@ test("Store v2 migration failure rolls back both new tables, markers, version, a
   });
 });
 
-test("a populated Store v3 migrates transactionally to v4 and reopens idempotently", async () => {
+test("a populated Store v3 migrates transactionally through v4 to v5 and reopens idempotently", async () => {
   await temporaryStore(async (paths) => {
     populatedV3Store(paths).close();
 
     const migrated = openStoreDatabase(paths);
     const reopened = openStoreDatabase(paths);
     try {
-      assert.equal(Number(migrated.pragma("user_version", { simple: true })), 4);
-      assert.equal(Number(reopened.pragma("user_version", { simple: true })), 4);
+      assert.equal(Number(migrated.pragma("user_version", { simple: true })), 5);
+      assert.equal(Number(reopened.pragma("user_version", { simple: true })), 5);
       assert.equal(migrated.prepare(
         "SELECT count(*) FROM source_catalog WHERE canonical_path = ?",
       ).pluck().get("/repo/v3.jsonl"), 1);
@@ -1139,6 +1454,7 @@ test("a populated Store v3 migrates transactionally to v4 and reopens idempotent
         "legacy-sentinel-v3",
         "schema-v3-source-catalog",
         "schema-v4-analysis-budgets",
+        INCREMENTAL_SOURCES_MIGRATION,
       ]);
     } finally {
       reopened.close();
@@ -1178,6 +1494,12 @@ test("Store v3 migration failure rolls back budget table, marker, and version wi
         "SELECT count(*) FROM store_migrations WHERE name = ?",
       ).pluck().get("schema-v4-analysis-budgets"), 0);
       assert.equal(v3.prepare(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('source_evidence_cache', 'source_discovery_roots')",
+      ).pluck().get(), 0);
+      assert.equal(v3.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get(INCREMENTAL_SOURCES_MIGRATION), 0);
+      assert.equal(v3.prepare(
         "SELECT record_json FROM analysis_snapshots WHERE snapshot_id = ?",
       ).pluck().get("snapshot-v3"), '{"schema":"v3"}');
       assert.equal(v3.prepare(
@@ -1191,16 +1513,183 @@ test("Store v3 migration failure rolls back budget table, marker, and version wi
 
     const retried = openStoreDatabase(paths);
     try {
-      assert.equal(Number(retried.pragma("user_version", { simple: true })), 4);
+      assert.equal(Number(retried.pragma("user_version", { simple: true })), 5);
       assert.equal(retried.prepare(
         "SELECT count(*) FROM store_migrations WHERE name = ?",
       ).pluck().get("schema-v4-analysis-budgets"), 1);
+      assert.equal(retried.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get(INCREMENTAL_SOURCES_MIGRATION), 1);
       assert.equal(retried.prepare(
         "SELECT count(*) FROM analysis_executions WHERE execution_id = ?",
       ).pluck().get("execution-v3"), 1);
       assert.equal(retried.prepare(
         "SELECT count(*) FROM source_catalog WHERE canonical_path = ?",
       ).pluck().get("/repo/v3.jsonl"), 1);
+    } finally {
+      retried.close();
+    }
+  });
+});
+
+test("a populated Store v4 migrates additively to v5 without rewriting rows", async () => {
+  await temporaryStore(async (paths) => {
+    const v4 = populatedV4Store(paths);
+    assertPopulatedV4Rows(v4);
+    v4.close();
+
+    const migrated = openStoreDatabase(paths);
+    const reopened = openStoreDatabase(paths);
+    try {
+      assert.equal(Number(migrated.pragma("user_version", { simple: true })), 5);
+      assert.equal(Number(reopened.pragma("user_version", { simple: true })), 5);
+      assertPopulatedV4Rows(migrated);
+      assert.deepEqual(migrated.prepare(
+        "SELECT name FROM store_migrations ORDER BY name",
+      ).pluck().all(), [
+        "legacy-sentinel-v4",
+        "schema-v3-source-catalog",
+        "schema-v4-analysis-budgets",
+        INCREMENTAL_SOURCES_MIGRATION,
+      ]);
+      assert.equal(migrated.prepare(
+        "SELECT count(*) FROM source_evidence_cache",
+      ).pluck().get(), 0);
+      assert.equal(migrated.prepare(
+        "SELECT count(*) FROM source_discovery_roots",
+      ).pluck().get(), 0);
+    } finally {
+      reopened.close();
+      migrated.close();
+    }
+  });
+});
+
+test("Store v4 migration rolls back the first v5 table when the second table creation fails", async () => {
+  await temporaryStore(async (paths) => {
+    const v4 = populatedV4Store(paths);
+    try {
+      v4.exec("CREATE TABLE source_discovery_roots(blocker TEXT NOT NULL)");
+
+      assert.throws(
+        () => openStoreDatabase(paths),
+        /source_discovery_roots.*already exists|already exists.*source_discovery_roots/iu,
+      );
+      assert.equal(Number(v4.pragma("user_version", { simple: true })), 4);
+      assert.equal(v4.prepare(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'source_evidence_cache'",
+      ).pluck().get(), 0);
+      assert.deepEqual(
+        tableColumns(v4, "source_discovery_roots").map(({ name }) => name),
+        ["blocker"],
+      );
+      assert.equal(v4.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get(INCREMENTAL_SOURCES_MIGRATION), 0);
+      assertPopulatedV4Rows(v4);
+
+      v4.exec("DROP TABLE source_discovery_roots");
+    } finally {
+      v4.close();
+    }
+
+    const retried = openStoreDatabase(paths);
+    try {
+      assert.equal(Number(retried.pragma("user_version", { simple: true })), 5);
+      assertPopulatedV4Rows(retried);
+    } finally {
+      retried.close();
+    }
+  });
+});
+
+test("Store v4 migration rolls back both v5 tables when its marker insert fails", async () => {
+  await temporaryStore(async (paths) => {
+    const v4 = populatedV4Store(paths);
+    try {
+      v4.exec(`
+        CREATE TRIGGER fail_incremental_sources_marker
+        BEFORE INSERT ON store_migrations
+        WHEN NEW.name = '${INCREMENTAL_SOURCES_MIGRATION}'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced Store v5 marker failure');
+        END;
+      `);
+
+      assert.throws(
+        () => openStoreDatabase(paths),
+        /forced Store v5 marker failure/u,
+      );
+      assert.equal(Number(v4.pragma("user_version", { simple: true })), 4);
+      assert.equal(v4.prepare(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('source_evidence_cache', 'source_discovery_roots')",
+      ).pluck().get(), 0);
+      assert.equal(v4.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get(INCREMENTAL_SOURCES_MIGRATION), 0);
+      assertPopulatedV4Rows(v4);
+
+      v4.exec("DROP TRIGGER fail_incremental_sources_marker");
+    } finally {
+      v4.close();
+    }
+
+    const retried = openStoreDatabase(paths);
+    try {
+      assert.equal(Number(retried.pragma("user_version", { simple: true })), 5);
+      assertPopulatedV4Rows(retried);
+    } finally {
+      retried.close();
+    }
+  });
+});
+
+test("Store v4 migration rolls back tables, marker, and version when commit fails", async () => {
+  await temporaryStore(async (paths) => {
+    const v4 = populatedV4Store(paths);
+    try {
+      v4.exec(`
+        CREATE TABLE migration_failure_parent(id INTEGER PRIMARY KEY);
+        CREATE TABLE migration_failure_child(
+          id INTEGER PRIMARY KEY,
+          parent_id INTEGER NOT NULL,
+          FOREIGN KEY(parent_id) REFERENCES migration_failure_parent(id)
+            DEFERRABLE INITIALLY DEFERRED
+        );
+        CREATE TRIGGER fail_incremental_sources_commit
+        AFTER INSERT ON store_migrations
+        WHEN NEW.name = '${INCREMENTAL_SOURCES_MIGRATION}'
+        BEGIN
+          INSERT INTO migration_failure_child(id, parent_id) VALUES (1, 999);
+        END;
+      `);
+
+      assert.throws(() => openStoreDatabase(paths), /foreign key constraint/iu);
+      assert.equal(Number(v4.pragma("user_version", { simple: true })), 4);
+      assert.equal(v4.prepare(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('source_evidence_cache', 'source_discovery_roots')",
+      ).pluck().get(), 0);
+      assert.equal(v4.prepare(
+        "SELECT count(*) FROM store_migrations WHERE name = ?",
+      ).pluck().get(INCREMENTAL_SOURCES_MIGRATION), 0);
+      assert.equal(v4.prepare(
+        "SELECT count(*) FROM migration_failure_child",
+      ).pluck().get(), 0);
+      assertPopulatedV4Rows(v4);
+
+      v4.exec(`
+        DROP TRIGGER fail_incremental_sources_commit;
+        DROP TABLE migration_failure_child;
+        DROP TABLE migration_failure_parent;
+      `);
+    } finally {
+      v4.close();
+    }
+
+    const retried = openStoreDatabase(paths);
+    try {
+      assert.equal(Number(retried.pragma("user_version", { simple: true })), 5);
+      assertPopulatedV4Rows(retried);
     } finally {
       retried.close();
     }
@@ -1322,6 +1811,31 @@ test("SQLite bootstrap rejects a v1 downgrade without mutation", async () => {
       );
     } finally {
       downgraded.close();
+    }
+  });
+});
+
+test("SQLite bootstrap rejects a negative schema without mutation", async () => {
+  await temporaryStore(async (paths) => {
+    const invalid = openStoreDatabase(paths);
+    try {
+      invalid.exec(
+        "CREATE TABLE negative_sentinel(value TEXT NOT NULL); INSERT INTO negative_sentinel VALUES ('preserve-me')",
+      );
+      invalid.pragma("user_version = -1");
+
+      assert.throws(() => openStoreDatabase(paths), (error: unknown) => {
+        assert.ok(error instanceof UnsupportedStoreSchemaError);
+        assert.equal(error.schema_version, -1);
+        return true;
+      });
+      assert.equal(Number(invalid.pragma("user_version", { simple: true })), -1);
+      assert.equal(
+        invalid.prepare("SELECT value FROM negative_sentinel").pluck().get(),
+        "preserve-me",
+      );
+    } finally {
+      invalid.close();
     }
   });
 });

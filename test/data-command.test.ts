@@ -40,6 +40,7 @@ const DAY_MS = 24 * 60 * 60 * 1_000;
 const NOW_MS = 200 * DAY_MS;
 const ANALYSIS_CUTOFF_MS = NOW_MS - (90 * DAY_MS);
 const DISMISSAL_CUTOFF_MS = NOW_MS - (14 * DAY_MS);
+const INCREMENTAL_SOURCES_MIGRATION = "schema-v5-incremental-sources";
 
 async function withStore(
   callback: (paths: StorePaths, root: string) => Promise<void>,
@@ -264,6 +265,7 @@ test("data gc applies retention boundaries, reachability, and legacy cleanup", a
           "legacy-dismissals-json-v1",
           SOURCE_CATALOG_MIGRATION,
           "schema-v4-analysis-budgets",
+          INCREMENTAL_SOURCES_MIGRATION,
         ],
       );
     } finally {
