@@ -37,16 +37,20 @@ export function boundTerminalHistory(
     ordered.length - TERMINAL_STATS_COLLECTION_LIMIT,
   );
   const truncated = ordered.slice(0, truncatedCount);
-  const entries = ordered.slice(truncatedCount);
+  const truncatedWorkUnitKeys = new Set(truncated.flatMap(
+    ({ work_unit_key }) => work_unit_key === undefined ? [] : [work_unit_key],
+  ));
+  const entries = ordered.slice(truncatedCount).filter(({ work_unit_key }) =>
+    work_unit_key === undefined || !truncatedWorkUnitKeys.has(work_unit_key)
+  );
   return {
     entries,
     metadata: {
       total_snapshot_count: ordered.length,
       window_snapshot_count: entries.length,
-      truncated_snapshot_count: truncatedCount,
+      truncated_snapshot_count: ordered.length - entries.length,
     },
-    truncated_work_unit_keys: new Set(truncated.flatMap(({ work_unit_key }) =>
-      work_unit_key === undefined ? [] : [work_unit_key])),
+    truncated_work_unit_keys: truncatedWorkUnitKeys,
   };
 }
 
