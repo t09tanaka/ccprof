@@ -6,7 +6,6 @@ import {
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import {
   mkdir,
-  lstat,
   mkdtemp,
   open,
   readFile,
@@ -761,33 +760,46 @@ test("bounded trust reads reuse one allocation across one-byte short reads", asy
   }
 });
 
-test("trust loading rejects a path identity change during the read", async (t) => {
+test("trust loading rejects a file change during the read", async (t) => {
   const fixture = await signedPolicyFixture(t);
-  type Lstat = typeof lstat;
+  const changedContent = Buffer.concat([
+    await readFile(fixture.policyPath),
+    Buffer.from(" "),
+  ]);
+  type OpenFile = typeof open;
   const cjsRequire = createRequire(import.meta.url);
-  const promises = cjsRequire("node:fs/promises") as { lstat: Lstat };
-  const originalLstat = promises.lstat;
-  let policyStats = 0;
-  const changingLstat = (async (...args: Parameters<Lstat>) => {
-    const stat = await originalLstat(...args);
-    if (String(args[0]) !== fixture.policyPath || ++policyStats === 1) {
-      return stat;
-    }
-    return new Proxy(stat, {
-      get(target, property) {
-        if (property === "ino") {
-          return typeof target.ino === "bigint"
-            ? target.ino + 1n
-            : target.ino + 1;
+  const promises = cjsRequire("node:fs/promises") as { open: OpenFile };
+  const originalOpen = promises.open;
+  let changed = false;
+  const instrumentedOpen = (async (...args: Parameters<OpenFile>) => {
+    const handle = await originalOpen(...args);
+    if (String(args[0]) === fixture.policyPath) {
+      const originalRead = handle.read.bind(handle) as (
+        buffer: Buffer,
+        offset: number,
+        length: number,
+        position: number | null,
+      ) => Promise<{ bytesRead: number; buffer: Buffer }>;
+      handle.read = (async (...readArgs: unknown[]) => {
+        const [buffer, offset, length, position] = readArgs as [
+          Buffer,
+          number,
+          number,
+          number | null,
+        ];
+        const result = await originalRead(buffer, offset, length, position);
+        if (!changed && result.bytesRead > 0) {
+          changed = true;
+          await writeFile(fixture.policyPath, changedContent);
         }
-        const value = Reflect.get(target, property, target) as unknown;
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    });
-  }) as Lstat;
+        return result;
+      }) as typeof handle.read;
+    }
+    return handle;
+  }) as OpenFile;
 
   try {
-    promises.lstat = changingLstat;
+    promises.open = instrumentedOpen;
     syncBuiltinESMExports();
     await assert.rejects(
       loadConfiguredOrganizationPolicy(fixture.environment),
@@ -797,8 +809,9 @@ test("trust loading rejects a path identity change during the read", async (t) =
         [fixture.policyPath],
       ),
     );
+    assert.equal(changed, true);
   } finally {
-    promises.lstat = originalLstat;
+    promises.open = originalOpen;
     syncBuiltinESMExports();
   }
 });
