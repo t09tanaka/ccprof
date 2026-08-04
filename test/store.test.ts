@@ -1978,6 +1978,7 @@ test("analysis audit identities label omitted snapshots as content fallbacks", (
 
   assert.deepEqual(fallback.snapshot_identity, { mode: "content-fallback" });
   assert.notDeepEqual(fallback.snapshot_identity, canonical.snapshot_identity);
+  assert.notEqual(fallback.snapshot_id, canonical.snapshot_id);
 });
 
 test("saved analysis audit identity matches its execution snapshot and replay", async () => {
