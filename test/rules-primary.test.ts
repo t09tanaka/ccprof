@@ -2272,6 +2272,32 @@ test("R004 partitions denied actions from sorted repeated-safe command groups", 
   assert.equal(generic.evidence.approval_count, 1);
 });
 
+test("R004 preserves UTF-8 canonical command order under input reversal", () => {
+  const actions = [
+    approvalWait("accent-1", 0, 100, "npm test -- é"),
+    approvalWait("ascii-1", 200, 300, "npm test -- z"),
+    approvalWait("accent-2", 400, 500, "npm test -- é"),
+    approvalWait("ascii-2", 600, 700, "npm test -- z"),
+  ];
+  const options = {
+    ruleSafety: approvalRuleSafety(["npm test -- *"]),
+  };
+  const forward = detectR004(actions, options)[0];
+  const reversed = detectR004([...actions].reverse(), options)[0];
+
+  assert.ok(forward);
+  assert.ok(reversed);
+  assert.deepEqual(forward.evidence.canonical_commands, [
+    "npm test -- z",
+    'npm test -- "é"',
+  ]);
+  assert.ok(
+    forward.fix_recipe.suggestion.indexOf("npm test -- z") <
+      forward.fix_recipe.suggestion.indexOf('npm test -- "é"'),
+  );
+  assert.equal(JSON.stringify(forward), JSON.stringify(reversed));
+});
+
 test("R004 emits a harmless point-zero observation without approval evidence", () => {
   const ordinary: AttributedTimelineAction = {
     ...timelineAction("ordinary", 0, 500, { kind: "human_wait" }),
