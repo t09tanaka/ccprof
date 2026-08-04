@@ -30,6 +30,7 @@ import {
 } from "../src/sources/codex/parser.js";
 import {
   boundedJsonlLines,
+  IncrementalParserStateByteTracker,
   JsonlBudgetTracker,
   type ParserProjectionBudgets,
   type ParserReadBudgets,
@@ -565,6 +566,246 @@ test("closed state normalizers reject unknown variants and inconsistent physical
   inconsistentCodex.rows[1]!.byte_start = inconsistentCodex.rows[0]!.byte_start;
   inconsistentCodex.rows[1]!.byte_end = inconsistentCodex.rows[0]!.byte_end;
   assert.throws(() => normalizeCodexParserState(inconsistentCodex));
+});
+
+test("physical row spans bind exact retained bytes for EOF, LF, and CRLF", async (t) => {
+  const claudeRows = [
+    claudeUser("physical-claude", "lf", 0, "first"),
+    claudeUser("physical-claude", "crlf", 1, "second"),
+    claudeUser("physical-claude", "eof", 2, "third"),
+  ];
+  const claudePath = await tempJsonl(
+    t,
+    "physical-claude.jsonl",
+    `${claudeRows[0]}\n${claudeRows[1]}\r\n${claudeRows[2]}`,
+  );
+  const claude = await readClaudeState(claudePath);
+  assert.deepEqual(
+    claude.state.rows.map((row) =>
+      row.byte_end - row.byte_start - row.original_bytes
+    ),
+    [1, 2, 0],
+  );
+
+  const restoredClaude = normalizeClaudeParserState(
+    JSON.parse(JSON.stringify(claude.state)) as unknown,
+  );
+  const exactRetainedBytes = claudeRows.reduce(
+    (total, row) => total + Buffer.byteLength(row),
+    0,
+  );
+  for (const maxRetainedBytes of [exactRetainedBytes, exactRetainedBytes - 1]) {
+    const budgets = { maxRetainedBytes };
+    assertCanonicalEqual(
+      projectClaudeParserState(restoredClaude, { budgets }),
+      await parseClaudeTranscriptDetailed(claudePath, { budgets }),
+    );
+  }
+
+  const zeroClaude = JSON.parse(JSON.stringify(claude.state)) as {
+    rows: Array<{ original_bytes: number }>;
+  };
+  zeroClaude.rows[0]!.original_bytes = 0;
+  assert.throws(() => normalizeClaudeParserState(zeroClaude));
+
+  const inflatedClaudeSpan = JSON.parse(JSON.stringify(claude.state)) as {
+    parsed_offset: number;
+    rows: Array<{ byte_end: number }>;
+  };
+  inflatedClaudeSpan.rows.at(-1)!.byte_end += 3;
+  inflatedClaudeSpan.parsed_offset += 3;
+  assert.throws(() => normalizeClaudeParserState(inflatedClaudeSpan));
+
+  const codexRows = [
+    codexRow(0, "session_meta", { id: "physical-codex" }),
+    codexRow(1, "response_item", {
+      type: "message",
+      role: "user",
+      content: "later",
+    }),
+  ];
+  const codexPath = await tempJsonl(
+    t,
+    "physical-codex.jsonl",
+    `${codexRows[0]}\r\n${codexRows[1]}`,
+  );
+  const codex = await readCodexState(codexPath);
+  assert.deepEqual(
+    codex.state.rows.map((row) =>
+      row.byte_end - row.byte_start - row.original_bytes
+    ),
+    [2, 0],
+  );
+
+  const zeroCodex = JSON.parse(JSON.stringify(codex.state)) as {
+    rows: Array<{ original_bytes: number }>;
+  };
+  zeroCodex.rows[0]!.original_bytes = 0;
+  assert.throws(() => normalizeCodexParserState(zeroCodex));
+
+  const inflatedCodexSpan = JSON.parse(JSON.stringify(codex.state)) as {
+    parsed_offset: number;
+    rows: Array<{ byte_end: number }>;
+  };
+  inflatedCodexSpan.rows.at(-1)!.byte_end += 3;
+  inflatedCodexSpan.parsed_offset += 3;
+  assert.throws(() => normalizeCodexParserState(inflatedCodexSpan));
+});
+
+test("state snapshots reject proxies before reflection and close own __proto__ data", async (t) => {
+  const claudePath = await tempJsonl(
+    t,
+    "descriptor-claude.jsonl",
+    `${claudeUser("descriptor-claude", "one", 0, "one")}\n`,
+  );
+  const codexPath = await tempJsonl(
+    t,
+    "descriptor-codex.jsonl",
+    `${codexRow(0, "response_item", {
+      type: "message",
+      role: "user",
+      content: "one",
+    })}\n`,
+  );
+  const claude = await readClaudeState(claudePath);
+  const codex = await readCodexState(codexPath);
+
+  const transparentProxy = <T extends object>(
+    target: T,
+    calls: string[],
+  ): T => new Proxy(target, {
+    getPrototypeOf(inner) {
+      calls.push("getPrototypeOf");
+      return Reflect.getPrototypeOf(inner);
+    },
+    ownKeys(inner) {
+      calls.push("ownKeys");
+      return Reflect.ownKeys(inner);
+    },
+    getOwnPropertyDescriptor(inner, key) {
+      calls.push("getOwnPropertyDescriptor");
+      return Reflect.getOwnPropertyDescriptor(inner, key);
+    },
+  });
+
+  for (const [name, state, normalize] of [
+    ["Claude", claude.state, normalizeClaudeParserState],
+    ["Codex", codex.state, normalizeCodexParserState],
+  ] as const) {
+    await t.test(`${name} rejects an object Proxy without traps`, () => {
+      const calls: string[] = [];
+      const proxied = transparentProxy(
+        JSON.parse(JSON.stringify(state)) as object,
+        calls,
+      );
+      assert.throws(() => normalize(proxied));
+      assert.deepEqual(calls, []);
+    });
+
+    await t.test(`${name} rejects an array Proxy without traps`, () => {
+      const calls: string[] = [];
+      const candidate = JSON.parse(JSON.stringify(state)) as {
+        rows: object[];
+      };
+      candidate.rows = transparentProxy(candidate.rows, calls);
+      assert.throws(() => normalize(candidate));
+      assert.deepEqual(calls, []);
+    });
+
+    await t.test(`${name} preserves own __proto__ for closed validation`, () => {
+      const candidate = JSON.parse(JSON.stringify(state)) as {
+        rows: Array<{ payload?: object; value?: object }>;
+      };
+      const rowPayload = candidate.rows[0]!.value ??
+        candidate.rows[0]!.payload;
+      assert.ok(rowPayload);
+      Object.defineProperty(rowPayload, "__proto__", {
+        value: { concealed: true },
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+      assert.throws(() => normalize(candidate));
+    });
+  }
+});
+
+test("capacity fallback keeps same-handle overlong-line skip-and-continue semantics", async (t) => {
+  const runWithForcedCapacity = async <T>(task: () => Promise<T>): Promise<T> => {
+    const prototype = IncrementalParserStateByteTracker.prototype;
+    const original = prototype.replaceBytes;
+    let forced = false;
+    prototype.replaceBytes = function(previousBytes, nextBytes): void {
+      if (!forced) {
+        forced = true;
+        throw new IncrementalParserStateCapacityError(
+          MAX_INCREMENTAL_PARSER_STATE_BYTES + 1,
+        );
+      }
+      original.call(this, previousBytes, nextBytes);
+    };
+    try {
+      return await task();
+    } finally {
+      prototype.replaceBytes = original;
+    }
+  };
+
+  await t.test("Claude retains a valid row after the skipped line", async () => {
+    const valid = claudeUser("fallback-claude", "later", 1, "later");
+    const maxLineBytes = Buffer.byteLength(valid);
+    const path = await tempJsonl(
+      t,
+      "capacity-fallback-claude.jsonl",
+      `${"x".repeat(maxLineBytes + 1)}\r\n${valid}\n`,
+    );
+    const parsed = await runWithForcedCapacity(() =>
+      parseClaudeTranscriptDetailed(path, {
+        budgets: { maxLineBytes },
+      })
+    );
+
+    assert.deepEqual(
+      parsed.sessions.flatMap((session) =>
+        session.events.map((event) => event.entry_uuid)
+      ),
+      ["later"],
+    );
+    assert.ok(parsed.warnings.some((warning) =>
+      warning.code === "parser_line_budget_exceeded"
+    ));
+  });
+
+  await t.test("Codex retains a valid row after the skipped line", async () => {
+    const metadata = codexRow(1, "session_meta", { id: "fallback-codex" });
+    const valid = codexRow(2, "response_item", {
+      type: "message",
+      role: "user",
+      content: "later",
+    });
+    const maxLineBytes = Math.max(
+      Buffer.byteLength(metadata),
+      Buffer.byteLength(valid),
+    );
+    const path = await tempJsonl(
+      t,
+      "capacity-fallback-codex.jsonl",
+      `${"x".repeat(maxLineBytes + 1)}\n${metadata}\n${valid}\n`,
+    );
+    const parsed = await runWithForcedCapacity(() =>
+      parseCodexSession({
+        sourcePath: path,
+        budgets: { maxLineBytes },
+      })
+    );
+
+    assert.ok(parsed?.events.some((event) =>
+      event.kind === "genuine_user" && event.text === "later"
+    ));
+    assert.ok(parsed?.warnings.some((warning) =>
+      warning.code === "parser_line_budget_exceeded"
+    ));
+  });
 });
 
 test("Claude state validation closes row payloads, tool results, and derived indexes", async (t) => {
