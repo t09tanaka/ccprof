@@ -27,6 +27,8 @@ import {
   normalizeTerminalStatsSnapshot,
   type TerminalStatsSnapshotV1 as ExportedTerminalStatsSnapshotV1,
 } from "../src/analysis/stats-aggregation.js";
+import * as terminalStatsAggregation from
+  "../src/analysis/stats-aggregation.js";
 import {
   buildCommandIdentity,
   commandIdentityKey,
@@ -2922,4 +2924,120 @@ test("terminal snapshot normalizer does not invoke accessors or proxies", () => 
     );
   }
   assert.equal(reads, 0);
+});
+
+test("terminal snapshot collections reject sparse lengths and excessive own keys", () => {
+  const collectionLimit = (
+    terminalStatsAggregation as unknown as {
+      TERMINAL_STATS_COLLECTION_LIMIT?: unknown;
+    }
+  ).TERMINAL_STATS_COLLECTION_LIMIT;
+  assert.equal(collectionLimit, 10_000);
+  assert.ok(Number.isSafeInteger(collectionLimit));
+  const limit = collectionLimit as number;
+
+  const hugeRules = new Array<unknown>(2 ** 32 - 1);
+  assert.throws(
+    () => normalizeTerminalStatsSnapshot({
+      ...canonicalTerminalSnapshot(),
+      rules: hugeRules,
+    }),
+    TypeError,
+  );
+
+  const excessiveKeys: unknown[] = [];
+  for (let index = 0; index <= limit; index += 1) {
+    Object.defineProperty(excessiveKeys, `extra-${index}`, {
+      enumerable: true,
+      value: index,
+    });
+  }
+  assert.throws(
+    () => normalizeTerminalStatsSnapshot({
+      ...canonicalTerminalSnapshot(),
+      rules: excessiveKeys,
+    }),
+    TypeError,
+  );
+
+  const ledger = terminalLedger([{ start_ms: 0, end_ms: 100 }]);
+  const excessiveCandidates = new Array<TerminalCandidate>(limit + 1);
+  assert.throws(
+    () => buildTerminalFixture(ledger, excessiveCandidates),
+    TypeError,
+  );
+
+  const excessiveIntervals = terminalCandidate(
+    "R001",
+    "excessive-intervals",
+    1,
+    1,
+    [{ start_ms: 0, end_ms: 1 }],
+  );
+  excessiveIntervals.recoverable.intervals = new Array(limit + 1);
+  const intervalSnapshot = buildTerminalFixture(ledger, [excessiveIntervals]);
+  assert.equal(intervalSnapshot.confirmed_critical_path_ms, 0);
+  assert.equal(intervalSnapshot.estimated_critical_path_upper_ms, 0);
+  assert.equal(intervalSnapshot.incomplete_interval_findings, 1);
+});
+
+function snapshotWithRuleAxes(
+  ruleId: RuleId,
+  axes: {
+    confirmed: number;
+    upper: number;
+    resource: number;
+  },
+): TerminalStatsSnapshotV1 {
+  const snapshot = canonicalTerminalSnapshot();
+  snapshot.rules = snapshot.rules.map((row) => row.rule_id === ruleId
+    ? {
+        ...row,
+        confirmed_critical_path_ms: axes.confirmed,
+        estimated_critical_path_upper_ms: axes.upper,
+        resource_cost_ms: axes.resource,
+      }
+    : row);
+  snapshot.confirmed_critical_path_ms = axes.confirmed;
+  snapshot.estimated_critical_path_upper_ms = axes.upper;
+  snapshot.resource_cost_ms = axes.resource;
+  return snapshot;
+}
+
+test("terminal snapshot rows reject metrics on the wrong manifest axis", () => {
+  for (const ruleId of ["R005", "R006"] as const) {
+    assert.throws(
+      () => normalizeTerminalStatsSnapshot(snapshotWithRuleAxes(ruleId, {
+        confirmed: 1,
+        upper: 1,
+        resource: 0,
+      })),
+      TypeError,
+      `${ruleId} critical-path axis`,
+    );
+  }
+
+  for (const ruleId of ["R001", "R002", "R003", "R007", "R008"] as const) {
+    assert.throws(
+      () => normalizeTerminalStatsSnapshot(snapshotWithRuleAxes(ruleId, {
+        confirmed: 0,
+        upper: 0,
+        resource: 1,
+      })),
+      TypeError,
+      `${ruleId} resource axis`,
+    );
+  }
+
+  for (const axes of [
+    { confirmed: 1, upper: 1, resource: 0 },
+    { confirmed: 0, upper: 1, resource: 0 },
+    { confirmed: 0, upper: 0, resource: 1 },
+  ]) {
+    assert.throws(
+      () => normalizeTerminalStatsSnapshot(snapshotWithRuleAxes("R004", axes)),
+      TypeError,
+      `R004 axes ${JSON.stringify(axes)}`,
+    );
+  }
 });
