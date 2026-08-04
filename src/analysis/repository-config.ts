@@ -30,6 +30,7 @@ const POLICY_KEYS = new Set([
   "allow_export",
   "raw_retention_days_max",
   "required_source_coverage",
+  "minimum_cohort_size",
   "approval_policy",
   "resource_domains",
 ]);
@@ -167,6 +168,18 @@ function assertOptionalCoverage(
   }
 }
 
+function assertOptionalMinimumCohortSize(
+  value: unknown,
+): asserts value is number | undefined {
+  if (
+    value !== undefined &&
+    (typeof value !== "number" || !Number.isSafeInteger(value) ||
+      value < 3 || value > 1_000)
+  ) {
+    throw new RepositoryConfigError("policy contains invalid values");
+  }
+}
+
 function snapshotRuleSafety<T>(action: () => T): T {
   try {
     return action();
@@ -185,12 +198,14 @@ function parsePolicyPreferences(
   const allowExport = value.allow_export;
   const rawRetentionDaysMax = value.raw_retention_days_max;
   const requiredSourceCoverage = value.required_source_coverage;
+  const minimumCohortSize = value.minimum_cohort_size;
   assertOptionalPrivacy(minimumPrivacy);
   assertOptionalBoolean(allowRaw);
   assertOptionalBoolean(allowAdvisory);
   assertOptionalBoolean(allowExport);
   assertOptionalRetention(rawRetentionDaysMax);
   assertOptionalCoverage(requiredSourceCoverage);
+  assertOptionalMinimumCohortSize(minimumCohortSize);
   const approvalPolicy = value.approval_policy === undefined
     ? undefined
     : snapshotRuleSafety(() =>
@@ -216,6 +231,9 @@ function parsePolicyPreferences(
     ...(requiredSourceCoverage === undefined
       ? {}
       : { required_source_coverage: requiredSourceCoverage }),
+    ...(minimumCohortSize === undefined
+      ? {}
+      : { minimum_cohort_size: minimumCohortSize }),
     ...(approvalPolicy === undefined
       ? {}
       : { approval_policy: approvalPolicy }),

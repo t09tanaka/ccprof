@@ -683,9 +683,9 @@ to the raw policy file's 65,536-byte ceiling.
 
 The v1 document is closed and is described by the packaged
 `schemas/organization-policy.schema.json`. The core fields remain required;
-`$schema`, `approval_policy`, `resource_domains`, and `kill_switches` are
-optional. When present, the nested objects are closed and their documented
-members are required.
+`$schema`, `minimum_cohort_size`, `approval_policy`, `resource_domains`, and
+`kill_switches` are optional. When present, the nested objects are closed and
+their documented members are required.
 
 ```json
 {
@@ -698,6 +698,7 @@ members are required.
   "allow_export": false,
   "raw_retention_days_max": 14,
   "required_source_coverage": 0.9,
+  "minimum_cohort_size": 20,
   "approval_policy": {
     "safe_patterns": ["cargo test", "npm test"],
     "allow_rule_recommendation": true
@@ -776,6 +777,9 @@ const canonical = {
   allow_export: input.allow_export,
   raw_retention_days_max: input.raw_retention_days_max,
   required_source_coverage: input.required_source_coverage,
+  ...(input.minimum_cohort_size === undefined
+    ? {}
+    : { minimum_cohort_size: input.minimum_cohort_size }),
   ...(input.approval_policy === undefined
     ? {}
     : {
@@ -849,7 +853,10 @@ and kill switches. For example:
 Organization, repository, and CLI layers combine
 monotonically: the strongest requested privacy wins; permission booleans use
 logical AND; the minimum retention limit wins; and the maximum source coverage
-requirement wins. A signed `kill_switches` value of `true` disables raw,
+requirement wins. The effective `minimum_cohort_size` is the maximum of the
+default 5, the signed organization value, and the repository value; configured
+values must be integers from 3 through 1,000, so a repository can only tighten
+the organization floor. A signed `kill_switches` value of `true` disables raw,
 advisory, or export regardless of lower layers. When raw is disabled, a `raw`
 request is raised to `balanced`; when advisory is disabled, ccprof never starts
 the advisory child process.

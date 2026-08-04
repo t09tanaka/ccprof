@@ -29,6 +29,10 @@ const POLICY_MAX_BYTES = 64 * 1024;
 const SIGNATURE_MAX_BYTES = 1024;
 const PUBLIC_KEY_MAX_BYTES = 16 * 1024;
 
+export const DEFAULT_MINIMUM_COHORT_SIZE = 5;
+export const MINIMUM_COHORT_SIZE = 3;
+export const MAXIMUM_COHORT_SIZE = 1_000;
+
 const POLICY_KEYS = new Set([
   "$schema",
   "policy_schema_version",
@@ -39,6 +43,7 @@ const POLICY_KEYS = new Set([
   "allow_export",
   "raw_retention_days_max",
   "required_source_coverage",
+  "minimum_cohort_size",
   "approval_policy",
   "resource_domains",
   "kill_switches",
@@ -50,6 +55,7 @@ const REPOSITORY_POLICY_KEYS = new Set([
   "allow_export",
   "raw_retention_days_max",
   "required_source_coverage",
+  "minimum_cohort_size",
   "approval_policy",
   "resource_domains",
 ]);
@@ -79,6 +85,7 @@ export interface OrganizationPolicy {
   allow_export: boolean;
   raw_retention_days_max: number;
   required_source_coverage: number;
+  minimum_cohort_size?: number;
   approval_policy?: ApprovalRulePolicy;
   resource_domains?: ResourceDomainPolicy[];
   kill_switches?: OrganizationPolicyKillSwitches;
@@ -91,6 +98,7 @@ export interface RepositoryPolicyPreferences {
   allow_export?: boolean;
   raw_retention_days_max?: number;
   required_source_coverage?: number;
+  minimum_cohort_size?: number;
   approval_policy?: RepositoryApprovalRulePolicy;
   resource_domains?: ResourceDomainPolicy[];
 }
@@ -115,6 +123,7 @@ export interface EffectivePolicy {
   allow_export: boolean;
   raw_retention_days_max?: number;
   required_source_coverage: number;
+  minimum_cohort_size: number;
   rule_safety?: EffectiveRuleSafetyPolicy;
 }
 
@@ -185,6 +194,17 @@ function privacyProfile(value: unknown): value is PrivacyProfile {
   return value === "strict" || value === "balanced" || value === "raw";
 }
 
+function snapshotMinimumCohortSize(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (
+    typeof value !== "number" || !Number.isSafeInteger(value) ||
+    value < MINIMUM_COHORT_SIZE || value > MAXIMUM_COHORT_SIZE
+  ) {
+    invalid();
+  }
+  return value;
+}
+
 function snapshotKillSwitches(
   value: unknown,
 ): OrganizationPolicyKillSwitches | undefined {
@@ -226,6 +246,9 @@ function snapshotPolicy(value: unknown): OrganizationPolicy {
   const allowExport = captured.allow_export;
   const rawRetentionDaysMax = captured.raw_retention_days_max;
   const requiredSourceCoverage = captured.required_source_coverage;
+  const minimumCohortSize = snapshotMinimumCohortSize(
+    captured.minimum_cohort_size,
+  );
   if (
     policySchemaVersion !== 1 ||
     typeof organization !== "string" || !ORGANIZATION.test(organization) ||
@@ -263,6 +286,9 @@ function snapshotPolicy(value: unknown): OrganizationPolicy {
     allow_export: allowExport,
     raw_retention_days_max: rawRetentionDaysMax,
     required_source_coverage: requiredSourceCoverage,
+    ...(minimumCohortSize === undefined
+      ? {}
+      : { minimum_cohort_size: minimumCohortSize }),
     ...(approvalPolicy === undefined
       ? {}
       : { approval_policy: approvalPolicy }),
@@ -519,6 +545,9 @@ function snapshotRepositoryPolicy(
   const allowExport = captured.allow_export;
   const rawRetentionDaysMax = captured.raw_retention_days_max;
   const requiredSourceCoverage = captured.required_source_coverage;
+  const minimumCohortSize = snapshotMinimumCohortSize(
+    captured.minimum_cohort_size,
+  );
   if (
     (minimumPrivacy !== undefined && !privacyProfile(minimumPrivacy)) ||
     (allowRaw !== undefined && typeof allowRaw !== "boolean") ||
@@ -560,6 +589,9 @@ function snapshotRepositoryPolicy(
     ...(requiredSourceCoverage === undefined
       ? {}
       : { required_source_coverage: requiredSourceCoverage }),
+    ...(minimumCohortSize === undefined
+      ? {}
+      : { minimum_cohort_size: minimumCohortSize }),
     ...(approvalPolicy === undefined
       ? {}
       : { approval_policy: approvalPolicy }),
@@ -626,6 +658,11 @@ export function resolveEffectivePolicy(input: {
     required_source_coverage: Math.max(
       organization?.required_source_coverage ?? 0,
       repository?.required_source_coverage ?? 0,
+    ),
+    minimum_cohort_size: Math.max(
+      DEFAULT_MINIMUM_COHORT_SIZE,
+      organization?.minimum_cohort_size ?? DEFAULT_MINIMUM_COHORT_SIZE,
+      repository?.minimum_cohort_size ?? DEFAULT_MINIMUM_COHORT_SIZE,
     ),
     ...(ruleSafety === undefined ? {} : { rule_safety: ruleSafety }),
   };
