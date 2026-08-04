@@ -106,6 +106,19 @@ export function selectorRefDigest(
     throw new TypeError("invalid selector ref role");
   }
   if (typeof ref !== "string") throw new TypeError("selector ref must be a string");
+  for (let index = 0; index < ref.length; index += 1) {
+    const codeUnit = ref.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const nextCodeUnit = ref.charCodeAt(index + 1);
+      if (index + 1 >= ref.length ||
+        nextCodeUnit < 0xdc00 || nextCodeUnit > 0xdfff) {
+        throw new TypeError("selector ref contains an unpaired UTF-16 surrogate");
+      }
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      throw new TypeError("selector ref contains an unpaired UTF-16 surrogate");
+    }
+  }
   const normalized = ref.normalize("NFC");
   if (normalized.length === 0) throw new TypeError("selector ref must be non-empty");
   const digest = createHash("sha256")

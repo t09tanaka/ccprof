@@ -880,7 +880,7 @@ function selectorDataObject(value: unknown): Record<string, unknown> {
   if (ownKeys.some((key) => typeof key !== "string")) {
     throw new TypeError("invalid snapshot selector");
   }
-  const data: Record<string, unknown> = {};
+  const data = Object.create(null) as Record<string, unknown>;
   for (const key of ownKeys as string[]) {
     const descriptor = descriptors[key];
     if (descriptor === undefined || descriptor.enumerable !== true ||
@@ -895,7 +895,8 @@ function exactSelectorFields(
   value: Record<string, unknown>, fields: readonly string[],
 ): boolean {
   const keys = Object.keys(value);
-  return keys.length === fields.length && fields.every((field) => field in value);
+  return keys.length === fields.length &&
+    fields.every((field) => Object.hasOwn(value, field));
 }
 function normalizeSelectorIdentity(value: unknown): AnalysisSelectorIdentity {
   const selector = selectorDataObject(value);
@@ -1330,13 +1331,16 @@ export async function saveAnalysis(
   options: AnalysisSaveOptions = {},
 ): Promise<AnalysisSaveResult> {
   const record = asRecord(input);
+  const snapshot = options.snapshot === undefined
+    ? undefined
+    : normalizeSnapshotIdentity(options.snapshot);
   const warnings: StoreWarning[] = [];
   const targetPath = storeDatabasePath(paths);
   let database: StoreDatabase | undefined;
   try {
     database = openStoreDatabase(paths);
     warnings.push(...migrateLegacyAnalyses(database, paths));
-    database.transaction(() => insertAnalysis(database as StoreDatabase, record, options.snapshot)).immediate();
+    database.transaction(() => insertAnalysis(database as StoreDatabase, record, snapshot)).immediate();
   } catch (error) {
     warnings.push({
       code: error instanceof StoreConflict ? error.code : "analysis_write_failed",
