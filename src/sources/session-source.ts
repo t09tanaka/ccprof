@@ -21,7 +21,6 @@ export interface SessionSourceContract {
   adapter_version: SourceAdapterVersion;
   capabilities: readonly SessionCapability[];
 }
-
 export interface SessionSource {
   readonly contract: SessionSourceContract;
   discover(query: SessionQuery): Promise<Session[]>;
@@ -31,10 +30,8 @@ export type SessionSourceValidationCode =
   | "invalid_shape" | "unknown_field" | "unknown_adapter"
   | "unsupported_version" | "invalid_capability" | "invalid_discover"
   | "invalid_result" | "adapter_mismatch";
-
 export class SessionSourceValidationError extends Error {
   readonly code: SessionSourceValidationCode;
-
   constructor(code: SessionSourceValidationCode) {
     super(`invalid session source: ${code}`);
     this.name = "SessionSourceValidationError";
@@ -45,7 +42,6 @@ export class SessionSourceValidationError extends Error {
 const CONTRACT_FIELDS = ["adapter_id", "adapter_version", "capabilities"] as const;
 const CONTRACT_FIELD_SET = new Set<string>(CONTRACT_FIELDS);
 const CAPABILITY_SET = new Set<string>(ALL_SESSION_CAPABILITIES);
-
 function fail(code: SessionSourceValidationCode): never {
   throw new SessionSourceValidationError(code);
 }
@@ -125,10 +121,8 @@ function makeContract(
     capabilities: validatedCapabilities(capabilities, true),
   });
 }
-
 export const CLAUDE_SESSION_SOURCE_CONTRACT = makeContract("claude", [...ALL_SESSION_CAPABILITIES].sort(compareCodeUnits));
 export const CODEX_SESSION_SOURCE_CONTRACT = makeContract("codex", ["edit_fragments", "tool_timestamps"]);
-
 function validateContract(value: unknown): SessionSourceContract {
   if (
     value === null || typeof value !== "object" || Array.isArray(value) ||
@@ -226,7 +220,7 @@ function sessionSnapshot(value: unknown): Record<string, unknown> {
     return fail("invalid_result");
   }
   if (prototype !== Object.prototype) return fail("invalid_result");
-  const snapshot: Record<string, unknown> = {};
+  const snapshot: Record<string, unknown> = Object.create(null);
   for (const key of Reflect.ownKeys(descriptors)) {
     if (typeof key !== "string") return fail("invalid_result");
     const descriptor = descriptors[key]!;

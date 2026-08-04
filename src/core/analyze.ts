@@ -122,6 +122,7 @@ import { CodexSessionSource } from "../sources/codex/discover.js";
 import { CombinedSessionSource } from "../sources/combined.js";
 import {
   admitSessionEventPrefix,
+  SessionSourceValidationError,
   validateSessionSource,
   type SessionSource,
 } from "../sources/session-source.js";
@@ -1304,7 +1305,7 @@ export async function analyze(
 ): Promise<AnalyzeResult> {
   const injectedSource = options.sessionSource;
   const validatedSource = injectedSource === undefined ||
-      injectedSource instanceof CombinedSessionSource
+      CombinedSessionSource.isDirectInstance(injectedSource)
     ? injectedSource : validateSessionSource(injectedSource);
   const persist = options.persist ?? true;
   const budgetMeter = options.budgets === undefined
@@ -1374,7 +1375,7 @@ export async function analyze(
         : { analysisBudgetMeter: budgetMeter }),
     });
   } catch (error) {
-    if (budgetMeter === undefined) throw error;
+    if (budgetMeter === undefined || error instanceof SessionSourceValidationError) throw error;
     budgetMeter.recordSourceFailure();
     discoveredSessions = [];
   }

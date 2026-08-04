@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
+import { AnalysisBudgetMeter } from "../src/analysis/budgets.js";
 import { analyze } from "../src/core/analyze.js";
 import type { Session, SessionCapability } from "../src/core/model.js";
 import { deriveSourceDescriptor } from "../src/core/source-descriptor.js";
@@ -34,6 +38,38 @@ const QUERY: SessionQuery = {
   startedAtMs: 0,
   endedAtMs: 1_000,
 };
+
+const BUDGETS = {
+  max_input_bytes: 1_000,
+  max_input_events: 100,
+  max_wall_ms: 1_000,
+  max_cpu_ms: 1_000,
+  max_output_bytes: 1_000,
+  max_source_items: 100,
+};
+
+const STEADY_CLOCK = { wall_ms: () => 0, cpu_ms: () => 0 };
+
+function analysisRunner(onCall: () => void = () => {}): CommandRunner {
+  return async (_command, args) => {
+    onCall();
+    if (args[0] === "rev-parse" && args[1] === "--show-toplevel") {
+      return { code: 0, stdout: "/repo\n", stderr: "" };
+    }
+    if (args[0] === "rev-parse") {
+      const oid = (args.at(-1)?.startsWith("main") === true ? "a" : "b")
+        .repeat(40);
+      return { code: 0, stdout: `${oid}\n`, stderr: "" };
+    }
+    if (args[0] === "merge-base") {
+      return { code: 0, stdout: `${"a".repeat(40)}\n`, stderr: "" };
+    }
+    if (args[0] === "log") {
+      return { code: 0, stdout: "1\n", stderr: "" };
+    }
+    return { code: 1, stdout: "", stderr: "unavailable" };
+  };
+}
 
 function session(
   overrides: Partial<Session> = {},
@@ -360,6 +396,28 @@ test("discovery results fail closed before invalid sessions reach consumers", as
     "invalid_result",
   );
   assert.equal(sourceReads, 0);
+
+  let prototypeReads = 0;
+  const inherited = new Proxy({}, {
+    get: () => {
+      prototypeReads += 1;
+      throw new Error("SECRET_CANARY inherited source");
+    },
+  });
+  const protoSession = {} as Record<string, unknown>;
+  Object.defineProperty(protoSession, "__proto__", {
+    enumerable: true,
+    value: inherited,
+  });
+  const protoResult = validateSessionSource({
+    contract: declaration(),
+    discover: async () => [protoSession],
+  } as unknown as SessionSource);
+  await assertAsyncSourceError(
+    () => protoResult.discover(QUERY),
+    "adapter_mismatch",
+  );
+  assert.equal(prototypeReads, 0);
 });
 
 test("CombinedSessionSource rejects an invalid leaf before any discovery starts", () => {
@@ -379,54 +437,121 @@ test("CombinedSessionSource rejects an invalid leaf before any discovery starts"
   assert.equal(calls, 0);
 });
 
-test("analyze rejects a legacy injected source before an exhausted budget can report", async () => {
-  const runner: CommandRunner = async (_command, args) => {
-    if (args[0] === "rev-parse" && args[1] === "--show-toplevel") {
-      return { code: 0, stdout: "/repo\n", stderr: "" };
-    }
-    if (args[0] === "rev-parse") {
-      const oid = (args.at(-1)?.startsWith("main") === true ? "a" : "b")
-        .repeat(40);
-      return { code: 0, stdout: `${oid}\n`, stderr: "" };
-    }
-    if (args[0] === "merge-base") {
-      return { code: 0, stdout: `${"a".repeat(40)}\n`, stderr: "" };
-    }
-    if (args[0] === "log") {
-      return { code: 0, stdout: "1\n", stderr: "" };
-    }
-    return { code: 1, stdout: "", stderr: "unavailable" };
-  };
-  let discoverCalls = 0;
+test("CombinedSessionSource propagates invalid discovery output in every budget mode", async () => {
+  const invalid = source([session({ source: "codex" })]);
+  await assertAsyncSourceError(
+    () => new CombinedSessionSource([invalid]).discover(QUERY),
+    "adapter_mismatch",
+  );
+  await assertAsyncSourceError(
+    () => new CombinedSessionSource([invalid]).discover({
+      ...QUERY,
+      analysisBudgetMeter: new AnalysisBudgetMeter(BUDGETS, STEADY_CLOCK),
+    }),
+    "adapter_mismatch",
+  );
+});
 
+test("analyze rejects hostile CombinedSessionSource injections before effects", async () => {
+  let discoverCalls = 0;
+  let runnerCalls = 0;
+  let proxyTraps = 0;
+  class HostileCombinedSessionSource extends CombinedSessionSource {
+    override async discover(_query: SessionQuery): Promise<Session[]> {
+      discoverCalls += 1;
+      return [];
+    }
+  }
+  const shadowed = new CombinedSessionSource([source([])]);
+  Object.defineProperty(shadowed, "discover", {
+    value: async () => {
+      discoverCalls += 1;
+      return [];
+    },
+  });
+  const proxied = new Proxy(new CombinedSessionSource([source([])]), {
+    getPrototypeOf: () => {
+      proxyTraps += 1;
+      throw new Error("SECRET_CANARY combined prototype");
+    },
+  });
+  const candidates: readonly CombinedSessionSource[] = [
+    new HostileCombinedSessionSource([source([])]),
+    shadowed,
+    proxied,
+  ];
+  for (const sessionSource of candidates) {
+    await assertAsyncSourceError(() => analyze({
+      cwd: "/repo",
+      pr: "main...feature",
+      sinceMs: 0,
+      nowMs: 1_000,
+      runner: analysisRunner(() => runnerCalls += 1),
+      persist: false,
+      sessionSource,
+    }), "invalid_shape");
+  }
+  assert.equal(discoverCalls, 0);
+  assert.equal(runnerCalls, 0);
+  assert.equal(proxyTraps, 0);
+});
+
+test("budgeted analyze propagates invalid discovery output", async () => {
   await assertAsyncSourceError(() => analyze({
     cwd: "/repo",
     pr: "main...feature",
     sinceMs: 0,
     nowMs: 1_000,
-    runner,
+    runner: analysisRunner(),
     persist: false,
-    budgets: {
-      max_input_bytes: 1_000,
-      max_input_events: 100,
-      max_wall_ms: 0,
-      max_cpu_ms: 1_000,
-      max_output_bytes: 1_000,
-      max_source_items: 100,
-    },
-    budgetClock: {
-      wall_ms: (() => {
-        let reads = 0;
-        return () => reads++;
-      })(),
-      cpu_ms: () => 0,
-    },
-    sessionSource: {
-      discover: async () => {
-        discoverCalls += 1;
-        return [];
+    budgets: BUDGETS,
+    budgetClock: STEADY_CLOCK,
+    sessionSource: source([session({ source: "codex" })]),
+  }), "adapter_mismatch");
+});
+
+test("analyze rejects a legacy injected source before an exhausted budget can report", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-invalid-source-"));
+  let discoverCalls = 0;
+  let runnerCalls = 0;
+  try {
+    await assertAsyncSourceError(() => analyze({
+      cwd: "/repo",
+      pr: "main...feature",
+      sinceMs: 0,
+      nowMs: 1_000,
+      runner: analysisRunner(() => runnerCalls += 1),
+      persist: true,
+      storePaths: {
+        canonical_repo: "/repo",
+        repo_hash: "repo-hash",
+        root_dir: root,
+        repo_dir: join(root, "repo"),
+        analyses_dir: join(root, "repo", "analyses"),
+        history_index_path: join(root, "repo", "index.json"),
+        dismissals_path: join(root, "repo", "dismissals.json"),
+        adoptions_path: join(root, "repo", "adoptions.json"),
+        hook_events_path: join(root, "repo", "hook-events.jsonl"),
       },
-    } as unknown as SessionSource,
-  }), "invalid_shape");
-  assert.equal(discoverCalls, 0);
+      budgets: { ...BUDGETS, max_wall_ms: 0 },
+      budgetClock: {
+        wall_ms: (() => {
+          let reads = 0;
+          return () => reads++;
+        })(),
+        cpu_ms: () => 0,
+      },
+      sessionSource: {
+        discover: async () => {
+          discoverCalls += 1;
+          return [];
+        },
+      } as unknown as SessionSource,
+    }), "invalid_shape");
+    assert.equal(discoverCalls, 0);
+    assert.equal(runnerCalls, 0);
+    assert.deepEqual(await readdir(root), []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
