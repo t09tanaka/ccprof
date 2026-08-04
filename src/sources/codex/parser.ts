@@ -335,6 +335,13 @@ function codexStateString(value: unknown, nullable = false): string | null {
   return value;
 }
 
+function codexStatePayloadText(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new TypeError("Parser-state payload text is invalid.");
+  }
+  return value;
+}
+
 function validateCodexWarningFact(value: unknown, expectedOrder: number): void {
   if (!isRecord(value)) throw new TypeError("Invalid parser-state warning fact.");
   codexExactKeys(value, [
@@ -379,7 +386,7 @@ function validateCodexTextField(value: unknown): void {
   if (!isRecord(value)) throw new TypeError("Invalid Codex state text field.");
   if (value.kind === "text") {
     codexExactKeys(value, ["kind", "value"]);
-    codexStateString(value.value);
+    codexStatePayloadText(value.value);
     return;
   }
   if (value.kind === "missing" || value.kind === "invalid") {
@@ -414,7 +421,7 @@ function validateCodexStatePayload(type: unknown, value: unknown): void {
   if (value.kind === "message") {
     codexExactKeys(value, ["kind", "role", "content"]);
     codexStateString(value.role, true);
-    codexStateString(value.content);
+    codexStatePayloadText(value.content);
     return;
   }
   if (value.kind === "function_call") {

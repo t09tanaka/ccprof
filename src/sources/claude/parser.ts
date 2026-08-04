@@ -305,7 +305,8 @@ function finiteInteger(value: unknown): number | undefined {
 
 function parseTimestamp(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) {
-    return Math.trunc(value);
+    const timestampMs = Math.trunc(value);
+    return Number.isSafeInteger(timestampMs) ? timestampMs : undefined;
   }
   if (typeof value !== "string") {
     return undefined;
@@ -1142,6 +1143,13 @@ function stateString(value: unknown, nullable = false): string | null {
   return value;
 }
 
+function statePayloadText(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new TypeError("Parser-state payload text is invalid.");
+  }
+  return value;
+}
+
 function validateWarningFact(value: unknown, expectedOrder: number): void {
   if (!isRecord(value)) throw new TypeError("Invalid parser-state warning fact.");
   exactKeys(value, [
@@ -1157,7 +1165,7 @@ function validateWarningFact(value: unknown, expectedOrder: number): void {
     exactKeys(value.applicability, ["kind"]);
   } else if (value.applicability.kind === "timestamp") {
     exactKeys(value.applicability, ["kind", "timestamp_ms"]);
-    nonnegativeInteger(value.applicability.timestamp_ms);
+    stateInteger(value.applicability.timestamp_ms);
   } else {
     throw new TypeError("Unknown parser-state warning applicability.");
   }
@@ -1186,7 +1194,7 @@ function validateClaudeAssistantBlock(value: unknown): void {
   const type = stateString(value.type);
   if (type === "text") {
     exactKeys(value, ["type"], ["text"]);
-    if (value.text !== undefined) stateString(value.text);
+    if (value.text !== undefined) statePayloadText(value.text);
     return;
   }
   if (type === "tool_use") {
@@ -1256,7 +1264,7 @@ function validateClaudeRowValue(value: unknown): void {
         if (block.type !== "text") {
           throw new TypeError("Unknown Claude user state block.");
         }
-        stateString(block.text);
+        statePayloadText(block.text);
       }
     }
     return;
@@ -1264,7 +1272,7 @@ function validateClaudeRowValue(value: unknown): void {
   if (value.type === "system") {
     exactKeys(value, ["type"], ["subtype", "content", "compactMetadata"]);
     if (value.subtype !== undefined) stateString(value.subtype);
-    if (value.content !== undefined) stateString(value.content);
+    if (value.content !== undefined) statePayloadText(value.content);
     if (value.compactMetadata !== undefined) {
       if (!isRecord(value.compactMetadata)) {
         throw new TypeError("Invalid Claude compact metadata.");
@@ -1294,7 +1302,7 @@ function validateClaudeToolResult(value: unknown): void {
     "estimated_tokens", "has_unknown_schema", "exit_code",
   ]);
   stateString(value.tool_use_id, true);
-  stateString(value.output);
+  statePayloadText(value.output);
   nonnegativeInteger(value.output_bytes);
   nonnegativeInteger(value.estimated_tokens);
   if (typeof value.has_unknown_schema !== "boolean") {
@@ -1450,7 +1458,7 @@ export function normalizeClaudeParserState(value: unknown): ClaudeParserStateV1 
     const byteEnd = nonnegativeInteger(row.byte_end);
     const line = nonnegativeInteger(row.line);
     const sourceIndex = nonnegativeInteger(row.source_index);
-    nonnegativeInteger(row.timestamp_ms);
+    stateInteger(row.timestamp_ms);
     const terminatorBytes = byteEnd - byteStart - originalBytes;
     const reachesProgress = byteEnd === parsedOffset;
     if (
