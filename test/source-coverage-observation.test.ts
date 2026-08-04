@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import test from "node:test";
+import { mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test, { type TestContext } from "node:test";
 
+import { discoverClaudeSessions, discoverClaudeSessionsObserved } from
+  "../src/sources/claude/discover.js";
+import { parseClaudeTranscriptDetailed, parseClaudeTranscriptObserved } from
+  "../src/sources/claude/parser.js";
+import { discoverCodexSessions, discoverCodexSessionsObserved } from
+  "../src/sources/codex/discover.js";
+import { parseCodexSession, parseCodexSessionObserved } from
+  "../src/sources/codex/parser.js";
 import {
   createBuiltInSourceCoverageAccumulator,
   unavailableSourceCoverage,
@@ -9,6 +20,27 @@ import {
 
 const PARSER_STATE_FINGERPRINT: `sha256:${string}` =
   `sha256:${"a".repeat(64)}`;
+
+async function tempRoot(t: TestContext, name: string): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), name));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  return root;
+}
+
+function claudeRow(repo: string): string {
+  return JSON.stringify({ sessionId: "coverage-claude", cwd: repo,
+    gitBranch: "feature/coverage", type: "user", uuid: "coverage-user",
+    timestamp: "2026-07-31T03:00:00.000Z",
+    message: { role: "user", content: "observe me" } });
+}
+
+function codexRow(type: string, payload: object): string {
+  return JSON.stringify({ timestamp: "2026-07-31T03:00:00.000Z", type, payload });
+}
+
+const query = (repoRoot: string) => ({ repoRoot, headBranch: "feature/coverage",
+  startedAtMs: Date.parse("2026-07-31T02:00:00.000Z"),
+  endedAtMs: Date.parse("2026-07-31T04:00:00.000Z") });
 
 function expectedFingerprint(adapterId: "claude" | "codex"): string {
   return `sha256:${createHash("sha256")
@@ -158,4 +190,114 @@ test("source coverage contract exposes one frozen unavailable value", () => {
   assert.deepEqual(first, { status: "unavailable" });
   assert.equal(first, second);
   assert.equal(Object.isFrozen(first), true);
+});
+
+test("cold parser coverage preserves Claude and Codex results with truthful loss", async (t) => {
+  const root = await tempRoot(t, "ccprof-coverage-parser-");
+  const repo = join(root, "repo");
+  await mkdir(repo);
+  const claudePath = join(root, "claude.jsonl");
+  await writeFile(claudePath, `${claudeRow(repo)}\n{malformed\n`);
+  const claudeObserved = await parseClaudeTranscriptObserved(claudePath);
+  assert.deepEqual(claudeObserved.result,
+    await parseClaudeTranscriptDetailed(claudePath));
+  assert.deepEqual(claudeObserved.observation, {
+    rows_seen: 2, rows_accepted: 1, events_emitted: 1,
+    completeness: "partial",
+  });
+
+  const codexPath = join(root, "rollout-parser.jsonl");
+  await writeFile(codexPath, `${[
+    codexRow("session_meta", { id: "coverage-codex", cwd: repo,
+      git: { branch: "feature/coverage" } }),
+    codexRow("response_item", { type: "message", role: "user",
+      content: "observe me" }),
+    "{malformed",
+  ].join("\n")}\n`);
+  const codexObserved = await parseCodexSessionObserved({ sourcePath: codexPath });
+  assert.deepEqual(codexObserved.result,
+    await parseCodexSession({ sourcePath: codexPath }));
+  assert.deepEqual(codexObserved.observation, {
+    rows_seen: 3, rows_accepted: 2, events_emitted: 1,
+    completeness: "partial",
+  });
+});
+
+test("cold parser coverage reports bounded reads as partial", async (t) => {
+  const root = await tempRoot(t, "ccprof-coverage-budget-");
+  const repo = join(root, "repo"); await mkdir(repo);
+  const first = claudeRow(repo);
+  const path = join(root, "bounded.jsonl");
+  await writeFile(path, `${first}\n${claudeRow(repo)}\n`);
+  const observed = await parseClaudeTranscriptObserved(path, {
+    budgets: { maxFileBytes: Buffer.byteLength(first) + 1 },
+  });
+  assert.equal(observed.observation.completeness, "partial");
+  assert.ok(observed.observation.rows_accepted <= observed.observation.rows_seen);
+});
+
+test("cold discovery coverage deduplicates and prefilters Claude candidates", async (t) => {
+  const root = await tempRoot(t, "ccprof-coverage-claude-");
+  const repo = join(root, "repo"); const projects = join(root, "projects");
+  await Promise.all([mkdir(repo), mkdir(projects)]);
+  const source = join(projects, "source.jsonl");
+  await writeFile(source, `${claudeRow(repo)}\n`);
+  await symlink(source, join(projects, "alias.jsonl"));
+  const old = join(projects, "old.jsonl");
+  await writeFile(old, `${claudeRow(repo)}\n`);
+  const oldTime = new Date("2026-07-30T00:00:00.000Z");
+  await utimes(old, oldTime, oldTime);
+  await writeFile(join(projects, "ignored.txt"), "{}\n");
+
+  const observed = await discoverClaudeSessionsObserved(projects, query(repo));
+  assert.deepEqual(observed.sessions,
+    await discoverClaudeSessions(projects, query(repo)));
+  assert.deepEqual(observed.source_coverage, {
+    status: "available", adapter_id: "claude", adapter_version: "1.0.0",
+    parser_version: "2.0.0",
+    schema_fingerprint: observed.source_coverage.status === "available"
+      ? observed.source_coverage.schema_fingerprint : "unreachable",
+    files_discovered: 1, files_parsed: 1, rows_seen: 1, rows_accepted: 1,
+    events_emitted: 1, completeness: "complete",
+  });
+  await assert.rejects(
+    discoverClaudeSessionsObserved(join(root, "missing"), query(repo)),
+    { name: "ClaudeDiscoveryError" },
+  );
+});
+
+test("cold discovery coverage distinguishes missing, empty, and zero-event Codex roots", async (t) => {
+  const root = await tempRoot(t, "ccprof-coverage-codex-");
+  const repo = join(root, "repo"); const sessions = join(root, "sessions");
+  const day = join(sessions, "2026", "07", "31");
+  await Promise.all([mkdir(repo), mkdir(day, { recursive: true })]);
+  await writeFile(join(day, "rollout-meta.jsonl"), `${codexRow("session_meta", {
+    id: "coverage-meta", cwd: repo, git: { branch: "feature/coverage" },
+  })}\n`);
+  const oldDay = join(sessions, "2026", "01", "01"); await mkdir(oldDay, { recursive: true });
+  await writeFile(join(oldDay, "rollout-old.jsonl"), `${codexRow("session_meta", {
+    id: "old", cwd: repo, git: { branch: "feature/coverage" },
+  })}\n`);
+  await writeFile(join(day, "ignored.jsonl"), "{}\n");
+
+  const observed = await discoverCodexSessionsObserved(sessions, query(repo));
+  assert.deepEqual(observed.sessions,
+    await discoverCodexSessions(sessions, query(repo)));
+  assert.equal(observed.source_coverage.status, "available");
+  if (observed.source_coverage.status === "available") {
+    assert.deepEqual({ ...observed.source_coverage,
+      schema_fingerprint: "fingerprint" }, {
+      status: "available", adapter_id: "codex", adapter_version: "1.0.0",
+      parser_version: "2.0.0", schema_fingerprint: "fingerprint",
+      files_discovered: 1, files_parsed: 1, rows_seen: 1, rows_accepted: 1,
+      events_emitted: 0, completeness: "complete",
+    });
+  }
+  const empty = join(root, "empty"); await mkdir(empty);
+  const emptyObserved = await discoverCodexSessionsObserved(empty, query(repo));
+  assert.equal(emptyObserved.source_coverage.status, "available");
+  if (emptyObserved.source_coverage.status === "available")
+    assert.equal(emptyObserved.source_coverage.files_discovered, 0);
+  const missing = await discoverCodexSessionsObserved(join(root, "missing"), query(repo));
+  assert.deepEqual(missing, { sessions: [], source_coverage: { status: "unavailable" } });
 });
