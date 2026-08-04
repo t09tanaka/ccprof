@@ -15,7 +15,7 @@ Store, or report runtime.
 The artifact is `schemas/trace-envelope-v1.schema.json` with the stable ID:
 
 ```text
-https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/trace-envelope-v1.schema.json
+https://schemas.ccprof.dev/trace-envelope/v1.json
 ```
 
 Instances repeat that URI in `$schema` and use `protocol_version: "1.0.0"`.
@@ -125,7 +125,7 @@ and absence of forbidden fixture literals.
 ## Packaging and documentation
 
 The schema is placed in the existing `schemas` directory already included in
-the npm artifact. README documentation names the stable raw URI, packaged path,
+the npm artifact. README documentation names the stable schema URI, packaged path,
 the two-stage validation rule, ordering scope, precision rules, and the neutral
 fixture. Existing package smoke already packs the entire `schemas` directory;
 the conformance test locks the manifest inclusion and parses the artifact.
