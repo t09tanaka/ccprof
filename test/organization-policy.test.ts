@@ -23,7 +23,10 @@ import {
   RepositoryConfigError,
 } from "../src/analysis/repository-config.js";
 import { runCli, type CliHandlers } from "../src/cli.js";
-import { runAnalyzeCommand } from "../src/commands/analyze.js";
+import {
+  runAnalyzeCommand,
+  type AnalyzeCommandDependencies,
+} from "../src/commands/analyze.js";
 import { runStatsCommand } from "../src/commands/stats.js";
 import type { AnalyzeOptions } from "../src/core/analyze.js";
 import type { ReportV2 } from "../src/core/model.js";
@@ -50,6 +53,7 @@ import {
 } from "../src/policy/rule-safety.js";
 import { renderJsonReport } from "../src/reporters/json.js";
 import type { PrivacyProfile } from "../src/reporters/privacy.js";
+import type { StorePaths } from "../src/store/paths.js";
 
 const ENVIRONMENT_KEYS = {
   organization: "CCPROF_ORGANIZATION",
@@ -2076,6 +2080,85 @@ test("analyze shares one cached effective rule policy with core and rendering", 
   assert.equal(capturedOptions?.cwd, repoRoot);
   assert.equal(resolvedRepo, canonicalRepo);
   assert.equal(resolverCalls, 1);
+});
+
+test("analyze resolves canonical Store policy before core and passes its cohort floor", async (t) => {
+  const repoRoot = await temporaryRepository(t);
+  const canonicalRepo = join(repoRoot, "canonical-main");
+  const storePaths: StorePaths = {
+    canonical_repo: canonicalRepo,
+    repo_hash: "1".repeat(64),
+    root_dir: join(repoRoot, "data"),
+    repo_dir: join(repoRoot, "data", "repo"),
+    analyses_dir: join(repoRoot, "data", "repo", "analyses"),
+    history_index_path: join(repoRoot, "data", "repo", "index.json"),
+    dismissals_path: join(repoRoot, "data", "repo", "dismissals.json"),
+    adoptions_path: join(repoRoot, "data", "repo", "adoptions.json"),
+    hook_events_path: join(repoRoot, "data", "repo", "hooks.jsonl"),
+  };
+  const scenarios = [
+    {
+      label: "omitted policy default",
+      expectedFloor: 5,
+      resolved: resolveEffectivePolicy({
+        request: { privacy: "raw", advisory: false },
+      }),
+    },
+    {
+      label: "organization floor cannot be weakened by repository",
+      expectedFloor: 20,
+      resolved: resolveEffectivePolicy({
+        organization: policyWithMinimumCohort(20),
+        repository: {
+          minimum_cohort_size: 5,
+        } as RepositoryPolicyWithMinimumCohort,
+        request: { privacy: "raw", advisory: false },
+      }),
+    },
+  ] as const;
+
+  for (const scenario of scenarios) {
+    const calls: string[] = [];
+    let captured:
+      | Parameters<NonNullable<AnalyzeCommandDependencies["analyze"]>>[0]
+      | undefined;
+    const dependencies = {
+      resolveStorePaths: async (cwd: string): Promise<StorePaths> => {
+        calls.push("store");
+        assert.equal(cwd, repoRoot, scenario.label);
+        return storePaths;
+      },
+      resolvePolicy: async (resolvedRepo: string) => {
+        calls.push("policy");
+        assert.equal(resolvedRepo, canonicalRepo, scenario.label);
+        return scenario.resolved;
+      },
+      analyze: async (
+        analyzeOptions:
+          Parameters<NonNullable<AnalyzeCommandDependencies["analyze"]>>[0],
+      ) => {
+        calls.push("analyze");
+        captured = analyzeOptions;
+        return { report: report(canonicalRepo), warnings: [] };
+      },
+    } satisfies AnalyzeCommandDependencies;
+
+    await runAnalyzeCommand({
+      cwd: repoRoot,
+      format: "json",
+      color: false,
+      privacy: "raw",
+    }, dependencies);
+
+    assert.deepEqual(calls, ["store", "policy", "analyze"], scenario.label);
+    assert.equal(captured?.storePaths, storePaths, scenario.label);
+    assert.equal(
+      (captured as typeof captured & { minimumCohortSize?: number })
+        ?.minimumCohortSize,
+      scenario.expectedFloor,
+      scenario.label,
+    );
+  }
 });
 
 test("analyze applies effective privacy and denies advisory before spawning", async (t) => {

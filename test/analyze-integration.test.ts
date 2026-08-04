@@ -27,6 +27,8 @@ import {
   type CommandRunner,
 } from "../src/git/client.js";
 import { findGitMarker } from "../src/git/common-dir.js";
+import { selectorRefDigest } from "../src/git/pr-context.js";
+import { listRuleManifests } from "../src/rules/manifest.js";
 import {
   ClaudeDiscoveryError,
   ClaudeSessionSource,
@@ -1180,6 +1182,87 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
     );
     assert.ok(current);
     assert.equal(current.unit.repo, storePaths.canonical_repo);
+    const workspaceId = analysisDigest(
+      "terminal-stats-workspace-v1",
+      storePaths.canonical_repo,
+    );
+    const terminalStats = current.terminal_stats_snapshot;
+    assert.ok(terminalStats);
+    assert.deepEqual(terminalStats.cohort, {
+      repository_id: storePaths.repo_hash,
+      workspace_id: workspaceId,
+      changed_files: 1,
+      changed_lines: 2,
+    });
+    assert.equal(
+      terminalStats.measured_wall_ms,
+      first.ledger.totals_ms.measured,
+    );
+    assert.equal(
+      terminalStats.human_wait_ms,
+      first.ledger.totals_ms.human_wait,
+    );
+    assert.equal(
+      terminalStats.unexplained_ms,
+      first.ledger.totals_ms.unexplained,
+    );
+    assert.deepEqual(
+      terminalStats.rules.map((row) => ({
+        rule_id: row.rule_id,
+        rule_version: row.rule_version,
+        compatibility_epoch: row.compatibility_epoch,
+      })),
+      listRuleManifests().map((manifest) => ({
+        rule_id: manifest.id,
+        rule_version: manifest.version,
+        compatibility_epoch: manifest.compatibility_epoch,
+      })),
+    );
+    assert.equal(
+      terminalStats.rules.reduce(
+        (total, row) => total + row.confirmed_critical_path_ms,
+        0,
+      ),
+      terminalStats.confirmed_critical_path_ms,
+    );
+    assert.equal(
+      terminalStats.rules.reduce(
+        (total, row) => total + row.estimated_critical_path_upper_ms,
+        0,
+      ),
+      terminalStats.estimated_critical_path_upper_ms,
+    );
+    assert.equal(
+      terminalStats.rules.reduce(
+        (total, row) => total + row.resource_cost_ms,
+        0,
+      ),
+      terminalStats.resource_cost_ms,
+    );
+    const currentEntry = stored.entries?.find(
+      ({ record }) => record.unit.pr_ref === "main...feature",
+    );
+    assert.ok(currentEntry);
+    assert.equal("mode" in currentEntry.identity, false);
+    assert.deepEqual(
+      "mode" in currentEntry.identity
+        ? undefined
+        : currentEntry.identity.selector,
+      {
+        kind: "explicit_range",
+        range: "triple_dot",
+        base_ref_digest: selectorRefDigest(
+          "explicit_range",
+          "base",
+          "main",
+        ),
+        head_ref_digest: selectorRefDigest(
+          "explicit_range",
+          "head",
+          "feature",
+        ),
+      },
+    );
     assert.equal(
       stored.records.filter(({ unit }) => unit.pr_ref === "main...feature")
         .length,
@@ -1262,6 +1345,65 @@ test("orchestrates a deterministic PR analysis, stores all findings, and applies
       "dismissal filters only the displayed top findings",
     );
     assert.ok(dismissed.suppressedKeys.includes(approval.finding_key));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("binary diffs suppress line cohorts and cohort policy changes snapshot identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ccprof-analyze-cohort-policy-"));
+  try {
+    const repo = await makeRepository(root);
+    await writeFile(join(repo, "asset.bin"), Buffer.from([0, 1, 2, 3]));
+    await git(repo, ["add", "asset.bin"]);
+    await git(repo, ["commit", "-m", "binary fixture"], {
+      GIT_AUTHOR_DATE: "2026-01-01T00:30:00.000Z",
+      GIT_COMMITTER_DATE: "2026-01-01T00:30:00.000Z",
+    });
+    const projects = await makeClaudeProjects(root, repo);
+    const storePaths = await resolveStorePaths(repo, {
+      env: { CCPROF_DATA_DIR: join(root, "data") },
+    });
+    const common = {
+      cwd: repo,
+      pr: "main...feature",
+      sessionSource: new ClaudeSessionSource(projects),
+      storePaths,
+    } as const;
+
+    const defaultFloor = await analyze({
+      ...common,
+      nowMs: NOW_MS,
+      minimumCohortSize: 5,
+    });
+    const organizationFloor = await analyze({
+      ...common,
+      nowMs: NOW_MS + 60_000,
+      minimumCohortSize: 20,
+    });
+
+    assert.equal(
+      "changed_lines" in
+        (defaultFloor.record.terminal_stats_snapshot?.cohort ?? {}),
+      false,
+    );
+    assert.equal(
+      defaultFloor.record.terminal_stats_snapshot?.cohort.changed_files,
+      2,
+    );
+    assert.equal(
+      "changed_lines" in
+        (organizationFloor.record.terminal_stats_snapshot?.cohort ?? {}),
+      false,
+    );
+
+    const entries = (await loadAnalyses(storePaths)).entries ?? [];
+    assert.equal(entries.length, 2);
+    const policyDigests = entries.flatMap(({ identity }) =>
+      "mode" in identity ? [] : [identity.policy_digest]
+    );
+    assert.equal(policyDigests.length, 2);
+    assert.notEqual(policyDigests[0], policyDigests[1]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

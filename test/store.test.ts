@@ -29,9 +29,15 @@ import type {
   RuleId,
 } from "../src/core/model.js";
 import type { AnalysisBudgetResult } from "../src/analysis/budgets.js";
-import type {
-  TerminalStatsSnapshotV1 as ExportedTerminalStatsSnapshotV1,
+import {
+  cohortDistribution,
+  selectTerminalSnapshots,
+  type TerminalStatsSnapshotV1 as ExportedTerminalStatsSnapshotV1,
 } from "../src/analysis/stats-aggregation.js";
+import {
+  projectStatsAggregationInput,
+  type StatsAggregationInput,
+} from "../src/analysis/stats-input.js";
 import { commandIdentityKey } from "../src/analysis/command-identity.js";
 import { detectChronicCost } from "../src/rules/chronic-cost.js";
 import { projectReportPrivacy } from "../src/reporters/privacy.js";
@@ -56,6 +62,7 @@ import {
   loadAnalyses,
   makeAnalysisRecord,
   saveAnalysis,
+  type AnalysisHistoryEntry,
   type AnalysisRecord,
   type AnalysisSnapshotIdentity,
 } from "../src/store/analyses.js";
@@ -4274,6 +4281,430 @@ function storedTerminalStatsSnapshot(): TerminalStatsSnapshotV1 {
     incomplete_interval_findings: 2,
   };
 }
+
+interface ComparableHistoryOptions {
+  id: string;
+  createdAtMs: number;
+  metric: number;
+  selector?: NonNullable<AnalysisSnapshotIdentity["selector"]>;
+  selectorNumber?: number;
+  displayRef?: string;
+  gitState?: string;
+  analysisVariant?: string;
+  repositoryId?: string;
+  workspaceId?: string;
+  changedFiles?: number;
+  /** `null` models a binary/truncated diff with no authoritative line count. */
+  changedLines?: number | null;
+}
+
+function comparableHistoryEntry(
+  options: ComparableHistoryOptions,
+): AnalysisHistoryEntry {
+  const repositoryId = options.repositoryId ?? "1".repeat(64);
+  const workspaceId = options.workspaceId ?? "2".repeat(64);
+  const terminal = storedTerminalStatsSnapshot();
+  terminal.cohort = {
+    repository_id: repositoryId,
+    workspace_id: workspaceId,
+    changed_files: options.changedFiles ?? 4,
+    ...(options.changedLines === null
+      ? {}
+      : { changed_lines: options.changedLines ?? 199 }),
+  };
+  const source = record(options.id, options.createdAtMs, {
+    metric: options.metric,
+  });
+  const normalized = makeAnalysisRecord({
+    ...source,
+    unit: {
+      ...source.unit,
+      pr_ref: options.displayRef ?? "main...feature",
+    },
+    terminal_stats_snapshot: terminal,
+  });
+  const stateDigest = analysisDigest(
+    "terminal-stats-test-git-state-v1",
+    options.gitState ?? options.id,
+  );
+  const identity: AnalysisSnapshotIdentity = {
+    repo_id: repositoryId,
+    base_oid: "a".repeat(40),
+    head_oid: stateDigest.slice(0, 40),
+    merge_base_oid: "a".repeat(40),
+    window: {
+      started_at_ms: 1,
+      start_source: "commit_anchor_lookback",
+      end_source: "analysis_time",
+      completeness: "partial",
+    },
+    source_digest: "3".repeat(64),
+    config_digest: "4".repeat(64),
+    policy_digest: analysisDigest(
+      "terminal-stats-test-policy-v1",
+      options.analysisVariant ?? "default",
+    ),
+    history_digest: "5".repeat(64),
+    selector: options.selector ?? {
+      kind: "github_pr",
+      number: options.selectorNumber ?? 1,
+    },
+  };
+  const {
+    analysis_id: _analysisId,
+    created_at_ms: _createdAtMs,
+    ...payload
+  } = normalized;
+  return {
+    snapshot_id: analysisDigest("analysis-snapshot-v1", {
+      schema_version: 1,
+      identity,
+      payload,
+    }),
+    identity,
+    record: normalized,
+  };
+}
+
+function projectComparableHistory(
+  entries: readonly AnalysisHistoryEntry[],
+): StatsAggregationInput[] {
+  return entries.map((entry) => projectStatsAggregationInput(entry));
+}
+
+type BaselineCurrentRejectsRawRecord = AnalysisRecord extends
+  Parameters<typeof computeBaseline>[0] ? false : true;
+type BaselineHistoryRejectsRawRecords = readonly AnalysisRecord[] extends
+  Parameters<typeof computeBaseline>[1] ? false : true;
+const baselineCurrentRejectsRawRecord: BaselineCurrentRejectsRawRecord = true;
+const baselineHistoryRejectsRawRecords: BaselineHistoryRejectsRawRecords = true;
+void baselineCurrentRejectsRawRecord;
+void baselineHistoryRejectsRawRecords;
+
+test("robust distributions are order invariant and exact cohort buckets are fixed", () => {
+  const values = [1, 2, 3, 100];
+  const expectedDistribution = {
+    median: 2.5,
+    p50: 2.5,
+    p75: 27.25,
+    mad: 1,
+    sample_count: 4,
+  };
+  assert.deepEqual(cohortDistribution(values), expectedDistribution);
+  assert.deepEqual(
+    cohortDistribution([100, 3, 1, 2]),
+    expectedDistribution,
+  );
+
+  const cohortKey = (
+    changedFiles: number,
+    changedLines: number | null,
+    repositoryId = "1".repeat(64),
+    workspaceId = "2".repeat(64),
+  ): string | undefined => projectStatsAggregationInput(
+    comparableHistoryEntry({
+      id: `bucket-${repositoryId[0]}-${workspaceId[0]}-${changedFiles}-${String(changedLines)}`,
+      createdAtMs: 1,
+      metric: 1,
+      selectorNumber: 42,
+      repositoryId,
+      workspaceId,
+      changedFiles,
+      changedLines,
+    }),
+  ).cohort_key;
+
+  const fileBuckets = [
+    [0],
+    [1],
+    [2, 3, 4],
+    [5, 9],
+    [10, 19],
+    [20, 49],
+    [50, 1_000],
+  ] as const;
+  const fileBucketKeys = fileBuckets.map((bucket) => {
+    const keys = bucket.map((files) => cohortKey(files, 199));
+    assert.equal(new Set(keys).size, 1);
+    return keys[0];
+  });
+  assert.equal(new Set(fileBucketKeys).size, fileBuckets.length);
+
+  const lineBuckets = [
+    [0],
+    [1, 9],
+    [10, 49],
+    [50, 199],
+    [200, 999],
+    [1_000, 10_000],
+  ] as const;
+  const lineBucketKeys = lineBuckets.map((bucket) => {
+    const keys = bucket.map((lines) => cohortKey(4, lines));
+    assert.equal(new Set(keys).size, 1);
+    return keys[0];
+  });
+  assert.equal(new Set(lineBucketKeys).size, lineBuckets.length);
+
+  const base = projectStatsAggregationInput(comparableHistoryEntry({
+    id: "exact-cohort-base",
+    createdAtMs: 1,
+    metric: 1,
+    changedFiles: 4,
+    changedLines: 199,
+  }));
+  assert.equal(base.repository_key, "1".repeat(64));
+  assert.equal(base.workspace_key, "2".repeat(64));
+  assert.equal(
+    cohortKey(2, 50),
+    base.cohort_key,
+    "exact counts inside the same fixed buckets remain comparable",
+  );
+  const changedDimensions = [
+    cohortKey(4, 199, "6".repeat(64), "2".repeat(64)),
+    cohortKey(4, 199, "1".repeat(64), "7".repeat(64)),
+    cohortKey(5, 199),
+    cohortKey(4, 200),
+  ];
+  for (const changed of changedDimensions) {
+    assert.ok(changed !== undefined);
+    assert.notEqual(changed, base.cohort_key);
+  }
+
+  const missingLines = projectStatsAggregationInput(comparableHistoryEntry({
+    id: "missing-lines",
+    createdAtMs: 2,
+    metric: 1,
+    changedLines: null,
+  }));
+  assert.equal(missingLines.cohort_key, undefined);
+  assert.ok(missingLines.reason_codes.includes("missing_changed_lines"));
+});
+
+test("baseline selects terminal exact cohorts before opaque self exclusion", () => {
+  const currentEntries = [
+    comparableHistoryEntry({
+      id: "current-state-a",
+      createdAtMs: 1_000,
+      metric: 900,
+      selectorNumber: 99,
+      displayRef: "shared-display-label",
+      gitState: "state-a",
+      analysisVariant: "a-original",
+    }),
+    comparableHistoryEntry({
+      id: "current-state-b",
+      createdAtMs: 2_000,
+      metric: 800,
+      selectorNumber: 99,
+      displayRef: "shared-display-label",
+      gitState: "state-b",
+      analysisVariant: "b",
+    }),
+    comparableHistoryEntry({
+      id: "current-state-a-variant",
+      createdAtMs: 3_000,
+      metric: 700,
+      selectorNumber: 99,
+      displayRef: "shared-display-label",
+      gitState: "state-a",
+      analysisVariant: "a-rerun",
+    }),
+  ];
+  const projectedCurrent = projectComparableHistory(currentEntries);
+  const selectedCurrent = selectTerminalSnapshots(projectedCurrent);
+  assert.deepEqual(
+    selectedCurrent.terminals.map(({ snapshot_id }) => snapshot_id),
+    [currentEntries[1]!.snapshot_id],
+    "state A keeps its first-seen time, so a later A variant cannot supersede B",
+  );
+  assert.equal(selectedCurrent.metadata.superseded_snapshot_count, 2);
+  const currentWorkUnitKey = projectedCurrent[0]?.work_unit_key;
+  const currentCohortKey = projectedCurrent[0]?.cohort_key;
+  assert.ok(currentWorkUnitKey !== undefined);
+  assert.ok(currentCohortKey !== undefined);
+  assert.ok(projectedCurrent.every(
+    ({ work_unit_key }) => work_unit_key === currentWorkUnitKey,
+  ));
+
+  const firstComparableStates = [
+    comparableHistoryEntry({
+      id: "comparable-one-old",
+      createdAtMs: 100,
+      metric: 1_000,
+      selectorNumber: 10,
+      gitState: "comparable-old",
+    }),
+    comparableHistoryEntry({
+      id: "comparable-one-terminal",
+      createdAtMs: 200,
+      metric: 1,
+      selectorNumber: 10,
+      gitState: "comparable-new",
+    }),
+  ];
+  const comparableEntries = [
+    ...firstComparableStates,
+    ...[2, 3, 4].map((metric, index) => comparableHistoryEntry({
+      id: `comparable-${metric}`,
+      createdAtMs: 300 + index,
+      metric,
+      selectorNumber: 11 + index,
+    })),
+    comparableHistoryEntry({
+      id: "same-display-different-selector",
+      createdAtMs: 400,
+      metric: 100,
+      displayRef: "shared-display-label",
+      selector: {
+        kind: "explicit_range",
+        range: "double_dot",
+        base_ref_digest: selectorRefDigest(
+          "explicit_range",
+          "base",
+          "main",
+        ),
+        head_ref_digest: selectorRefDigest(
+          "explicit_range",
+          "head",
+          "feature",
+        ),
+      },
+    }),
+  ];
+  const ineligibleComparables = [
+    comparableHistoryEntry({
+      id: "neighboring-file-bucket",
+      createdAtMs: 500,
+      metric: 5_000,
+      selectorNumber: 20,
+      changedFiles: 5,
+    }),
+    comparableHistoryEntry({
+      id: "neighboring-line-bucket",
+      createdAtMs: 501,
+      metric: 6_000,
+      selectorNumber: 21,
+      changedLines: 200,
+    }),
+    comparableHistoryEntry({
+      id: "different-repository",
+      createdAtMs: 502,
+      metric: 7_000,
+      selectorNumber: 22,
+      repositoryId: "6".repeat(64),
+    }),
+    comparableHistoryEntry({
+      id: "different-workspace",
+      createdAtMs: 503,
+      metric: 8_000,
+      selectorNumber: 23,
+      workspaceId: "7".repeat(64),
+    }),
+  ];
+  const currentMetrics = [{
+    metric: "human_wait_ratio",
+    value: 50,
+  }] as const;
+  const mode = {
+    mode: "analysis_current",
+    current_work_unit_key: currentWorkUnitKey,
+    current_cohort_key: currentCohortKey,
+  } as const;
+  const fourComparableWorkUnits = projectComparableHistory([
+    ...currentEntries,
+    ...comparableEntries.slice(0, -1),
+  ]);
+  assert.equal(
+    computeBaseline(currentMetrics, fourComparableWorkUnits, mode, 5),
+    null,
+  );
+
+  const projectedHistory = projectComparableHistory([
+    ...currentEntries,
+    ...comparableEntries,
+    ...ineligibleComparables,
+  ]);
+  const expected = {
+    prs: 5,
+    notable: [{
+      metric: "human_wait_ratio",
+      value: 50,
+      baseline: 3,
+      median: 3,
+      p50: 3,
+      p75: 4,
+      mad: 1,
+      sample_count: 5,
+    }],
+  };
+  assert.deepEqual(
+    computeBaseline(currentMetrics, projectedHistory, mode, 5),
+    expected,
+  );
+  assert.deepEqual(
+    computeBaseline(currentMetrics, [...projectedHistory].reverse(), mode, 5),
+    expected,
+  );
+  assert.equal(
+    computeBaseline(currentMetrics, projectedHistory, mode, 20),
+    null,
+  );
+
+  const twenty = Array.from({ length: 20 }, (_, index) =>
+    comparableHistoryEntry({
+      id: `floor-twenty-${index + 1}`,
+      createdAtMs: 10_000 + index,
+      metric: index + 1,
+      selectorNumber: 100 + index,
+    })
+  );
+  assert.deepEqual(
+    computeBaseline(currentMetrics, projectComparableHistory(twenty), mode, 20),
+    {
+      prs: 20,
+      notable: [{
+        metric: "human_wait_ratio",
+        value: 50,
+        baseline: 10.5,
+        median: 10.5,
+        p50: 10.5,
+        p75: 15.25,
+        mad: 5,
+        sample_count: 20,
+      }],
+    },
+  );
+});
+
+test("legacy mean-only baselines remain readable without robust labels", () => {
+  const legacy = record("legacy-mean-baseline", 900);
+  const normalized = makeAnalysisRecord({
+    ...legacy,
+    summary: {
+      ...legacy.summary,
+      baseline: {
+        prs: 3,
+        notable: [{
+          metric: "human_wait_ratio",
+          value: 0.5,
+          baseline: 0.25,
+        }],
+      },
+    },
+  });
+  assert.deepEqual(normalized.summary.baseline, {
+    prs: 3,
+    notable: [{
+      metric: "human_wait_ratio",
+      value: 0.5,
+      baseline: 0.25,
+    }],
+  });
+  assert.equal(
+    "median" in (normalized.summary.baseline?.notable[0] ?? {}),
+    false,
+  );
+});
 
 test("analysis records clone and persist optional terminal stats snapshots", async () => {
   const source = storedTerminalStatsSnapshot();
