@@ -1941,6 +1941,8 @@ test("analysis audit identities exclude execution fields and normalize snapshots
     merge_base_oid: "D".repeat(40),
     source_digest: "E".repeat(64),
     config_digest: "F".repeat(64),
+    policy_digest: "A".repeat(64),
+    history_digest: "B".repeat(64),
   };
   const expectedIdentity = {
     ...snapshot,
@@ -1950,6 +1952,8 @@ test("analysis audit identities exclude execution fields and normalize snapshots
     merge_base_oid: snapshot.merge_base_oid.toLowerCase(),
     source_digest: snapshot.source_digest.toLowerCase(),
     config_digest: snapshot.config_digest.toLowerCase(),
+    policy_digest: snapshot.policy_digest.toLowerCase(),
+    history_digest: snapshot.history_digest.toLowerCase(),
   };
 
   const first = analysisAuditIdentity(firstRecord, { snapshot });
@@ -1979,6 +1983,37 @@ test("analysis audit identities label omitted snapshots as content fallbacks", (
   assert.deepEqual(fallback.snapshot_identity, { mode: "content-fallback" });
   assert.notDeepEqual(fallback.snapshot_identity, canonical.snapshot_identity);
   assert.notEqual(fallback.snapshot_id, canonical.snapshot_id);
+});
+
+test("analysis audit identities reject hostile records without evaluating them", () => {
+  const canary = "AUDIT_IDENTITY_CANARY";
+  let getterReads = 0;
+  const accessor = record("audit-identity-accessor", 100) as AnalysisRecord & {
+    analysis_budget?: AnalysisBudgetResult;
+  };
+  Object.defineProperty(accessor, "analysis_budget", {
+    enumerable: true,
+    get() {
+      getterReads += 1;
+      throw new Error(canary);
+    },
+  });
+  let proxyReads = 0;
+  const proxy = new Proxy(record("audit-identity-proxy", 200), {
+    ownKeys() {
+      proxyReads += 1;
+      throw new Error(canary);
+    },
+  });
+
+  for (const hostile of [accessor, proxy]) {
+    assert.throws(() => analysisAuditIdentity(hostile), (error: unknown) => {
+      assert.ok(error instanceof TypeError);
+      assert.equal(error.message.includes(canary), false);
+      return true;
+    });
+  }
+  assert.deepEqual({ getterReads, proxyReads }, { getterReads: 0, proxyReads: 0 });
 });
 
 test("saved analysis audit identity matches its execution snapshot and replay", async () => {
