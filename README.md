@@ -95,11 +95,26 @@ ccprof hook-event [--notify]
 ccprof hooks install|uninstall [--global] [--yes]
 ccprof data gc|delete
 ccprof schema report-v3
+ccprof doctor [--json]
 ccprof --version
 ```
 
 `--version` (or `-v`) prints `ccprof <version>` and exits 0; `--help` (or `-h`)
 prints the usage above. When both are given, `--help` wins.
+
+### Doctor diagnostics
+
+`ccprof doctor [--json]` deterministically checks repository configuration,
+organization policy, built-in source capabilities, parser budgets, Store
+schema, migration status, open health, and encryption readiness. Messages are
+fixed and privacy-safe: configured paths, policy values, key material, and raw
+errors are never printed.
+
+Store inspection is read-only. Doctor does not create the Store, initialize it,
+migrate it, repair it, backfill it, vacuum it, chmod it, or otherwise modify it.
+A missing Store, operator-configurable parser budget profile, or encryption
+support is reported as a warning. Exit 0 means no check failed, exit 1 means at
+least one check failed, and exit 2 means invalid command usage.
 
 ### Published Report v3 schema
 

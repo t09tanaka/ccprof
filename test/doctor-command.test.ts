@@ -106,6 +106,32 @@ test("doctor preserves global help precedence", async (t) => {
   assert.deepEqual(result, { code: 0, stdout: USAGE, stderr: "" });
 });
 
+test("README documents the doctor command contract", async () => {
+  const readme = await readFile(join(process.cwd(), "README.md"), "utf8");
+  const prose = readme.replaceAll(/\s+/gu, " ");
+
+  assert.match(readme, /ccprof doctor \[--json\]/u);
+  for (const phrase of [
+    "configuration",
+    "organization policy",
+    "source capabilities",
+    "parser budgets",
+    "Store schema",
+    "migration",
+    "open health",
+    "encryption",
+  ]) {
+    assert.match(prose, new RegExp(phrase, "u"));
+  }
+  for (const property of ["deterministically", "privacy-safe", "read-only"]) {
+    assert.match(readme, new RegExp(property, "u"));
+  }
+  assert.match(prose, /Doctor does not create the Store/u);
+  assert.match(prose, /Exit 0 means no check failed/u);
+  assert.match(prose, /exit 1 means at least one check failed/u);
+  assert.match(prose, /exit 2 means invalid command usage/u);
+});
+
 test("doctor command exposes an empty warnings collection", async (t) => {
   const { repo, dataRoot } = await fixture(t);
   const result = await runDoctorCommand({
