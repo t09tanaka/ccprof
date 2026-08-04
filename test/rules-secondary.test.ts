@@ -480,6 +480,14 @@ test("R005 gates concrete parallel recipes on one signed safe domain", () => {
     "parallel_unsafe",
     "node-workspace",
   );
+  assert.match(
+    repositoryUnsafe.fix_recipe.suggestion,
+    /effective resource-domain policy/iu,
+  );
+  assert.doesNotMatch(
+    repositoryUnsafe.fix_recipe.suggestion,
+    /signed (?:organization|resource-domain) policy/iu,
+  );
 
   const repositoryCannotWiden = onlyR005(
     actions,
