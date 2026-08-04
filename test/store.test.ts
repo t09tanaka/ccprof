@@ -32,6 +32,7 @@ import { commandIdentityKey } from "../src/analysis/command-identity.js";
 import { detectChronicCost } from "../src/rules/chronic-cost.js";
 import { projectReportPrivacy } from "../src/reporters/privacy.js";
 import { findingKey } from "../src/rules/shared.js";
+import { selectorRefDigest } from "../src/git/pr-context.js";
 import {
   loadAdoptions,
   saveAdoptions,
@@ -44,6 +45,7 @@ import {
   makeAnalysisRecord,
   saveAnalysis,
   type AnalysisRecord,
+  type AnalysisSnapshotIdentity,
 } from "../src/store/analyses.js";
 import {
   applyDismissals,
@@ -1419,6 +1421,152 @@ test("rich snapshot input and normalized-result changes create distinct snapshot
   });
 });
 
+test("snapshot-aware history preserves records and exposes exact normalized entries", async () => {
+  await temporaryStore(async (paths) => {
+    const selector = {
+      kind: "explicit_range",
+      range: "double_dot",
+      base_ref_digest: selectorRefDigest("explicit_range", "base", "main"),
+      head_ref_digest: selectorRefDigest("explicit_range", "head", "feature"),
+    } as const;
+    const rawStateAIdentity = {
+      repo_id: "A".repeat(64),
+      base_oid: "B".repeat(40),
+      head_oid: "C".repeat(40),
+      merge_base_oid: "B".repeat(40),
+      window: {
+        started_at_ms: 1,
+        start_source: "commit_anchor_lookback",
+        end_source: "analysis_time",
+        completeness: "partial",
+      },
+      source_digest: "D".repeat(64),
+      config_digest: "E".repeat(64),
+      policy_digest: "F".repeat(64),
+      history_digest: "1".repeat(64),
+      selector,
+    } satisfies AnalysisSnapshotIdentity;
+    const stateAIdentity = {
+      ...rawStateAIdentity,
+      repo_id: rawStateAIdentity.repo_id.toLowerCase(),
+      base_oid: rawStateAIdentity.base_oid.toLowerCase(),
+      head_oid: rawStateAIdentity.head_oid.toLowerCase(),
+      merge_base_oid: rawStateAIdentity.merge_base_oid.toLowerCase(),
+      source_digest: rawStateAIdentity.source_digest.toLowerCase(),
+      config_digest: rawStateAIdentity.config_digest.toLowerCase(),
+      policy_digest: rawStateAIdentity.policy_digest.toLowerCase(),
+    } satisfies AnalysisSnapshotIdentity;
+    const stateBIdentity = {
+      ...stateAIdentity,
+      head_oid: "2".repeat(40),
+    } satisfies AnalysisSnapshotIdentity;
+    const stateAVariantIdentity = {
+      ...stateAIdentity,
+      history_digest: "3".repeat(64),
+    } satisfies AnalysisSnapshotIdentity;
+    const selectorlessIdentity = snapshotOptions("7".repeat(64)).snapshot;
+
+    const stateA = record("state-a", 1_000);
+    const stateB = record("state-b", 2_000);
+    const stateAVariant = {
+      ...stateA,
+      analysis_id: "state-a-variant",
+      created_at_ms: 3_000,
+    };
+    const selectorless = record("selectorless-legacy", 4_000);
+    const contentFallback = record("content-fallback-legacy", 5_000);
+    const stateARerun = {
+      ...stateA,
+      analysis_id: "state-a-rerun",
+      created_at_ms: 6_000,
+    };
+    await mkdir(paths.analyses_dir, { recursive: true });
+    await writeFile(
+      join(paths.analyses_dir, "content-fallback.json"),
+      `${JSON.stringify(contentFallback)}\n`,
+      "utf8",
+    );
+
+    assert.deepEqual(
+      (await saveAnalysis(paths, stateA, { snapshot: rawStateAIdentity })).warnings,
+      [],
+    );
+    assert.deepEqual(
+      (await saveAnalysis(paths, stateB, { snapshot: stateBIdentity })).warnings,
+      [],
+    );
+    assert.deepEqual(
+      (await saveAnalysis(paths, stateAVariant, {
+        snapshot: stateAVariantIdentity,
+      })).warnings,
+      [],
+    );
+    assert.deepEqual(
+      (await saveAnalysis(paths, selectorless, {
+        snapshot: selectorlessIdentity,
+      })).warnings,
+      [],
+    );
+    assert.deepEqual(
+      (await saveAnalysis(paths, stateARerun, { snapshot: stateAIdentity }))
+        .warnings,
+      [],
+    );
+
+    const snapshotId = (
+      storedRecord: AnalysisRecord,
+      identity: AnalysisSnapshotIdentity | { mode: "content-fallback" },
+    ): string => {
+      const {
+        analysis_id: _analysisId,
+        created_at_ms: _createdAtMs,
+        ...payload
+      } = storedRecord;
+      return analysisDigest("analysis-snapshot-v1", {
+        schema_version: 1,
+        identity,
+        payload,
+      });
+    };
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded.warnings, []);
+    assert.deepEqual(loaded.records, [
+      stateA,
+      stateB,
+      stateAVariant,
+      selectorless,
+      contentFallback,
+    ]);
+    assert.deepEqual(loaded.entries, [
+      {
+        snapshot_id: snapshotId(stateA, stateAIdentity),
+        identity: stateAIdentity,
+        record: stateA,
+      },
+      {
+        snapshot_id: snapshotId(stateB, stateBIdentity),
+        identity: stateBIdentity,
+        record: stateB,
+      },
+      {
+        snapshot_id: snapshotId(stateAVariant, stateAVariantIdentity),
+        identity: stateAVariantIdentity,
+        record: stateAVariant,
+      },
+      {
+        snapshot_id: snapshotId(selectorless, selectorlessIdentity),
+        identity: selectorlessIdentity,
+        record: selectorless,
+      },
+      {
+        snapshot_id: snapshotId(contentFallback, { mode: "content-fallback" }),
+        identity: { mode: "content-fallback" },
+        record: contentFallback,
+      },
+    ]);
+  });
+});
+
 test("analysis budget results save and load through normalized Store v4 rows", async () => {
   await temporaryStore(async (paths) => {
     const complete = budgetRecord("budget-complete", 100, "complete");
@@ -1515,7 +1663,8 @@ test("legacy analysis snapshots remain readable with no synthetic budget result"
     assert.deepEqual((await saveAnalysis(paths, legacy)).warnings, []);
 
     const loaded = await loadAnalyses(paths);
-    assert.deepEqual(loaded, { records: [legacy], warnings: [] });
+    assert.deepEqual(loaded.records, [legacy]);
+    assert.deepEqual(loaded.warnings, []);
     assert.equal("analysis_budget" in (loaded.records[0] ?? {}), false);
 
     const database = openStoreDatabase(paths);
@@ -1776,7 +1925,8 @@ test("legacy analysis migration leaves a non-directory source incomplete and ret
     );
 
     const retried = await loadAnalyses(paths);
-    assert.deepEqual(retried, { records: [repaired], warnings: [] });
+    assert.deepEqual(retried.records, [repaired]);
+    assert.deepEqual(retried.warnings, []);
     database = openStoreDatabase(paths);
     try {
       assert.equal(database.prepare(
@@ -1831,7 +1981,8 @@ test("legacy analysis migration rolls back rows and marker after an operational 
     }
 
     const retried = await loadAnalyses(paths);
-    assert.deepEqual(retried, { records: [legacy], warnings: [] });
+    assert.deepEqual(retried.records, [legacy]);
+    assert.deepEqual(retried.warnings, []);
     database = openStoreDatabase(paths);
     try {
       assert.equal(database.prepare(
@@ -1851,7 +2002,9 @@ test("legacy analysis migration rolls back rows and marker after an operational 
 
 test("completed legacy migration remains readable while another connection holds the writer lock", async () => {
   await temporaryStore(async (paths) => {
-    assert.deepEqual(await loadAnalyses(paths), { records: [], warnings: [] });
+    const initial = await loadAnalyses(paths);
+    assert.deepEqual(initial.records, []);
+    assert.deepEqual(initial.warnings, []);
 
     const writer = openStoreDatabase(paths);
     writer.exec("BEGIN IMMEDIATE");
@@ -1859,7 +2012,8 @@ test("completed legacy migration remains readable while another connection holds
       const startedAtMs = Date.now();
       const loaded = await loadAnalyses(paths);
       const elapsedMs = Date.now() - startedAtMs;
-      assert.deepEqual(loaded, { records: [], warnings: [] });
+      assert.deepEqual(loaded.records, []);
+      assert.deepEqual(loaded.warnings, []);
       assert.ok(
         elapsedMs < 2_000,
         `marker fast path waited ${elapsedMs}ms for an unnecessary writer lock`,
@@ -2982,13 +3136,13 @@ test("legacy finding normalization is idempotent across save, load, and migratio
     assert.deepEqual(saved.warnings, []);
     assert.deepEqual(saved.record, normalized);
     const loaded = await loadAnalyses(paths);
-    assert.deepEqual(loaded, { records: [normalized], warnings: [] });
+    assert.deepEqual(loaded.records, [normalized]);
+    assert.deepEqual(loaded.warnings, []);
     const savedAgain = await saveAnalysis(paths, loaded.records[0]!);
     assert.deepEqual(savedAgain, { record: normalized, warnings: [] });
-    assert.deepEqual(await loadAnalyses(paths), {
-      records: [normalized],
-      warnings: [],
-    });
+    const loadedAgain = await loadAnalyses(paths);
+    assert.deepEqual(loadedAgain.records, [normalized]);
+    assert.deepEqual(loadedAgain.warnings, []);
   });
 
   await temporaryStore(async (paths) => {
@@ -2998,14 +3152,12 @@ test("legacy finding normalization is idempotent across save, load, and migratio
       `${JSON.stringify(legacy)}\n`,
       "utf8",
     );
-    assert.deepEqual(await loadAnalyses(paths), {
-      records: [normalized],
-      warnings: [],
-    });
-    assert.deepEqual(await loadAnalyses(paths), {
-      records: [normalized],
-      warnings: [],
-    });
+    const migrated = await loadAnalyses(paths);
+    assert.deepEqual(migrated.records, [normalized]);
+    assert.deepEqual(migrated.warnings, []);
+    const loadedAgain = await loadAnalyses(paths);
+    assert.deepEqual(loadedAgain.records, [normalized]);
+    assert.deepEqual(loadedAgain.warnings, []);
   });
 });
 
