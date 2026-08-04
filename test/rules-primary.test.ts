@@ -27,8 +27,11 @@ import type {
   GenuineUserEvent,
   ImpactEstimate,
   MatchedAction,
+  NormalizedEvent,
   Session,
   TimelineAction,
+  ToolResultEvent,
+  ToolUseEvent,
 } from "../src/core/model.js";
 import { commandIdentityKey } from "../src/analysis/command-identity.js";
 import {
@@ -43,7 +46,15 @@ import {
   type StoredReadObservation,
 } from "../src/store/analyses.js";
 import { resolveStorePaths } from "../src/store/paths.js";
-import type { AttributedTimelineAction } from "../src/analysis/timeline.js";
+import {
+  buildTimeline,
+  type AttributedTimelineAction,
+} from "../src/analysis/timeline.js";
+import {
+  resolveRuleSafetyPolicy,
+  type EffectiveRuleSafetyPolicy,
+  type RepositoryApprovalRulePolicy,
+} from "../src/policy/rule-safety.js";
 import {
   createFindingCandidate,
   findingKey,
@@ -194,6 +205,136 @@ function assistantEvent(
     kind: "assistant",
     text,
   };
+}
+
+function approvalToolUse(
+  toolUseId: string,
+  command: string,
+  sourceIndex: number,
+  timestampMs = 0,
+): ToolUseEvent {
+  return {
+    ...eventBase(`use-${toolUseId}`, timestampMs, sourceIndex),
+    kind: "tool_use",
+    tool_use_id: toolUseId,
+    tool_name: "Bash",
+    input: { command },
+    paths: [],
+    edit_fragments: [],
+    command,
+    approval: {
+      required: true,
+      reason: "Bash requires approval",
+    },
+  };
+}
+
+function successfulToolResult(
+  toolUseId: string,
+  sourceIndex: number,
+  timestampMs = 110,
+): ToolResultEvent {
+  return {
+    ...eventBase(`result-${toolUseId}`, timestampMs, sourceIndex),
+    kind: "tool_result",
+    tool_use_id: toolUseId,
+    status: "success",
+    output: "ok",
+    output_bytes: 2,
+    estimated_tokens: 1,
+  };
+}
+
+function timelineSession(events: readonly NormalizedEvent[]): Session {
+  const timestamps = events.map((event) => event.timestamp_ms);
+  return {
+    session_id: "s1",
+    source: "claude",
+    source_path: "/tmp/r004-session.jsonl",
+    observed_cwds: ["/repo"],
+    observed_branches: ["feature/r004"],
+    started_at_ms: Math.min(...timestamps),
+    ended_at_ms: Math.max(...timestamps),
+    confidence: "high",
+    events: [...events],
+    warnings: [],
+  };
+}
+
+function approvalWait(
+  actionId: string,
+  startMs: number,
+  endMs: number,
+  command?: string,
+): AttributedTimelineAction {
+  return {
+    ...timelineAction(actionId, startMs, endMs, {
+      kind: "human_wait",
+      ...(command === undefined ? {} : { command }),
+    }),
+    approval: {
+      required: true,
+      reason: "Bash requires approval",
+    },
+  };
+}
+
+interface R004TestOptions {
+  assistantEvents?: readonly AssistantEvent[];
+  sourceCompleteness?: number;
+  ruleSafety?: EffectiveRuleSafetyPolicy;
+}
+
+function detectR004(
+  actions: readonly AttributedTimelineAction[],
+  options: R004TestOptions = {},
+): FindingCandidate[] {
+  return detectHumanWait(actions, options);
+}
+
+function approvalRuleSafety(
+  organizationPatterns: readonly string[] = ["npm *"],
+  organizationAllows = true,
+  repositoryApproval?: RepositoryApprovalRulePolicy,
+): EffectiveRuleSafetyPolicy {
+  return resolveRuleSafetyPolicy(
+    {
+      safe_patterns: [...organizationPatterns],
+      allow_rule_recommendation: organizationAllows,
+    },
+    [],
+    repositoryApproval,
+  );
+}
+
+function genericR004(
+  findings: readonly FindingCandidate[],
+  observedApprovalMs: number,
+): FindingCandidate {
+  const finding = findings.find(
+    ({ evidence }) =>
+      evidence.latency_classification === "approval_policy_latency",
+  );
+  assert.ok(finding, "missing generic R004 observation");
+  assert.equal(finding.target, "approval-policy-latency");
+  assert.equal("canonical_commands" in finding.evidence, false);
+  assert.deepEqual(finding.impact, {
+    lower_ms: 0,
+    upper_ms: observedApprovalMs,
+    kind: "critical_path_latency",
+  });
+  assert.equal(
+    finding.recoverable.bound,
+    observedApprovalMs === 0 ? "point" : "upper",
+  );
+  assert.equal(finding.recoverable.estimated_ms, observedApprovalMs);
+  assert.equal(
+    finding.fix_recipe.suggestion,
+    "Review whether the measured approval latency is required by policy before changing permissions.",
+  );
+  assert.doesNotMatch(finding.fix_recipe.suggestion, /allowlist/iu);
+  assert.equal(finding.fix_recipe.verify, "ccprof --json");
+  return finding;
 }
 
 function historyRecord(
@@ -1883,7 +2024,75 @@ test("analyze stores frozen-head reads, caps session confidence, and omits unver
   }
 });
 
-test("R004 reports all active wait but claims only explicit or tightly phrased approvals", () => {
+test("timeline binds one same-turn approval command only to its causal human wait", () => {
+  const use = approvalToolUse("approved", "npm test", 1);
+  const timeline = buildTimeline([
+    timelineSession([
+      assistantEvent("This command needs approval.", 0, "approval-prompt"),
+      use,
+      userEvent("approved", 100, "approval-answer"),
+      successfulToolResult(use.tool_use_id, 3),
+      assistantEvent("Do you want a summary?", 200, "ordinary-prompt"),
+      userEvent("yes", 300, "ordinary-answer"),
+    ]),
+  ]);
+  const waits = timeline.actions.filter(({ kind }) => kind === "human_wait");
+
+  assert.equal(waits.length, 2);
+  const approval = waits.find(({ interval }) => interval.start_ms === 0);
+  const unrelated = waits.find(({ interval }) => interval.start_ms === 200);
+  assert.ok(approval);
+  assert.ok(unrelated);
+  assert.equal(approval.command, "npm test");
+  assert.deepEqual(approval.approval, {
+    required: true,
+    reason: "Bash requires approval",
+  });
+  assert.equal("command" in unrelated, false);
+  assert.equal("approval" in unrelated, false);
+});
+
+test("timeline makes multiple same-turn approval commands irreversibly ambiguous", () => {
+  const uses = [
+    approvalToolUse("first", "npm test", 1),
+    approvalToolUse("second", "cargo test", 2),
+    approvalToolUse("later", "pnpm test", 3),
+  ] as const;
+  const permutations = [
+    [uses[0], uses[1], uses[2]],
+    [uses[0], uses[2], uses[1]],
+    [uses[1], uses[0], uses[2]],
+    [uses[1], uses[2], uses[0]],
+    [uses[2], uses[0], uses[1]],
+    [uses[2], uses[1], uses[0]],
+  ] as const;
+  const serialized = permutations.map((orderedUses) => {
+    const timeline = buildTimeline([
+      timelineSession([
+        assistantEvent("Choose whether to approve.", 0, "prompt"),
+        ...orderedUses,
+        userEvent("approved", 100, "answer"),
+        ...uses.map((use, index) =>
+          successfulToolResult(use.tool_use_id, 4 + index, 110 + index)
+        ),
+      ]),
+    ]);
+    const wait = timeline.actions.find(({ kind }) => kind === "human_wait") as
+      | (AttributedTimelineAction & {
+        approval_command_ambiguous?: boolean;
+      })
+      | undefined;
+    assert.ok(wait);
+    assert.equal(wait.approval?.required, true);
+    assert.equal(wait.approval_command_ambiguous, true);
+    assert.equal("command" in wait, false);
+    return JSON.stringify(wait);
+  });
+
+  assert.equal(new Set(serialized).size, 1);
+});
+
+test("R004 keeps unproven or unsafe approval latency generic", () => {
   assert.deepEqual(APPROVAL_PROMPT_PHRASES, [
     "allow this command",
     "approval required",
@@ -1893,78 +2102,236 @@ test("R004 reports all active wait but claims only explicit or tightly phrased a
     "承認が必要",
     "許可が必要",
   ]);
-  const waits: AttributedTimelineAction[] = [
+
+  const phraseWait: AttributedTimelineAction = {
+    ...timelineAction("phrase", 0, 200, {
+      kind: "human_wait",
+      session_refs: ["s1#approval-prompt", "s1#phrase-end"],
+    }),
+  };
+  const signedWildcard = approvalRuleSafety(["*"]);
+  const cases: Array<{
+    name: string;
+    actions: AttributedTimelineAction[];
+    options?: R004TestOptions;
+    observedMs: number;
+  }> = [
     {
-      ...timelineAction("explicit", 0, 120, { kind: "human_wait" }),
-      approval: { required: true, reason: "Bash requires approval" },
+      name: "one authorized occurrence is not a repeated pattern",
+      actions: [approvalWait("one", 0, 100, "npm test")],
+      options: { ruleSafety: approvalRuleSafety() },
+      observedMs: 100,
     },
     {
-      ...timelineAction("ordinary", 200, 700, { kind: "human_wait" }),
+      name: "phrase-only approval has no causal command",
+      actions: [phraseWait],
+      options: {
+        assistantEvents: [
+          assistantEvent(
+            "Permission required. Please approve this command.",
+            0,
+            "approval-prompt",
+          ),
+        ],
+        ruleSafety: approvalRuleSafety(),
+      },
+      observedMs: 200,
     },
     {
-      ...timelineAction("phrase", 800, 1_000, {
-        kind: "human_wait",
-        session_refs: ["s1#approval-prompt", "s1#phrase-end"],
-      }),
+      name: "organization policy is absent",
+      actions: [approvalWait("absent", 0, 100, "npm test")],
+      observedMs: 100,
     },
     {
-      ...timelineAction("away", 1_000, 5_000, { kind: "away" }),
-      approval: { required: true },
+      name: "organization recommendation is denied",
+      actions: [approvalWait("organization-deny", 0, 100, "npm test")],
+      options: { ruleSafety: approvalRuleSafety(["npm *"], false) },
+      observedMs: 100,
+    },
+    {
+      name: "repository recommendation is denied",
+      actions: [approvalWait("repository-deny", 0, 100, "npm test")],
+      options: {
+        ruleSafety: approvalRuleSafety(["npm *"], true, {
+          allow_rule_recommendation: false,
+        }),
+      },
+      observedMs: 100,
+    },
+    {
+      name: "repository patterns tighten the organization intersection",
+      actions: [approvalWait("intersection", 0, 100, "npm test")],
+      options: {
+        ruleSafety: approvalRuleSafety(["npm *"], true, {
+          safe_patterns: ["cargo *"],
+        }),
+      },
+      observedMs: 100,
+    },
+    ...[
+      ["unsafe removal", "rm -rf ."],
+      ["unknown executable", "mystery --help"],
+      ["shell assignment", "CI=1 npm test"],
+      ["output redirect", "npm test > result.log"],
+      ["composite shell command", "npm test && npm test"],
+    ].map(([name, command], index) => ({
+      name: name ?? `unsafe-${index}`,
+      actions: [approvalWait(`unsafe-${index}`, 0, 100, command)],
+      options: { ruleSafety: signedWildcard },
+      observedMs: 100,
+    })),
+  ];
+
+  for (const fixture of cases) {
+    const findings = detectR004(fixture.actions, fixture.options);
+    assert.equal(findings.length, 1, fixture.name);
+    const finding = genericR004(findings, fixture.observedMs);
+    assert.deepEqual(
+      finding.scoring_rationale,
+      ["estimated_upper_only", "policy_dependent"],
+      fixture.name,
+    );
+  }
+
+  const phraseFinding = genericR004(
+    detectR004([phraseWait], cases[1]?.options),
+    200,
+  );
+  assert.ok(
+    phraseFinding.caveats.some((caveat) => /phrase/iu.test(caveat)),
+  );
+});
+
+test("R004 emits one aggregated repeated-safe candidate at two or more occurrences", () => {
+  const ruleSafety = approvalRuleSafety(["npm *"]);
+  for (const count of [2, 3]) {
+    const actions = Array.from({ length: count }, (_, index) =>
+      approvalWait(
+        `repeat-${count}-${index}`,
+        index * 200,
+        index * 200 + 100,
+        index === 0 ? "  npm\t test  " : "npm test",
+      )
+    );
+    const findings = detectR004(actions, { ruleSafety });
+
+    assert.equal(findings.length, 1, `count=${count}`);
+    const repeated = findings[0];
+    assert.ok(repeated);
+    assert.equal(
+      repeated.evidence.latency_classification,
+      "repeated_safe_approval_latency",
+    );
+    assert.equal(repeated.target, "repeated-safe-approval-latency");
+    assert.deepEqual(repeated.evidence.canonical_commands, ["npm test"]);
+    assert.deepEqual(repeated.impact, {
+      lower_ms: 0,
+      upper_ms: count * 100,
+      kind: "critical_path_latency",
+    });
+    assert.equal(repeated.recoverable.bound, "upper");
+    assert.equal(repeated.recoverable.estimated_ms, count * 100);
+    assert.match(repeated.fix_recipe.suggestion, /allowlist/iu);
+    assert.equal(repeated.fix_recipe.verify, "ccprof --json");
+    assert.deepEqual(repeated.scoring_rationale, [
+      "estimated_upper_only",
+      "policy_dependent",
+    ]);
+  }
+});
+
+test("R004 partitions denied actions from sorted repeated-safe command groups", () => {
+  const findings = detectR004([
+    approvalWait("npm-1", 0, 100, "npm test"),
+    approvalWait("cargo-1", 200, 300, "cargo test"),
+    approvalWait("unsafe", 400, 500, "rm -rf ."),
+    approvalWait("npm-2", 600, 700, "npm test"),
+    approvalWait("cargo-2", 800, 900, "cargo test"),
+  ], {
+    ruleSafety: approvalRuleSafety(["npm *", "cargo *"]),
+  });
+
+  assert.equal(findings.length, 2);
+  const generic = genericR004(findings, 100);
+  const repeated = findings.find(
+    ({ evidence }) =>
+      evidence.latency_classification === "repeated_safe_approval_latency",
+  );
+  assert.ok(repeated);
+  assert.deepEqual(repeated.evidence.canonical_commands, [
+    "cargo test",
+    "npm test",
+  ]);
+  assert.deepEqual(repeated.impact, {
+    lower_ms: 0,
+    upper_ms: 400,
+    kind: "critical_path_latency",
+  });
+  assert.equal(generic.evidence.approval_count, 1);
+});
+
+test("R004 emits a harmless point-zero observation without approval evidence", () => {
+  const ordinary: AttributedTimelineAction = {
+    ...timelineAction("ordinary", 0, 500, { kind: "human_wait" }),
+  };
+  const findings = detectR004([ordinary], {
+    ruleSafety: approvalRuleSafety(),
+  });
+
+  assert.equal(findings.length, 1);
+  const generic = genericR004(findings, 0);
+  assert.deepEqual(generic.scoring_rationale, ["policy_dependent"]);
+  assert.deepEqual(generic.recoverable.intervals, []);
+  assert.equal(generic.evidence.approval_count, 0);
+  assert.equal(generic.evidence.total_wait_ms, 500);
+});
+
+test("R004 fails the complete recommendation decision closed at every limit overflow", () => {
+  const actionOverflow = Array.from({ length: 65 }, (_, index) =>
+    approvalWait(`action-${index}`, index * 2, index * 2 + 1, "npm test")
+  );
+  const distinctOverflow = Array.from({ length: 33 }, (_, index) =>
+    approvalWait(
+      `distinct-${index}`,
+      index * 2,
+      index * 2 + 1,
+      `npm test -- case-${index}`,
+    )
+  );
+  const prefix = "npm test -- ";
+  const expensiveCommand = `${prefix}${"a".repeat(
+    4_096 - Buffer.byteLength(prefix),
+  )}`;
+  const expensiveMisses = Array.from(
+    { length: 16 },
+    (_, index) => `*never-${index.toString().padStart(2, "0")}`,
+  );
+  const fixtures = [
+    {
+      name: "65 actions",
+      actions: actionOverflow,
+      policy: approvalRuleSafety(["npm *"]),
+      observedMs: 65,
+    },
+    {
+      name: "33 distinct commands",
+      actions: distinctOverflow,
+      policy: approvalRuleSafety(["npm *"]),
+      observedMs: 33,
+    },
+    {
+      name: "shared step budget",
+      actions: [approvalWait("step-budget", 0, 1, expensiveCommand)],
+      policy: approvalRuleSafety([...expensiveMisses, "npm *"]),
+      observedMs: 1,
     },
   ];
 
-  const finding = detectHumanWait(waits, {
-    assistantEvents: [
-      assistantEvent(
-        "Permission required. Please approve this command.",
-        800,
-        "approval-prompt",
-      ),
-    ],
-  })[0];
-  assert.ok(finding !== undefined);
-  assert.equal(finding.rule_id, "R004");
-  assert.equal(finding.classification, "config");
-  assert.equal(finding.scope, "separate_issue");
-  assert.equal(finding.cause, null);
-  assert.equal(finding.confidence, "medium");
-  assert.equal(finding.finding_key, findingKey("R004", "approval-wait"));
-  assert.equal(finding.evidence.count, 3);
-  assert.equal(finding.evidence.approval_count, 2);
-  assert.equal(finding.evidence.total_wait_ms, 820);
-  assert.equal(finding.evidence.approval_wait_ms, 320);
-  assert.deepEqual(finding.evidence.interval_ids, [
-    "R004:explicit",
-    "R004:ordinary",
-    "R004:phrase",
-  ]);
-  assert.deepEqual(finding.recoverable.intervals.map((entry) => entry.interval_id), [
-    "R004:explicit",
-    "R004:phrase",
-  ]);
-  assert.equal(finding.recoverable.estimated_ms, 320);
-  assert.equal(finding.recoverable.bound, "point");
-  assertCanonicalCandidate(finding, {
-    impact: {
-      lower_ms: 320,
-      upper_ms: 320,
-      kind: "critical_path_latency",
-    },
-    finding_confidence: {
-      evidence: "medium",
-      causal: "medium",
-      source_completeness: 1,
-    },
-    severity: "medium",
-    scoring_rationale: ["observed_lower_bound", "policy_dependent"],
-    confidence: "medium",
-  });
-  assert.notEqual(finding.fix_recipe.suggestion, "");
-  assert.notEqual(finding.fix_recipe.verify, "");
-  assert.ok(
-    finding.caveats.some((caveat) => /evidence only/iu.test(caveat)),
-  );
-  assert.ok(
-    finding.caveats.some((caveat) => /phrase/iu.test(caveat)),
-  );
+  for (const fixture of fixtures) {
+    const findings = detectR004(fixture.actions, {
+      ruleSafety: fixture.policy,
+    });
+    assert.equal(findings.length, 1, fixture.name);
+    genericR004(findings, fixture.observedMs);
+  }
 });
