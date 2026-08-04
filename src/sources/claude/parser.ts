@@ -1,5 +1,6 @@
 import { open as openFile, type FileHandle } from "node:fs/promises";
 import { basename } from "node:path";
+import { types as utilTypes } from "node:util";
 
 import {
   makeSessionRef,
@@ -1030,9 +1031,15 @@ function snapshotJson(
     capacity.addBytes(canonicalJsonBytes(value));
     return value;
   }
+  if (typeof value !== "object" || value === undefined) {
+    throw new TypeError("Invalid parser-state value.");
+  }
+  if (utilTypes.isProxy(value)) {
+    throw new TypeError("Parser-state proxies are forbidden.");
+  }
   if (Array.isArray(value)) {
     const descriptors = Object.getOwnPropertyDescriptors(value);
-    const keys = Reflect.ownKeys(value);
+    const keys = Reflect.ownKeys(descriptors);
     if (
       keys.length !== value.length + 1 ||
       keys.some((key) =>
@@ -1057,21 +1064,19 @@ function snapshotJson(
     const result: JsonValue[] = [];
     for (let index = 0; index < value.length; index += 1) {
       if (index > 0) capacity.addBytes(1);
-      result.push(snapshotJson(value[index], capacity, depth + 1));
+      const descriptor = descriptors[index.toString(10)]!;
+      result.push(snapshotJson(descriptor.value, capacity, depth + 1));
     }
     capacity.addBytes(1);
     return result;
-  }
-  if (typeof value !== "object" || value === undefined) {
-    throw new TypeError("Invalid parser-state value.");
   }
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) {
     throw new TypeError("Parser-state objects must be plain objects.");
   }
-  const result: JsonObject = {};
+  const result = Object.create(null) as JsonObject;
   const descriptors = Object.getOwnPropertyDescriptors(value);
-  const keys = Reflect.ownKeys(value);
+  const keys = Reflect.ownKeys(descriptors);
   capacity.addBytes(1);
   for (let index = 0; index < keys.length; index += 1) {
     const key = keys[index]!;
@@ -1087,7 +1092,12 @@ function snapshotJson(
     }
     if (index > 0) capacity.addBytes(1);
     capacity.addBytes(canonicalJsonStringBytes(key) + 1);
-    result[key] = snapshotJson(descriptor.value, capacity, depth + 1);
+    Object.defineProperty(result, key, {
+      value: snapshotJson(descriptor.value, capacity, depth + 1),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
   }
   capacity.addBytes(1);
   return result;
@@ -1441,10 +1451,16 @@ export function normalizeClaudeParserState(value: unknown): ClaudeParserStateV1 
     const line = nonnegativeInteger(row.line);
     const sourceIndex = nonnegativeInteger(row.source_index);
     nonnegativeInteger(row.timestamp_ms);
+    const terminatorBytes = byteEnd - byteStart - originalBytes;
+    const reachesProgress = byteEnd === parsedOffset;
     if (
       line < 1 || line <= previousLine || sourceIndex !== line - 1 ||
-      byteStart < previousEnd || byteEnd < byteStart ||
-      byteEnd - byteStart < originalBytes || byteEnd > parsedOffset
+      originalBytes === 0 || byteStart < previousEnd || byteEnd < byteStart ||
+      terminatorBytes < 0 || terminatorBytes > 2 ||
+      (terminatorBytes === 0 && !reachesProgress) ||
+      (reachesProgress &&
+        cloned.ends_with_newline !== (terminatorBytes > 0)) ||
+      byteEnd > parsedOffset
     ) throw new TypeError("Inconsistent Claude physical row indexes.");
     stateString(row.session_id);
     stateString(row.entry_uuid);
@@ -1891,6 +1907,7 @@ export async function readClaudeParserState(options: {
 async function readRows(
   sourcePath: string,
   options: ClaudeTranscriptParseOptions,
+  fileHandle: FileHandle,
 ): Promise<{ rows: ParsedRow[]; warnings: PendingWarning[];
   tracker: JsonlBudgetTracker }> {
   const tracker = new JsonlBudgetTracker(options);
@@ -1903,9 +1920,24 @@ async function readRows(
       "Suppressed further parser warnings after reaching maxWarnings.",
     ),
   );
+  let readStopIndex = 0;
+  const pushReadStops = (): void => {
+    while (readStopIndex < tracker.readStops.length) {
+      warnings.push(parserBudgetWarning(
+        sourcePath,
+        tracker.readStops[readStopIndex]!,
+      ));
+      readStopIndex += 1;
+    }
+  };
 
   try {
-    for await (const inputLine of boundedJsonlLines(sourcePath, tracker)) {
+    for await (const inputLine of boundedJsonlLines(sourcePath, tracker, {
+      file_handle: fileHandle,
+      start_offset: 0,
+      starting_line: 1,
+    })) {
+      pushReadStops();
       const { text: rawLine, bytes: rawBytes, line } = inputLine;
     if (rawLine.trim().length === 0) {
       warnings.push(
@@ -2034,6 +2066,7 @@ async function readRows(
       );
     }
     }
+    pushReadStops();
   } catch (error) {
     tracker.throwIfAborted();
     if (!(error instanceof ParserBudgetExceededError)) throw error;
@@ -2853,9 +2886,14 @@ export function projectClaudeParserState(
 
 async function parseClaudeTranscriptDetailedLegacy(
   sourcePath: string,
-  instrumentation: ClaudeTranscriptParseOptions = {},
+  instrumentation: ClaudeTranscriptParseOptions,
+  fileHandle: FileHandle,
 ): Promise<ClaudeTranscriptParseResult> {
-  const { rows, warnings, tracker } = await readRows(sourcePath, instrumentation);
+  const { rows, warnings, tracker } = await readRows(
+    sourcePath,
+    instrumentation,
+    fileHandle,
+  );
   const grouped = new Map<string, ParsedRow[]>();
   for (const row of rows) {
     tracker.throwIfAborted();
@@ -2923,11 +2961,15 @@ export async function parseClaudeTranscriptDetailed(
       });
     } catch (error) {
       if (!(error instanceof IncrementalParserStateCapacityError)) throw error;
+      return await parseClaudeTranscriptDetailedLegacy(
+        sourcePath,
+        instrumentation,
+        fileHandle,
+      );
     }
   } finally {
     await fileHandle.close();
   }
-  return parseClaudeTranscriptDetailedLegacy(sourcePath, instrumentation);
 }
 
 export async function parseClaudeTranscript(

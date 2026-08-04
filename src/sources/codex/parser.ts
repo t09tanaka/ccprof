@@ -1,5 +1,6 @@
 import { open as openFile, type FileHandle } from "node:fs/promises";
 import { basename } from "node:path";
+import { types as utilTypes } from "node:util";
 
 import {
   makeSessionRef,
@@ -221,9 +222,15 @@ function snapshotCodexJson(
     capacity.addBytes(canonicalJsonBytes(value));
     return value;
   }
+  if (typeof value !== "object" || value === undefined) {
+    throw new TypeError("Invalid parser-state value.");
+  }
+  if (utilTypes.isProxy(value)) {
+    throw new TypeError("Parser-state proxies are forbidden.");
+  }
   if (Array.isArray(value)) {
     const descriptors = Object.getOwnPropertyDescriptors(value);
-    const keys = Reflect.ownKeys(value);
+    const keys = Reflect.ownKeys(descriptors);
     if (
       keys.length !== value.length + 1 ||
       keys.some((key) =>
@@ -248,21 +255,23 @@ function snapshotCodexJson(
     const result: JsonValue[] = [];
     for (let index = 0; index < value.length; index += 1) {
       if (index > 0) capacity.addBytes(1);
-      result.push(snapshotCodexJson(value[index], capacity, depth + 1));
+      const descriptor = descriptors[index.toString(10)]!;
+      result.push(snapshotCodexJson(
+        descriptor.value,
+        capacity,
+        depth + 1,
+      ));
     }
     capacity.addBytes(1);
     return result;
-  }
-  if (typeof value !== "object" || value === undefined) {
-    throw new TypeError("Invalid parser-state value.");
   }
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) {
     throw new TypeError("Parser-state objects must be plain objects.");
   }
-  const result: JsonObject = {};
+  const result = Object.create(null) as JsonObject;
   const descriptors = Object.getOwnPropertyDescriptors(value);
-  const keys = Reflect.ownKeys(value);
+  const keys = Reflect.ownKeys(descriptors);
   capacity.addBytes(1);
   for (let index = 0; index < keys.length; index += 1) {
     const key = keys[index]!;
@@ -278,7 +287,12 @@ function snapshotCodexJson(
     }
     if (index > 0) capacity.addBytes(1);
     capacity.addBytes(canonicalJsonStringBytes(key) + 1);
-    result[key] = snapshotCodexJson(descriptor.value, capacity, depth + 1);
+    Object.defineProperty(result, key, {
+      value: snapshotCodexJson(descriptor.value, capacity, depth + 1),
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
   }
   capacity.addBytes(1);
   return result;
@@ -500,9 +514,15 @@ export function normalizeCodexParserState(value: unknown): CodexParserStateV1 {
     const byteEnd = codexNonnegativeInteger(row.byte_end);
     const line = codexNonnegativeInteger(row.line);
     codexSafeInteger(row.timestamp_ms);
+    const terminatorBytes = byteEnd - byteStart - originalBytes;
+    const reachesProgress = byteEnd === parsedOffset;
     if (
-      line < 1 || line <= previousLine || byteStart < previousEnd ||
-      byteEnd < byteStart || byteEnd - byteStart < originalBytes ||
+      line < 1 || line <= previousLine || originalBytes === 0 ||
+      byteStart < previousEnd || byteEnd < byteStart ||
+      terminatorBytes < 0 || terminatorBytes > 2 ||
+      (terminatorBytes === 0 && !reachesProgress) ||
+      (reachesProgress &&
+        cloned.ends_with_newline !== (terminatorBytes > 0)) ||
       byteEnd > parsedOffset
     ) throw new TypeError("Inconsistent Codex physical row indexes.");
     validateCodexStatePayload(row.type, row.payload);
@@ -941,6 +961,7 @@ export async function readCodexParserState(options: {
 
 async function parseRows(
   options: ParseCodexSessionOptions,
+  fileHandle: FileHandle,
 ): Promise<{ rows: ParsedRow[]; warnings: SourceWarning[];
   tracker: JsonlBudgetTracker;
   firstBudgetError: ParserBudgetExceededError | undefined }> {
@@ -957,9 +978,25 @@ async function parseRows(
   );
   const rows: ParsedRow[] = [];
   let firstBudgetError: ParserBudgetExceededError | undefined;
+  let readStopIndex = 0;
+  const pushReadStops = (): void => {
+    while (readStopIndex < tracker.readStops.length) {
+      const error = tracker.readStops[readStopIndex]!;
+      firstBudgetError ??= error;
+      warnings.push(
+        warn(sourcePath, error.line, budgetWarningCode(error), error.message),
+      );
+      readStopIndex += 1;
+    }
+  };
 
   try {
-    for await (const inputLine of boundedJsonlLines(sourcePath, tracker)) {
+    for await (const inputLine of boundedJsonlLines(sourcePath, tracker, {
+      file_handle: fileHandle,
+      start_offset: 0,
+      starting_line: 1,
+    })) {
+      pushReadStops();
       const { text: rawLine, bytes: rawBytes, line } = inputLine;
     if (rawLine.trim().length === 0) {
       continue;
@@ -1036,6 +1073,7 @@ async function parseRows(
     }
     rows.push({ type, payload: parsed.payload, timestampMs, line });
     }
+    pushReadStops();
   } catch (error) {
     tracker.throwIfAborted();
     if (!(error instanceof ParserBudgetExceededError)) throw error;
@@ -1596,8 +1634,12 @@ export function projectCodexParserState(
 
 async function parseCodexSessionLegacy(
   options: ParseCodexSessionOptions,
+  fileHandle: FileHandle,
 ): Promise<Session | null> {
-  const { rows, warnings, tracker, firstBudgetError } = await parseRows(options);
+  const { rows, warnings, tracker, firstBudgetError } = await parseRows(
+    options,
+    fileHandle,
+  );
   return projectCodexRows(
     options.sourcePath,
     rows,
@@ -1628,9 +1670,9 @@ export async function parseCodexSession(
       });
     } catch (error) {
       if (!(error instanceof IncrementalParserStateCapacityError)) throw error;
+      return await parseCodexSessionLegacy(options, fileHandle);
     }
   } finally {
     await fileHandle.close();
   }
-  return parseCodexSessionLegacy(options);
 }
