@@ -43,7 +43,12 @@ import {
   type StatsAggregationInput,
 } from "../src/analysis/stats-input.js";
 import { commandIdentityKey } from "../src/analysis/command-identity.js";
-import { detectChronicCost } from "../src/rules/chronic-cost.js";
+import { buildChronicCostMaterializationEntries } from "../src/core/analyze.js";
+import {
+  buildChronicCostAggregates,
+  materializeChronicCostFindings,
+  type ChronicCostAggregate,
+} from "../src/rules/chronic-cost.js";
 import { projectReportPrivacy } from "../src/reporters/privacy.js";
 import {
   findingKey,
@@ -3522,175 +3527,6 @@ test("blocked SQLite store paths retain dismissal and adoption warning codes", a
   });
 });
 
-function r006FindingKey(identity: CommandIdentity): string {
-  return findingKey("R006", `command-identity:${Buffer.from(
-    commandIdentityKey(identity), "utf8").toString("hex")}`);
-}
-test("R006 requires five histories, identity presence in three, and a 30 percent cost ratio", () => {
-  const api = commandIdentity("packages/api");
-  const qualifying = Array.from({ length: 5 }, (_, index) =>
-    record(`r006-${index}`, index, {
-      commandMin: index < 3 ? 50 : 0,
-      includeCommand: index < 3,
-      commandIdentity: api,
-    })
-  );
-  const findings = detectChronicCost(qualifying);
-  assert.equal(findings.length, 1);
-  const chronic = findings[0];
-  assert.ok(chronic !== undefined);
-  assert.equal(chronic.rule_id, "R006");
-  assert.equal(chronic.classification, "repo");
-  assert.equal(chronic.scope, "separate_issue");
-  assert.equal(chronic.target, "packages/api :: npm test");
-  assert.equal(chronic.finding_key, r006FindingKey(api));
-  assert.deepEqual(chronic.evidence.command_identity, api);
-  assert.equal(chronic.evidence.history_count, 5);
-  assert.equal(chronic.evidence.presence_count, 3);
-  assert.equal(chronic.evidence.cost_ratio, 0.3);
-  assert.equal(chronic.evidence.minimum_history_count, 5);
-  assert.equal(chronic.evidence.minimum_presence_count, 3);
-  assert.equal(chronic.evidence.minimum_cost_ratio, 0.3);
-  assert.equal(chronic.recoverable.bound, "upper");
-  assert.deepEqual(chronic.impact, {
-    lower_ms: 0,
-    upper_ms: chronic.recoverable.estimated_ms,
-    kind: "resource_cost",
-  });
-  assert.deepEqual(chronic.finding_confidence, {
-    evidence: "high",
-    causal: "medium",
-    source_completeness: 1,
-  });
-  assert.equal(chronic.severity, "medium");
-  assert.deepEqual(chronic.scoring_rationale, [
-    "estimated_upper_only",
-    "resource_cost_only",
-  ]);
-  assert.equal(chronic.confidence, "medium");
-  assert.equal(chronic.fix_recipe.verify, "npm test");
-  assert.match(chronic.fix_recipe.suggestion, /packages\/api/u);
-
-  assert.deepEqual(detectChronicCost(qualifying.slice(0, 4)), []);
-  assert.deepEqual(
-    detectChronicCost(
-      qualifying.map((entry, index) =>
-        index < 2 ? entry : record(`presence-${index}`, index, {
-          includeCommand: false,
-        })
-      ),
-    ),
-    [],
-  );
-  assert.deepEqual(
-    detectChronicCost(
-      Array.from({ length: 5 }, (_, index) =>
-        record(`ratio-${index}`, index, {
-          commandMin: index < 3 ? 49.99 : 0,
-          includeCommand: index < 3,
-          commandIdentity: api,
-        })
-      ),
-    ),
-    [],
-  );
-});
-
-test("R006 isolates identity lanes and accepts only exact-identity finding refs", () => {
-  const api = commandIdentity("packages/api");
-  const web = commandIdentity("packages/web");
-  const native = commandIdentity("packages/api", undefined, "native-tool");
-  const cost = (identity: CommandIdentity | undefined, duration_min: number, ref: string) => ({
-    command: "npm test", ...(identity === undefined ? {} : { command_identity: identity }),
-    duration_min, session_refs: [ref],
-  });
-  const histories = Array.from({ length: 5 }, (_, index) => ({
-    ...record(`lanes-${index}`, index, { includeCommand: false }),
-    command_costs: [
-      ...(index < 3 ? [cost(api, 50, `api-cost-${index}`)] : []),
-      ...(index < 2 ? [cost(web, 80, `web-cost-${index}`),
-        cost(native, 80, `native-cost-${index}`)] : []),
-      cost(undefined, 100, `legacy-cost-${index}`),
-    ],
-  }));
-  const evidence = (key: string, identity?: CommandIdentity) => {
-    const value = finding(key, `different display ${key}`);
-    value.evidence.session_refs = [`${key}#finding`];
-    if (identity !== undefined) value.evidence.command_identity = identityEvidence(identity);
-    return value;
-  };
-  const malformed = evidence("malformed", api);
-  malformed.evidence.command_identity = { ...identityEvidence(api), repo_relative_cwd: "/repo" };
-  histories[0]!.findings = [evidence("api", api), evidence("web", web),
-    evidence("native", native), evidence("legacy"), malformed];
-  const chronic = detectChronicCost(histories)[0];
-  assert.ok(chronic !== undefined);
-  assert.equal(chronic.evidence.cost_min, 150);
-  assert.equal(chronic.evidence.presence_count, 3);
-  assert.deepEqual(chronic.evidence.session_refs,
-    ["api-cost-0", "api-cost-1", "api-cost-2", "api#finding"]);
-});
-test("R006 ignores legacy presence and sums duplicate decimal costs deterministically", () => {
-  const api = commandIdentity("packages/api");
-  const legacy = Array.from({ length: 5 }, (_, index) =>
-    record(`legacy-${index}`, index, { commandMin: 100, commandIdentity: undefined }));
-  assert.deepEqual(detectChronicCost(legacy), []);
-  assert.deepEqual(detectChronicCost(legacy.map((_, index) =>
-    record(`mixed-${index}`, index, { commandMin: 100,
-      commandIdentity: index < 2 ? api : undefined }))), []);
-  const fractional = Array.from({ length: 5 }, (_, index) => ({
-    ...record(`fractional-${index}`, index, { measuredMin: 1, includeCommand: false }),
-    command_costs: [0.1, 0.2, 0.3].map((duration_min, costIndex) => ({
-      command: "npm test", command_identity: api, duration_min,
-      session_refs: [`fractional-${index}#${costIndex}`],
-    })),
-  }));
-  const reversed = fractional.map((entry) => ({
-    ...entry, command_costs: [...entry.command_costs].reverse(),
-  })).reverse();
-  const findings = detectChronicCost(fractional);
-  assert.deepEqual(findings, detectChronicCost(reversed));
-  assert.equal(findings[0]?.evidence.cost_min, 3);
-  assert.equal(findings[0]?.evidence.presence_count, 5);
-});
-test("R006 distinguishes a native identity and clones its exact argv", () => {
-  const argv = ["npm", "test", "", "--flag", "--flag"];
-  const native = commandIdentity("packages/api", argv, "native-tool");
-  const histories = Array.from({ length: 5 }, (_, index) => record(`native-${index}`, index, {
-    commandMin: index < 3 ? 50 : 0, includeCommand: index < 3, commandIdentity: native,
-  }));
-  const chronic = detectChronicCost(histories)[0];
-  assert.ok(chronic !== undefined);
-  assert.equal(chronic.target, "packages/api :: npm test [native-tool]");
-  assert.equal(chronic.finding_key, r006FindingKey(native));
-  assert.notEqual(chronic.finding_key, r006FindingKey(commandIdentity("packages/api", argv)));
-  assert.deepEqual(chronic.evidence.command_identity, native);
-  assert.notEqual(chronic.evidence.command_identity?.normalized_argv, argv);
-});
-test("R006 defensively ignores malformed finding evidence at its boundary", () => {
-  const api = commandIdentity("packages/api");
-  const histories = Array.from({ length: 5 }, (_, index) =>
-    record(`defensive-${index}`, index, {
-      commandMin: index < 3 ? 50 : 0,
-      includeCommand: index < 3,
-      commandIdentity: api,
-    })
-  );
-  histories[0] = {
-    ...histories[0] as AnalysisRecord,
-    findings: [null] as unknown as Finding[],
-  };
-  histories[1] = {
-    ...histories[1] as AnalysisRecord,
-    findings: [{
-      ...finding("bad-evidence"),
-      evidence: null,
-    }] as unknown as Finding[],
-  };
-
-  assert.equal(detectChronicCost(histories).length, 1);
-});
-
 test("loads a legacy analysis record without human_wait_min and no warnings", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-legacy-summary-"));
   try {
@@ -4282,6 +4118,9 @@ interface ComparableHistoryOptions {
   changedFiles?: number;
   /** `null` models a binary/truncated diff with no authoritative line count. */
   changedLines?: number | null;
+  measuredWallMs?: number;
+  commandCosts?: AnalysisRecord["command_costs"];
+  findings?: AnalysisRecord["findings"];
 }
 
 function comparableHistoryEntry(
@@ -4290,6 +4129,7 @@ function comparableHistoryEntry(
   const repositoryId = options.repositoryId ?? "1".repeat(64);
   const workspaceId = options.workspaceId ?? "2".repeat(64);
   const terminal = storedTerminalStatsSnapshot();
+  terminal.measured_wall_ms = options.measuredWallMs ?? terminal.measured_wall_ms;
   terminal.cohort = {
     repository_id: repositoryId,
     workspace_id: workspaceId,
@@ -4307,6 +4147,8 @@ function comparableHistoryEntry(
       ...source.unit,
       pr_ref: options.displayRef ?? "main...feature",
     },
+    findings: options.findings ?? source.findings,
+    command_costs: options.commandCosts ?? source.command_costs,
     terminal_stats_snapshot: terminal,
   });
   const stateDigest = analysisDigest(
@@ -4357,6 +4199,543 @@ function projectComparableHistory(
 ): StatsAggregationInput[] {
   return entries.map((entry) => projectStatsAggregationInput(entry));
 }
+
+type Task7CommandCost = AnalysisRecord["command_costs"][number] & {
+  cache_state?: "cold" | "warm";
+};
+
+function task7CommandCost(options: {
+  identity?: CommandIdentity;
+  cacheState?: "cold" | "warm";
+  durationMs?: number;
+  command?: string;
+  ref?: string;
+} = {}): Task7CommandCost {
+  return {
+    command: options.command ?? "npm test",
+    ...(options.identity === undefined
+      ? {}
+      : { command_identity: commandIdentity(
+          options.identity.repo_relative_cwd,
+          options.identity.normalized_argv,
+          options.identity.executor,
+        ) }),
+    ...(options.cacheState === undefined
+      ? {}
+      : { cache_state: options.cacheState }),
+    duration_min: (options.durationMs ?? 1_000) / 60_000,
+    session_refs: [options.ref ?? "session#command"],
+  };
+}
+
+function task7History(options: {
+  prefix: string;
+  count: number;
+  costs(index: number): AnalysisRecord["command_costs"];
+  findings?(index: number): AnalysisRecord["findings"];
+  repositoryId?: string;
+  workspaceId?: string;
+  changedFiles?: number;
+  changedLines?: number;
+  measuredWallMs?: number;
+  selectorOffset?: number;
+}): AnalysisHistoryEntry[] {
+  return Array.from({ length: options.count }, (_, index) =>
+    comparableHistoryEntry({
+      id: `${options.prefix}-${index + 1}`,
+      createdAtMs: index + 1,
+      metric: index + 1,
+      selectorNumber: (options.selectorOffset ?? 0) + index + 1,
+      ...(options.repositoryId === undefined
+        ? {}
+        : { repositoryId: options.repositoryId }),
+      ...(options.workspaceId === undefined
+        ? {}
+        : { workspaceId: options.workspaceId }),
+      ...(options.changedFiles === undefined
+        ? {}
+        : { changedFiles: options.changedFiles }),
+      ...(options.changedLines === undefined
+        ? {}
+        : { changedLines: options.changedLines }),
+      measuredWallMs: options.measuredWallMs ?? 2_000,
+      commandCosts: options.costs(index),
+      ...(options.findings === undefined
+        ? {}
+        : { findings: options.findings(index) }),
+    })
+  );
+}
+
+test("Store preserves optional command cache state and projection drops unobservable lanes", () => {
+  const api = commandIdentity("packages/api");
+  const missing = task7CommandCost({ identity: api, ref: "missing" });
+  const unknown = {
+    ...task7CommandCost({ identity: api, ref: "unknown" }),
+    cache_state: "unknown",
+  } as unknown as Task7CommandCost;
+  const entry = comparableHistoryEntry({
+    id: "r006-cache-projection",
+    createdAtMs: 1,
+    metric: 1,
+    selectorNumber: 501,
+    commandCosts: [
+      task7CommandCost({ identity: api, cacheState: "cold", durationMs: 400,
+        ref: "COLD_PRIVATE_REF_A" }),
+      task7CommandCost({ identity: api, cacheState: "cold", durationMs: 600,
+        ref: "COLD_PRIVATE_REF_B" }),
+      task7CommandCost({ identity: api, cacheState: "warm", ref: "WARM_PRIVATE_REF" }),
+      missing,
+      unknown,
+    ],
+  });
+
+  const storedStates = entry.record.command_costs.map((cost) =>
+    (cost as Task7CommandCost).cache_state);
+  assert.equal(storedStates.length, 3);
+  assert.equal(storedStates.filter((state) => state === undefined).length, 1);
+  assert.equal(storedStates.filter((state) => state === "cold").length, 1);
+  assert.equal(storedStates.filter((state) => state === "warm").length, 1);
+  const coldDuration = entry.record.command_costs.find(
+    (cost) => (cost as Task7CommandCost).cache_state === "cold")?.duration_min;
+  assert.ok(coldDuration !== undefined);
+  assert.ok(Math.abs(coldDuration - 1 / 60) < Number.EPSILON);
+
+  const projected = projectStatsAggregationInput(entry);
+  assert.deepEqual(projected.command_costs.map((cost) => ({
+    keys: Object.keys(cost).sort(),
+    cache_state: cost.cache_state,
+    duration_ms: cost.duration_ms,
+  })), [{
+    keys: ["cache_state", "command_key", "duration_ms"],
+    cache_state: "cold",
+    duration_ms: 1_000,
+  }, {
+    keys: ["cache_state", "command_key", "duration_ms"],
+    cache_state: "warm",
+    duration_ms: 1_000,
+  }]);
+  assert.equal(projected.command_costs[0]?.command_key,
+    projected.command_costs[1]?.command_key);
+  const serialized = JSON.stringify(projected);
+  for (const canary of [
+    "packages/api", "npm test", "COLD_PRIVATE_REF_A",
+    "COLD_PRIVATE_REF_B", "WARM_PRIVATE_REF", "missing", "unknown",
+  ]) assert.doesNotMatch(serialized, new RegExp(canary, "u"));
+
+  let accessorReads = 0;
+  const accessor = task7CommandCost({ identity: api }) as Task7CommandCost;
+  Object.defineProperty(accessor, "cache_state", {
+    enumerable: true,
+    get() {
+      accessorReads += 1;
+      return "cold";
+    },
+  });
+  const {
+    analysis_id: ignoredAnalysisId,
+    ...accessorRecordInput
+  } = entry.record;
+  void ignoredAnalysisId;
+  assert.throws(() => makeAnalysisRecord({
+    ...accessorRecordInput,
+    command_costs: [accessor],
+  }), TypeError);
+  assert.equal(accessorReads, 0);
+});
+
+test("R006 uses the full absent-command denominator and one summed sample per snapshot", () => {
+  const api = commandIdentity("packages/api");
+  const entries = task7History({
+    prefix: "r006-exact-milliseconds",
+    count: 6,
+    measuredWallMs: 2_000,
+    costs: (index) => index === 5 ? [] : index === 0
+      ? [
+          task7CommandCost({ identity: api, cacheState: "cold", durationMs: 400,
+            ref: "exact#0-a" }),
+          task7CommandCost({ identity: api, cacheState: "cold", durationMs: 600,
+            ref: "exact#0-b" }),
+        ]
+      : [task7CommandCost({ identity: api, cacheState: "cold", durationMs: 1_000,
+          ref: `exact#${index}` })],
+  });
+  const projected = projectComparableHistory(entries);
+  const aggregates = buildChronicCostAggregates(
+    projected,
+    { mode: "stats_all_groups" },
+    5,
+  );
+  assert.equal(aggregates.length, 1);
+  assert.deepEqual(aggregates[0], {
+    cohort_key: projected[0]!.cohort_key,
+    command_key: projected[0]!.command_costs[0]!.command_key,
+    cache_state: "cold",
+    history_count: 6,
+    presence_count: 5,
+    distribution: {
+      median: 1_000,
+      p50: 1_000,
+      p75: 1_000,
+      mad: 0,
+      sample_count: 5,
+    },
+    ratio: 0.4167,
+    resource_upper_ms: 833.3333,
+  } satisfies ChronicCostAggregate);
+  assert.deepEqual(Object.keys(aggregates[0]!).sort(), [
+    "cache_state", "cohort_key", "command_key", "distribution",
+    "history_count", "presence_count", "ratio", "resource_upper_ms",
+  ]);
+  assert.doesNotMatch(JSON.stringify(aggregates),
+    /npm test|packages\/api|session|fix|argv|cwd/u);
+  assert.deepEqual(
+    buildChronicCostAggregates([...projected].reverse(),
+      { mode: "stats_all_groups" }, 5),
+    aggregates,
+  );
+});
+
+test("R006 selects terminals before current exclusion and isolates exact cohort, command, and cache lanes", () => {
+  const api = commandIdentity("packages/api");
+  const web = commandIdentity("packages/web");
+  const laneCosts = (ref: string): AnalysisRecord["command_costs"] => [
+    task7CommandCost({ identity: api, cacheState: "cold", durationMs: 1_000,
+      ref: `${ref}#api-cold` }),
+    task7CommandCost({ identity: api, cacheState: "warm", durationMs: 800,
+      ref: `${ref}#api-warm` }),
+    task7CommandCost({ identity: web, cacheState: "cold", durationMs: 700,
+      ref: `${ref}#web-cold` }),
+    task7CommandCost({ identity: api, durationMs: 50_000,
+      ref: `${ref}#missing-cache` }),
+  ];
+  const currentVariants = [
+    comparableHistoryEntry({ id: "r006-current-a", createdAtMs: 1_000, metric: 1,
+      selectorNumber: 700, gitState: "state-a", analysisVariant: "a",
+      displayRef: "shared-display", measuredWallMs: 2_000,
+      commandCosts: laneCosts("current-a") }),
+    comparableHistoryEntry({ id: "r006-current-b", createdAtMs: 2_000, metric: 2,
+      selectorNumber: 700, gitState: "state-b", analysisVariant: "b",
+      displayRef: "shared-display", measuredWallMs: 2_000,
+      commandCosts: laneCosts("current-b") }),
+    comparableHistoryEntry({ id: "r006-current-a-rerun", createdAtMs: 3_000, metric: 3,
+      selectorNumber: 700, gitState: "state-a", analysisVariant: "a-rerun",
+      displayRef: "shared-display", measuredWallMs: 2_000,
+      commandCosts: laneCosts("current-a-rerun") }),
+  ];
+  const comparables = task7History({
+    prefix: "r006-comparable",
+    count: 5,
+    selectorOffset: 710,
+    costs: (index) => laneCosts(`comparable-${index}`),
+  });
+  comparables[4] = comparableHistoryEntry({
+    id: "r006-same-display-different-selector",
+    createdAtMs: 4_000,
+    metric: 4,
+    displayRef: "shared-display",
+    selector: {
+      kind: "explicit_range",
+      range: "double_dot",
+      base_ref_digest: selectorRefDigest("explicit_range", "base", "main"),
+      head_ref_digest: selectorRefDigest("explicit_range", "head", "feature"),
+    },
+    measuredWallMs: 2_000,
+    commandCosts: laneCosts("different-selector"),
+  });
+  const neighboringDimensions: Array<{
+    prefix: string;
+    selectorOffset: number;
+    changedFiles?: number;
+    changedLines?: number;
+    repositoryId?: string;
+    workspaceId?: string;
+  }> = [{
+    prefix: "r006-neighboring-file-bucket",
+    selectorOffset: 800,
+    changedFiles: 5,
+  }, {
+    prefix: "r006-neighboring-line-bucket",
+    selectorOffset: 810,
+    changedLines: 200,
+  }, {
+    prefix: "r006-neighboring-repository",
+    selectorOffset: 820,
+    repositoryId: "6".repeat(64),
+  }, {
+    prefix: "r006-neighboring-workspace",
+    selectorOffset: 830,
+    workspaceId: "7".repeat(64),
+  }];
+  const neighboring = neighboringDimensions.flatMap((dimensions) => task7History({
+    ...dimensions,
+    count: 5,
+    costs: (index) => [task7CommandCost({ identity: api, cacheState: "cold",
+      durationMs: 1_000, ref: `${dimensions.prefix}#${index}` })],
+  }));
+  const history = [...currentVariants, ...comparables, ...neighboring];
+  const projected = projectComparableHistory(history);
+  const projectedCurrent = projected[0]!;
+  assert.ok(projectedCurrent.work_unit_key !== undefined);
+  assert.ok(projectedCurrent.cohort_key !== undefined);
+  const analysisMode = {
+    mode: "analysis_current",
+    current_work_unit_key: projectedCurrent.work_unit_key,
+    current_cohort_key: projectedCurrent.cohort_key,
+  } as const;
+  const analysis = buildChronicCostAggregates(projected, analysisMode, 5);
+  assert.equal(analysis.length, 3);
+  assert.ok(analysis.every(({ history_count, presence_count, cohort_key }) =>
+    history_count === 5 && presence_count === 5 &&
+    cohort_key === projectedCurrent.cohort_key));
+  assert.deepEqual(new Set(analysis.map(({ cache_state }) => cache_state)),
+    new Set(["cold", "warm"]));
+  assert.equal(new Set(analysis.map(({ command_key }) => command_key)).size, 2);
+
+  const stats = buildChronicCostAggregates(
+    projected,
+    { mode: "stats_all_groups" },
+    5,
+  );
+  assert.equal(stats.length, 7);
+  const currentGroup = stats.filter(
+    ({ cohort_key }) => cohort_key === projectedCurrent.cohort_key,
+  );
+  assert.equal(currentGroup.length, 3);
+  assert.ok(currentGroup.every(({ history_count, presence_count }) =>
+    history_count === 6 && presence_count === 6));
+  const neighboringGroup = stats.filter(
+    ({ cohort_key }) => cohort_key !== projectedCurrent.cohort_key,
+  );
+  assert.equal(neighboringGroup.length, 4);
+  assert.equal(new Set(neighboringGroup.map(({ cohort_key }) => cohort_key)).size, 4);
+  assert.ok(neighboringGroup.every(({ history_count, presence_count }) =>
+    history_count === 5 && presence_count === 5));
+  assert.equal(stats.some(({ cache_state }) =>
+    (cache_state as string) === "unknown"), false);
+});
+
+test("R006 applies exact history, presence, ratio, and organization floors", () => {
+  const api = commandIdentity("packages/api");
+  const population = (count: number, positive: number, durationMs = 1_000) =>
+    task7History({
+      prefix: `r006-floor-${count}-${positive}-${durationMs}`,
+      count,
+      costs: (index) => index < positive
+        ? [task7CommandCost({ identity: api, cacheState: "cold", durationMs,
+            ref: `floor#${index}` })]
+        : [],
+    });
+  const aggregate = (entries: readonly AnalysisHistoryEntry[], floor?: number) =>
+    buildChronicCostAggregates(projectComparableHistory(entries),
+      { mode: "stats_all_groups" }, floor);
+
+  assert.equal(aggregate(population(5, 5)).length, 1);
+  assert.deepEqual(aggregate(population(4, 4)), []);
+  assert.deepEqual(aggregate(population(5, 4)), []);
+  assert.deepEqual(aggregate(population(5, 5, 599)), []);
+  assert.deepEqual(aggregate(population(20, 3), 20), []);
+  assert.equal(aggregate(population(20, 20), 20)[0]?.history_count, 20);
+  assert.equal(aggregate(population(20, 20), 20)[0]?.presence_count, 20);
+
+  const zeroWall = projectComparableHistory(population(5, 5));
+  for (const input of zeroWall) input.terminal_metrics!.measured_wall_ms = 0;
+  assert.deepEqual(buildChronicCostAggregates(zeroWall,
+    { mode: "stats_all_groups" }, 5), []);
+  const missingWall = projectComparableHistory(population(5, 5));
+  delete missingWall[0]!.terminal_metrics;
+  assert.deepEqual(buildChronicCostAggregates(missingWall,
+    { mode: "stats_all_groups" }, 5), []);
+});
+
+test("R006 materialization uses only revalidated exact-composite detached entries", () => {
+  const api = commandIdentity("packages/api");
+  const legacyTarget = "packages/api :: npm test [cold]";
+  const legacyKey = findingKeyForCompatibility("R006", legacyTarget, 1);
+  const legacyR006 = {
+    ...finding("legacy-r006", "npm test"),
+    finding_key: legacyKey,
+    rule_id: "R006",
+    target: legacyTarget,
+    confidence: "medium",
+    evidence: {
+      session_refs: ["LEGACY_R006_REF_MUST_NOT_JOIN"],
+      interval_ids: [],
+      command: "npm test",
+      command_identity: identityEvidence(api),
+      cache_state: "cold",
+    },
+    recoverable: { min: 100, bound: "upper" },
+    impact: { lower_ms: 0, upper_ms: 6_000_000, kind: "resource_cost" },
+    finding_confidence: {
+      evidence: "high",
+      causal: "medium",
+      source_completeness: 1,
+    },
+    severity: "medium",
+    scoring_rationale: ["estimated_upper_only", "resource_cost_only"],
+    rule_version: "1.0.0",
+    compatibility_epoch: 1,
+  } satisfies Finding;
+  const entries = task7History({
+    prefix: "r006-materialize",
+    count: 5,
+    costs: (index) => [
+      task7CommandCost({ identity: api, cacheState: "cold", durationMs: 1_000,
+        ref: `materialize#cold-${index}` }),
+      task7CommandCost({ identity: api, cacheState: "warm", durationMs: 800,
+        ref: `materialize#warm-${index}` }),
+    ],
+    findings: (index) => index === 0 ? [legacyR006] : [],
+  });
+  const projected = projectComparableHistory(entries);
+  const mode = { mode: "stats_all_groups" } as const;
+  const aggregates = buildChronicCostAggregates(projected, mode, 5);
+  const materializations = buildChronicCostMaterializationEntries(
+    projected,
+    entries,
+    mode,
+  );
+  assert.equal(materializations.length, 2);
+  for (const entry of materializations) {
+    assert.deepEqual(Object.keys(entry).sort(), [
+      "cache_state", "cohort_key", "command", "command_identity",
+      "command_key", "session_refs",
+    ]);
+    assert.equal(Object.hasOwn(entry, "record"), false);
+    assert.equal(Object.hasOwn(entry, "history"), false);
+  }
+  assert.deepEqual(
+    buildChronicCostMaterializationEntries(
+      [...projected].reverse(),
+      [...entries].reverse(),
+      mode,
+    ),
+    materializations,
+  );
+
+  const candidates = materializeChronicCostFindings(
+    aggregates,
+    materializations,
+    { sourceCompleteness: 1 },
+  );
+  assert.equal(candidates.length, 2);
+  assert.notEqual(candidates[0]?.finding_key, candidates[1]?.finding_key);
+  assert.ok(candidates.every(({ finding_key }) => finding_key !== legacyKey));
+  for (const candidate of candidates) {
+    assert.equal(candidate.rule_id, "R006");
+    assert.equal(candidate.classification, "repo");
+    assert.equal(candidate.scope, "separate_issue");
+    assert.equal(candidate.evidence.cache_state === "cold" ||
+      candidate.evidence.cache_state === "warm", true);
+    assert.equal(candidate.evidence.history_count, 5);
+    assert.equal(candidate.evidence.presence_count, 5);
+    assert.equal(candidate.evidence.sample_count, 5);
+    assert.equal(candidate.evidence.ratio === 0.5 ||
+      candidate.evidence.ratio === 0.4, true);
+    assert.equal(candidate.evidence.resource_upper_ms === 1_000 ||
+      candidate.evidence.resource_upper_ms === 800, true);
+    assert.deepEqual(candidate.evidence.command_identity, api);
+    assert.deepEqual(candidate.evidence.interval_ids, []);
+    assert.equal(candidate.recoverable.bound, "upper");
+    assert.deepEqual(candidate.recoverable.intervals, []);
+    assert.equal(candidate.impact.kind, "resource_cost");
+    assert.equal(candidate.impact.lower_ms, 0);
+    assert.equal(candidate.impact.upper_ms, candidate.recoverable.estimated_ms);
+    assert.equal(candidate.fix_recipe.verify, "npm test");
+    assert.match(candidate.fix_recipe.suggestion, /packages\/api/u);
+    assert.notEqual(candidate.finding_key,
+      findingKeyForCompatibility("R006", candidate.target, 1));
+  }
+  const cold = candidates.find(({ evidence }) => evidence.cache_state === "cold");
+  assert.deepEqual(cold?.evidence.session_refs, [
+    "materialize#cold-0", "materialize#cold-1", "materialize#cold-2",
+    "materialize#cold-3", "materialize#cold-4",
+  ]);
+  assert.doesNotMatch(JSON.stringify(candidates), /LEGACY_R006_REF_MUST_NOT_JOIN/u);
+
+  const exact = materializations[0]!;
+  const aggregate = aggregates.find(({ cohort_key, command_key, cache_state }) =>
+    cohort_key === exact.cohort_key && command_key === exact.command_key &&
+    cache_state === exact.cache_state)!;
+  assert.deepEqual(materializeChronicCostFindings([aggregate], [],
+    { sourceCompleteness: 1 }), []);
+  for (const mismatched of [
+    { ...exact, cohort_key: "f".repeat(64) },
+    { ...exact, command_key: "e".repeat(64) },
+    { ...exact, cache_state: exact.cache_state === "cold" ? "warm" : "cold" },
+  ] satisfies Array<typeof exact>) {
+    assert.deepEqual(materializeChronicCostFindings([aggregate], [mismatched],
+      { sourceCompleteness: 1 }), []);
+  }
+});
+
+test("R006 materialization builder invalidates missing, duplicate, conflicting, or digest-mismatched lanes", () => {
+  const api = commandIdentity("packages/api");
+  const entries = task7History({
+    prefix: "r006-revalidation",
+    count: 5,
+    costs: (index) => [task7CommandCost({ identity: api, cacheState: "cold",
+      ref: `revalidation#${index}` })],
+  });
+  const projected = projectComparableHistory(entries);
+  const mode = { mode: "stats_all_groups" } as const;
+
+  assert.deepEqual(buildChronicCostMaterializationEntries(
+    projected,
+    entries.slice(1),
+    mode,
+  ), []);
+  assert.deepEqual(buildChronicCostMaterializationEntries(
+    projected,
+    [...entries, structuredClone(entries[0]!)],
+    mode,
+  ), []);
+
+  const wrongCommandDigest = structuredClone(projected);
+  wrongCommandDigest[0]!.command_costs[0]!.command_key = "f".repeat(64);
+  assert.deepEqual(buildChronicCostMaterializationEntries(
+    wrongCommandDigest,
+    entries,
+    mode,
+  ), []);
+  const wrongCohortDigest = structuredClone(projected);
+  wrongCohortDigest[0]!.cohort_key = "e".repeat(64);
+  assert.deepEqual(buildChronicCostMaterializationEntries(
+    wrongCohortDigest,
+    entries,
+    mode,
+  ), []);
+  const wrongRawIdentity = structuredClone(entries);
+  wrongRawIdentity[0]!.record.command_costs[0]!.command_identity =
+    commandIdentity("packages/web");
+  assert.deepEqual(buildChronicCostMaterializationEntries(
+    projected,
+    wrongRawIdentity,
+    mode,
+  ), []);
+
+  const conflicting = entries.map((entry, index) => index === 4
+    ? comparableHistoryEntry({
+        id: "r006-conflicting-display",
+        createdAtMs: 5,
+        metric: 5,
+        selectorNumber: 5,
+        measuredWallMs: 2_000,
+        commandCosts: [task7CommandCost({
+          identity: api,
+          cacheState: "cold",
+          command: "pnpm test",
+          ref: "revalidation#conflict",
+        })],
+      })
+    : entry);
+  assert.deepEqual(buildChronicCostMaterializationEntries(
+    projectComparableHistory(conflicting),
+    conflicting,
+    mode,
+  ), []);
+});
 
 type BaselineCurrentRejectsRawRecord = AnalysisRecord extends
   Parameters<typeof computeBaseline>[0] ? false : true;
