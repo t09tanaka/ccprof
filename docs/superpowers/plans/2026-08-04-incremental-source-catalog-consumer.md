@@ -396,6 +396,7 @@ export interface SourcePrepareContext {
 export function sourceEligibilityIdentity(canonicalRoot: string): string;
 
 declare const sourceCommitCandidateBrand: unique symbol;
+declare const sourceAdmissionProofBrand: unique symbol;
 
 export interface PreparedUnwindowedEvidenceV1 {
   adapter_id: SourceAdapterId;
@@ -437,11 +438,13 @@ export interface PreparedSourceEvidence {
   commit_candidate: SourceCommitCandidate | null;
 }
 
-export interface EligibleSourceEvidence {
-  commit_candidate: SourceCommitCandidate;
-  eligible_session_ids: string[];
-  all_projected_events_admitted: boolean;
-  meter?: AnalysisBudgetMeter;
+export interface SourceAdmissionProof {
+  readonly [sourceAdmissionProofBrand]: true;
+}
+
+export interface AdmittedPreparedSource {
+  admitted_sessions: Session[];
+  commit_proof: SourceAdmissionProof | null;
 }
 
 export interface DirectoryTokenV1 {
@@ -507,6 +510,8 @@ export interface IncrementalSourceDependencies {
   projectClaudeState: typeof projectClaudeParserState;
   readCodexState: typeof readCodexParserState;
   projectCodexState: typeof projectCodexParserState;
+  canonicalizeSessionCwds: typeof canonicalizeSessionCwds;
+  cwdMatchesRepository: typeof cwdMatchesRepository;
   openStore(paths: StorePaths): Database.Database;
   statfsType(path: string): Promise<bigint>;
   openDirectoryNoFollow(path: string): Promise<DirectoryReadHandle>;
@@ -524,7 +529,8 @@ export class IncrementalSourceCatalogConsumer {
   knownPaths(adapter: SourceAdapterId): string[];
   prepareClaude(path: string, context: SourcePrepareContext): Promise<PreparedSourceEvidence>;
   prepareCodex(path: string, context: SourcePrepareContext): Promise<PreparedSourceEvidence>;
-  commitEligible(value: EligibleSourceEvidence): IncrementalWarning[];
+  admitPreparedEvents(candidate: SourceCommitCandidate): AdmittedPreparedSource;
+  commitEligible(proof: SourceAdmissionProof): Promise<IncrementalWarning[]>;
   close(): void;
 }
 
@@ -552,11 +558,15 @@ The consumer owns every `FileHandle`, `DirectoryReadHandle`, and database
 returned by dependencies: borrowed hash/stat/parser/projector calls never close
 them; the consumer closes primary and final-binding file handles and every
 directory handle exactly once in `finally`, and closes the database exactly once
-from `close()`. A runtime `WeakSet` authenticates/consumes each branded commit
-candidate once; every scalar/context/budget value and detached nested value is
-deep-frozen, and structural casting cannot mint one. The dependency object is an
-embedder seam, not a test-only method, and every default member uses production
-code with the ownership above.
+from `close()`. Per-consumer private `WeakMap`s authenticate and advance each
+branded candidate through `prepared -> admission proof -> consumed` exactly
+once. The candidate record binds the exact prepare-time meter reference (or a
+private no-meter sentinel), frozen projected sessions and expected event count;
+the opaque proof record binds that candidate and meter and exposes no caller-
+settable ids, booleans, counts, sessions, or meter. Every scalar/context/budget
+value and detached nested value is deep-frozen, and structural casting cannot
+mint either object. The dependency object is an embedder seam, not a test-only
+method, and every default member uses production code with the ownership above.
 
 ### Task 1: RED query-independent parser state and read receipts
 
@@ -902,11 +912,18 @@ failures add warning but do not record a source failure.
 Assert `prepare*` itself checkpoints/claims source item before open, stats, and
 admits file bytes from the supplied meter/parser budgets. It returns a runtime-
 authenticated candidate only for stable complete cold/suffix work. Forged,
-replayed, cache-hit, bounded, unstable, and mixed candidates cannot write. After
-event admission, exact and one-over event limits plus a final wall/CPU stop must
-preserve the old pair; only all-events-admitted plus final `checkpoint() === true`
-may publish a new pair. Assert every dependency handle/database owner closes it
-exactly once on all exits.
+replayed, cross-consumer, cache-hit, bounded, and unstable candidates cannot
+write. `admitPreparedEvents` must use the privately bound prepare-time meter and
+the privately captured projected sessions, return the actual admitted prefix,
+and issue an opaque one-shot proof only when its returned event count equals the
+captured expected count. Prove that a swapped or omitted caller meter, a skipped
+or one-over admission, a forged/replayed/cross-consumer proof, and legacy-shaped
+objects with invented eligible ids or `all_projected_events_admitted: true`
+cannot write. Even with a valid proof, commit independently canonicalizes every
+unwindowed session and makes mixed Repo A/Repo B discard the candidate. Exact
+event admission followed by final `checkpoint() === true` is the only write
+path; a final wall/CPU stop preserves the old pair. Assert every dependency
+handle/database owner closes it exactly once on all exits.
 
 - [ ] **Step 8: Delegate RED and commit tests**
 
@@ -964,31 +981,40 @@ capacity overflow, or other unsupported state cold parses the whole file.
 `prepareClaude`/`prepareCodex` never write. Stable complete cold/suffix work gets
 a one-shot branded candidate containing every frozen observation/context value;
 cache hits and all partial/unstable paths get `null`. `commitEligible` classifies
-the unwindowed result: all eligible creates positive evidence; all ineligible or
-empty creates a marker only when repository-visible warnings are empty; mixed or
-warning-bearing empty results consume/discard the candidate without writing.
-Runtime `WeakSet` membership rejects forged/replayed candidates. Cache write
-errors return one warning and preserve the prepared result. Compare effective
-file/line/node/depth budgets to the checked-in defaults before cache lookup; any
-read-budget override is cold-only and produces no commit candidate, while
-retained/warning overrides remain projector inputs.
+the unwindowed result itself using the captured canonical eligibility root plus
+the canonicalize/match dependencies: all eligible creates positive evidence;
+all ineligible or empty creates a marker only when repository-visible warnings
+are empty; mixed or warning-bearing empty consumes/discards without writing. It
+never accepts caller-provided eligible ids. Private `WeakMap` membership rejects
+forged/replayed/cross-consumer candidates and proofs. Cache write errors return
+one warning and preserve the prepared result. Compare effective file/line/node/
+depth budgets to the checked-in defaults before cache lookup; any read-budget
+override is cold-only and produces no commit candidate, while retained/warning
+overrides remain projector inputs.
 
 - [ ] **Step 5: Gate commit after event admission and final checkpoint**
 
 Use the already-sorted caller order and existing `admitSessionEventPrefix`; do
-not debit cached bytes/events differently. `commitEligible` requires
-`all_projected_events_admitted`, calls the final `meter.checkpoint()`, checks
-`meter.stopped === false`, and only then performs the pair transaction. An event
-prefix or time stop discards the candidate and preserves any old pair. Keep the
-existing output limiter/finalization unchanged, and checkpoint every hash/parser/
-validation batch so wall/CPU savings remain observable.
+not debit cached bytes/events differently. For a candidate,
+`admitPreparedEvents` invokes that helper itself with the exact prepare-bound
+meter and frozen projected sessions. It counts actual returned events and mints
+the second opaque proof only on an exact count; otherwise it consumes/discards
+the candidate. `commitEligible` accepts only that proof, resolves the same meter
+from its private record, calls the final `meter.checkpoint()`, checks
+`meter.stopped === false`, and only then performs the pair transaction. With no
+configured analysis meter, the candidate is bound to the private no-meter
+sentinel and the consumer admits the full projection without pretending a clock
+checkpoint occurred. An event prefix or time stop preserves any old pair. Keep
+the existing output limiter/finalization unchanged, and checkpoint every hash/
+parser/validation batch so wall/CPU savings remain observable.
 
 - [ ] **Step 6: Implement the exact dependency seam and ownership**
 
 Implement every `IncrementalSourceDependencies` signature above. Borrowed hash,
-stat, parser, and projector functions never close; the consumer closes primary/
-binding file handles in `finally`, owns the Store connection until `close()`, and
-rejects use after close. No production function relies on a test-only hook.
+stat, parser, projector, cwd-canonicalization, and repository-match functions
+never close; the consumer closes primary/binding file handles in `finally`, owns
+the Store connection until `close()`, and rejects use after close. No production
+function relies on a test-only hook.
 
 - [ ] **Step 7: Delegate GREEN and commit production**
 
@@ -1106,10 +1132,13 @@ prefixes, and route partial warnings/errors exactly as Task 7 specifies.
 
 Load root-contained known paths, reconcile new paths, canonical-deduplicate the
 whole union, apply `compareSourceCandidates`, and only then visit/admit. Pass each
-candidate through prepare and unwindowed repo eligibility. Apply existing time/
-branch/alignment and event-prefix admission, then redeem a candidate only after
-all projected events were admitted and the final wall/CPU checkpoint succeeds.
-Cache hits are read-only; stopped/partial work never refreshes a pair.
+candidate through prepare, then consumer-owned event admission when prepare
+returns a commit candidate. Apply existing time/branch/alignment to the returned
+admitted prefix. For a non-null candidate, use only the returned opaque proof;
+`commitEligible` performs unwindowed repo eligibility from captured evidence/root
+and then the final wall/CPU checkpoint. A null-candidate cache hit remains read-
+only and uses the same existing admission helper directly. Stopped/partial work
+never refreshes a pair.
 
 - [ ] **Step 4: Wire analyzer lifecycle without custom-source drift**
 
@@ -1242,6 +1271,9 @@ Under standing authorization merge through the PR, never locally. Read and run
   7–8.
 - Item 8: all-events/final-checkpoint commit gate and old-pair preservation —
   Tasks 5–8.
+- Third review item 1: prepare-bound meter, consumer-owned exact event admission,
+  opaque one-shot proof, and independent commit-side eligibility — API
+  vocabulary, Tasks 5–6, 8.
 - Every production task follows an observed RED and receives spec review before
   quality review. RED and production commits remain separate; no amend or local
   merge is used.

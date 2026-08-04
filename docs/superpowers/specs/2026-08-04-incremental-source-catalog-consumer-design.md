@@ -1,7 +1,7 @@
 # Incremental Source Catalog Consumer Design
 
-**Status:** Revised after two independent focused specification reviews;
-approved program scope, pending third re-review before production implementation.
+**Status:** Revised after three independent focused specification reviews;
+approved program scope, pending final re-review before production implementation.
 
 ## Goal and completion boundary
 
@@ -268,17 +268,29 @@ Parser/restore and persistence are intentionally two phases:
 1. `prepare*Source` returns a detached observation, projected result, warning
    list, and either `null` or a runtime-authenticated branded commit candidate.
    The candidate closes over the exact source observation, unwindowed state,
-   query end, read/projection budgets, observation time, discovery cursor,
-   parser/schema versions, roots, repository identity, and Store target needed
-   for one later commit. It performs no Store write.
-2. The discoverer applies canonical cwd repository eligibility to the
-   **unwindowed** full sessions. An all-eligible positive result may retain its
-   state. An exactly empty/warning-free or all-other-repository/warning-free
-   result may become a no-raw negative marker. A mixed result is never cached.
-3. After event admission for that source, the discoverer calls one final
-   wall/CPU checkpoint. Only if every projected event was admitted and the meter
-   remains unstopped may it redeem the still-branded candidate against that
-   repository's Store.
+   projected sessions, query end, read/projection budgets, observation time,
+   discovery cursor, parser/schema versions, roots, repository identity, and
+   Store target needed for one later commit. A consumer-private `WeakMap` also
+   binds it to the exact `AnalysisBudgetMeter` instance supplied to prepare (or
+   an explicit private no-meter sentinel). It performs no Store write.
+2. For a candidate, the discoverer must ask the same consumer to admit events.
+   That method invokes `admitSessionEventPrefix` itself over the privately
+   captured projected sessions and exact bound meter; the caller cannot supply a
+   meter, event count, boolean, session ids, or replacement sessions. It returns
+   the admitted prefix and mints a second opaque one-shot admission proof only
+   when the actual admitted event count equals the captured projected event
+   count. A partial admission consumes the candidate and returns no proof.
+3. `commitEligible` accepts only that opaque proof. Before any Store write it
+   consumes the proof, resolves its privately bound candidate and meter, and
+   independently canonicalizes and classifies every captured **unwindowed** full
+   session against the captured eligibility root. An all-eligible positive
+   result may retain its state. An exactly empty/warning-free or
+   all-other-repository/warning-free result may become a no-raw negative marker.
+   A mixed result is discarded. No caller-provided eligibility claim participates.
+4. Immediately before the transaction, `commitEligible` performs the final
+   wall/CPU checkpoint on that same private meter, when present. Only a valid
+   proof whose bound meter remains unstopped may publish. The unbudgeted path is
+   represented by the bound no-meter sentinel and has no fabricated checkpoint.
 
 Cache and negative-marker hits are always read-only and return `null` candidates,
 even when the meter remains unstopped; exact unchanged reuse never refreshes a
@@ -308,6 +320,10 @@ negative-marker hit read before a later input/event/time stop may still supply
 the already-admitted prefix, but it never refreshes its catalog/cache row. A
 cold or suffix candidate that admits only an event prefix, or whose final
 checkpoint stops, is discarded and the old pair remains byte-for-byte unchanged.
+Candidate and proof registries are per consumer. Both transitions are one-shot,
+and the proof registry records the exact candidate and its prepare-time meter;
+structural casts, replay, cross-consumer use, swapped/omitted meters, invented
+eligible ids, and invented all-events-admitted flags cannot authorize a write.
 
 Two simultaneous v4 opens serialize inside the migration transaction: the
 winner creates v5; the waiter re-reads `user_version` after acquiring the write
@@ -495,7 +511,9 @@ Incremental state is an optimization, never a budget bypass:
   open;
 - current stat size receives the same input-byte admission before hashing;
 - fresh/restored projected events pass through the same
-  `admitSessionEventPrefix` in physical source order;
+  `admitSessionEventPrefix` in physical source order; for a writable candidate,
+  the consumer invokes it over its private frozen projection and issues the
+  admission proof only after counting the actual returned events;
 - output projection/finalization uses the unchanged `admitOutputBytes` limiter,
   so cache reuse can neither bypass the limit nor leak an unadmitted byte.
 
@@ -573,6 +591,10 @@ warnings, output, and source digest are identical.
 - Cache/suffix/cold mutation during validation/final binding, BigInt identity,
   null-identity pathname swap, and exact/one-over/time/event-stop proof that no
   new pair commits and the prior pair is unchanged.
+- Forged/replayed/cross-consumer candidates and admission proofs, prepare-time
+  meter A versus attempted swapped/omitted meter B, fabricated eligible ids or
+  all-events boolean, mixed eligibility despite a valid admission proof, and a
+  skipped/partial event-admission path; none may mutate the old pair.
 - Cache/tree write failure, unavailable/read-only Store, transaction trigger,
   caller mutation of detached results, and descriptor/payload secret canaries
   absent from identity/error/warning text.
