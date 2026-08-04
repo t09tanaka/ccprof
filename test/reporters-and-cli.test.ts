@@ -45,6 +45,12 @@ import {
 } from "../src/core/model.js";
 import { commandIdentityKey } from "../src/analysis/command-identity.js";
 import {
+  aggregateTerminalStats,
+  exactCohortKey,
+  statsOpaqueDigest,
+} from "../src/analysis/stats-aggregation.js";
+import type { StatsAggregationInput } from "../src/analysis/stats-input.js";
+import {
   InvalidAnalysisWindowError,
   NoAnalyzableTimestampsError,
   NoMatchingSessionsError,
@@ -63,6 +69,7 @@ import {
   renderStatsJson,
   renderStatsTty,
   summarizeStats,
+  summarizeTerminalStats,
   type StatsReport,
 } from "../src/reporters/stats.js";
 import {
@@ -79,6 +86,7 @@ import {
   resolveEffectivePolicy,
   type PolicyRequest,
 } from "../src/policy/organization-policy.js";
+import { listRuleManifests } from "../src/rules/manifest.js";
 import type { StorePaths } from "../src/store/paths.js";
 
 function finding(
@@ -3117,6 +3125,327 @@ function adoptionRecordFixture(
     ...overrides,
   };
 }
+
+const TASK6_REPOSITORY_KEY = "a".repeat(64);
+const TASK6_WORKSPACE_KEY = "b".repeat(64);
+const TASK6_AXIS_VALUES = {
+  confirmed_critical_path_ms: 60_000,
+  estimated_critical_path_upper_ms: 120_000,
+  resource_cost_ms: 180_000,
+  human_wait_ms: 240_000,
+  unexplained_ms: 300_000,
+} as const;
+type Task6Axis = keyof typeof TASK6_AXIS_VALUES;
+
+interface Task6AggregateMetadata {
+  stored_snapshot_count: number;
+  distinct_work_unit_count: number;
+  terminal_snapshot_count: number;
+  superseded_snapshot_count: number;
+  ineligible_snapshot_count: number;
+  sample_count: number;
+  minimum_cohort_size: number;
+  status: "available" | "suppressed";
+  reason_codes: string[];
+}
+
+interface Task6AggregateResult {
+  selected_snapshot_ids: string[];
+  metadata: Task6AggregateMetadata;
+  terminal_metrics?: Record<Task6Axis, number>;
+  rule_minutes: Array<{ rule_id: string; minutes: number }>;
+  cohorts: Array<{
+    cohort_key: string;
+    metadata: Pick<
+      Task6AggregateMetadata,
+      "sample_count" | "minimum_cohort_size" | "status" | "reason_codes"
+    >;
+    distributions?: Record<Task6Axis, {
+      median: number;
+      p50: number;
+      p75: number;
+      mad: number;
+      sample_count: number;
+    }>;
+  }>;
+}
+
+function task6TerminalInput(options: {
+  id: string;
+  createdAtMs: number;
+  workUnit?: string;
+  gitState?: string;
+  changedFilesBucket?: NonNullable<
+    StatsAggregationInput["changed_files_bucket"]
+  >;
+  changedLinesBucket?: NonNullable<
+    StatsAggregationInput["changed_lines_bucket"]
+  >;
+}): StatsAggregationInput {
+  const workUnit = options.workUnit ?? options.id;
+  const gitState = options.gitState ?? options.id;
+  const changedFilesBucket = options.changedFilesBucket ?? "files_2_4";
+  const changedLinesBucket = options.changedLinesBucket ?? "lines_50_199";
+  const cohortKey = exactCohortKey({
+    repository_key: TASK6_REPOSITORY_KEY,
+    workspace_key: TASK6_WORKSPACE_KEY,
+    changed_files_bucket: changedFilesBucket,
+    changed_lines_bucket: changedLinesBucket,
+  });
+  return {
+    schema_version: 1,
+    snapshot_id: statsOpaqueDigest("task6-snapshot-v1", options.id),
+    created_at_ms: options.createdAtMs,
+    work_unit_key: statsOpaqueDigest("task6-work-unit-v1", workUnit),
+    git_state_key: statsOpaqueDigest("task6-git-state-v1", [
+      workUnit,
+      gitState,
+    ]),
+    repository_key: TASK6_REPOSITORY_KEY,
+    workspace_key: TASK6_WORKSPACE_KEY,
+    changed_files_bucket: changedFilesBucket,
+    changed_lines_bucket: changedLinesBucket,
+    cohort_key: cohortKey,
+    terminal_metrics: {
+      measured_wall_ms: 900_000,
+      ...TASK6_AXIS_VALUES,
+      rules: listRuleManifests().map((manifest) => ({
+        rule_id: manifest.id,
+        rule_version: manifest.version,
+        compatibility_epoch: manifest.compatibility_epoch,
+        confirmed_critical_path_ms:
+          manifest.id === "R001"
+            ? TASK6_AXIS_VALUES.confirmed_critical_path_ms
+            : 0,
+        estimated_critical_path_upper_ms:
+          manifest.id === "R001"
+            ? TASK6_AXIS_VALUES.estimated_critical_path_upper_ms
+            : 0,
+        resource_cost_ms:
+          manifest.id === "R005" ? TASK6_AXIS_VALUES.resource_cost_ms : 0,
+      })),
+    },
+    baseline_metrics: [],
+    command_costs: [],
+    reason_codes: [],
+  };
+}
+
+function task6Aggregate(
+  input: readonly StatsAggregationInput[],
+  minimumCohortSize = 5,
+): Task6AggregateResult {
+  return aggregateTerminalStats(
+    input,
+    { mode: "stats_all_groups" },
+    minimumCohortSize,
+  ) as Task6AggregateResult;
+}
+
+test("terminal stats gate five axes and confirmed-only rule minutes at the effective floor", () => {
+  const input = Array.from({ length: 5 }, (_, index) =>
+    task6TerminalInput({
+      id: `floor-${index + 1}`,
+      createdAtMs: index + 1,
+    })
+  );
+  const four = task6Aggregate(input.slice(0, 4));
+  assert.equal("terminal_metrics" in four, false);
+  assert.equal(four.metadata.sample_count, 4);
+  assert.equal(four.metadata.minimum_cohort_size, 5);
+  assert.equal(four.metadata.status, "suppressed");
+  assert.deepEqual(four.metadata.reason_codes, ["below_minimum"]);
+  assert.deepEqual(four.rule_minutes, []);
+
+  const five = task6Aggregate(input);
+  assert.deepEqual(five.terminal_metrics, {
+    confirmed_critical_path_ms: 300_000,
+    estimated_critical_path_upper_ms: 600_000,
+    resource_cost_ms: 900_000,
+    human_wait_ms: 1_200_000,
+    unexplained_ms: 1_500_000,
+  });
+  assert.equal(five.metadata.sample_count, 5);
+  assert.equal(five.metadata.status, "available");
+  assert.deepEqual(five.metadata.reason_codes, []);
+  assert.deepEqual(five.rule_minutes, [{ rule_id: "R001", minutes: 5 }]);
+  assert.equal(
+    five.rule_minutes.some(({ rule_id }) => rule_id === "R005"),
+    false,
+    "resource upper estimates never enter confirmed rule minutes",
+  );
+});
+
+test("stats keeps exact cohort distributions independently policy-sized", () => {
+  const cohortA = (count: number) => Array.from({ length: count }, (_, index) =>
+    task6TerminalInput({
+      id: `cohort-a-${index + 1}`,
+      createdAtMs: 100 + index,
+      changedFilesBucket: "files_2_4",
+    })
+  );
+  const cohortB = (count: number) => Array.from({ length: count }, (_, index) =>
+    task6TerminalInput({
+      id: `cohort-b-${index + 1}`,
+      createdAtMs: 200 + index,
+      changedFilesBucket: "files_5_9",
+    })
+  );
+  const cohortAKey = cohortA(1)[0]!.cohort_key!;
+  const cohortBKey = cohortB(1)[0]!.cohort_key!;
+  assert.notEqual(cohortAKey, cohortBKey);
+
+  const individuallySmall = task6Aggregate([
+    ...cohortA(3),
+    ...cohortB(2),
+  ]);
+  assert.equal(
+    individuallySmall.metadata.status,
+    "available",
+    "the top-level terminal population reaches five",
+  );
+  assert.equal(individuallySmall.cohorts.length, 2);
+  const smallByKey = new Map(
+    individuallySmall.cohorts.map((cohort) => [cohort.cohort_key, cohort]),
+  );
+  assert.equal(smallByKey.get(cohortAKey)?.metadata.sample_count, 3);
+  assert.equal(smallByKey.get(cohortBKey)?.metadata.sample_count, 2);
+  for (const cohort of individuallySmall.cohorts) {
+    assert.equal(cohort.metadata.status, "suppressed");
+    assert.deepEqual(cohort.metadata.reason_codes, ["below_minimum"]);
+    assert.equal("distributions" in cohort, false);
+  }
+
+  const independentlyReady = task6Aggregate([
+    ...cohortA(5),
+    ...cohortB(5),
+  ]);
+  assert.deepEqual(
+    independentlyReady.cohorts.map(({ cohort_key }) => cohort_key),
+    [cohortAKey, cohortBKey].sort((left, right) =>
+      left.localeCompare(right)),
+  );
+  assert.equal(independentlyReady.selected_snapshot_ids.length, 10);
+  const expectedDistributions = Object.fromEntries(
+    Object.entries(TASK6_AXIS_VALUES).map(([metric, value]) => [metric, {
+      median: value,
+      p50: value,
+      p75: value,
+      mad: 0,
+      sample_count: 5,
+    }]),
+  ) as Task6AggregateResult["cohorts"][number]["distributions"];
+  for (const cohort of independentlyReady.cohorts) {
+    assert.equal(cohort.metadata.sample_count, 5);
+    assert.equal(cohort.metadata.status, "available");
+    assert.deepEqual(cohort.metadata.reason_codes, []);
+    assert.deepEqual(cohort.distributions, expectedDistributions);
+  }
+  assert.deepEqual(
+    task6Aggregate([
+      ...cohortB(5).reverse(),
+      ...cohortA(5).reverse(),
+    ]),
+    independentlyReady,
+  );
+});
+
+test("terminal snapshot IDs bound recurrence adoption and the history label", () => {
+  const projected = [
+    task6TerminalInput({
+      id: "observational-a-original",
+      createdAtMs: 1_000,
+      workUnit: "observational-work-one",
+      gitState: "state-a",
+    }),
+    task6TerminalInput({
+      id: "observational-b-terminal",
+      createdAtMs: 2_000,
+      workUnit: "observational-work-one",
+      gitState: "state-b",
+    }),
+    task6TerminalInput({
+      id: "observational-a-rerun",
+      createdAtMs: 3_000,
+      workUnit: "observational-work-one",
+      gitState: "state-a",
+    }),
+    ...Array.from({ length: 4 }, (_, index) => task6TerminalInput({
+      id: `observational-independent-${index + 1}`,
+      createdAtMs: 2_100 + index,
+    })),
+  ];
+  const aggregate = task6Aggregate(projected);
+  const originalId = projected[0]!.snapshot_id;
+  const terminalId = projected[1]!.snapshot_id;
+  const rerunId = projected[2]!.snapshot_id;
+  assert.ok(aggregate.selected_snapshot_ids.includes(terminalId));
+  assert.equal(aggregate.selected_snapshot_ids.includes(originalId), false);
+  assert.equal(aggregate.selected_snapshot_ids.includes(rerunId), false);
+  assert.equal(aggregate.metadata.stored_snapshot_count, 7);
+  assert.equal(aggregate.metadata.terminal_snapshot_count, 5);
+  assert.equal(aggregate.metadata.superseded_snapshot_count, 2);
+
+  const terminalOnlyFinding = adoptionFinding("terminal-only-key", {
+    rule_id: "R002",
+    title: "Only terminal work units count",
+    recoverable: { min: 6, bound: "point" },
+  });
+  const findingsById = new Map<string, Finding[]>([
+    ["observational-a-original", [structuredClone(terminalOnlyFinding)]],
+    ["observational-a-rerun", [structuredClone(terminalOnlyFinding)]],
+    ["observational-independent-1", [
+      structuredClone(terminalOnlyFinding),
+    ]],
+  ]);
+  const recordsBySnapshot = new Map<string, AnalysisRecord>();
+  const allRecords = projected.map((entry, index) => {
+    const id = index < 3
+      ? [
+          "observational-a-original",
+          "observational-b-terminal",
+          "observational-a-rerun",
+        ][index]!
+      : `observational-independent-${index - 2}`;
+    const record = adoptionAnalysisRecord(
+      `terminal-record-${index}`,
+      entry.created_at_ms,
+      findingsById.get(id) ?? [],
+      index < 3 ? "shared-observational-pr" : `terminal-pr-${index}`,
+    );
+    recordsBySnapshot.set(entry.snapshot_id, record);
+    return record;
+  });
+  assert.equal(
+    summarizeStats(allRecords).recurring_findings[0]?.occurrence_count,
+    3,
+    "the fixture would recur if superseded records leaked into stats",
+  );
+  const terminalRecords = aggregate.selected_snapshot_ids.map((snapshotId) => {
+    const record = recordsBySnapshot.get(snapshotId);
+    assert.ok(record !== undefined);
+    return record;
+  });
+  const stats = summarizeTerminalStats(
+    aggregate,
+    terminalRecords,
+    [adoptionRecordFixture({
+      finding_key: "terminal-only-key",
+      rule_id: "R002",
+      detected_at_ms: 1_500,
+    })],
+  ) as StatsReport;
+
+  assert.equal(stats.history_count, 5);
+  assert.deepEqual(stats.recurring_findings, []);
+  assert.equal(stats.adoptions[0]?.minutes_before, 0);
+  assert.equal(stats.adoptions[0]?.analyses_after, 5);
+  assert.equal(stats.adoptions[0]?.recurrences_after, 1);
+  assert.equal(stats.adoptions[0]?.minutes_after, 6);
+  assert.equal(stats.adoptions[0]?.status, "recurred");
+  assert.deepEqual(stats.rule_minutes, [{ rule_id: "R001", minutes: 5 }]);
+  assert.match(renderStatsTty(stats), /^History: 5 terminal work units$/mu);
+});
 
 const ADOPTION_DAY0_MS = Date.UTC(2026, 7, 1, 12, 0, 0);
 

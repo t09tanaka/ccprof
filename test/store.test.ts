@@ -4363,6 +4363,269 @@ const baselineHistoryRejectsRawRecords: BaselineHistoryRejectsRawRecords = true;
 void baselineCurrentRejectsRawRecord;
 void baselineHistoryRejectsRawRecords;
 
+test("terminal selection suppresses an incomplete terminal without historical fallback", () => {
+  const completeEntries = [
+    comparableHistoryEntry({
+      id: "terminal-a-original",
+      createdAtMs: 1_000,
+      metric: 1,
+      selectorNumber: 70,
+      gitState: "state-a",
+      analysisVariant: "a-original",
+    }),
+    comparableHistoryEntry({
+      id: "terminal-b",
+      createdAtMs: 2_000,
+      metric: 2,
+      selectorNumber: 70,
+      gitState: "state-b",
+      analysisVariant: "b",
+    }),
+    comparableHistoryEntry({
+      id: "terminal-a-rerun",
+      createdAtMs: 3_000,
+      metric: 3,
+      selectorNumber: 70,
+      gitState: "state-a",
+      analysisVariant: "a-rerun",
+    }),
+  ];
+  const completeProjected = projectComparableHistory(completeEntries);
+  assert.deepEqual(
+    selectTerminalSnapshots(completeProjected).terminals.map(
+      ({ snapshot_id }) => snapshot_id,
+    ),
+    [completeEntries[1]!.snapshot_id],
+    "the later A variant cannot resurrect state A after state B",
+  );
+
+  const incompleteEntries = structuredClone(completeEntries);
+  const incompleteTerminal = incompleteEntries[1]!;
+  delete incompleteTerminal.record.terminal_stats_snapshot;
+  const {
+    analysis_id: ignoredAnalysisId,
+    created_at_ms: ignoredCreatedAtMs,
+    ...incompletePayload
+  } = incompleteTerminal.record;
+  void ignoredAnalysisId;
+  void ignoredCreatedAtMs;
+  incompleteTerminal.snapshot_id = analysisDigest("analysis-snapshot-v1", {
+    schema_version: 1,
+    identity: incompleteTerminal.identity,
+    payload: incompletePayload,
+  });
+
+  const projected = projectComparableHistory(incompleteEntries);
+  assert.equal(projected[1]?.terminal_metrics, undefined);
+  assert.ok(projected[1]?.reason_codes.includes("missing_terminal_metrics"));
+  const selected = selectTerminalSnapshots(projected);
+  assert.deepEqual(
+    selected.terminals,
+    [],
+    "an older complete state must not replace the incomplete terminal state",
+  );
+  assert.deepEqual(selected.metadata, {
+    stored_snapshot_count: 3,
+    terminal_snapshot_count: 0,
+    superseded_snapshot_count: 2,
+    ineligible_snapshot_count: 1,
+  });
+});
+
+test("terminal selection resolves equal state and variant times by opaque digests", () => {
+  const entries = [
+    ...["left-a", "left-b"].map((variant) => comparableHistoryEntry({
+      id: `digest-tie-${variant}`,
+      createdAtMs: 4_000,
+      metric: 1,
+      selectorNumber: 71,
+      gitState: "tie-left",
+      analysisVariant: variant,
+    })),
+    ...["right-a", "right-b"].map((variant) => comparableHistoryEntry({
+      id: `digest-tie-${variant}`,
+      createdAtMs: 4_000,
+      metric: 1,
+      selectorNumber: 71,
+      gitState: "tie-right",
+      analysisVariant: variant,
+    })),
+  ];
+  const projected = projectComparableHistory(entries);
+  const terminalStateKey = [...new Set(projected.map(({ git_state_key }) => {
+    assert.ok(git_state_key !== undefined);
+    return git_state_key;
+  }))].sort((left, right) => left.localeCompare(right)).at(-1);
+  assert.ok(terminalStateKey !== undefined);
+  const expectedSnapshotId = projected
+    .filter(({ git_state_key }) => git_state_key === terminalStateKey)
+    .map(({ snapshot_id }) => snapshot_id)
+    .sort((left, right) => left.localeCompare(right))
+    .at(-1);
+  assert.ok(expectedSnapshotId !== undefined);
+
+  for (const input of [projected, [...projected].reverse()]) {
+    const selected = selectTerminalSnapshots(input);
+    assert.deepEqual(
+      selected.terminals.map(({ snapshot_id }) => snapshot_id),
+      [expectedSnapshotId],
+    );
+    assert.equal(selected.metadata.superseded_snapshot_count, 3);
+  }
+});
+
+test("stats projection exposes only closed numeric bounded and opaque data", () => {
+  const canary = "TASK6_RAW_PROJECTION_CANARY";
+  const rawEntry = comparableHistoryEntry({
+    id: "projection-canary",
+    createdAtMs: 5_000,
+    metric: 0.5,
+    displayRef: `${canary}-selector-token`,
+    selector: {
+      kind: "explicit_range",
+      range: "triple_dot",
+      base_ref_digest: selectorRefDigest(
+        "explicit_range",
+        "base",
+        `${canary}-base`,
+      ),
+      head_ref_digest: selectorRefDigest(
+        "explicit_range",
+        "head",
+        `${canary}-head`,
+      ),
+    },
+  });
+  rawEntry.record.unit = {
+    repo: `/private/${canary}/repository`,
+    pr_ref: `${canary}-display-selector`,
+    sessions: [`${canary}-session`],
+  };
+  rawEntry.record.command_costs = [{
+    command: `${canary}-command`,
+    command_identity: {
+      repo_relative_cwd: `packages/${canary}`,
+      normalized_argv: ["runner", `${canary}-argv`],
+      executor: "native-tool",
+    },
+    duration_min: 1,
+    session_refs: [`${canary}-command-session`],
+  }];
+  const rawFinding = finding("projection-canary-finding");
+  rawFinding.title = `${canary}-title`;
+  rawFinding.evidence = {
+    ...rawFinding.evidence,
+    session_refs: [`${canary}-finding-session`],
+    interval_ids: [`${canary}-interval-id`],
+    url: `https://example.invalid/${canary}`,
+    prompt: `${canary}-prompt`,
+    intervals: [{ start_ms: 1, end_ms: 2, token: canary }],
+  };
+  rawFinding.fix_recipe = {
+    suggestion: `${canary}-suggestion`,
+    verify: `${canary}-verify`,
+  };
+  rawEntry.record.findings = [rawFinding];
+
+  const objectReferences = (value: unknown): Set<object> => {
+    const result = new Set<object>();
+    const visit = (entry: unknown): void => {
+      if (entry === null || typeof entry !== "object" || result.has(entry)) {
+        return;
+      }
+      result.add(entry);
+      for (const child of Object.values(entry)) visit(child);
+    };
+    visit(value);
+    return result;
+  };
+  const rawReferences = objectReferences(rawEntry);
+  const projected = projectStatsAggregationInput(rawEntry);
+  const serialized = JSON.stringify(projected);
+  assert.equal(serialized.includes(canary), false);
+  for (const forbidden of [
+    "unit",
+    "findings",
+    "evidence",
+    "normalized_argv",
+    "repo_relative_cwd",
+    "executor",
+    "session_refs",
+    "interval_ids",
+    "fix_recipe",
+  ]) {
+    assert.equal(serialized.includes(`\"${forbidden}\"`), false, forbidden);
+  }
+  assert.deepEqual(Object.keys(projected).sort(), [
+    "baseline_metrics",
+    "changed_files_bucket",
+    "changed_lines_bucket",
+    "cohort_key",
+    "command_costs",
+    "created_at_ms",
+    "git_state_key",
+    "reason_codes",
+    "repository_key",
+    "schema_version",
+    "snapshot_id",
+    "terminal_metrics",
+    "work_unit_key",
+    "workspace_key",
+  ]);
+  const projectedReferences = objectReferences(projected);
+  for (const reference of rawReferences) {
+    assert.equal(projectedReferences.has(reference), false);
+  }
+  const snapshot = structuredClone(projected);
+  rawEntry.record.unit.repo = `/${canary}-mutated`;
+  rawEntry.record.findings.length = 0;
+  assert.deepEqual(projected, snapshot);
+
+  let hostileReads = 0;
+  const accessor = comparableHistoryEntry({
+    id: "projection-accessor",
+    createdAtMs: 5_001,
+    metric: 1,
+  });
+  Object.defineProperty(accessor.record.unit, "repo", {
+    enumerable: true,
+    get() {
+      hostileReads += 1;
+      throw new Error(canary);
+    },
+  });
+  const proxied = comparableHistoryEntry({
+    id: "projection-proxy",
+    createdAtMs: 5_002,
+    metric: 1,
+  });
+  proxied.record.command_costs = new Proxy(proxied.record.command_costs, {
+    get() {
+      hostileReads += 1;
+      throw new Error(canary);
+    },
+  });
+  const unknown = {
+    ...comparableHistoryEntry({
+      id: "projection-unknown",
+      createdAtMs: 5_003,
+      metric: 1,
+    }),
+    unexpected: canary,
+  };
+  for (const hostile of [accessor, proxied, unknown]) {
+    assert.throws(
+      () => projectStatsAggregationInput(hostile),
+      (error: unknown) => {
+        assert.ok(error instanceof TypeError);
+        assert.equal(error.message.includes(canary), false);
+        return true;
+      },
+    );
+  }
+  assert.equal(hostileReads, 0);
+});
+
 test("robust distributions are order invariant and exact cohort buckets are fixed", () => {
   const values = [1, 2, 3, 100];
   const expectedDistribution = {
