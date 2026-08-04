@@ -90,6 +90,8 @@ async function findRolloutFiles(directory: string,
       files.push(...(await findRolloutFiles(path, failed)));
     } else if (entry.isFile() && ROLLOUT_FILE_PATTERN.test(entry.name)) {
       files.push(path);
+    } else if (entry.isSymbolicLink() && ROLLOUT_FILE_PATTERN.test(entry.name)) {
+      failed?.();
     }
   }
   return files;

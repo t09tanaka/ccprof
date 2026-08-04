@@ -1669,7 +1669,6 @@ async function parseCodexSessionLegacy(
     tracker,
     firstBudgetError,
   );
-  if (result !== null) Reflect.deleteProperty(result.warnings, "push");
   return { result, observation: { rows_seen: tracker.lastPhysicalLine,
     rows_accepted: rows.length, events_emitted: result?.events.length ?? 0,
     completeness: tracker.readStops.length === 0 && warnings.length === 0 &&
@@ -1695,11 +1694,11 @@ export async function parseCodexSessionObserved(
         ...(options.budgets === undefined ? {} : { budgets: options.budgets }),
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
-      if (result !== null) Reflect.deleteProperty(result.warnings, "push");
       return { result, observation: { rows_seen: read.state.line_count,
         rows_accepted: read.state.rows.length, events_emitted: result?.events.length ?? 0,
         completeness: read.completeness === "complete" &&
-          read.state.warnings.length === 0 && (result?.warnings.length ?? 0) === 0
+          read.state.warnings.length === 0 && read.state.seen_subtypes.length === 0 &&
+          (result?.warnings.length ?? 0) === 0
           ? "complete" : "partial" } };
     } catch (error) {
       if (!(error instanceof IncrementalParserStateCapacityError)) throw error;

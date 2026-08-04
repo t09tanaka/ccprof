@@ -215,12 +215,33 @@ test("cold parser coverage preserves Claude and Codex results with truthful loss
     "{malformed",
   ].join("\n")}\n`);
   const codexObserved = await parseCodexSessionObserved({ sourcePath: codexPath });
-  assert.deepEqual(codexObserved.result,
-    await parseCodexSession({ sourcePath: codexPath }));
+  const codexLegacy = await parseCodexSession({ sourcePath: codexPath });
+  assert.ok(codexObserved.result); assert.ok(codexLegacy);
+  assert.deepEqual({ ...codexObserved.result, warnings: [...codexObserved.result.warnings] },
+    { ...codexLegacy, warnings: [...codexLegacy.warnings] });
+  for (const warnings of [codexObserved.result.warnings, codexLegacy.warnings]) {
+    const descriptor = Object.getOwnPropertyDescriptor(warnings, "push");
+    assert.equal(typeof descriptor?.value, "function");
+    assert.deepEqual({ enumerable: descriptor?.enumerable,
+      writable: descriptor?.writable, configurable: descriptor?.configurable },
+    { enumerable: true, writable: true, configurable: true });
+  }
   assert.deepEqual(codexObserved.observation, {
     rows_seen: 3, rows_accepted: 2, events_emitted: 1,
     completeness: "partial",
   });
+});
+
+test("cold parser coverage marks a dropped unknown Codex subtype partial", async (t) => {
+  const root = await tempRoot(t, "ccprof-coverage-unknown-");
+  const path = join(root, "rollout-unknown.jsonl");
+  await writeFile(path, `${[
+    codexRow("session_meta", { id: "coverage-unknown", cwd: root }),
+    codexRow("response_item", { type: "future_item" }),
+  ].join("\n")}\n`);
+  const observed = await parseCodexSessionObserved({ sourcePath: path });
+  assert.equal(observed.result, null);
+  assert.equal(observed.observation.completeness, "partial");
 });
 
 test("cold parser coverage reports bounded reads as partial", async (t) => {
@@ -300,4 +321,15 @@ test("cold discovery coverage distinguishes missing, empty, and zero-event Codex
     assert.equal(emptyObserved.source_coverage.files_discovered, 0);
   const missing = await discoverCodexSessionsObserved(join(root, "missing"), query(repo));
   assert.deepEqual(missing, { sessions: [], source_coverage: { status: "unavailable" } });
+
+  const links = join(root, "links"); await mkdir(links);
+  await symlink(join(day, "rollout-meta.jsonl"),
+    join(links, "rollout-link.jsonl"));
+  const linked = await discoverCodexSessionsObserved(links, query(repo));
+  assert.deepEqual(linked.sessions, await discoverCodexSessions(links, query(repo)));
+  assert.equal(linked.source_coverage.status, "available");
+  if (linked.source_coverage.status === "available") {
+    assert.equal(linked.source_coverage.files_discovered, 0);
+    assert.equal(linked.source_coverage.completeness, "partial");
+  }
 });
