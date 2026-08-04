@@ -356,6 +356,35 @@ test("partitions human wait separately with recoverable precedence", () => {
   assert.equal(result.normal_min, 0.5);
 });
 
+test("preserves observed human wait before finding attribution", () => {
+  const result = reconcileLedger({
+    rawIntervals: [{ start_ms: 0, end_ms: 120_000 }],
+    activeIntervals: [{ start_ms: 20_000, end_ms: 100_000 }],
+    contributingIntervals: [],
+    humanWaitIntervals: [
+      { start_ms: 0, end_ms: 50_000 },
+      { start_ms: 40_000, end_ms: 90_000 },
+      { start_ms: 110_000, end_ms: 120_000 },
+    ],
+    candidates: [
+      candidate(
+        "R004",
+        "approval-attribution",
+        "point",
+        [{ start_ms: 60_000, end_ms: 80_000 }],
+      ),
+    ],
+  });
+
+  assert.deepEqual(result.observedHumanWaitIntervals, [
+    { start_ms: 20_000, end_ms: 90_000 },
+  ]);
+  assert.deepEqual(result.humanWaitIntervals, [
+    { start_ms: 20_000, end_ms: 60_000 },
+    { start_ms: 80_000, end_ms: 90_000 },
+  ]);
+});
+
 test("human wait overlapping contributing time wins over normal", () => {
   const result = reconcileLedger({
     rawIntervals: [{ start_ms: 0, end_ms: 60_000 }],

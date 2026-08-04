@@ -906,6 +906,49 @@ test("malformed git log rows are ignored and reported as warnings", async () => 
   assert.match(context.warnings[0] ?? "", /not-a-timestamp/);
 });
 
+test("collectDiffEvidence counts complete text additions and deletions only", async () => {
+  const fixture = fakeRunner(({ args }) => {
+    if (args[1] === "diff" && args.includes("--name-status")) {
+      return ok("M\0src/a.ts\0A\0src/b.ts\0");
+    }
+    if (args[1] === "diff") {
+      return ok([
+        "diff --git a/src/a.ts b/src/a.ts",
+        "index 111..222 100644",
+        "--- a/src/a.ts",
+        "+++ b/src/a.ts",
+        "@@ -1,2 +1,3 @@",
+        "-old",
+        " context",
+        "+new",
+        "+++starts-with-plus",
+        "diff --git a/src/b.ts b/src/b.ts",
+        "new file mode 100644",
+        "--- /dev/null",
+        "+++ b/src/b.ts",
+        "@@ -0,0 +1,2 @@",
+        "+first",
+        "+second",
+        "",
+      ].join("\n"));
+    }
+    return ok("");
+  });
+
+  const evidence = await collectDiffEvidence({
+    cwd: "/repo",
+    baseOid: BASE,
+    headOid: HEAD,
+    runner: fixture.runner,
+  });
+
+  assert.equal(evidence.changedLineCount, 5);
+  assert.deepEqual(evidence.files.map(({ addedLines }) => addedLines), [
+    ["new", "++starts-with-plus"],
+    ["first", "second"],
+  ]);
+});
+
 test("collectDiffEvidence pairs status with patch order and parses only hunk additions", async () => {
   const binaryPath = "assets/a\nb.bin";
   const status = [
@@ -1064,6 +1107,7 @@ test("collectDiffEvidence pairs status with patch order and parses only hunk add
   assert.equal(evidence.files[0]?.contentComplete, true);
   assert.equal(evidence.files[2]?.binary, true);
   assert.equal(evidence.files[2]?.contentComplete, false);
+  assert.equal("changedLineCount" in evidence, false);
   assert.deepEqual(evidence.reverts, [
     {
       commitOid: revertOid,
@@ -1114,6 +1158,7 @@ test("patch/status mismatch does not attribute patch content by shifted index", 
       { path: "src/second.ts", addedLines: [], contentComplete: false },
     ],
   );
+  assert.equal("changedLineCount" in evidence, false);
   assert.match(evidence.caveats[0] ?? "", /paired completely/i);
 });
 
@@ -1140,6 +1185,7 @@ test("truncated patch marks textual content incomplete without losing status evi
 
   assert.equal(evidence.truncated, true);
   assert.equal(evidence.files[0]?.contentComplete, false);
+  assert.equal("changedLineCount" in evidence, false);
   assert.match(evidence.caveats[0] ?? "", /truncated/i);
 });
 
