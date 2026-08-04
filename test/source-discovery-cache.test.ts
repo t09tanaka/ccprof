@@ -20,6 +20,9 @@ import { openStoreDatabase } from "../src/store/sqlite.js";
 import { resolveStorePaths, type StorePaths } from "../src/store/paths.js";
 
 const SECRET_CANARY = "SECRET_DISCOVERY_CACHE_CANARY";
+const MAX_DISCOVERY_TREE_JSON_BYTES = 128 * 1024 * 1024;
+const MAX_DISCOVERY_ENTRIES = 100_000;
+const MAX_DISCOVERY_DEPTH = 64;
 const ROOT_COLUMNS = [
   "root_identity", "adapter_id", "canonical_root", "cursor", "capability",
   "tree_json", "tree_digest", "observed_at_ms", "completeness",
@@ -198,6 +201,50 @@ function fullScanTree(
     ...tree,
     capability: { kind: "full_scan_required", reason },
   };
+}
+
+function entryCountTree(
+  canonicalRoot: string,
+  count: number,
+): DiscoveryTreeV1 {
+  const tree = fullScanTree(canonicalRoot, "uncertain");
+  tree.directories = [directory("", "11", Array.from(
+    { length: count },
+    (_, index) => ({
+      name: `entry-${index.toString().padStart(6, "0")}`,
+      kind: "file" as const,
+    }),
+  ))];
+  return tree;
+}
+
+function depthTree(
+  canonicalRoot: string,
+  maximumDepth: number,
+): DiscoveryTreeV1 {
+  const tree = fullScanTree(canonicalRoot, "uncertain");
+  tree.directories = Array.from({ length: maximumDepth + 1 }, (_, depth) =>
+    directory(
+      Array.from({ length: depth }, () => "d").join("/"),
+      (depth + 11).toString(10),
+      depth === maximumDepth
+        ? [{ name: "leaf.jsonl", kind: "file" }]
+        : [{ name: "d", kind: "directory" }],
+    ));
+  return tree;
+}
+
+function treeWithJsonBytes(
+  canonicalRoot: string,
+  targetBytes: number,
+): DiscoveryTreeV1 {
+  const tree = entryCountTree(canonicalRoot, 1);
+  tree.directories[0]!.entries[0]!.name = "界";
+  const baseBytes = Buffer.byteLength(canonicalJson(tree));
+  assert.ok(baseBytes <= targetBytes);
+  tree.directories[0]!.entries[0]!.name += "x".repeat(targetBytes - baseBytes);
+  assert.equal(Buffer.byteLength(canonicalJson(tree)), targetBytes);
+  return tree;
 }
 
 function discoveryRoot(options: {
@@ -433,6 +480,8 @@ test("discovery trees reject unknown fields, noncanonical order, and invalid sta
   for (const [field, value] of [
     ["device", "07"],
     ["inode", "0"],
+    ["mtime_ns", "0"],
+    ["ctime_ns", "0"],
     ["mtime_ns", "-1"],
     ["ctime_ns", "1.5"],
   ] as const) {
@@ -454,6 +503,68 @@ test("discovery trees reject unknown fields, noncanonical order, and invalid sta
       ["invalid_shape", "unknown_field", "invalid_state"],
     );
   }
+
+  const foreignChildDevice = cloneTree(row);
+  foreignChildDevice.directories[1]!.token.device = "8";
+  assertDiscoveryError(
+    () => validateSourceDiscoveryRoot(withTree(row, foreignChildDevice)),
+    ["foreign_binding", "invalid_state"],
+  );
+});
+
+test("discovery trees enforce exact UTF-8, entry-count, and path-depth bounds", {
+  timeout: 120_000,
+}, () => {
+  const sizeRoot = "/sessions/tree-size-bound";
+  const exactSize = discoveryRoot({
+    canonicalRoot: sizeRoot,
+    tree: treeWithJsonBytes(sizeRoot, MAX_DISCOVERY_TREE_JSON_BYTES),
+  });
+  assert.equal(
+    Buffer.byteLength(exactSize.tree_json),
+    MAX_DISCOVERY_TREE_JSON_BYTES,
+  );
+  assert.doesNotThrow(() => validateSourceDiscoveryRoot(exactSize));
+
+  const overSizeTree = cloneTree(exactSize);
+  overSizeTree.directories[0]!.entries[0]!.name += "界";
+  assert.ok(
+    Buffer.byteLength(canonicalJson(overSizeTree)) >
+      MAX_DISCOVERY_TREE_JSON_BYTES,
+  );
+  assertDiscoveryError(
+    () => validateSourceDiscoveryRoot(discoveryRoot({
+      canonicalRoot: sizeRoot,
+      tree: overSizeTree,
+    })),
+    "invalid_state",
+  );
+
+  const entryRoot = "/sessions/tree-entry-bound";
+  assert.doesNotThrow(() => validateSourceDiscoveryRoot(discoveryRoot({
+    canonicalRoot: entryRoot,
+    tree: entryCountTree(entryRoot, MAX_DISCOVERY_ENTRIES),
+  })));
+  assertDiscoveryError(
+    () => validateSourceDiscoveryRoot(discoveryRoot({
+      canonicalRoot: entryRoot,
+      tree: entryCountTree(entryRoot, MAX_DISCOVERY_ENTRIES + 1),
+    })),
+    "invalid_state",
+  );
+
+  const depthRoot = "/sessions/tree-depth-bound";
+  assert.doesNotThrow(() => validateSourceDiscoveryRoot(discoveryRoot({
+    canonicalRoot: depthRoot,
+    tree: depthTree(depthRoot, MAX_DISCOVERY_DEPTH),
+  })));
+  assertDiscoveryError(
+    () => validateSourceDiscoveryRoot(discoveryRoot({
+      canonicalRoot: depthRoot,
+      tree: depthTree(depthRoot, MAX_DISCOVERY_DEPTH + 1),
+    })),
+    "invalid_state",
+  );
 });
 
 test("capability evidence and row digests bind the exact root, adapter, cursor, and labels", () => {
@@ -724,6 +835,18 @@ test("directory cursor commits cover replay, conflict, generation advance, stale
   });
   assert.equal(commitSourceDiscoveryRoot(store.database, partial), "inserted");
   assert.equal(commitSourceDiscoveryRoot(store.database, partial), "unchanged");
+  const advancedPartial = rebindRoot(partial, {
+    cursor: partial.cursor + 1,
+    observed_at_ms: partial.observed_at_ms + 1,
+  });
+  assertDiscoveryError(
+    () => commitSourceDiscoveryRoot(store.database, advancedPartial),
+    "progress_regression",
+  );
+  assert.deepEqual(
+    getSourceDiscoveryRoot(store.database, partial.root_identity),
+    partial,
+  );
   const completed = rebindRoot(partial, {
     cursor: partial.cursor + 1,
     observed_at_ms: partial.observed_at_ms + 1,
