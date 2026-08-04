@@ -1461,6 +1461,7 @@ test("captures one cohort floor for baseline eligibility and persisted policy id
     });
     const delegate = new ClaudeSessionSource(projects);
     const pausingSource: SessionSource = {
+      contract: CLAUDE_SESSION_SOURCE_CONTRACT,
       discover: async (query) => {
         markPaused();
         await resumed;
