@@ -36,7 +36,14 @@ import {
   type EffectivePolicy,
   type OrganizationPolicy,
   type PolicyRequest,
+  type RepositoryPolicyPreferences,
 } from "../src/policy/organization-policy.js";
+import type {
+  ApprovalRulePolicy,
+  EffectiveRuleSafetyPolicy,
+  RepositoryApprovalRulePolicy,
+  ResourceDomainPolicy,
+} from "../src/policy/rule-safety.js";
 import { renderJsonReport } from "../src/reporters/json.js";
 import type { PrivacyProfile } from "../src/reporters/privacy.js";
 
@@ -61,6 +68,82 @@ function policy(
     required_source_coverage: 0.9,
     ...overrides,
   };
+}
+
+type OrganizationPolicyWithRuleSafety = OrganizationPolicy & {
+  approval_policy?: ApprovalRulePolicy;
+  resource_domains?: ResourceDomainPolicy[];
+};
+
+type RepositoryPolicyWithRuleSafety = RepositoryPolicyPreferences & {
+  approval_policy?: RepositoryApprovalRulePolicy;
+  resource_domains?: ResourceDomainPolicy[];
+};
+
+type EffectivePolicyWithRuleSafety = EffectivePolicy & {
+  rule_safety?: EffectiveRuleSafetyPolicy;
+};
+
+function ruleSafetyPolicy(
+  overrides: Partial<OrganizationPolicyWithRuleSafety> = {},
+): OrganizationPolicyWithRuleSafety {
+  return {
+    ...policy(),
+    approval_policy: {
+      safe_patterns: ["npm test"],
+      allow_rule_recommendation: true,
+    },
+    resource_domains: [{
+      match: ["npm test"],
+      domain: "validation",
+      parallel_safe: true,
+    }],
+    ...overrides,
+  };
+}
+
+function policyWithCanonicalBytes(
+  targetBytes: number,
+): OrganizationPolicyWithRuleSafety {
+  const resourceDomains = Array.from({ length: 8 }, (_, domainIndex) => ({
+    match: Array.from(
+      { length: 32 },
+      (_, patternIndex) => `p${domainIndex}-${patternIndex}-`,
+    ),
+    domain: `domain-${domainIndex}`,
+    parallel_safe: domainIndex % 2 === 0,
+  }));
+  const value = ruleSafetyPolicy({ resource_domains: resourceDomains });
+  let remaining = targetBytes - Buffer.byteLength(JSON.stringify(value));
+  assert.ok(remaining >= 0);
+  for (const domain of resourceDomains) {
+    for (let index = 0; index < domain.match.length; index += 1) {
+      const pattern = domain.match[index] as string;
+      const capacity = 256 - Buffer.byteLength(pattern);
+      const added = Math.min(capacity, remaining);
+      domain.match[index] = `${pattern}${"x".repeat(added)}`;
+      remaining -= added;
+    }
+  }
+  assert.equal(remaining, 0);
+  assert.equal(Buffer.byteLength(JSON.stringify(value)), targetBytes);
+  return value;
+}
+
+function assertRuntimeConstraintAnnotation(value: unknown): void {
+  assert.ok(Array.isArray(value));
+  const annotation = value.join(" ");
+  for (const constraint of [
+    /UTF-8.*byte/iu,
+    /NFC.*whitespace/iu,
+    /duplicate/iu,
+    /descriptor.*proxy/iu,
+    /canonical.*payload.*byte/iu,
+    /tuple.*order/iu,
+    /monotonic.*merge/iu,
+  ]) {
+    assert.match(annotation, constraint);
+  }
 }
 
 function report(repoRoot: string): ReportV2 {
@@ -232,8 +315,66 @@ test("published organization policy schema is closed and exact", async () => {
     "allow_export",
     "raw_retention_days_max",
     "required_source_coverage",
+    "approval_policy",
+    "resource_domains",
     "kill_switches",
   ]);
+  const approval = schema.properties?.approval_policy as {
+    additionalProperties?: unknown;
+    required?: unknown;
+    properties?: Record<string, {
+      type?: unknown;
+      minItems?: unknown;
+      maxItems?: unknown;
+      items?: Record<string, unknown>;
+    }>;
+  };
+  assert.equal(approval.additionalProperties, false);
+  assert.deepEqual(approval.required, [
+    "safe_patterns",
+    "allow_rule_recommendation",
+  ]);
+  assert.equal(approval.properties?.safe_patterns?.type, "array");
+  assert.equal(approval.properties?.safe_patterns?.maxItems, 64);
+  assert.equal(approval.properties?.safe_patterns?.items?.maxLength, 256);
+  assert.equal(
+    approval.properties?.allow_rule_recommendation?.type,
+    "boolean",
+  );
+
+  const domains = schema.properties?.resource_domains as {
+    type?: unknown;
+    maxItems?: unknown;
+    items?: {
+      additionalProperties?: unknown;
+      required?: unknown;
+      properties?: Record<string, {
+        type?: unknown;
+        minItems?: unknown;
+        maxItems?: unknown;
+        maxLength?: unknown;
+        pattern?: unknown;
+        items?: Record<string, unknown>;
+      }>;
+    };
+  };
+  assert.equal(domains.type, "array");
+  assert.equal(domains.maxItems, 64);
+  assert.equal(domains.items?.additionalProperties, false);
+  assert.deepEqual(domains.items?.required, [
+    "match",
+    "domain",
+    "parallel_safe",
+  ]);
+  assert.equal(domains.items?.properties?.match?.minItems, 1);
+  assert.equal(domains.items?.properties?.match?.maxItems, 32);
+  assert.equal(domains.items?.properties?.match?.items?.maxLength, 256);
+  assert.equal(domains.items?.properties?.domain?.maxLength, 64);
+  assert.equal(
+    domains.items?.properties?.domain?.pattern,
+    "^[a-z0-9][a-z0-9._-]{0,63}$",
+  );
+  assert.equal(domains.items?.properties?.parallel_safe?.type, "boolean");
   const killSwitches = schema.properties?.kill_switches as {
     additionalProperties?: unknown;
     required?: unknown;
@@ -265,7 +406,73 @@ test("repository config schema publishes a closed optional policy section", asyn
     "allow_export",
     "raw_retention_days_max",
     "required_source_coverage",
+    "approval_policy",
+    "resource_domains",
   ]);
+  const approval = policySchema?.properties?.approval_policy as {
+    additionalProperties?: unknown;
+    required?: unknown;
+    properties?: Record<string, { type?: unknown }>;
+  };
+  assert.equal(approval.additionalProperties, false);
+  assert.deepEqual(approval.required, []);
+  assert.equal(approval.properties?.safe_patterns?.type, "array");
+  assert.equal(
+    approval.properties?.allow_rule_recommendation?.type,
+    "boolean",
+  );
+
+  const domains = policySchema?.properties?.resource_domains as {
+    type?: unknown;
+    maxItems?: unknown;
+    items?: { additionalProperties?: unknown; required?: unknown };
+  };
+  assert.equal(domains.type, "array");
+  assert.equal(domains.maxItems, 64);
+  assert.equal(domains.items?.additionalProperties, false);
+  assert.deepEqual(domains.items?.required, [
+    "match",
+    "domain",
+    "parallel_safe",
+  ]);
+});
+
+test("policy schemas annotate their runtime-only rule safety constraints", async () => {
+  const organizationSchema = JSON.parse(await readFile(
+    resolve(process.cwd(), "schemas/organization-policy.schema.json"),
+    "utf8",
+  )) as {
+    properties?: Record<string, {
+      "x-ccprof-runtime-constraints"?: unknown;
+      items?: { "x-ccprof-runtime-constraints"?: unknown };
+    }>;
+  };
+  const repositorySchema = JSON.parse(await readFile(
+    resolve(process.cwd(), "schemas/config.schema.json"),
+    "utf8",
+  )) as {
+    properties?: {
+      policy?: {
+        properties?: Record<string, {
+          "x-ccprof-runtime-constraints"?: unknown;
+          items?: { "x-ccprof-runtime-constraints"?: unknown };
+        }>;
+      };
+    };
+  };
+  for (const properties of [
+    organizationSchema.properties,
+    repositorySchema.properties?.policy?.properties,
+  ]) {
+    assertRuntimeConstraintAnnotation(
+      properties?.approval_policy?.["x-ccprof-runtime-constraints"],
+    );
+    assertRuntimeConstraintAnnotation(
+      properties?.resource_domains?.items?.[
+        "x-ccprof-runtime-constraints"
+      ],
+    );
+  }
 });
 
 test("README documents the signed organization policy operator contract", async () => {
@@ -283,6 +490,8 @@ test("README documents the signed organization policy operator contract", async 
     "allow_export",
     "raw_retention_days_max",
     "required_source_coverage",
+    "approval_policy",
+    "resource_domains",
     "kill_switches",
   ]) {
     assert.ok(readme.includes(field), `README is missing ${field}`);
@@ -300,6 +509,10 @@ test("README documents the signed organization policy operator contract", async 
   assert.match(readme, /not yet consumed.*allow_export/isu);
   assert.match(readme, /not yet consumed.*raw_retention_days_max/isu);
   assert.match(readme, /not yet consumed.*required_source_coverage/isu);
+  assert.ok(readme.includes("x-ccprof-runtime-constraints"));
+  assert.match(readme, /UTF-8.*NFC.*duplicate/isu);
+  assert.match(readme, /canonical.*65,536.*byte/isu);
+  assert.match(readme, /repository.*tighten.*rule/isu);
 });
 
 test("the npm package includes both policy schemas", async () => {
@@ -381,6 +594,173 @@ test("repository policy preferences are independently optional", async (t) => {
   }
 });
 
+test("repository rule safety preferences are optional, normalized, and isolated", async (t) => {
+  const repoRoot = await temporaryRepository(t);
+  await writeRepositoryConfig(repoRoot, {
+    schema_version: 1,
+    policy: {
+      approval_policy: {
+        safe_patterns: [" npm\t test ", "cargo check"],
+        allow_rule_recommendation: false,
+      },
+      resource_domains: [
+        { match: ["npm test"], domain: "z", parallel_safe: true },
+        { match: [" cargo\t check "], domain: "a", parallel_safe: false },
+      ],
+    },
+  });
+
+  const expected: RepositoryPolicyWithRuleSafety = {
+    approval_policy: {
+      safe_patterns: ["cargo check", "npm test"],
+      allow_rule_recommendation: false,
+    },
+    resource_domains: [
+      { match: ["cargo check"], domain: "a", parallel_safe: false },
+      { match: ["npm test"], domain: "z", parallel_safe: true },
+    ],
+  };
+  const preferences = await loadRepositoryPolicyPreferences(repoRoot) as
+    RepositoryPolicyWithRuleSafety;
+  assert.deepEqual(preferences, expected);
+  preferences.approval_policy?.safe_patterns?.push("mutated");
+  preferences.resource_domains?.[0]?.match.push("mutated");
+  assert.deepEqual(
+    await loadRepositoryPolicyPreferences(repoRoot),
+    expected,
+  );
+
+  for (const [approvalPolicy, expectedApproval] of [
+    [{}, {}],
+    [{ safe_patterns: [" npm\t test "] }, { safe_patterns: ["npm test"] }],
+    [
+      { allow_rule_recommendation: false },
+      { allow_rule_recommendation: false },
+    ],
+  ] as const) {
+    const optionalRoot = await temporaryRepository(t);
+    await writeRepositoryConfig(optionalRoot, {
+      schema_version: 1,
+      policy: { approval_policy: approvalPolicy },
+    });
+    assert.deepEqual(
+      await loadRepositoryPolicyPreferences(optionalRoot),
+      { approval_policy: expectedApproval },
+    );
+  }
+});
+
+test("repository rule safety validation enforces runtime bounds content-free", async (t) => {
+  const sentinel = "CCPROF_PRIVATE_RULE_POLICY_c31f8a";
+  const sixtyFour = Array.from({ length: 64 }, (_, index) => `npm test ${index}`);
+  const thirtyTwo = Array.from({ length: 32 }, (_, index) => `npm test ${index}`);
+  const validRoot = await temporaryRepository(t);
+  await writeRepositoryConfig(validRoot, {
+    schema_version: 1,
+    policy: {
+      approval_policy: {
+        safe_patterns: ["é".repeat(128)],
+        allow_rule_recommendation: true,
+      },
+      resource_domains: [],
+    },
+  });
+  assert.equal(
+    (await loadRepositoryPolicyPreferences(validRoot) as
+      RepositoryPolicyWithRuleSafety).approval_policy?.safe_patterns?.[0],
+    "é".repeat(128),
+  );
+
+  const invalidPolicies: readonly unknown[] = [
+    { approval_policy: { [sentinel]: true } },
+    {
+      approval_policy: {
+        safe_patterns: [...sixtyFour, "npm test 64"],
+        allow_rule_recommendation: true,
+      },
+    },
+    {
+      approval_policy: {
+        safe_patterns: ["é".repeat(128) + "a"],
+        allow_rule_recommendation: true,
+      },
+    },
+    {
+      approval_policy: {
+        safe_patterns: ["\u0344".repeat(128)],
+        allow_rule_recommendation: true,
+      },
+    },
+    {
+      approval_policy: {
+        safe_patterns: ["*a".repeat(17)],
+        allow_rule_recommendation: true,
+      },
+    },
+    {
+      resource_domains: Array.from({ length: 65 }, (_, index) => ({
+        match: [`npm test ${index}`],
+        domain: `domain-${index}`,
+        parallel_safe: true,
+      })),
+    },
+    {
+      resource_domains: [{
+        match: [...thirtyTwo, "npm test 32"],
+        domain: "validation",
+        parallel_safe: true,
+      }],
+    },
+    {
+      resource_domains: [{
+        match: [],
+        domain: "validation",
+        parallel_safe: true,
+      }],
+    },
+    {
+      resource_domains: [{
+        match: ["npm test"],
+        domain: "Invalid/Domain",
+        parallel_safe: true,
+      }],
+    },
+    {
+      resource_domains: [{
+        match: ["npm test"],
+        domain: "a".repeat(65),
+        parallel_safe: true,
+      }],
+    },
+    {
+      resource_domains: [{
+        match: [sentinel, ` ${sentinel} `],
+        domain: "validation",
+        parallel_safe: true,
+      }],
+    },
+  ];
+  for (const value of invalidPolicies) {
+    const repoRoot = await temporaryRepository(t);
+    await writeRepositoryConfig(repoRoot, {
+      schema_version: 1,
+      policy: value,
+    });
+    await assert.rejects(
+      loadRepositoryPolicyPreferences(repoRoot),
+      (error: unknown) => {
+        assert.ok(error instanceof RepositoryConfigError);
+        assert.equal(
+          error.message,
+          ".ccprof/config.json: policy contains invalid values",
+        );
+        assert.equal(error.message.includes(sentinel), false);
+        return true;
+      },
+    );
+  }
+});
+
 test("repository policy validation is closed, bounded, and content-free", async (t) => {
   const sentinel = "CCPROF_PRIVATE_REPOSITORY_POLICY_817ca2";
   const invalidPolicies: readonly unknown[] = [
@@ -451,6 +831,127 @@ test("organization policy parser returns the exact validated contract", () => {
     }))).kill_switches?.advisory,
     true,
   );
+});
+
+test("organization rule safety policy is normalized and deeply snapshotted", () => {
+  const parsed = parseOrganizationPolicy(JSON.stringify(ruleSafetyPolicy({
+    approval_policy: {
+      safe_patterns: [" npm\t test ", "cargo check"],
+      allow_rule_recommendation: true,
+    },
+    resource_domains: [
+      { match: ["npm test"], domain: "z", parallel_safe: true },
+      { match: [" cargo\t check "], domain: "a", parallel_safe: false },
+    ],
+  }))) as OrganizationPolicyWithRuleSafety;
+  assert.deepEqual(parsed.approval_policy, {
+    safe_patterns: ["cargo check", "npm test"],
+    allow_rule_recommendation: true,
+  });
+  assert.deepEqual(parsed.resource_domains, [
+    { match: ["cargo check"], domain: "a", parallel_safe: false },
+    { match: ["npm test"], domain: "z", parallel_safe: true },
+  ]);
+
+  parsed.approval_policy?.safe_patterns.push("mutated");
+  parsed.resource_domains?.[0]?.match.push("mutated");
+  const fresh = parseOrganizationPolicy(
+    JSON.stringify(ruleSafetyPolicy()),
+  ) as OrganizationPolicyWithRuleSafety;
+  assert.deepEqual(fresh.approval_policy?.safe_patterns, ["npm test"]);
+  assert.deepEqual(fresh.resource_domains?.[0]?.match, ["npm test"]);
+});
+
+test("organization rule safety validation enforces runtime bounds content-free", () => {
+  const sentinel = "CCPROF_PRIVATE_SIGNED_RULE_POLICY_70cb4d";
+  const sixtyFour = Array.from({ length: 64 }, (_, index) => `npm test ${index}`);
+  const thirtyTwo = Array.from({ length: 32 }, (_, index) => `npm test ${index}`);
+  const accepted = parseOrganizationPolicy(JSON.stringify(ruleSafetyPolicy({
+    approval_policy: {
+      safe_patterns: ["é".repeat(128)],
+      allow_rule_recommendation: true,
+    },
+  }))) as OrganizationPolicyWithRuleSafety;
+  assert.equal(accepted.approval_policy?.safe_patterns[0], "é".repeat(128));
+
+  const invalidPolicies: readonly unknown[] = [
+    ruleSafetyPolicy({
+      approval_policy: {
+        safe_patterns: ["npm test"],
+        allow_rule_recommendation: true,
+        [sentinel]: true,
+      } as ApprovalRulePolicy,
+    }),
+    ruleSafetyPolicy({
+      approval_policy: {
+        safe_patterns: [...sixtyFour, "npm test 64"],
+        allow_rule_recommendation: true,
+      },
+    }),
+    ruleSafetyPolicy({
+      approval_policy: {
+        safe_patterns: ["é".repeat(128) + "a"],
+        allow_rule_recommendation: true,
+      },
+    }),
+    ruleSafetyPolicy({
+      approval_policy: {
+        safe_patterns: ["\u0344".repeat(128)],
+        allow_rule_recommendation: true,
+      },
+    }),
+    ruleSafetyPolicy({
+      approval_policy: {
+        safe_patterns: ["*a".repeat(17)],
+        allow_rule_recommendation: true,
+      },
+    }),
+    ruleSafetyPolicy({
+      resource_domains: Array.from({ length: 65 }, (_, index) => ({
+        match: [`npm test ${index}`],
+        domain: `domain-${index}`,
+        parallel_safe: true,
+      })),
+    }),
+    ruleSafetyPolicy({
+      resource_domains: [{
+        match: [...thirtyTwo, "npm test 32"],
+        domain: "validation",
+        parallel_safe: true,
+      }],
+    }),
+    ruleSafetyPolicy({
+      resource_domains: [{
+        match: [],
+        domain: "validation",
+        parallel_safe: true,
+      }],
+    }),
+    ruleSafetyPolicy({
+      resource_domains: [{
+        match: ["npm test"],
+        domain: "a".repeat(65),
+        parallel_safe: true,
+      }],
+    }),
+    ruleSafetyPolicy({
+      resource_domains: [{
+        match: [sentinel, ` ${sentinel} `],
+        domain: "validation",
+        parallel_safe: true,
+      }],
+    }),
+  ];
+  for (const value of invalidPolicies) {
+    assert.throws(
+      () => parseOrganizationPolicy(JSON.stringify(value)),
+      (error: unknown) => assertPolicyError(
+        error,
+        "invalid_policy",
+        [sentinel],
+      ),
+    );
+  }
 });
 
 test("organization policy validation is closed, bounded, and content-free", () => {
@@ -529,6 +1030,53 @@ test("canonical policy bytes use fixed semantic order and exclude $schema", () =
   );
 });
 
+test("canonical signed rule safety fields append in fixed semantic order", () => {
+  const parsed = parseOrganizationPolicy(JSON.stringify({
+    resource_domains: [
+      { parallel_safe: true, domain: "z", match: ["npm test"] },
+      { parallel_safe: false, domain: "a", match: [" cargo\t check "] },
+    ],
+    required_source_coverage: 0.9,
+    allow_export: true,
+    $schema: "https://private.example.invalid/schema.json",
+    organization: "example-corp",
+    raw_retention_days_max: 14,
+    approval_policy: {
+      allow_rule_recommendation: true,
+      safe_patterns: [" npm\t test ", "cargo check"],
+    },
+    allow_advisory: false,
+    minimum_privacy: "strict",
+    allow_raw: false,
+    policy_schema_version: 1,
+    kill_switches: { export: true, advisory: false, raw: true },
+  }));
+
+  assert.equal(
+    canonicalOrganizationPolicy(parsed).toString("utf8"),
+    '{"policy_schema_version":1,"organization":"example-corp",' +
+      '"minimum_privacy":"strict","allow_raw":false,' +
+      '"allow_advisory":false,"allow_export":true,' +
+      '"raw_retention_days_max":14,"required_source_coverage":0.9,' +
+      '"approval_policy":{"safe_patterns":["cargo check","npm test"],' +
+      '"allow_rule_recommendation":true},' +
+      '"resource_domains":[' +
+      '{"match":["cargo check"],"domain":"a","parallel_safe":false},' +
+      '{"match":["npm test"],"domain":"z","parallel_safe":true}],' +
+      '"kill_switches":{"raw":true,"advisory":false,"export":true}}',
+  );
+});
+
+test("canonical signed payload has an independent exact 64 KiB ceiling", () => {
+  const exact = policyWithCanonicalBytes(65_536);
+  const tooLarge = policyWithCanonicalBytes(65_537);
+  assert.equal(canonicalOrganizationPolicy(exact).byteLength, 65_536);
+  assert.throws(
+    () => canonicalOrganizationPolicy(tooLarge),
+    (error: unknown) => assertPolicyError(error, "invalid_policy"),
+  );
+});
+
 test("configured policy verifies a genuine detached Ed25519 signature", async (t) => {
   const fixture = await signedPolicyFixture(t, policy({
     kill_switches: { raw: false, advisory: false, export: false },
@@ -539,6 +1087,17 @@ test("configured policy verifies a genuine detached Ed25519 signature", async (t
   );
 
   assert.equal(await loadConfiguredOrganizationPolicy({}), undefined);
+});
+
+test("configured rule safety policy verifies a genuine Ed25519 signature", async (t) => {
+  const value = ruleSafetyPolicy({
+    kill_switches: { raw: false, advisory: false, export: false },
+  });
+  const fixture = await signedPolicyFixture(t, value);
+  assert.deepEqual(
+    await loadConfiguredOrganizationPolicy(fixture.environment),
+    value,
+  );
 });
 
 test("trusted public key input rejects matching private key material", async (t) => {
@@ -610,6 +1169,31 @@ test("configured trust files are bounded regular files and never fall back", asy
       error,
       "policy_unreadable",
       [fixture.policyPath, realPolicyPath, sentinel],
+    ),
+  );
+});
+
+test("signed policy raw bytes accept 65,536 and reject 65,537 content-free", async (t) => {
+  const fixture = await signedPolicyFixture(t);
+  const serialized = Buffer.from(JSON.stringify(fixture.value), "utf8");
+  const exact = Buffer.concat([
+    serialized,
+    Buffer.alloc(65_536 - serialized.byteLength, 0x20),
+  ]);
+  assert.equal(exact.byteLength, 65_536);
+  await writeFile(fixture.policyPath, exact);
+  assert.deepEqual(
+    await loadConfiguredOrganizationPolicy(fixture.environment),
+    fixture.value,
+  );
+
+  await writeFile(fixture.policyPath, Buffer.concat([exact, Buffer.from(" ")]));
+  await assert.rejects(
+    loadConfiguredOrganizationPolicy(fixture.environment),
+    (error: unknown) => assertPolicyError(
+      error,
+      "policy_unreadable",
+      [fixture.policyPath, fixture.value.organization],
     ),
   );
 });
@@ -938,6 +1522,33 @@ test("canonicalization rejects hostile objects with content-free deterministic e
   assertHostile({ ...policy(), kill_switches: changingSwitches });
   assert.equal(nestedGetterCalls, 0);
 
+  let approvalGetterCalls = 0;
+  const changingApproval = {
+    allow_rule_recommendation: true,
+  } as Record<string, unknown>;
+  Object.defineProperty(changingApproval, "safe_patterns", {
+    enumerable: true,
+    get() {
+      approvalGetterCalls += 1;
+      throw new Error(sentinel);
+    },
+  });
+  assertHostile(ruleSafetyPolicy({
+    approval_policy: changingApproval as unknown as ApprovalRulePolicy,
+  }));
+  assert.equal(approvalGetterCalls, 0);
+
+  const hostileDomain = new Proxy({
+    match: ["npm test"],
+    domain: "validation",
+    parallel_safe: true,
+  }, {
+    ownKeys() {
+      throw new Error(sentinel);
+    },
+  });
+  assertHostile(ruleSafetyPolicy({ resource_domains: [hostileDomain] }));
+
   assertHostile(Object.assign(Object.create({ sentinel }), policy()));
   assertHostile(new Proxy(policy(), {
     ownKeys() {
@@ -972,6 +1583,7 @@ test("organization constraints cannot be weakened by repository or CLI", () => {
     allow_export: true,
     raw_retention_days_max: 14,
     required_source_coverage: 0.9,
+    rule_safety: { organization_resource_domains: [] },
   });
 });
 
@@ -1004,6 +1616,7 @@ test("repository preferences and CLI can only tighten organization policy", () =
     allow_export: false,
     raw_retention_days_max: 7,
     required_source_coverage: 0.75,
+    rule_safety: { organization_resource_domains: [] },
   });
 });
 
@@ -1033,7 +1646,116 @@ test("signed administrative kill switches override every lower layer", () => {
     allow_export: false,
     raw_retention_days_max: 14,
     required_source_coverage: 0.9,
+    rule_safety: { organization_resource_domains: [] },
   });
+});
+
+test("rule safety resolution is signed-only, monotonic, and mutation isolated", () => {
+  const organization = ruleSafetyPolicy({
+    approval_policy: {
+      safe_patterns: ["npm *", "cargo *"],
+      allow_rule_recommendation: true,
+    },
+    resource_domains: [
+      { match: ["npm *"], domain: "node", parallel_safe: true },
+      { match: ["cargo *"], domain: "rust", parallel_safe: true },
+    ],
+  });
+  const repository: RepositoryPolicyWithRuleSafety = {
+    approval_policy: {
+      safe_patterns: [" npm\t test "],
+      allow_rule_recommendation: false,
+    },
+    resource_domains: [{
+      match: ["npm test"],
+      domain: "node",
+      parallel_safe: false,
+    }],
+  };
+  const resolved = resolveEffectivePolicy({
+    organization,
+    repository,
+    request: { privacy: "strict", advisory: false },
+  }) as EffectivePolicyWithRuleSafety;
+  assert.deepEqual(resolved.rule_safety, {
+    approval: {
+      allow_rule_recommendation: false,
+      organization_safe_patterns: ["cargo *", "npm *"],
+      repository_safe_patterns: ["npm test"],
+    },
+    organization_resource_domains: [
+      { match: ["npm *"], domain: "node", parallel_safe: true },
+      { match: ["cargo *"], domain: "rust", parallel_safe: true },
+    ],
+    repository_resource_domains: [{
+      match: ["npm test"],
+      domain: "node",
+      parallel_safe: false,
+    }],
+  });
+
+  organization.approval_policy?.safe_patterns.push("mutated");
+  organization.resource_domains?.[0]?.match.push("mutated");
+  repository.approval_policy?.safe_patterns?.push("mutated");
+  repository.resource_domains?.[0]?.match.push("mutated");
+  assert.deepEqual(resolved.rule_safety, {
+    approval: {
+      allow_rule_recommendation: false,
+      organization_safe_patterns: ["cargo *", "npm *"],
+      repository_safe_patterns: ["npm test"],
+    },
+    organization_resource_domains: [
+      { match: ["npm *"], domain: "node", parallel_safe: true },
+      { match: ["cargo *"], domain: "rust", parallel_safe: true },
+    ],
+    repository_resource_domains: [{
+      match: ["npm test"],
+      domain: "node",
+      parallel_safe: false,
+    }],
+  });
+
+  const repositoryOnly = resolveEffectivePolicy({
+    repository: {
+      approval_policy: {
+        safe_patterns: ["*"],
+        allow_rule_recommendation: true,
+      },
+      resource_domains: [{
+        match: ["*"],
+        domain: "everything",
+        parallel_safe: true,
+      }],
+    } as RepositoryPolicyWithRuleSafety,
+    request: { privacy: "raw", advisory: true },
+  }) as EffectivePolicyWithRuleSafety;
+  assert.equal(Object.hasOwn(repositoryOnly, "rule_safety"), false);
+});
+
+test("rule safety resolution rejects hostile repository preferences without reads", () => {
+  const sentinel = "CCPROF_HOSTILE_REPOSITORY_RULE_POLICY_523f7a";
+  let getterCalls = 0;
+  const repository = {} as Record<string, unknown>;
+  Object.defineProperty(repository, "approval_policy", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      throw new Error(sentinel);
+    },
+  });
+  assert.throws(
+    () => resolveEffectivePolicy({
+      organization: ruleSafetyPolicy(),
+      repository: repository as unknown as RepositoryPolicyWithRuleSafety,
+      request: { privacy: "strict", advisory: false },
+    }),
+    (error: unknown) => assertPolicyError(
+      error,
+      "invalid_policy",
+      [sentinel],
+    ),
+  );
+  assert.equal(getterCalls, 0);
 });
 
 test("ungoverned policy resolution preserves current CLI defaults", () => {
@@ -1098,6 +1820,7 @@ test("repository policy resolver composes signed and repository layers", async (
     allow_export: true,
     raw_retention_days_max: 14,
     required_source_coverage: 0.9,
+    rule_safety: { organization_resource_domains: [] },
   });
 });
 
