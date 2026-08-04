@@ -4,7 +4,7 @@
 
 **Goal:** Keep R004/R005 measurements while emitting concrete allowlist or parallel-invocation recommendations only under bounded, signed, monotonically tightened safety contracts.
 
-**Architecture:** A focused `rule-safety` policy module validates and snapshots command patterns, safely canonicalizes raw action commands, performs bounded non-regex wildcard decisions, and resolves signed organization plus repository-tightening layers. R004 and R005 receive only one closed effective snapshot through an optional core-analysis callback; its canonical digest participates in snapshot identity while only the outer digest is stored. New semantics stay inside Finding evidence and epoch-2 manifests, preserving Report v2 and Store compatibility.
+**Architecture:** A focused `rule-safety` policy module validates and snapshots command patterns, safely canonicalizes raw action commands, performs bounded non-regex wildcard decisions, and resolves signed organization plus repository-tightening layers. R004 and R005 receive only one closed effective snapshot through an optional core-analysis callback; its canonical digest participates in snapshot identity while, of the policy-identity material, only the outer digest is stored. Authorized Finding evidence remains governed by existing privacy modes. New semantics stay inside Finding evidence and epoch-2 manifests, preserving Report v2 and Store compatibility.
 
 **Tech Stack:** TypeScript 5.9, Node.js 22/24, Ed25519 `node:crypto`, Node test runner, JSON Schema draft 2020-12, existing Rule Manifest/Store/privacy pipeline.
 
@@ -131,10 +131,14 @@ Treat `safeCanonicalCommand(raw)` as the sole safety entrance for both rule
 decisions. Assert `rm -rf .`, unknown commands, assignments, `env`/`command`
 wrappers, redirects, composites, opaque commands, and mutating Git commands
 remain denied even under `*`; known test/build/check/inspect and conservative
-read-only Git commands may pass. On Windows, admit only the fixed bare-basename
-map (`npm.cmd`, `pnpm.cmd`, `yarn.cmd`, `bun.exe`, `cargo.exe`, `git.exe`,
-`node.exe`, `rg.exe`) with ASCII case-insensitive suffixes. Reject `.bat`, paths,
-and every unlisted `.cmd`/`.exe` name.
+read-only Git commands may pass. For every family, require the first token to be
+a bare executable; reject `/tmp/npm`, `./cargo`, `C:\\tools\\npm.cmd`, and other
+Unix/Windows paths even under a signed `*` pattern. On Windows, admit only the
+fixed bare-basename map (`npm.cmd`, `pnpm.cmd`, `yarn.cmd`, `bun.exe`,
+`cargo.exe`, `git.exe`, `node.exe`, `rg.exe`) with ASCII case-insensitive
+suffixes. Reject `.bat` and every unlisted `.cmd`/`.exe` name. Test `node` and
+mapped `node.exe`/`NODE.EXE` as safe only when the second token is exactly
+`--test`; reject scripts, `-e`, and every other Node mode.
 
 Prove normalization and policy ordering use an explicit UTF-8 byte comparator,
 never `localeCompare`, over the full resource-domain tuple `(domain, normalized
@@ -290,11 +294,16 @@ export function commandPatternMatches(
 `safeCanonicalCommand(raw)` performs an O(1) code-unit length guard and then the
 byte preflight before `classifyCommand`/`tokenizeCommand`; when called by a
 decision it charges raw code-unit length plus fixed classifier stages to the
-shared budget before invoking those bounded helpers. It rejects stripped wrappers/assignments,
+shared budget before invoking those bounded helpers. Before classification it
+rejects a first token containing `/`, `\`, a drive/path prefix, or dot-segment
+path syntax; the existing basename-extracting classifier must not make a path
+eligible. It rejects stripped wrappers/assignments,
 opaque/composite/redirected values, unsafe or unknown executables, and admits
 only test/build/check/inspect plus conservative read-only Git subcommands and
-the fixed Windows mapping above. Neither R004 nor R005 may pass an already
-canonicalized string around this function.
+the fixed Windows mapping above. Add one local exception for bare `node` and
+mapped `node.exe`: only a second token exactly equal to `--test` is recognized
+as safe; do not broaden `src/analysis/command.ts`. Neither R004 nor R005 may
+pass an already canonicalized string around this function.
 
 Create one budget and one raw-command memo cache per whole decision. Reject an
 over-limit action set before scanning; count all policy elements, entry visits,
@@ -335,9 +344,9 @@ git commit -m "feat: add bounded rule safety policy kernel"
 
 The specification reviewer checks every bound, hostile input, monotonic rule,
 and deny path from the design. After approval, a different quality/security
-reviewer checks linear matching, descriptor safety, copy isolation, fixed
-errors, and absence of execution/I/O. Fix through the same RED/GREEN delegation
-and obtain both re-approvals.
+reviewer checks bounded shared-budget matching, descriptor safety, executable
+path rejection, copy isolation, fixed errors, and absence of execution/I/O. Fix
+through the same RED/GREEN delegation and obtain both re-approvals.
 
 ### Task 2: Extend signed and repository policy schemas monotonically
 
@@ -611,8 +620,10 @@ Keep existing upper-estimate assertions and add these policy matrices:
 - signed `false` plus repository `true` stays `parallel_unsafe`;
 - assignments, `env`/`command` wrappers, redirects, composites, opaque
   commands, unknown executables, `.bat`, and arbitrary `.cmd`/`.exe` names stay
-  investigation candidates even when a signed `*` pattern matches; the fixed
-  Windows bare-basename map has explicit positive cases;
+  investigation candidates even when a signed `*` pattern matches; `/tmp/npm`,
+  `./cargo`, and Windows executable paths do too. The fixed Windows
+  bare-basename map has explicit positive cases, with `node`/`node.exe`
+  positive only for `--test` and negative for scripts/`-e`;
 - 64 actions and 32 distinct raw commands stay within their independent test
   fixtures, while 65 actions, 33 distinct commands, or the first step beyond
   the 65,536 shared budget always yields `investigation_candidate`;
@@ -715,11 +726,16 @@ normalized effective value changes it; an absent policy uses an explicit
 canonical `{ mode: "absent" }` marker. Mutating the callback's source object
 after resolution must change neither detector behavior nor identity.
 
-Persist an analysis through the Store with secret canaries in raw policy
-patterns and source objects. Assert the serialized envelope contains only the
-outer 64-hex `SnapshotIdentity.policy_digest` and contains none of the canary,
-raw patterns, domains, raw commands, canonical snapshot, or nested policy
-object.
+Persist an analysis through the Store with secret canaries placed only in an
+unmatched valid policy pattern and an unused resource-domain contract entry.
+Assert that the only policy-snapshot identity material in the serialized
+envelope is the outer 64-hex `AnalysisSnapshotIdentity.policy_digest`: neither
+canary, policy pattern, complete domain contract, effective snapshot, nor inner
+rule-safety digest may appear structurally or textually. At the same time,
+assert that intended authorized Finding evidence remains legal: an R004 finding
+may persist its approved `canonical_commands`, and an unambiguous R005 finding
+may persist its selected `resource_domain`, subject to the existing privacy
+projection. Do not assert a blanket prohibition on commands or domain strings.
 
 - [ ] **Step 2: Delegate RED verification and commit**
 
@@ -737,7 +753,8 @@ Expected: compilation/assertion failure because `AnalyzeOptions` has no
 `resolveRuleSafetyPolicy` and detectors receive no rule-safety option. Commit:
 
 ```bash
-git add test/analyze-integration.test.ts test/organization-policy.test.ts
+git add test/analyze-integration.test.ts test/organization-policy.test.ts \
+  test/capability-coverage.test.ts test/store.test.ts
 git commit -m "test: define rule policy analysis plumbing"
 ```
 
@@ -789,9 +806,11 @@ const ruleSafetyDigest = analysisDigest(
 
 Add only `{ rule_safety_digest: ruleSafetyDigest }` to the object already hashed
 by `snapshotIdentity(...)` into its outer `policy_digest`. Do not add a public
-`AnalysisSnapshotIdentity` field. Never place raw/canonical patterns, domains,
-commands, the effective snapshot, or the inner digest elsewhere in the report
-or Store.
+`AnalysisSnapshotIdentity` field. Never place raw/canonical policy patterns,
+complete resource-domain contracts, the effective snapshot, or the inner digest
+elsewhere in the report or Store. This restriction does not remove authorized
+Finding evidence such as approved canonical commands or the selected
+`resource_domain` identifier.
 
 - [ ] **Step 4: Delegate GREEN verification and commit**
 
@@ -800,11 +819,13 @@ one per repository, concrete output only with injected signed authorization,
 and existing advisory/privacy behavior unchanged. Commit:
 
 ```bash
-git add src/core/analyze.ts src/commands/analyze.ts \
-  test/analyze-integration.test.ts test/organization-policy.test.ts \
-  test/capability-coverage.test.ts test/store.test.ts
+git add src/core/analyze.ts src/commands/analyze.ts
 git commit -m "feat: apply effective policy to rule recommendations"
 ```
+
+The RED commit already owns all four Task 5 test files; the normal GREEN commit
+stages production files only. If a test correction is genuinely required, make
+it as a separate non-amended commit with its own delegated RED evidence.
 
 - [ ] **Step 5: Run specification then quality review**
 
@@ -812,7 +833,8 @@ Check trust failure ordering, one closed snapshot, cache identity, direct-core
 deny defaults, absent marker, normalized/reordered digest equivalence, mutation
 isolation, analysis-budget behavior, and Store canary absence. Then review
 dependency direction, exact optional properties, callback lifetime, custom
-dependency compatibility, and that only the outer digest is persisted.
+dependency compatibility, and that only the outer digest—not the policy
+snapshot or inner digest—is persisted as policy-identity material.
 
 ### Task 6: Publish epoch-2 manifests and prove all compatibility boundaries
 
@@ -859,9 +881,11 @@ sanitize command canaries; raw output retains permitted evidence. README tests
 must require the new signed/repository JSON examples, observe-only warning,
 resource-domain ambiguity rules (including multiple matching entries with one
 domain), structural-schema versus runtime-semantics contract and vendor
-annotation, UTF-8/raw/canonical/budget limits, fixed Windows launcher mapping,
+annotation, UTF-8/raw/canonical/budget limits, bare-executable enforcement and
+fixed Windows launcher mapping, `node[.exe] --test`-only handling,
 no-shell/non-regex statement, R004 point-zero behavior, neutral R005 unsafe
-language, digest-only persistence, and legacy compatibility.
+language, policy-snapshot digest-only persistence, authorized Finding evidence,
+and legacy compatibility.
 
 - [ ] **Step 2: Delegate RED verification and commit**
 
@@ -921,16 +945,21 @@ duplicates are rejected. List the 65,536-byte raw signed-file and canonical
 payload limits separately, 256-byte pattern/4,096-byte raw command preflights,
 64-action/32-distinct-command/65,536-step decision limits, and the fixed Windows
 bare-basename `.cmd`/`.exe` map; `.bat` and arbitrary suffix normalization are
-unsupported. Explain that budget exhaustion denies/investigates without prefix
-authorization and that patterns are matched without regex/shell/glob execution.
+unsupported. Every Unix/Windows executable path is rejected before the existing
+basename-based classifier. Bare `node` and mapped `node.exe` are recognized only
+when their next token is `--test`. Explain that budget exhaustion
+denies/investigates without prefix authorization and that patterns are matched
+without regex/shell/glob execution.
 
 Document JSON Schema as the structural contract and the
 `x-ccprof-runtime-constraints`/README material as the authoritative runtime
 semantic supplement for UTF-8 byte counts, normalization duplicates, hostile
 descriptors, canonical-payload limits, ordering, and monotonic resolution. Do
 not claim exact schema/runtime parity. State that Store/report identity persists
-only the outer policy digest, never patterns, domains, raw commands, or the
-effective policy snapshot.
+only the outer policy digest, never policy patterns, complete domain contracts,
+the effective policy snapshot, or the inner rule-safety digest. Clarify that
+authorized Finding evidence may still contain approved canonical commands and
+the selected `resource_domain` under the existing privacy modes.
 
 - [ ] **Step 4: Delegate focused GREEN and impacted-suite verification**
 

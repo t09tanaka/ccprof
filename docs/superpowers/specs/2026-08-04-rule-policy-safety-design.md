@@ -186,13 +186,18 @@ character, including regular-expression punctuation, is literal.
 `safeCanonicalCommand(raw)` is the only command entrance for both R004 and
 R005 policy decisions. It first uses an O(1) `string.length > 4_096` rejection,
 then performs a 4,096-byte UTF-8 raw preflight before NFC, tokenization, or
-classification. It returns no value for assignments, `env` or
+classification. Before using the existing classifier, it requires the raw first
+token itself to be a bare executable name: no `/`, `\`, drive prefix, `.`/`..`
+segment, or other path form is accepted for any command family. Thus
+`/tmp/npm`, `./cargo`, and Windows executable paths remain unsafe even when a
+signed `*` pattern matches. It returns no value for assignments, `env` or
 `command` wrappers, redirection, composition, opacity, unknown families,
 VCS-mutating forms, or destructive commands. Accepted commands are recognized
-test/build/check/inspect forms or the fixed conservative read-only Git
-subcommands, and return a canonical command string at most 4,096 UTF-8 bytes.
-R005 passes raw action commands to the decision API; a caller cannot bypass the
-safety gate by supplying a pre-normalized string.
+test/build/check/inspect forms, the fixed conservative read-only Git
+subcommands, or the narrowly recognized `node --test` form, and return a
+canonical command string at most 4,096 UTF-8 bytes. R005 passes raw action
+commands to the decision API; a caller cannot bypass the safety gate by
+supplying a pre-normalized string.
 
 Windows launchers use one explicit basename map before classification:
 `npm.cmd -> npm`, `pnpm.cmd -> pnpm`, `yarn.cmd -> yarn`, `bun.exe -> bun`,
@@ -200,7 +205,11 @@ Windows launchers use one explicit basename map before classification:
 `rg.exe -> rg`. Lookup is ASCII-case-insensitive and accepts only a bare
 basename, never a path. No `.bat` launcher and no other `.cmd`/`.exe` name is
 recognized. Their absence from this fixed map means unsupported/unsafe, not a
-generic suffix-stripping fallback.
+generic suffix-stripping fallback. `node` and mapped `node.exe` are safe only
+when the next token is exactly `--test`; `node script.js`, `node -e ...`, and
+other Node modes are unknown/unsafe. This rule-safety-local special case aligns
+with the existing supported test-command/privacy contract without broadening
+the shared command classifier.
 
 The matcher uses a greedy string scan and never constructs a `RegExp` from
 policy input, invokes a shell, expands a filesystem glob, reads the filesystem,
@@ -364,12 +373,16 @@ const ruleSafetyDigest = analysisDigest(
 
 and includes only `rule_safety_digest: ruleSafetyDigest` in the object hashed
 into `AnalysisSnapshotIdentity.policy_digest`, beside coverage, skipped rules,
-and the Rule Manifest. The Store envelope therefore contains only the outer
-64-hex `policy_digest`; it never contains patterns, domains, raw commands, or
-the canonical snapshot. The explicit absent marker prevents an omitted policy
-from colliding with an empty future representation. Different effective
-contracts produce different snapshot identities, while reordered equivalent
-input and post-snapshot mutation do not.
+and the Rule Manifest. The only policy-snapshot identity material persisted by
+the Store is the outer 64-hex `policy_digest`. The Store never persists policy
+patterns, complete resource-domain contract entries, the effective snapshot,
+or the inner `ruleSafetyDigest`. This does not ban ordinary authorized Finding
+evidence: an R004 finding may contain its approved canonical commands, and an
+unambiguous R005 finding may contain the selected `resource_domain` identifier,
+subject to the existing privacy projection. The explicit absent marker prevents
+an omitted policy from colliding with an empty future representation. Different
+effective contracts produce different snapshot identities, while reordered
+equivalent input and post-snapshot mutation do not.
 
 Report v2 and the Store keep their current schemas. New classification and
 domain facts live in the existing open `Finding.evidence` JSON object. Strict
@@ -402,7 +415,9 @@ Manifest, Store legacy-read, CLI no-flag, JSON/TTY/Markdown, strict/balanced/raw
 privacy, deterministic UTF-8 ordering, analysis-budget output, and analysis
 integration tests guard compatibility. Snapshot tests assert effective-policy
 changes alter `policy_digest`, equivalent reorderings and caller mutation do
-not, the absent marker is stable, and a canary policy pattern is absent from
-persisted Store bytes. Static checks and all test commands are delegated to
-independent subagents, followed by separate specification and quality reviews
-before push.
+not, the absent marker is stable, and canaries placed only in an unmatched valid
+policy pattern and an unused resource-domain contract are absent from persisted
+Store bytes. The same test permits the authorized Finding's canonical command
+and selected `resource_domain`, preventing an accidental ban on intended
+evidence. Static checks and all test commands are delegated to independent
+subagents, followed by separate specification and quality reviews before push.
