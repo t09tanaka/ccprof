@@ -169,6 +169,44 @@ async function readCodexState(
   }
 }
 
+async function assertClaudePublicStateRoundTrip(
+  path: string,
+): Promise<{
+  state: ClaudeParserStateV1;
+  parsed: Awaited<ReturnType<typeof parseClaudeTranscriptDetailed>>;
+}> {
+  const read = await readClaudeState(path);
+  const fresh = projectClaudeParserState(read.state);
+  const restored = normalizeClaudeParserState(
+    JSON.parse(JSON.stringify(read.state)) as unknown,
+  );
+  const roundTripped = projectClaudeParserState(restored);
+  const parsed = await parseClaudeTranscriptDetailed(path);
+
+  assertCanonicalEqual(fresh, parsed);
+  assertCanonicalEqual(roundTripped, parsed);
+  return { state: read.state, parsed };
+}
+
+async function assertCodexPublicStateRoundTrip(
+  path: string,
+): Promise<{
+  state: CodexParserStateV1;
+  parsed: Awaited<ReturnType<typeof parseCodexSession>>;
+}> {
+  const read = await readCodexState(path);
+  const fresh = projectCodexParserState(read.state);
+  const restored = normalizeCodexParserState(
+    JSON.parse(JSON.stringify(read.state)) as unknown,
+  );
+  const roundTripped = projectCodexParserState(restored);
+  const parsed = await parseCodexSession({ sourcePath: path });
+
+  assertCanonicalEqual(fresh, parsed);
+  assertCanonicalEqual(roundTripped, parsed);
+  return { state: read.state, parsed };
+}
+
 test("reads an exact UTF-8 range from the supplied handle without reopening its path", async (t) => {
   const jsonPrefix = "{\"value\":\"";
   const boundaryText = `${"a".repeat(
@@ -326,6 +364,203 @@ test("T2 restores one complete Codex state and projects a later window without r
   assert.equal(projectedLate?.events.length, 2);
   assert.ok(projectedLate?.events.some((event) => event.kind === "assistant"));
   assert.equal(stateReaderCalls, 1);
+});
+
+test("Codex public parsing matches fresh and round-tripped state with NUL-bearing response fields", async (t) => {
+  const nul = "\0";
+
+  await t.test("message content", async (t) => {
+    const message = `before${nul}after`;
+    const path = await tempJsonl(
+      t,
+      "codex-nul-message.jsonl",
+      `${[
+        codexRow(0, "session_meta", {
+          id: "codex-nul-message",
+          cwd: "/workspace/repo",
+        }),
+        codexRow(1, "response_item", {
+          type: "message",
+          role: "assistant",
+          content: message,
+        }),
+      ].join("\n")}\n`,
+    );
+    const { state, parsed } = await assertCodexPublicStateRoundTrip(path);
+    const row = state.rows.find((candidate) =>
+      candidate.type === "response_item" && candidate.payload.kind === "message"
+    );
+
+    assert.equal(row?.payload.kind === "message" && row.payload.content, message);
+    assert.ok(parsed?.events.some((event) =>
+      event.kind === "assistant" && event.text === message
+    ));
+  });
+
+  await t.test("function-call output", async (t) => {
+    const output = `line one${nul}line two`;
+    const path = await tempJsonl(
+      t,
+      "codex-nul-function-output.jsonl",
+      `${[
+        codexRow(0, "session_meta", {
+          id: "codex-nul-output",
+          cwd: "/workspace/repo",
+        }),
+        codexRow(1, "response_item", {
+          type: "function_call",
+          name: "exec_command",
+          call_id: "call-nul-output",
+          arguments: JSON.stringify({ cmd: "true" }),
+        }),
+        codexRow(2, "response_item", {
+          type: "function_call_output",
+          call_id: "call-nul-output",
+          output,
+        }),
+      ].join("\n")}\n`,
+    );
+    const { state, parsed } = await assertCodexPublicStateRoundTrip(path);
+    const row = state.rows.find((candidate) =>
+      candidate.type === "response_item" &&
+      candidate.payload.kind === "function_call_output"
+    );
+
+    assert.equal(
+      row?.payload.kind === "function_call_output" &&
+        row.payload.output.kind === "text" && row.payload.output.value,
+      output,
+    );
+    assert.ok(parsed?.events.some((event) =>
+      event.kind === "tool_result" && event.output === output
+    ));
+  });
+
+  await t.test("function-call arguments", async (t) => {
+    const args = `{"cmd":"before${nul}after"}`;
+    const path = await tempJsonl(
+      t,
+      "codex-nul-function-arguments.jsonl",
+      `${[
+        codexRow(0, "session_meta", {
+          id: "codex-nul-arguments",
+          cwd: "/workspace/repo",
+        }),
+        codexRow(1, "response_item", {
+          type: "function_call",
+          name: "exec_command",
+          call_id: "call-nul-arguments",
+          arguments: args,
+        }),
+      ].join("\n")}\n`,
+    );
+    const { state } = await assertCodexPublicStateRoundTrip(path);
+    const row = state.rows.find((candidate) =>
+      candidate.type === "response_item" &&
+      candidate.payload.kind === "function_call"
+    );
+
+    assert.equal(
+      row?.payload.kind === "function_call" &&
+        row.payload.arguments.kind === "text" && row.payload.arguments.value,
+      args,
+    );
+  });
+});
+
+test("Claude public parsing matches fresh and round-tripped state with NUL-bearing event text", async (t) => {
+  const nul = "\0";
+
+  await t.test("assistant text", async (t) => {
+    const text = `before${nul}after`;
+    const path = await tempJsonl(
+      t,
+      "claude-nul-assistant.jsonl",
+      `${claudeAssistant(
+        "claude-nul-assistant",
+        "assistant-nul",
+        "message-nul",
+        0,
+        [{ type: "text", text }],
+      )}\n`,
+    );
+    const { state, parsed } = await assertClaudePublicStateRoundTrip(path);
+    const row = state.rows.find((candidate) =>
+      candidate.value.type === "assistant"
+    );
+    const content = row?.value.type === "assistant"
+      ? row.value.message.content
+      : null;
+
+    assert.ok(Array.isArray(content));
+    const firstBlock = content[0];
+    assert.deepEqual(firstBlock, { type: "text", text });
+    assert.ok(parsed.sessions.some((session) =>
+      session.events.some((event) =>
+        event.kind === "assistant" && event.text === text
+      )
+    ));
+  });
+
+  await t.test("tool output", async (t) => {
+    const output = `first${nul}second`;
+    const path = await tempJsonl(
+      t,
+      "claude-nul-tool-output.jsonl",
+      `${[
+        claudeAssistant(
+          "claude-nul-output",
+          "assistant-tool",
+          "message-tool",
+          0,
+          [{
+            type: "tool_use",
+            id: "tool-nul-output",
+            name: "Bash",
+            input: { command: "true" },
+          }],
+        ),
+        claudeUser("claude-nul-output", "result-nul", 1, [{
+          type: "tool_result",
+          tool_use_id: "tool-nul-output",
+          content: output,
+        }]),
+      ].join("\n")}\n`,
+    );
+    const { state, parsed } = await assertClaudePublicStateRoundTrip(path);
+
+    assert.ok(state.rows.some((row) =>
+      row.tool_results.some((result) => result.output === output)
+    ));
+    assert.ok(parsed.sessions.some((session) =>
+      session.events.some((event) =>
+        event.kind === "tool_result" && event.output === output
+      )
+    ));
+  });
+});
+
+test("Claude public parsing matches fresh and round-tripped state for a finite negative numeric timestamp", async (t) => {
+  const rawTimestamp = -1.75;
+  const path = await tempJsonl(
+    t,
+    "claude-negative-timestamp.jsonl",
+    `${JSON.stringify({
+      sessionId: "claude-negative-timestamp",
+      cwd: "/workspace/repo",
+      type: "user",
+      uuid: "negative-timestamp",
+      timestamp: rawTimestamp,
+      message: { role: "user", content: "before the Unix epoch" },
+    })}\n`,
+  );
+  const { state, parsed } = await assertClaudePublicStateRoundTrip(path);
+
+  assert.equal(state.rows[0]?.timestamp_ms, Math.trunc(rawTimestamp));
+  assert.equal(
+    parsed.sessions[0]?.events[0]?.timestamp_ms,
+    Math.trunc(rawTimestamp),
+  );
 });
 
 test("Claude seeded state preserves branch lanes, cross-suffix ancestry, grouping, results, and multiple sessions", async (t) => {
