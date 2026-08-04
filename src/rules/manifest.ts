@@ -128,7 +128,7 @@ const ROWS = [
   ["R003", "1.0.0", 1, [], "critical_path_latency", "enabled", "union", "low"],
   ["R004", "2.0.0", 2, [], "policy_latency", "observe_only", "never_aggregate", "high"],
   ["R005", "2.0.0", 2, ["tool_timestamps"], "resource_cost", "enabled", "max", "medium"],
-  ["R006", "1.0.0", 1, [], "resource_cost", "enabled", "max", "medium"],
+  ["R006", "2.0.0", 2, [], "resource_cost", "enabled", "max", "medium"],
   ["R007", "1.0.0", 1, ["token_usage"], "critical_path_latency", "enabled", "max", "low"],
   ["R008", "1.0.0", 1, [], "critical_path_latency", "enabled", "union", "medium"],
 ] as const;

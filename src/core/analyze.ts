@@ -52,6 +52,7 @@ import { sliceSessionsToAnalysisWindow } from "../analysis/window.js";
 import {
   classifyCommand,
   commandMayMutateRepo,
+  normalizeCommand,
 } from "../analysis/command.js";
 import { commandIdentityKey } from "../analysis/command-identity.js";
 import {
@@ -71,9 +72,15 @@ import {
   mergeTestMaps,
   type TestMap,
 } from "../analysis/test-map.js";
-import { projectStatsAggregationInput } from
+import { projectStatsAggregationInput, statsCommandKey } from
   "../analysis/stats-input.js";
-import { buildTerminalStatsSnapshot } from
+import {
+  buildTerminalStatsSnapshot,
+  exactCohortKey,
+  selectComparableTerminalSnapshots,
+  type CohortEvaluationMode,
+  type StatsAggregationInput,
+} from
   "../analysis/stats-aggregation.js";
 import { loadRepositoryConfig } from "../analysis/repository-config.js";
 import { runCommand, type CommandRunner } from "../git/client.js";
@@ -98,7 +105,11 @@ import {
   ruleCoverage,
   sessionSupportsRule,
 } from "../rules/capabilities.js";
-import { detectChronicCost } from "../rules/chronic-cost.js";
+import {
+  buildChronicCostAggregates,
+  materializeChronicCostFindings,
+  type ChronicCostMaterializationEntry,
+} from "../rules/chronic-cost.js";
 import { detectContextBloat } from "../rules/context-bloat.js";
 import {
   detectFlakyTests,
@@ -1029,6 +1040,111 @@ function findingSourceCompleteness(entry: RuleCoverage): number {
   return entry.truncated ? 0 : entry.completeness;
 }
 
+export function buildChronicCostMaterializationEntries(
+  projected: readonly StatsAggregationInput[],
+  historyEntries: readonly AnalysisHistoryEntry[],
+  mode: CohortEvaluationMode,
+): ChronicCostMaterializationEntry[] {
+  try {
+    const terminals = selectComparableTerminalSnapshots(projected, mode);
+    const terminalBySnapshot = new Map<string, StatsAggregationInput>();
+    for (const terminal of terminals) {
+      if (terminalBySnapshot.has(terminal.snapshot_id)) return [];
+      terminalBySnapshot.set(terminal.snapshot_id, terminal);
+    }
+    if (terminalBySnapshot.size === 0) return [];
+
+    const historyBySnapshot = new Map<string, AnalysisHistoryEntry>();
+    for (const entry of historyEntries) {
+      if (!terminalBySnapshot.has(entry.snapshot_id)) continue;
+      if (historyBySnapshot.has(entry.snapshot_id)) return [];
+      historyBySnapshot.set(entry.snapshot_id, entry);
+    }
+    if (historyBySnapshot.size !== terminalBySnapshot.size) return [];
+
+    const lanes = new Map<string, ChronicCostMaterializationEntry & {
+      identity_key: string;
+    }>();
+    for (const terminal of terminals) {
+      const raw = historyBySnapshot.get(terminal.snapshot_id);
+      if (raw === undefined) return [];
+      const reprojected = projectStatsAggregationInput(raw);
+      if (JSON.stringify(reprojected) !== JSON.stringify(terminal)) return [];
+      if (
+        terminal.cohort_key === undefined ||
+        terminal.repository_key === undefined ||
+        terminal.workspace_key === undefined ||
+        terminal.changed_files_bucket === undefined ||
+        terminal.changed_lines_bucket === undefined ||
+        exactCohortKey({
+          repository_key: terminal.repository_key,
+          workspace_key: terminal.workspace_key,
+          changed_files_bucket: terminal.changed_files_bucket,
+          changed_lines_bucket: terminal.changed_lines_bucket,
+        }) !== terminal.cohort_key
+      ) return [];
+
+      const expected = new Set(terminal.command_costs.map((cost) =>
+        `${cost.command_key}\0${cost.cache_state}`));
+      const seen = new Set<string>();
+      for (const cost of raw.record.command_costs) {
+        if (
+          cost.command_identity === undefined ||
+          (cost.cache_state !== "cold" && cost.cache_state !== "warm")
+        ) continue;
+        const command = normalizeCommand(cost.command);
+        if (command === null) return [];
+        const commandKey = statsCommandKey(cost.command_identity);
+        const projectedLane = `${commandKey}\0${cost.cache_state}`;
+        if (!expected.has(projectedLane) || seen.has(projectedLane)) return [];
+        seen.add(projectedLane);
+        const key = `${terminal.cohort_key}\0${projectedLane}`;
+        const identity = {
+          ...cost.command_identity,
+          normalized_argv: [...cost.command_identity.normalized_argv],
+        };
+        const identityKey = JSON.stringify(identity);
+        const existing = lanes.get(key);
+        if (existing === undefined) {
+          lanes.set(key, {
+            cohort_key: terminal.cohort_key,
+            command_key: commandKey,
+            cache_state: cost.cache_state,
+            command,
+            command_identity: identity,
+            session_refs: [...cost.session_refs].sort(),
+            identity_key: identityKey,
+          });
+        } else {
+          if (existing.command !== command || existing.identity_key !== identityKey) {
+            return [];
+          }
+          existing.session_refs = uniqueSorted([
+            ...existing.session_refs,
+            ...cost.session_refs,
+          ]);
+        }
+      }
+      if (seen.size !== expected.size) return [];
+    }
+    return [...lanes.values()]
+      .sort((left, right) =>
+        left.cohort_key.localeCompare(right.cohort_key) ||
+        left.command_key.localeCompare(right.command_key) ||
+        left.cache_state.localeCompare(right.cache_state))
+      .map(({ identity_key: _identityKey, ...entry }) => ({
+        ...entry,
+        command_identity: {
+          ...entry.command_identity,
+          normalized_argv: [...entry.command_identity.normalized_argv],
+        },
+        session_refs: [...entry.session_refs],
+      }));
+  } catch {
+    return [];
+  }
+}
+
 function ruleCandidates(
   lanes: Readonly<Record<RuleId, RuleEvidenceLane>>,
   coverage: readonly RuleCoverage[],
@@ -1080,9 +1196,6 @@ function ruleCandidates(
     ...detectSerialSlack(lanes.R005.matched, {
       ...(ruleSafety === undefined ? {} : { ruleSafety }),
       sourceCompleteness: completeness("R005"),
-    }),
-    ...detectChronicCost(history, {
-      sourceCompleteness: completeness("R006"),
     }),
     ...detectContextBloat(lanes.R007.matched, {
       events: lanes.R007.events,
@@ -1758,7 +1871,7 @@ export async function analyze(
       paths,
     );
   }
-  const candidates = ruleCandidates(
+  let candidates = ruleCandidates(
     ruleLanes,
     coverage,
     history,
@@ -1773,7 +1886,7 @@ export async function analyze(
     pr_ref: context.prRef,
     sessions: uniqueSorted(sessions.map((session) => session.session_id)),
   };
-  const ledgerInput = {
+  let ledgerInput = {
     rawIntervals: timeline.rawIntervals,
     activeIntervals: timeline.activeIntervals,
     contributingIntervals: contributingIntervals(matched),
@@ -1783,29 +1896,9 @@ export async function analyze(
     humanWaitIntervals: timeline.humanWaitIntervals,
     candidates,
   };
-  const preliminaryLedger = reconcileLedger(ledgerInput);
+  let preliminaryLedger = reconcileLedger(ledgerInput);
   const metrics = analysisMetrics(timeline);
   const costs = commandCosts(matched);
-  const terminalStatsSnapshot = buildTerminalStatsSnapshot({
-    repositoryId: paths.repo_hash,
-    workspaceId: analysisDigest(
-      "terminal-stats-workspace-v1",
-      paths.canonical_repo,
-    ),
-    changedFiles: diff.files.length,
-    ...(diff.changedLineCount === undefined
-      ? {}
-      : { changedLines: diff.changedLineCount }),
-    ledger: preliminaryLedger,
-    candidates: candidates.map((candidate) => {
-      const manifest = ruleManifest(candidate.rule_id);
-      return {
-        ...candidate,
-        rule_version: manifest.version,
-        compatibility_epoch: manifest.compatibility_epoch,
-      };
-    }),
-  });
   const currentSnapshotIdentity = snapshotIdentity(
     paths,
     context,
@@ -1821,30 +1914,94 @@ export async function analyze(
     sourceErrors,
     hookEvents.warnings,
   );
-  const draftRecord = makeAnalysisRecord({
+  const buildCurrentTerminal = (
+    currentLedger: LedgerResult,
+    currentCandidates: readonly FindingCandidate[],
+  ) => buildTerminalStatsSnapshot({
+    repositoryId: paths.repo_hash,
+    workspaceId: analysisDigest(
+      "terminal-stats-workspace-v1",
+      paths.canonical_repo,
+    ),
+    changedFiles: diff.files.length,
+    ...(diff.changedLineCount === undefined
+      ? {}
+      : { changedLines: diff.changedLineCount }),
+    ledger: currentLedger,
+    candidates: currentCandidates.map((candidate) => {
+      const manifest = ruleManifest(candidate.rule_id);
+      return {
+        ...candidate,
+        rule_version: manifest.version,
+        compatibility_epoch: manifest.compatibility_epoch,
+      };
+    }),
+  });
+  const buildCurrentRecord = (
+    currentLedger: LedgerResult,
+    currentCandidates: readonly FindingCandidate[],
+  ): AnalysisRecord => makeAnalysisRecord({
     created_at_ms: context.resolvedAtMs,
     unit,
-    summary: preliminaryLedger.summary,
-    findings: [...preliminaryLedger.findings].sort(findingOrder),
+    summary: currentLedger.summary,
+    findings: [...currentLedger.findings].sort(findingOrder),
     metrics,
     command_costs: costs,
     read_observations: reads.observations,
-    terminal_stats_snapshot: terminalStatsSnapshot,
+    terminal_stats_snapshot: buildCurrentTerminal(
+      currentLedger,
+      currentCandidates,
+    ),
   });
-  const {
-    analysis_id: _draftAnalysisId,
-    created_at_ms: _draftCreatedAtMs,
-    ...draftPayload
-  } = draftRecord;
-  const projectedCurrent = projectStatsAggregationInput({
-    snapshot_id: analysisDigest("analysis-snapshot-v1", {
-      schema_version: 1,
+  const projectCurrentRecord = (record: AnalysisRecord) => {
+    const {
+      analysis_id: _draftAnalysisId,
+      created_at_ms: _draftCreatedAtMs,
+      ...payload
+    } = record;
+    return projectStatsAggregationInput({
+      snapshot_id: analysisDigest("analysis-snapshot-v1", {
+        schema_version: 1,
+        identity: currentSnapshotIdentity,
+        payload,
+      }),
       identity: currentSnapshotIdentity,
-      payload: draftPayload,
-    }),
-    identity: currentSnapshotIdentity,
-    record: draftRecord,
-  });
+      record,
+    });
+  };
+  let draftRecord = buildCurrentRecord(preliminaryLedger, candidates);
+  let projectedCurrent = projectCurrentRecord(draftRecord);
+  if (
+    projectedCurrent.work_unit_key !== undefined &&
+    projectedCurrent.cohort_key !== undefined
+  ) {
+    const mode = {
+      mode: "analysis_current",
+      current_work_unit_key: projectedCurrent.work_unit_key,
+      current_cohort_key: projectedCurrent.cohort_key,
+    } as const;
+    const chronicCoverage = coverage.find(({ rule_id }) => rule_id === "R006");
+    const chronicCandidates = materializeChronicCostFindings(
+      buildChronicCostAggregates(projectedHistory, mode, minimumCohortSize),
+      buildChronicCostMaterializationEntries(
+        projectedHistory,
+        historyResult.entries ?? [],
+        mode,
+      ),
+      {
+        sourceCompleteness: chronicCoverage === undefined
+          ? 0
+          : findingSourceCompleteness(chronicCoverage),
+      },
+    );
+    if (chronicCandidates.length > 0) {
+      candidates = [...candidates, ...chronicCandidates];
+      ledgerInput = { ...ledgerInput, candidates };
+      preliminaryLedger = reconcileLedger(ledgerInput);
+      draftRecord = buildCurrentRecord(preliminaryLedger, candidates);
+      projectedCurrent = projectCurrentRecord(draftRecord);
+    }
+  }
   const baseline = projectedCurrent.work_unit_key === undefined ||
       projectedCurrent.cohort_key === undefined
     ? null
@@ -1861,6 +2018,10 @@ export async function analyze(
   const ledger = baseline === null
     ? preliminaryLedger
     : reconcileLedger({ ...ledgerInput, baseline });
+  const terminalStatsSnapshot = buildCurrentTerminal(
+    preliminaryLedger,
+    candidates,
+  );
   const allFindings = ledger.findings.map(withRuleManifest).sort(findingOrder);
   budgetMeter?.checkpoint();
   if (budgetMeter !== undefined) {

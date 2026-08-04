@@ -10,6 +10,7 @@ import {
   type StatsAggregationInput as ProjectedStatsAggregationInput,
   type StatsInputReason,
 } from "./stats-aggregation.js";
+import type { CommandIdentity } from "../core/model.js";
 import type { AnalysisSelectorIdentity } from "../store/analyses.js";
 
 export type { StatsAggregationInput } from "./stats-aggregation.js";
@@ -323,6 +324,88 @@ function baselineMetrics(
   return metrics.sort((left, right) => left.metric.localeCompare(right.metric));
 }
 
+function projectedCommandIdentity(value: unknown): CommandIdentity | undefined {
+  try {
+    const identity = exactDataObject(
+      value,
+      ["repo_relative_cwd", "normalized_argv", "executor"],
+      [],
+      "invalid stats command identity",
+    );
+    const cwd = identity.get("repo_relative_cwd");
+    const argvValue = identity.get("normalized_argv");
+    const executor = identity.get("executor");
+    if (
+      typeof cwd !== "string" ||
+      (cwd !== "." && (cwd === "" || cwd.includes("\0") ||
+        cwd.startsWith("/") || /^[A-Za-z]:[\\/]/u.test(cwd) ||
+        cwd.split("/").some((segment) =>
+          segment === "" || segment === "." || segment === ".."))) ||
+      !Array.isArray(argvValue) || utilTypes.isProxy(argvValue) ||
+      Object.getPrototypeOf(argvValue) !== Array.prototype ||
+      argvValue.length === 0 || argvValue[0] === "" ||
+      argvValue.some((entry) => typeof entry !== "string") ||
+      (executor !== "shell" && executor !== "native-tool")
+    ) return undefined;
+    return {
+      repo_relative_cwd: cwd,
+      normalized_argv: [...argvValue] as string[],
+      executor,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export function statsCommandKey(value: unknown): string {
+  const identity = projectedCommandIdentity(value);
+  if (identity === undefined) throw new TypeError("invalid stats command identity");
+  return statsOpaqueDigest("stats-command-identity-v1", [
+    identity.repo_relative_cwd,
+    identity.normalized_argv,
+    identity.executor,
+  ]);
+}
+
+function projectedCommandCosts(
+  value: unknown,
+): ProjectedStatsAggregationInput["command_costs"] {
+  if (!Array.isArray(value) || utilTypes.isProxy(value)) {
+    throw new TypeError("invalid stats history command costs");
+  }
+  return value.flatMap((raw): Array<{
+    command_key: string;
+    cache_state: "cold" | "warm";
+    duration_ms: number;
+  }> => {
+    const cost = exactDataObject(
+      raw,
+      ["command", "duration_min", "session_refs"],
+      ["command_identity", "cache_state"],
+      "invalid stats history command cost",
+    );
+    const identity = projectedCommandIdentity(cost.get("command_identity"));
+    const cacheState = cost.get("cache_state");
+    const durationMin = cost.get("duration_min");
+    if (
+      identity === undefined ||
+      (cacheState !== "cold" && cacheState !== "warm") ||
+      typeof durationMin !== "number" || !Number.isFinite(durationMin) ||
+      durationMin < 0 || Object.is(durationMin, -0)
+    ) return [];
+    const durationMs = durationMin * 60_000;
+    if (!Number.isFinite(durationMs)) return [];
+    return [{
+      command_key: statsCommandKey(identity),
+      cache_state: cacheState,
+      duration_ms: durationMs,
+    }];
+  }).sort((left, right) =>
+    left.command_key.localeCompare(right.command_key) ||
+    left.cache_state.localeCompare(right.cache_state) ||
+    left.duration_ms - right.duration_ms);
+}
+
 export function projectStatsAggregationInput(
   value: unknown,
 ): ProjectedStatsAggregationInput {
@@ -442,7 +525,7 @@ export function projectStatsAggregationInput(
       },
     }),
     baseline_metrics: baselineMetrics(record.get("metrics")),
-    command_costs: [],
+    command_costs: projectedCommandCosts(record.get("command_costs")),
     reason_codes: [...reasons].sort((left, right) =>
       left.localeCompare(right)),
   };

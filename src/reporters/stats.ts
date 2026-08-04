@@ -24,7 +24,16 @@ export interface StatsBaselineMetric extends BaselineNotable {}
 export interface StatsChronicCommand {
   command: string;
   command_identity?: CommandIdentity;
+  cache_state?: "cold" | "warm";
+  history_count?: number;
   presence_count: number;
+  sample_count?: number;
+  ratio?: number;
+  resource_upper_ms?: number;
+  median?: number;
+  p50?: number;
+  p75?: number;
+  mad?: number;
   cost_ratio: number;
   estimated_min: number;
 }
@@ -474,6 +483,29 @@ function chronicCommandLabel(entry: StatsChronicCommand): string {
       (identity.executor === "native-tool" ? " [native-tool]" : "");
 }
 
+function chronicCommandDetail(entry: StatsChronicCommand): string {
+  if (
+    entry.cache_state !== undefined &&
+    entry.history_count !== undefined &&
+    entry.sample_count !== undefined &&
+    entry.ratio !== undefined &&
+    entry.resource_upper_ms !== undefined &&
+    entry.median !== undefined &&
+    entry.p50 !== undefined &&
+    entry.p75 !== undefined &&
+    entry.mad !== undefined
+  ) {
+    return `${entry.cache_state}, ${entry.presence_count}/${entry.history_count}, ${
+      rounded(entry.ratio * 100)
+    }%, ${entry.resource_upper_ms} ms avg upper, median ${entry.median}, p50 ${
+      entry.p50
+    }, p75 ${entry.p75}, MAD ${entry.mad}`;
+  }
+  return `${formatMinutes(entry.estimated_min)} avg upper (${rounded(
+    entry.cost_ratio * 100,
+  )}%, ${entry.presence_count} analyses)`;
+}
+
 export function renderStatsTty(stats: StatsReport): string {
   const terminalStats = stats.metadata !== undefined;
   const lines = [
@@ -517,7 +549,7 @@ export function renderStatsTty(stats: StatsReport): string {
       ? ["- none"]
       : stats.chronic_commands.map(
           (command) =>
-            `- ${oneLine(chronicCommandLabel(command))}: ${formatMinutes(command.estimated_min)} avg upper (${rounded(command.cost_ratio * 100)}%, ${command.presence_count} analyses)`,
+            `- ${oneLine(chronicCommandLabel(command))}: ${chronicCommandDetail(command)}`,
         )),
     "Baseline metrics:",
     ...(stats.baseline_metrics.length === 0

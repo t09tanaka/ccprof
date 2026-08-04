@@ -383,7 +383,24 @@ export function projectStatsPrivacy(
       return {
         command,
         ...(identity === undefined ? {} : { command_identity: identity }),
+        ...(entry.cache_state === undefined
+          ? {}
+          : { cache_state: entry.cache_state }),
+        ...(entry.history_count === undefined
+          ? {}
+          : { history_count: entry.history_count }),
         presence_count: entry.presence_count,
+        ...(entry.sample_count === undefined
+          ? {}
+          : { sample_count: entry.sample_count }),
+        ...(entry.ratio === undefined ? {} : { ratio: entry.ratio }),
+        ...(entry.resource_upper_ms === undefined
+          ? {}
+          : { resource_upper_ms: entry.resource_upper_ms }),
+        ...(entry.median === undefined ? {} : { median: entry.median }),
+        ...(entry.p50 === undefined ? {} : { p50: entry.p50 }),
+        ...(entry.p75 === undefined ? {} : { p75: entry.p75 }),
+        ...(entry.mad === undefined ? {} : { mad: entry.mad }),
         cost_ratio: entry.cost_ratio,
         estimated_min: entry.estimated_min,
       };

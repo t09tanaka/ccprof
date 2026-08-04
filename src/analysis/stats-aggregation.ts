@@ -105,7 +105,11 @@ export interface StatsAggregationInput {
     metric: BoundedBaselineMetric;
     value: number;
   }[];
-  command_costs: readonly [];
+  command_costs: readonly {
+    command_key: OpaqueDigest;
+    cache_state: "cold" | "warm";
+    duration_ms: number;
+  }[];
   reason_codes: readonly StatsInputReason[];
 }
 
@@ -1106,6 +1110,9 @@ const PROJECTED_TERMINAL_METRIC_FIELDS = [
   "rules",
 ] as const;
 const PROJECTED_BASELINE_ROW_FIELDS = ["metric", "value"] as const;
+const PROJECTED_COMMAND_COST_FIELDS = [
+  "command_key", "cache_state", "duration_ms",
+] as const;
 const CHANGED_FILES_BUCKETS = new Set<ChangedFilesBucket>([
   "files_0",
   "files_1",
@@ -1222,6 +1229,31 @@ function normalizedProjectedReasonCodes(value: unknown): StatsInputReason[] {
   return result;
 }
 
+function normalizedProjectedCommandCosts(
+  value: unknown,
+): StatsAggregationInput["command_costs"] {
+  const values = snapshotArray(value);
+  if (values === null) throw new TypeError(INVALID_STATS_AGGREGATION_INPUT);
+  return values.map<StatsAggregationInput["command_costs"][number]>(
+    (rowValue) => {
+      const row = exactDataValues(rowValue, PROJECTED_COMMAND_COST_FIELDS);
+      const cacheState = row.get("cache_state");
+      if (cacheState !== "cold" && cacheState !== "warm") {
+        throw new TypeError(INVALID_STATS_AGGREGATION_INPUT);
+      }
+      const normalizedCacheState: "cold" | "warm" = cacheState;
+      return {
+        command_key: opaqueId(row.get("command_key")),
+        cache_state: normalizedCacheState,
+        duration_ms: metricValue(row.get("duration_ms")),
+      };
+    },
+  ).sort((left, right) =>
+    compareStrings(left.command_key, right.command_key) ||
+    compareStrings(left.cache_state, right.cache_state) ||
+    left.duration_ms - right.duration_ms);
+}
+
 function optionalOpaqueValue(
   entries: ReadonlyMap<string, unknown>,
   key: string,
@@ -1257,10 +1289,9 @@ function projectedInput(value: unknown): StatsAggregationInput {
       !Number.isSafeInteger(createdAt) ||
       createdAt < 0
     ) throw new TypeError(INVALID_STATS_AGGREGATION_INPUT);
-    const commandCosts = snapshotArray(entries.get("command_costs"));
-    if (commandCosts === null || commandCosts.length !== 0) {
-      throw new TypeError(INVALID_STATS_AGGREGATION_INPUT);
-    }
+    const commandCosts = normalizedProjectedCommandCosts(
+      entries.get("command_costs"),
+    );
     const workUnitKey = optionalOpaqueValue(entries, "work_unit_key");
     const gitStateKey = optionalOpaqueValue(entries, "git_state_key");
     const repositoryKey = optionalOpaqueValue(entries, "repository_key");
@@ -1320,7 +1351,7 @@ function projectedInput(value: unknown): StatsAggregationInput {
         ? {}
         : { terminal_metrics: terminalMetrics }),
       baseline_metrics: baselineMetrics,
-      command_costs: [],
+      command_costs: commandCosts,
       reason_codes: reasonCodes,
     };
   } catch {
