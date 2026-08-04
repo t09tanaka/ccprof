@@ -9,6 +9,7 @@ import Database from "better-sqlite3";
 import {
   CliUsageError, parseCliArgs, runCli,
 } from "../src/cli.js";
+import { runDoctorCommand } from "../src/commands/doctor.js";
 import { resolveStorePaths } from "../src/store/paths.js";
 import {
   INCREMENTAL_SOURCES_MIGRATION,
@@ -94,6 +95,18 @@ test("doctor parses its exact public command shapes", () => {
     ["doctor", "--json", "extra"],
     ["doctor", "--json", "--json"],
   ]) assert.throws(() => parseCliArgs(args), CliUsageError);
+});
+
+test("doctor command exposes an empty warnings collection", async (t) => {
+  const { repo, dataRoot } = await fixture(t);
+  const result = await runDoctorCommand({
+    cwd: repo,
+    json: true,
+    env: { CCPROF_DATA_DIR: dataRoot },
+  });
+
+  assert.deepEqual(Object.keys(result), ["stdout", "warnings", "exitCode"]);
+  assert.deepEqual((result as unknown as { warnings: unknown }).warnings, []);
 });
 
 test("doctor is deterministic, ordered, warning-safe, and read-only", async (t) => {

@@ -189,7 +189,7 @@ function sourceCapabilitiesCheck(): DoctorCheck {
 }
 
 export async function runDoctorCommand(options: DoctorOptions): Promise<{
-  stdout: string; exitCode: number;
+  stdout: string; warnings: readonly string[]; exitCode: number;
 }> {
   const env = options.env ?? process.env;
   let configuration: DoctorCheck;
@@ -243,5 +243,5 @@ export async function runDoctorCommand(options: DoctorOptions): Promise<{
     : [`ccprof doctor: ${status}`, ...checks.map((item) =>
         `[${item.status.toUpperCase()}] ${item.id}: ${item.message}`)]
       .join("\n") + "\n";
-  return { stdout, exitCode: status === "fail" ? 1 : 0 };
+  return { stdout, warnings: [], exitCode: status === "fail" ? 1 : 0 };
 }
