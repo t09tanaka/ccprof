@@ -74,21 +74,31 @@ type AnalysisSelectorIdentity =
   | {
       kind: "explicit_range";
       range: "double_dot" | "triple_dot";
-      base_label: string;
-      head_label: string;
+      base_ref_digest: string;
+      head_ref_digest: string;
     }
   | {
       kind: "inferred_local_range";
-      base_label: string;
-      head_label: string;
+      base_ref_digest: string;
+      head_ref_digest: string;
     };
 ```
 
 An explicit `A..B` and `A...B` therefore remain distinct even though the
 existing display `pr_ref` canonicalizes both to `A...B`. A current or explicitly
 selected GitHub PR uses the numeric PR identity. A local fallback without GitHub
-metadata uses `inferred_local_range`. Empty labels, unsafe integers, unknown
-kinds or fields, and non-canonical objects fail validation.
+metadata uses `inferred_local_range`.
+
+The two ref digests are produced before any display-label canonicalization.
+Each input token is normalized to NFC and hashed in a role- and selector-kind-
+separated domain. Thus `refs/heads/release`, `refs/tags/release`,
+`refs/remotes/origin/release`, `release`, and `HEAD` remain different selector
+values even when they resolve to the same object ID or later produce the same
+display label. Digests use the closed `sha256:<64 lowercase hex>` form; raw ref
+tokens are never persisted in selector identity or aggregate output. The range
+enum separately preserves `..` versus `...`. Empty ref tokens, unsafe PR
+integers, malformed digests, unknown kinds or fields, and non-canonical objects
+fail validation.
 
 The internal work-unit key is a domain-separated digest of the exact
 repository ID and selector identity:
@@ -194,23 +204,47 @@ cohort then suppresses instead of guessing a size.
 
 Only findings whose canonical impact, confidence, current exact rule version,
 compatibility epoch, and interval evidence validate can contribute. The
-manifest's `aggregation_policy` is applied per rule:
+manifest's `aggregation_policy` is applied independently to each metric of a
+rule:
 
 - `never_aggregate`: contributes zero to every KPI. R004 therefore never
   becomes confirmed or possible savings; its observed wait remains human wait.
 - `union`: eligible interval slices are unioned.
-- `max`: the deterministic finding with the greatest eligible estimate is used;
-  ties use finding key and interval signature.
+- `max`: exactly one eligible candidate is chosen separately for confirmed
+  critical-path, upper critical-path, and resource cost. A winner on one axis
+  does not become the winner on another axis.
 - `sum`: numeric resource contributions are summed; critical-path interval
   slices are collected, but the final wall-clock union still removes overlap.
 
-Critical-path findings use interval evidence capped by the applicable canonical
-bound. An interval-less critical-path finding cannot be placed on measured wall
-time and contributes zero; it increments `incomplete_interval_findings`.
-`expected_ms` is presentation/calibration information and is never substituted
-for a missing lower or upper bound. Legacy findings, partial canonical field
-sets, missing exact rule metadata, and invalid/missing intervals always produce
-zero confirmed time.
+Eligibility is fail closed before comparison. A candidate is rejected when its
+canonical impact kind disagrees with the manifest, its rule version or
+compatibility epoch is not exact, its canonical fields are incomplete, or its
+required interval placement is malformed or empty. Such a rejected
+critical-path candidate increments `incomplete_interval_findings`. A confirmed
+critical-path candidate additionally requires high evidence confidence, high
+causality confidence, and full source coverage. An upper critical-path
+candidate may have medium confidence but still requires complete canonical
+impact and valid interval placement. `expected_ms` is presentation/calibration
+information and is never used as an eligibility score or substituted for a
+missing bound.
+
+Every critical-path candidate carries its own interval slice clipped to
+measured wall time and capped by the applicable canonical bound. For a `max`
+rule, the confirmed score is the duration of that candidate's placed lower
+slice, the upper score is the duration of its placed upper slice, and the
+resource score is canonical `upper_ms`. Winners are selected separately using:
+
+1. greatest eligible placed score;
+2. greatest applicable canonical bound;
+3. lexicographically smallest canonical finding key;
+4. lexicographically smallest canonical interval signature.
+
+The winning bound and interval always come from the same candidate; aggregation
+never combines one finding's bound with another finding's placement. Therefore,
+for example, a strict candidate placed at lower/upper `100/100` wins the
+confirmed axis while a medium-confidence candidate placed at `0/200` wins the
+upper axis. Malformed placement or an impact-kind mismatch is ineligible rather
+than silently compared as zero.
 
 Resource cost is a separate non-wall axis. For R005 and R006 the current
 manifest policy is `max`, so the largest canonical `upper_ms` for the rule is
@@ -226,26 +260,45 @@ sets in order:
 
 ```text
 C = union(manifest-eligible strict high/high/full lower-bound intervals)
-P = union(manifest-eligible critical-path upper intervals) - C
+E = full manifest-eligible critical-path upper envelope, including C
+P = E - C
 W = observed human-wait intervals - C - P
 U = ledger unexplained intervals - C - P - W
 N = M - C - P - W - U
 ```
 
-The stored numeric fields are the durations of `M`, `C`, `P`, `W`, and `U`.
+`P` is an internal residual-possible set only; it is not the value stored as
+`estimated_critical_path_upper_ms`. The stored numeric fields are the durations
+of `M`, `C`, full envelope `E`, `W`, and `U`. The upper envelope is constructed
+to contain `C`. For a `max` rule, the separately selected upper winner can add
+only enough uncovered placement to reach the greater of its placed upper score
+and that rule's confirmed duration; it cannot cause `confirmed + upper` to be
+reported as two independent quantities. Global and per-rule interval ownership
+is then assigned deterministically in `(manifest id, finding key, interval
+signature)` order, so confirmed rule rows sum to `duration(C)` and upper rule
+rows sum to `duration(E)` without overlap across rows.
+
+For example, a lower placement of 1,000 ms and a full upper envelope of 1,500
+ms are stored as confirmed `1,000` and estimated upper `1,500`; the residual
+possible portion used by the partition is 500 ms. Consumers must never add the
+two stored values.
+
 All interval inputs are clipped to `M`; invalid, negative, non-finite, or
-reversed intervals are ignored and recorded as incomplete. Therefore:
+reversed intervals are ignored and recorded as incomplete. Because `C` is a
+subset of `E`:
 
 ```text
-C, P, W, U, and N are pairwise disjoint
-confirmed + possible_upper + human_wait + unexplained <= measured_wall
+C, P=(E-C), W, U, and N are pairwise disjoint
+estimated_upper + human_wait + unexplained <= measured_wall
+confirmed <= estimated_upper
 resource_cost is not part of this wall-clock equation
 ```
 
 Property tests generate overlaps, permutations, fractional bounds, missing
 intervals, and hostile legacy records to hold this invariant. The terminal
 snapshot validator independently rejects negative/non-finite values, a wall
-sum over `measured_wall_ms`, duplicate/non-canonical rule rows, or a rule-row
+sum `estimated_upper + human_wait + unexplained` over `measured_wall_ms`,
+`confirmed > estimated_upper`, duplicate/non-canonical rule rows, or a rule-row
 sum inconsistent with its snapshot totals.
 
 ## Comparable cohorts
@@ -286,24 +339,46 @@ rounded once to four decimal places.
 
 ### R006 command cohorts
 
-R006 does not reuse a single command key attached to the whole snapshot. For
-each stored command cost it builds a separate cohort requiring:
+R006 does not reuse a single command key attached to the whole snapshot. Its
+comparable population is all selected terminal snapshots with the same exact
+repository ID, workspace ID, changed-file bucket, and changed-line bucket as
+the current work unit. `history_count` is the size of that entire population,
+including snapshots on which the command/cache pair is absent.
 
-- the same work-unit repository, workspace, and size buckets;
-- the exact canonical `CommandIdentity`;
-- the exact per-command cache state when it was observed.
+Within the population, the exact cohort key is a domain-separated opaque digest
+of canonical `CommandIdentity` plus the exact cache state `cold` or `warm`.
+`StoredCommandCost` gains an optional `cache_state: "cold" | "warm"`. A row
+with an absent or unknown cache state is ineligible and is never placed into an
+`unknown` cohort. Current sources do not reliably observe cache state, so this
+intentionally suppresses R006 for ordinary current data until a source can
+provide the dimension; complete programmatic/test records exercise the contract
+now.
 
-`StoredCommandCost` gains an optional `cache_state: "cold" | "warm"`. Current
-sources do not reliably observe cache state, so an absent value suppresses that
-command cohort. Unknown cache states are never grouped together and no
-cold/warm guess is made. This intentionally makes current R006 conservative
-until a source can provide the dimension; complete programmatic/test records
-exercise the command cohort contract now.
+Multiple matching command rows in one terminal snapshot are deterministically
+summed into one non-negative per-snapshot cost. `presence_count` is the number
+of population snapshots whose combined cost is positive, so at most one sample
+comes from each work unit. The distribution sample contains only those positive
+per-snapshot costs and therefore `sample_count === presence_count`; absence is
+not inserted as a zero distribution observation. The cost ratio is:
 
-R006's history count, presence count, ratio denominator, and median/p50/p75/MAD
-are calculated from the command's comparable terminal cohort, not every
-analysis. Its resulting finding remains `resource_cost` with the manifest's
-`max` aggregation policy.
+```text
+sum(positive per-snapshot command/cache costs)
+--------------------------------------------------------------
+sum(measured_wall_ms across all history_count population rows)
+```
+
+Missing, non-finite, or zero population wall time suppresses the result. A
+finding is emitted only when `history_count` meets the effective policy minimum,
+`presence_count` meets the existing chronic-cost minimum of 3, and the ratio is
+at least 0.30. Thus absence affects the population denominator but not the
+positive-cost distribution.
+
+The R006 finding key includes the opaque command-identity digest and cache
+state. Its bounded evidence and stats output include `cache_state`,
+`history_count`, `presence_count`, distribution `sample_count`, median, p50,
+p75, MAD, and ratio. Cold and warm observations always produce distinct
+findings and rows. The finding remains interval-less `resource_cost` with the
+manifest's `max` aggregation policy.
 
 ## Minimum cohort policy
 
@@ -321,11 +396,27 @@ organization-policy bytes and signatures; when present, the field is appended
 in one fixed canonical position. Invalid or unknown policy values continue to
 fail closed.
 
-The effective threshold gates both terminal aggregate emission and comparable
-cohort distributions in `stats`. Analysis-time baseline and R006 use the same
-default of 5 when no resolved policy is available. A smaller function-level
-threshold may be injected only by tests; it is not a CLI or persisted policy
-bypass.
+Every CLI analysis resolves the effective policy before invoking core analysis,
+using the existing canonical repository-root and signed-policy resolver. The
+resolved `minimum_cohort_size` is passed through `AnalyzeOptions` to both the
+analysis-time work-unit baseline and R006 detector; neither component silently
+falls back to 5 after a policy has been resolved. The stats command uses the
+same resolver and passes the same effective value to aggregation. A direct
+programmatic core caller that supplies no resolved policy may use the default
+of 5, but there is no CLI or persisted-policy bypass.
+
+The effective value is included in the canonical policy material used by
+`AnalysisSnapshotIdentity.policy_digest`. Changing the floor therefore changes
+snapshot identity as well as behavior, while remaining an analysis variant of
+the same Git state for terminal selection. Tests cover default 5 and an
+organization floor of 20: a five-snapshot cohort emits under the default but
+both baseline and R006 remain suppressed under the organization floor until 20
+comparable snapshots exist. A repository value below 20 cannot weaken that
+floor.
+
+The effective threshold gates terminal aggregate emission and every comparable
+cohort distribution in `stats`, and it gates analysis-time baseline and R006 at
+the point where those values are computed.
 
 At fewer samples, metric values are absent rather than zero and metadata gives
 `status: "suppressed"`, the effective threshold, actual sample count, and a
@@ -334,19 +425,82 @@ used as a fallback.
 
 ## Stats report and privacy flow
 
-`runStatsCommand` passes the complete history entries and effective minimum
-cohort size to summarization. Summarization selects terminals and creates only
-in-memory totals. The existing stats privacy projection then produces the only
-object handed to JSON or TTY rendering:
+Raw `AnalysisRecord` values are never inputs to the terminal/cohort aggregator.
+`runStatsCommand` first uses the Store normalizers to validate a closed snapshot
+of every history entry without invoking accessors or proxy traps. It then calls
+`projectStatsAggregationInput`, whose return type contains only:
+
+- opaque canonical digests for snapshot, work-unit, Git-state, repository,
+  workspace, and command identity;
+- finite non-negative times and counts;
+- closed size-bucket and cache-state enums;
+- finalized numeric metric and canonical per-rule rows.
+
+The closed shape is equivalent to:
+
+```ts
+interface StatsAggregationInput {
+  schema_version: 1;
+  snapshot_id: OpaqueDigest;
+  created_at_ms: number;
+  work_unit_key?: OpaqueDigest;
+  git_state_key?: OpaqueDigest;
+  repository_key?: OpaqueDigest;
+  workspace_key?: OpaqueDigest;
+  changed_files_bucket?: ChangedFilesBucket;
+  changed_lines_bucket?: ChangedLinesBucket;
+  terminal_metrics?: {
+    measured_wall_ms: number;
+    confirmed_critical_path_ms: number;
+    estimated_critical_path_upper_ms: number;
+    resource_cost_ms: number;
+    human_wait_ms: number;
+    unexplained_ms: number;
+    rules: readonly CanonicalNumericRuleRow[];
+  };
+  baseline_metrics: readonly {
+    metric: BoundedBaselineMetric;
+    value: number;
+  }[];
+  command_costs: readonly {
+    command_key: OpaqueDigest;
+    cache_state: "cold" | "warm";
+    duration_ms: number;
+  }[];
+  reason_codes: readonly StatsInputReason[];
+}
+```
+
+`BoundedBaselineMetric`, both bucket types, and `StatsInputReason` are closed
+allowlists; unknown legacy metric names are ignored rather than copied. Missing
+optional keys are enough to count and explain an ineligible row without carrying
+the raw value that failed eligibility.
+
+It contains no raw selector token, repository path, command argv/cwd/executor,
+finding, evidence, interval, title, URL, prompt, or session data. The terminal
+selector, metric reducer, distributions, and R006 cohort code accept only
+`readonly StatsAggregationInput[]`; their public types do not expose the source
+record. Canary tests serialize the projection and inspect the aggregator input
+to prove raw values are unavailable, not merely omitted at render time.
+
+The full flow is:
 
 ```text
 raw Store history
-  -> validate entries
-  -> select terminal snapshots
-  -> aggregate numeric summaries/cohorts in memory
-  -> project selected privacy profile
+  -> strict closed validation/snapshot
+  -> project numeric/bounded/opaque StatsAggregationInput
+  -> select terminals and aggregate metrics/cohorts in memory
+  -> optionally join selected opaque snapshot/command keys to normalized
+     records for legacy observational and privacy-governed command display
+  -> project the selected display privacy profile
   -> render JSON or TTY
 ```
+
+Malformed objects, accessors, and proxies fail before aggregation. The optional
+display join is outside the terminal/cohort aggregator, is keyed only by its
+opaque selections, and its result must still pass through the existing display
+privacy projection. No raw record reference is retained in aggregation input or
+output.
 
 The additive stats metadata includes the privacy profile, effective minimum,
 stored snapshot count, distinct work-unit count, superseded count, ineligible
@@ -390,6 +544,8 @@ does not add another rendering or privacy bypass.
 3. Two snapshots first seen at the same millisecond use canonical digest ties.
 4. A GitHub PR, explicit `..`, explicit `...`, and inferred local range never
    share a work-unit bucket merely because their display labels match.
+   `refs/heads/x`, `refs/tags/x`, `refs/remotes/origin/x`, and `x` remain
+   distinct even when they resolve to the same object ID.
 5. Different repositories with the same PR number remain distinct.
 6. Legacy/content-fallback snapshots and malformed or absent selector metadata
    remain readable but are not enterprise KPI samples.
@@ -398,44 +554,62 @@ does not add another rendering or privacy bypass.
 8. Unknown workspace, truncated/binary diff size, malformed bucket data, and
    non-finite or unsafe counts suppress instead of broadening a cohort.
 9. Size-bucket boundary values are inclusive exactly as listed.
-10. Missing, malformed, or secret-bearing command identities cannot form an
-    R006 cohort.
-11. Missing command cache state suppresses R006; `cold` and `warm` never mix.
-12. A cohort one below the effective minimum is suppressed; one exactly at it
+10. Missing or malformed command identities cannot form an R006 cohort; valid
+    identities are converted to opaque digests before aggregation.
+11. Missing command cache state suppresses R006; `cold` and `warm` never mix or
+    share finding keys.
+12. R006 history includes comparable terminal snapshots where the command is
+    absent, presence and distribution include only positive per-snapshot cost,
+    and the ratio denominator includes measured wall for the full population.
+13. A cohort one below the effective minimum is suppressed; one exactly at it
     is emitted.
-13. Repository policy below the organization minimum has no effect; a higher
-    repository minimum tightens it.
-14. Odd/even cohorts, repeated values, zero MAD, fractional values, and input
+14. Default 5 and a resolved organization floor of 20 affect analysis-time
+    baseline, R006, snapshot policy digest, and stats consistently. Repository
+    policy below the organization minimum has no effect; a higher value tightens
+    it.
+15. Odd/even cohorts, repeated values, zero MAD, fractional values, and input
     permutations produce deterministic distributions.
-15. Overlapping findings within and across rules never double-count wall time.
-16. `never_aggregate` findings remain outside KPIs even if high confidence.
-17. `max`, `union`, and `sum` use their manifest meanings; expected-only and
-    interval-less critical impacts never become confirmed wall time.
-18. R006's interval-less historical upper can appear only on the separate
+16. Overlapping findings within and across rules never double-count wall time.
+17. A 1,000 ms lower placement with a 1,500 ms full upper envelope reports
+    confirmed 1,000 and upper 1,500; the partition uses only the 500 ms residual
+    and consumers never add confirmed to upper.
+18. `never_aggregate` findings remain outside KPIs even if high confidence.
+19. `max`, `union`, and `sum` use their manifest meanings. `max` selects each
+    metric independently: strict `100/100` can win confirmed while medium
+    `0/200` wins upper. Malformed placement and impact-kind mismatch fail
+    closed; expected-only and interval-less critical impacts never become
+    confirmed wall time.
+20. R006's interval-less historical upper can appear only on the separate
     resource axis under manifest `max`.
-19. Legacy scalar point estimates, partial canonical fields, non-high evidence
+21. Legacy scalar point estimates, partial canonical fields, non-high evidence
     or causality, incomplete source coverage, and invalid intervals all produce
     zero confirmed time.
-20. Resource cost never participates in the measured-wall partition equation.
-21. Strict and balanced stats output contains no raw selector, repository,
+22. Resource cost never participates in the measured-wall partition equation.
+23. Aggregation input contains no raw selector, repository, workspace, command,
+    path, URL, token, finding, interval, or evidence data.
+24. Strict and balanced stats output contains no raw selector, repository,
     workspace, command identity, path, URL, token, or evidence payload.
-22. Aggregate and cohort values are never persisted to a new table, and stats
+25. Aggregate and cohort values are never persisted to a new table, and stats
     never modifies raw snapshot records.
 
 ## Verification strategy
 
 - Store tests prove additive selector parsing, history entry metadata, exact
   execution deduplication, and superseded-state rerun behavior.
-- Git-context tests prove selector-kind and `..`/`...` distinctions.
+- Git-context tests prove selector-kind, `..`/`...`, and exact ref-domain digest
+  distinctions across local, branch, tag, and remote-qualified tokens.
 - Ledger/aggregation unit and property tests prove manifest policy behavior,
+  per-metric `max` winners, full-upper versus residual partition semantics,
   interval clipping/deduplication, fail-closed legacy handling, and the wall
   partition invariant.
 - Cohort tests prove bucket boundaries, terminal-only populations, robust
-  distributions, separate R006 command cohorts, cache suppression, and minimum
-  threshold boundaries.
+  distributions, separate R006 command/cache populations and denominators,
+  cache suppression, and default-5/organization-20 threshold boundaries.
 - Policy/config tests prove bounds, canonical signature compatibility, and
-  organization-over-repository monotonicity.
+  organization-over-repository monotonicity, analysis-time resolution, and
+  effective-floor inclusion in snapshot policy identity.
 - Reporter/CLI tests prove additive JSON and TTY output, strict privacy,
+  numeric/opaque aggregation projection before terminal selection,
   non-weakenable CI behavior, and absence of raw detail.
 - Existing Store compatibility, analysis, reporter, policy, rule, and
   deterministic golden suites remain green. Full repository checks run before
