@@ -540,7 +540,7 @@ test("discovery results fail closed before invalid sessions reach consumers", as
   } as unknown as SessionSource);
   await assertAsyncSourceError(
     () => protoResult.discover(QUERY),
-    "adapter_mismatch",
+    "invalid_result",
   );
   assert.equal(prototypeReads, 0);
 });

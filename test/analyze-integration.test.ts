@@ -3151,11 +3151,11 @@ test("fixed-window analysis is invariant to high-impact events outside the snaps
   const outside: Session["events"] = [
     { ...common, kind: "tool_use", timestamp_ms: startedAtMs - 20_000,
       entry_uuid: "pre-command", session_ref: "window-session#pre-command",
-      source_index: -2, tool_use_id: "pre", tool_name: "Bash", input: {},
+      source_index: 0, tool_use_id: "pre", tool_name: "Bash", input: {},
       paths: [], edit_fragments: [], command: "npm test" },
     { ...common, kind: "tool_result", timestamp_ms: startedAtMs - 10_000,
       entry_uuid: "pre-result", session_ref: "window-session#pre-result",
-      source_index: -1, tool_use_id: "pre", status: "success",
+      source_index: 1, tool_use_id: "pre", status: "success",
       output: "x".repeat(100_000), output_bytes: 100_000, estimated_tokens: 25_000 },
     { ...common, kind: "compaction", timestamp_ms: NOW_MS + 1,
       entry_uuid: "post-compact", session_ref: "window-session#post-compact",
