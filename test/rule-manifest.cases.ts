@@ -589,7 +589,10 @@ test("R006 epoch two isolates new keys while explicit v1 rows remain readable", 
   });
 
   assert.equal(stored.findings[0]?.finding_key, legacyKey);
-  assert.deepEqual(findingCompatibilityMetadata(stored.findings[0]!), {
+  const storedCompatibility = findingCompatibilityMetadata(stored.findings[0]!);
+  assert.deepEqual(storedCompatibility.valid
+    ? storedCompatibility.metadata
+    : undefined, {
     rule_version: "1.0.0",
     compatibility_epoch: 1,
   });
@@ -599,7 +602,10 @@ test("R006 epoch two isolates new keys while explicit v1 rows remain readable", 
     ...finding("R006", target),
     finding_key: currentKey,
   });
-  assert.deepEqual(findingCompatibilityMetadata(current), {
+  const currentCompatibility = findingCompatibilityMetadata(current);
+  assert.deepEqual(currentCompatibility.valid
+    ? currentCompatibility.metadata
+    : undefined, {
     rule_version: "2.0.0",
     compatibility_epoch: 2,
   });

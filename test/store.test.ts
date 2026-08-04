@@ -4539,7 +4539,20 @@ test("R006 applies exact history, presence, ratio, and organization floors", () 
   assert.equal(aggregate(population(20, 20), 20)[0]?.presence_count, 20);
 
   const zeroWall = projectComparableHistory(population(5, 5));
-  for (const input of zeroWall) input.terminal_metrics!.measured_wall_ms = 0;
+  for (const input of zeroWall) {
+    const terminal = input.terminal_metrics!;
+    terminal.measured_wall_ms = 0;
+    terminal.confirmed_critical_path_ms = 0;
+    terminal.estimated_critical_path_upper_ms = 0;
+    terminal.resource_cost_ms = 0;
+    terminal.human_wait_ms = 0;
+    terminal.unexplained_ms = 0;
+    for (const rule of terminal.rules) {
+      rule.confirmed_critical_path_ms = 0;
+      rule.estimated_critical_path_upper_ms = 0;
+      rule.resource_cost_ms = 0;
+    }
+  }
   assert.deepEqual(buildChronicCostAggregates(zeroWall,
     { mode: "stats_all_groups" }, 5), []);
   const missingWall = projectComparableHistory(population(5, 5));
