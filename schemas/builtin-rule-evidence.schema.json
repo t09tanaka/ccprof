@@ -1,0 +1,756 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json",
+  "title": "ccprof built-in rule evidence schemas",
+  "$defs": {
+    "nonnegativeSafeInteger": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "positiveSafeInteger": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "nonnegativeNumber": {
+      "type": "number",
+      "minimum": 0
+    },
+    "positiveNumber": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "nonemptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "stringArray": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/nonemptyString"
+      }
+    },
+    "nonemptyStringArray": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/nonemptyString"
+      }
+    },
+    "sessionRefs": {
+      "$ref": "#/$defs/nonemptyStringArray"
+    },
+    "intervalIds": {
+      "$ref": "#/$defs/stringArray"
+    },
+    "commandIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repo_relative_cwd",
+        "normalized_argv",
+        "executor"
+      ],
+      "properties": {
+        "repo_relative_cwd": {
+          "$ref": "#/$defs/nonemptyString"
+        },
+        "normalized_argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/nonemptyString"
+          }
+        },
+        "executor": {
+          "enum": [
+            "shell",
+            "native-tool"
+          ]
+        }
+      }
+    },
+    "R001": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "ccprof://rules/R001/evidence/v1",
+      "title": "R001 evidence v1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_refs",
+        "interval_ids",
+        "paths",
+        "edit_count",
+        "duration_ms",
+        "correction_signal"
+      ],
+      "properties": {
+        "session_refs": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/sessionRefs"
+        },
+        "interval_ids": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/intervalIds"
+        },
+        "paths": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/stringArray"
+        },
+        "edit_count": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+        },
+        "duration_ms": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeSafeInteger"
+        },
+        "correction_signal": {
+          "type": "boolean"
+        }
+      }
+    },
+    "R002": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "ccprof://rules/R002/evidence/v1",
+      "title": "R002 evidence v1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_refs",
+        "interval_ids",
+        "command",
+        "command_identity",
+        "count",
+        "irrelevant_count",
+        "duration_ms",
+        "paths",
+        "relevance",
+        "prior_success_required",
+        "prior_success_proven",
+        "prior_success_basis"
+      ],
+      "properties": {
+        "session_refs": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/sessionRefs"
+        },
+        "interval_ids": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/intervalIds"
+        },
+        "command": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonemptyString"
+        },
+        "command_identity": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/commandIdentity"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 9007199254740991
+        },
+        "irrelevant_count": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+        },
+        "duration_ms": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+        },
+        "paths": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/stringArray"
+        },
+        "relevance": {
+          "const": "irrelevant"
+        },
+        "prior_success_required": {
+          "type": "boolean"
+        },
+        "prior_success_proven": {
+          "type": "boolean"
+        },
+        "prior_success_basis": {
+          "const": "matcher-classification"
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "prior_success_required": {
+              "const": true
+            },
+            "prior_success_proven": {
+              "const": true
+            }
+          }
+        },
+        {
+          "properties": {
+            "prior_success_required": {
+              "const": false
+            },
+            "prior_success_proven": {
+              "const": false
+            }
+          }
+        }
+      ]
+    },
+    "R003": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "ccprof://rules/R003/evidence/v1",
+      "title": "R003 evidence v1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_refs",
+        "interval_ids",
+        "paths",
+        "duplicate_count",
+        "current_read_count",
+        "duration_ms",
+        "read_duration_ms",
+        "post_result_inference_ms",
+        "estimated_tokens"
+      ],
+      "properties": {
+        "session_refs": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/sessionRefs"
+        },
+        "interval_ids": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/intervalIds"
+        },
+        "paths": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonemptyStringArray"
+        },
+        "duplicate_count": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeSafeInteger"
+        },
+        "current_read_count": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+        },
+        "duration_ms": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeSafeInteger"
+        },
+        "read_duration_ms": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeSafeInteger"
+        },
+        "post_result_inference_ms": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeSafeInteger"
+        },
+        "estimated_tokens": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeSafeInteger"
+        },
+        "historical_prs": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonemptyStringArray"
+        },
+        "historical_duration_min": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeNumber"
+        },
+        "historical_session_refs": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/sessionRefs"
+        }
+      },
+      "dependentRequired": {
+        "historical_prs": [
+          "historical_duration_min",
+          "historical_session_refs"
+        ],
+        "historical_duration_min": [
+          "historical_prs",
+          "historical_session_refs"
+        ],
+        "historical_session_refs": [
+          "historical_prs",
+          "historical_duration_min"
+        ]
+      }
+    },
+    "R004": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "ccprof://rules/R004/evidence/v2",
+      "title": "R004 evidence v2",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_refs",
+        "interval_ids",
+        "latency_classification",
+        "count",
+        "approval_count",
+        "total_wait_ms",
+        "approval_wait_ms",
+        "non_approval_wait_ms",
+        "approval_detection",
+        "approval_reasons"
+      ],
+      "properties": {
+        "session_refs": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/sessionRefs"
+        },
+        "interval_ids": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/intervalIds"
+        },
+        "latency_classification": {
+          "enum": [
+            "approval_policy_latency",
+            "repeated_safe_approval_latency"
+          ]
+        },
+        "count": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+        },
+        "approval_count": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeSafeInteger"
+        },
+        "total_wait_ms": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeSafeInteger"
+        },
+        "approval_wait_ms": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeSafeInteger"
+        },
+        "non_approval_wait_ms": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeSafeInteger"
+        },
+        "approval_detection": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "explicit",
+              "phrase"
+            ]
+          }
+        },
+        "approval_reasons": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/stringArray"
+        },
+        "canonical_commands": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonemptyStringArray"
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "latency_classification": {
+              "const": "approval_policy_latency"
+            }
+          },
+          "not": {
+            "properties": {
+              "canonical_commands": {}
+            },
+            "required": [
+              "canonical_commands"
+            ]
+          }
+        },
+        {
+          "required": [
+            "canonical_commands"
+          ],
+          "properties": {
+            "latency_classification": {
+              "const": "repeated_safe_approval_latency"
+            },
+            "approval_count": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 9007199254740991
+            }
+          }
+        }
+      ]
+    },
+    "R005": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "ccprof://rules/R005/evidence/v2",
+      "title": "R005 evidence v2",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_refs",
+        "interval_ids",
+        "paths",
+        "action_count",
+        "serial_duration_ms",
+        "longest_action_ms",
+        "commands",
+        "tool_names",
+        "parallelization_classification"
+      ],
+      "properties": {
+        "session_refs": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/sessionRefs"
+        },
+        "interval_ids": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/intervalIds"
+        },
+        "paths": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonemptyString"
+          }
+        },
+        "action_count": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 9007199254740991
+        },
+        "serial_duration_ms": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+        },
+        "longest_action_ms": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+        },
+        "commands": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/stringArray"
+        },
+        "tool_names": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/stringArray"
+        },
+        "parallelization_classification": {
+          "enum": [
+            "parallel_safe",
+            "parallel_unsafe",
+            "investigation_candidate"
+          ]
+        },
+        "resource_domain": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonemptyString"
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "parallelization_classification": {
+              "const": "investigation_candidate"
+            }
+          },
+          "not": {
+            "properties": {
+              "resource_domain": {}
+            },
+            "required": [
+              "resource_domain"
+            ]
+          }
+        },
+        {
+          "required": [
+            "resource_domain"
+          ],
+          "properties": {
+            "parallelization_classification": {
+              "enum": [
+                "parallel_safe",
+                "parallel_unsafe"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "R006": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "ccprof://rules/R006/evidence/v2",
+      "title": "R006 evidence v2",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "session_refs",
+            "interval_ids",
+            "command",
+            "command_identity",
+            "history_count",
+            "presence_count",
+            "cost_min",
+            "measured_min",
+            "cost_ratio",
+            "minimum_history_count",
+            "minimum_presence_count",
+            "minimum_cost_ratio"
+          ],
+          "properties": {
+            "session_refs": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/sessionRefs"
+            },
+            "interval_ids": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/intervalIds"
+            },
+            "command": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonemptyString"
+            },
+            "command_identity": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/commandIdentity"
+            },
+            "history_count": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+            },
+            "presence_count": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+            },
+            "cost_min": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveNumber"
+            },
+            "measured_min": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveNumber"
+            },
+            "cost_ratio": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveNumber"
+            },
+            "minimum_history_count": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+            },
+            "minimum_presence_count": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+            },
+            "minimum_cost_ratio": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveNumber"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "session_refs",
+            "interval_ids",
+            "command",
+            "command_identity",
+            "cache_state",
+            "history_count",
+            "presence_count",
+            "sample_count",
+            "ratio",
+            "resource_upper_ms",
+            "median",
+            "p50",
+            "p75",
+            "mad"
+          ],
+          "properties": {
+            "session_refs": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/sessionRefs"
+            },
+            "interval_ids": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/intervalIds"
+            },
+            "command": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonemptyString"
+            },
+            "command_identity": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/commandIdentity"
+            },
+            "cache_state": {
+              "enum": [
+                "cold",
+                "warm"
+              ]
+            },
+            "history_count": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+            },
+            "presence_count": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+            },
+            "sample_count": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+            },
+            "ratio": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveNumber"
+            },
+            "resource_upper_ms": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveNumber"
+            },
+            "median": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveNumber"
+            },
+            "p50": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveNumber"
+            },
+            "p75": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveNumber"
+            },
+            "mad": {
+              "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeNumber"
+            }
+          }
+        }
+      ]
+    },
+    "R007": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "ccprof://rules/R007/evidence/v1",
+      "title": "R007 evidence v1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_refs",
+        "interval_ids",
+        "threshold_tokens",
+        "result_count",
+        "compaction_count",
+        "max_estimated_tokens",
+        "output_bytes",
+        "caused_latency_ms",
+        "tool_use_ids",
+        "tool_names",
+        "commands"
+      ],
+      "properties": {
+        "session_refs": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/sessionRefs"
+        },
+        "interval_ids": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/intervalIds"
+        },
+        "threshold_tokens": {
+          "const": 50000
+        },
+        "result_count": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeSafeInteger"
+        },
+        "compaction_count": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeSafeInteger"
+        },
+        "max_estimated_tokens": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeSafeInteger"
+        },
+        "output_bytes": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeSafeInteger"
+        },
+        "caused_latency_ms": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeSafeInteger"
+        },
+        "tool_use_ids": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/stringArray"
+        },
+        "tool_names": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/stringArray"
+        },
+        "commands": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/stringArray"
+        }
+      },
+      "anyOf": [
+        {
+          "properties": {
+            "result_count": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        {
+          "properties": {
+            "compaction_count": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      ]
+    },
+    "R008": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "ccprof://rules/R008/evidence/v1",
+      "title": "R008 evidence v1",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_refs",
+        "interval_ids",
+        "investigation_interval_ids",
+        "command",
+        "command_identity",
+        "failed_tests",
+        "episode_count",
+        "failed_run_count",
+        "passing_run_count",
+        "investigation_action_count",
+        "unrelated_edit_count",
+        "unrelated_edit_paths",
+        "result_sources"
+      ],
+      "properties": {
+        "session_refs": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/sessionRefs"
+        },
+        "interval_ids": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/intervalIds"
+        },
+        "investigation_interval_ids": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/intervalIds"
+        },
+        "command": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonemptyString"
+        },
+        "command_identity": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/commandIdentity"
+        },
+        "failed_tests": {
+          "type": "array",
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonemptyString"
+          }
+        },
+        "episode_count": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+        },
+        "failed_run_count": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+        },
+        "passing_run_count": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+        },
+        "investigation_action_count": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/positiveSafeInteger"
+        },
+        "unrelated_edit_count": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeSafeInteger"
+        },
+        "unrelated_edit_paths": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/stringArray"
+        },
+        "result_sources": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "explicit_status",
+              "exit_code",
+              "tool_adapter",
+              "output_pattern"
+            ]
+          }
+        },
+        "historical_prs": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonemptyStringArray"
+        },
+        "historical_duration_min": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/nonnegativeNumber"
+        },
+        "historical_session_refs": {
+          "$ref": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/builtin-rule-evidence.schema.json#/$defs/sessionRefs"
+        }
+      },
+      "dependentRequired": {
+        "historical_prs": [
+          "historical_duration_min",
+          "historical_session_refs"
+        ],
+        "historical_duration_min": [
+          "historical_prs",
+          "historical_session_refs"
+        ],
+        "historical_session_refs": [
+          "historical_prs",
+          "historical_duration_min"
+        ]
+      }
+    }
+  }
+}
