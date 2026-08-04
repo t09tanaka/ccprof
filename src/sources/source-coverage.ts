@@ -80,7 +80,8 @@ export function createBuiltInSourceCoverageAccumulator(
   if (adapterVersion !== "1.0.0")
     throw new TypeError("Invalid built-in source adapter version.");
   validateVersion(parserVersion);
-  if (!PARSER_STATE_FINGERPRINT.test(parserStateFingerprint))
+  if (typeof parserStateFingerprint !== "string" ||
+    !PARSER_STATE_FINGERPRINT.test(parserStateFingerprint))
     throw new TypeError("Invalid parser-state fingerprint.");
 
   const fingerprint = schemaFingerprint(adapterId, adapterVersion, parserVersion,

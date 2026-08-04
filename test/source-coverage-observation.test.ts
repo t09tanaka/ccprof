@@ -124,6 +124,21 @@ test("source coverage contract rejects invalid identities and observations", () 
   assert.throws(() => undiscovered.recordParsedFile(0, 0, 0, "complete"), TypeError);
 });
 
+test("source coverage contract rejects non-string parser fingerprints without coercion", () => {
+  let coercions = 0;
+  const fingerprint = {
+    toString(): string {
+      coercions += 1;
+      return PARSER_STATE_FINGERPRINT;
+    },
+  };
+  assert.throws(() => createBuiltInSourceCoverageAccumulator(
+    "claude", "1.0.0", "2.0.0",
+    fingerprint as unknown as `sha256:${string}`,
+  ), TypeError);
+  assert.equal(coercions, 0);
+});
+
 test("source coverage contract rejects counter overflow", () => {
   const accumulator = createBuiltInSourceCoverageAccumulator(
     "claude", "1.0.0", "2.0.0", PARSER_STATE_FINGERPRINT,
