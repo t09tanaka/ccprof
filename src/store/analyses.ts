@@ -103,6 +103,7 @@ export interface AnalysisRecord {
 
 export interface AnalysisSaveResult {
   record: AnalysisRecord;
+  audit_identity: AnalysisAuditIdentity;
   warnings: StoreWarning[];
 }
 
@@ -141,6 +142,17 @@ export interface AnalysisSnapshotIdentity {
   source_digest: string; config_digest: string;
   policy_digest: string; history_digest: string;
   selector?: AnalysisSelectorIdentity;
+}
+
+export type AnalysisSnapshotEnvelopeIdentity = AnalysisSnapshotIdentity |
+  { mode: "content-fallback" };
+
+export interface AnalysisAuditIdentity {
+  analysis_id: string;
+  snapshot_id: string;
+  created_at_ms: number;
+  deterministic_digest: `sha256:${string}`;
+  snapshot_identity: AnalysisSnapshotEnvelopeIdentity;
 }
 
 export interface AnalysisSaveOptions { snapshot?: AnalysisSnapshotIdentity; }
@@ -916,6 +928,7 @@ function asRecord(
 ): AnalysisRecord {
   let descriptors: PropertyDescriptorMap;
   try {
+    if (utilTypes.isProxy(input)) throw new TypeError();
     descriptors = Object.getOwnPropertyDescriptors(input);
   } catch {
     throw new TypeError("Invalid analysis budget result.");
@@ -956,8 +969,14 @@ function asRecord(
 
 type StoreDatabase = ReturnType<typeof openStoreDatabase>;
 function closeDatabase(database: StoreDatabase | undefined): void { try { database?.close(); } catch { /* Preserve the operation result. */ } }
-type SnapshotEnvelope = { schema_version: 1; identity: AnalysisSnapshotIdentity |
-  { mode: "content-fallback" }; payload: Omit<AnalysisRecord, "analysis_id" | "created_at_ms"> };
+type SnapshotEnvelope = { schema_version: 1; identity: AnalysisSnapshotEnvelopeIdentity;
+  payload: Omit<AnalysisRecord, "analysis_id" | "created_at_ms"> };
+interface PreparedAnalysis {
+  record: AnalysisRecord;
+  envelope: SnapshotEnvelope;
+  record_json: string;
+  snapshot_id: string;
+}
 const LEGACY_ANALYSES_MIGRATION = "legacy-analyses-json-v1", HEX_64 = /^[0-9a-f]{64}$/u;
 const SELECTOR_DIGEST = /^sha256:[0-9a-f]{64}$/u;
 const WINDOW_STARTS = new Set(["explicit", "branch_reflog", "session_branch_transition", "commit_anchor_lookback"]);
@@ -1087,6 +1106,38 @@ function snapshotEnvelope(record: AnalysisRecord, identity?: AnalysisSnapshotIde
   return { schema_version: 1, identity: identity === undefined
       ? { mode: "content-fallback" } : normalizeSnapshotIdentity(identity),
     payload: cloneJson(payload) };
+}
+function prepareAnalysis(
+  record: AnalysisRecord,
+  snapshot?: AnalysisSnapshotIdentity,
+): PreparedAnalysis {
+  const envelope = snapshotEnvelope(record, snapshot);
+  return {
+    record,
+    envelope,
+    record_json: canonicalJson(envelope),
+    snapshot_id: analysisDigest("analysis-snapshot-v1", envelope),
+  };
+}
+function auditIdentity(prepared: PreparedAnalysis): AnalysisAuditIdentity {
+  return {
+    analysis_id: prepared.record.analysis_id,
+    snapshot_id: prepared.snapshot_id,
+    created_at_ms: prepared.record.created_at_ms,
+    deterministic_digest: `sha256:${prepared.snapshot_id}`,
+    snapshot_identity: cloneJson(prepared.envelope.identity),
+  };
+}
+
+export function analysisAuditIdentity(
+  input: AnalysisRecord | AnalysisRecordInput,
+  options: AnalysisSaveOptions = {},
+): AnalysisAuditIdentity {
+  const record = asRecord(input);
+  const snapshot = options.snapshot === undefined
+    ? undefined
+    : normalizeSnapshotIdentity(options.snapshot);
+  return auditIdentity(prepareAnalysis(record, snapshot));
 }
 class StoreConflict extends Error {
   constructor(readonly code: "analysis_record_conflict" | "analysis_snapshot_conflict", message: string) { super(message); }
@@ -1245,11 +1296,8 @@ function budgetResultFromRow(row: AnalysisBudgetRow): AnalysisBudgetResult {
   });
 }
 
-function insertAnalysis(database: StoreDatabase, record: AnalysisRecord,
-  identity?: AnalysisSnapshotIdentity): void {
-  const envelope = snapshotEnvelope(record, identity);
-  const recordJson = canonicalJson(envelope);
-  const snapshotId = analysisDigest("analysis-snapshot-v1", envelope);
+function insertAnalysis(database: StoreDatabase, prepared: PreparedAnalysis): void {
+  const { record, record_json: recordJson, snapshot_id: snapshotId } = prepared;
   const execution = database.prepare(`SELECT e.snapshot_id, e.executed_at_ms, s.record_json
     FROM analysis_executions e JOIN analysis_snapshots s USING (snapshot_id)
     WHERE e.execution_id = ?`).get(record.analysis_id) as
@@ -1334,7 +1382,7 @@ function migrateLegacyAnalyses(database: StoreDatabase, paths: StorePaths): Stor
   const scanned = scanLegacyAnalyses(paths);
   return database.transaction(() => {
     if (migrationComplete(database)) return [];
-    for (const record of scanned.records) insertAnalysis(database, record);
+    for (const record of scanned.records) insertAnalysis(database, prepareAnalysis(record));
     database.prepare("INSERT INTO store_migrations(name, completed_at_ms) VALUES (?, ?)")
       .run(LEGACY_ANALYSES_MIGRATION, Date.now());
     return scanned.warnings;
@@ -1433,13 +1481,15 @@ export async function saveAnalysis(
   const snapshot = options.snapshot === undefined
     ? undefined
     : normalizeSnapshotIdentity(options.snapshot);
+  const prepared = prepareAnalysis(record, snapshot);
+  const audit = auditIdentity(prepared);
   const warnings: StoreWarning[] = [];
   const targetPath = storeDatabasePath(paths);
   let database: StoreDatabase | undefined;
   try {
     database = openStoreDatabase(paths);
     warnings.push(...migrateLegacyAnalyses(database, paths));
-    database.transaction(() => insertAnalysis(database as StoreDatabase, record, snapshot)).immediate();
+    database.transaction(() => insertAnalysis(database as StoreDatabase, prepared)).immediate();
   } catch (error) {
     warnings.push({
       code: error instanceof StoreConflict ? error.code : "analysis_write_failed",
@@ -1447,7 +1497,12 @@ export async function saveAnalysis(
       path: targetPath,
     });
   } finally { closeDatabase(database); }
-  return { record, warnings };
+  return Object.defineProperty({ record, warnings }, "audit_identity", {
+    configurable: true,
+    enumerable: false,
+    value: audit,
+    writable: true,
+  }) as AnalysisSaveResult;
 }
 
 function roundedMetric(value: number): number {
