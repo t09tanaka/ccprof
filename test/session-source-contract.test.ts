@@ -146,6 +146,7 @@ function eventBase(sourceIndex: number) {
 function richSession(): Session {
   return session({
     capabilities: [...ALL_CAPABILITIES],
+    capability_descriptor: legacyCapabilitiesToDescriptor(ALL_CAPABILITIES),
     verified_ended_at_ms: 201,
     events: [{
       ...eventBase(0),
