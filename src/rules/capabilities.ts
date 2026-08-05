@@ -44,6 +44,10 @@ import type {
   Session,
   SessionCapability,
 } from "../core/model.js";
+import {
+  CAPABILITY_DESCRIPTOR_VERSION,
+  supportsCapability,
+} from "../protocol/capability-descriptor.js";
 import { listRuleManifests } from "./manifest.js";
 
 export const RULE_REQUIRED_CAPABILITIES: Readonly<
@@ -59,14 +63,16 @@ export interface RuleApplicability {
   missing: SessionCapability[];
 }
 
-function sessionHasCapability(
+export function sessionSupportsCapability(
   session: Session,
   capability: SessionCapability,
 ): boolean {
-  return (
-    session.capabilities === undefined ||
-    session.capabilities.includes(capability)
-  );
+  return session.capabilities?.includes(capability) === true &&
+    session.capability_descriptor !== undefined &&
+    supportsCapability(session.capability_descriptor, {
+      id: `ccprof.dev/capabilities/${capability}`,
+      version: CAPABILITY_DESCRIPTOR_VERSION,
+    });
 }
 
 export function sessionSupportsRule(
@@ -74,7 +80,7 @@ export function sessionSupportsRule(
   ruleId: RuleId,
 ): boolean {
   return RULE_REQUIRED_CAPABILITIES[ruleId].every((capability) =>
-    sessionHasCapability(session, capability)
+    sessionSupportsCapability(session, capability)
   );
 }
 
@@ -100,7 +106,7 @@ export function ruleCoverage(
     );
     const missing = [...new Set(sessions.flatMap((session) =>
       required.filter((capability) =>
-        !sessionHasCapability(session, capability)
+        !sessionSupportsCapability(session, capability)
       )
     ))].sort((left, right) => left.localeCompare(right));
     const eligibleSessions = eligible.length;

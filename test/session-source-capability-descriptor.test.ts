@@ -22,7 +22,10 @@ import {
 import {
   legacyCapabilitiesToDescriptor,
 } from "../src/protocol/legacy-capability-descriptor.js";
-import { ruleCoverage } from "../src/rules/capabilities.js";
+import {
+  ruleCoverage,
+  sessionSupportsRule,
+} from "../src/rules/capabilities.js";
 import {
   SessionSourceValidationError,
   admitSessionEventPrefix,
@@ -342,6 +345,96 @@ function laneSessionIds(
     ],
   ));
 }
+
+test("rule evidence intersects a session subset with its neutral descriptor", () => {
+  const capability = "token_usage" as const;
+  const capabilityId = LEGACY_ID(capability);
+  const source = "dev.example.agent/adapters/dummy-agent";
+  const sessionWith = (
+    id: string,
+    capabilityDescriptor: CapabilityDescriptorV1 | MutableDescriptor,
+  ): Session => ({
+    ...rawSession({
+      session_id: id,
+      source,
+      source_path: `/logs/${id}.jsonl`,
+    }),
+    capabilities: [capability],
+    capability_descriptor: capabilityDescriptor as CapabilityDescriptorV1,
+  });
+
+  const validDescriptors: readonly [string, CapabilityDescriptorV1 | MutableDescriptor][] = [
+    ["exact", descriptor([supported(capabilityId, {
+      state: "supported_exact",
+      evidence: { quality: "exact", provenance: "producer_declared" },
+    })])],
+    ["estimated", descriptor([supported(capabilityId, {
+      state: "supported_estimated",
+      evidence: { quality: "estimated", provenance: "observed" },
+    })])],
+    ["partial", descriptor([supported(capabilityId)])],
+    [
+      "legacy partial unknown",
+      legacyCapabilitiesToDescriptor([capability]),
+    ],
+  ];
+  for (const [label, capabilityDescriptor] of validDescriptors) {
+    const value = sessionWith(label.replaceAll(" ", "-"), capabilityDescriptor);
+    assert.equal(value.source, source);
+    assert.equal(sessionSupportsRule(value, "R007"), true, label);
+  }
+
+  const withoutSubset = sessionWith("without-subset", validDescriptors[0]![1]);
+  delete withoutSubset.capabilities;
+  const withoutDescriptor = sessionWith(
+    "without-descriptor",
+    validDescriptors[0]![1],
+  );
+  delete withoutDescriptor.capability_descriptor;
+  const failClosed = [
+    ["absent subset", withoutSubset],
+    ["absent descriptor", withoutDescriptor],
+    ["undeclared", sessionWith("undeclared", descriptor([
+      supported("dummy.example/capabilities/neutral_signal", {
+        state: "supported_exact",
+        evidence: { quality: "exact", provenance: "producer_declared" },
+      }),
+    ]))],
+    ["unknown", sessionWith("unknown", descriptor([
+      unsupported(capabilityId, "unknown"),
+    ]))],
+    ["unsupported", sessionWith("unsupported", descriptor([
+      unsupported(capabilityId, "unsupported"),
+    ]))],
+    ["invalid tuple", sessionWith("invalid-tuple", descriptor([
+      supported(capabilityId, {
+        state: "supported_exact",
+        evidence: { quality: "partial", provenance: "adapter_declared" },
+      }),
+    ]))],
+  ] as const;
+  for (const [label, value] of failClosed) {
+    assert.equal(sessionSupportsRule(value, "R007"), false, label);
+    assert.equal(
+      sessionSupportsRule(value, "R002"),
+      true,
+      `${label}: requirement-empty rule`,
+    );
+  }
+
+  const missing = ruleCoverage([failClosed.at(-1)![1]])
+    .find(({ rule_id }) => rule_id === "R007");
+  assert.deepEqual(missing, {
+    rule_id: "R007",
+    eligible_sessions: 0,
+    total_sessions: 1,
+    status: "partial",
+    missing_capabilities: ["token_usage"],
+    completeness: 0,
+    truncated: false,
+  });
+  assert.ok(missing?.missing_capabilities.every((id) => !id.includes("/")));
+});
 
 test("legacy-only contracts gain a detached descriptor and keep their projection", () => {
   const capabilities: SessionCapability[] = ["approvals", "tool_timestamps"];

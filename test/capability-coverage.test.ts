@@ -24,6 +24,8 @@ import {
   RULE_REQUIRED_CAPABILITIES,
   ruleCoverage,
 } from "../src/rules/capabilities.js";
+import { legacyCapabilitiesToDescriptor } from
+  "../src/protocol/legacy-capability-descriptor.js";
 import { ruleManifest } from "../src/rules/manifest.js";
 import { runCommand } from "../src/git/client.js";
 import { renderJsonReport } from "../src/reporters/json.js";
@@ -84,6 +86,7 @@ function session(options: {
   warningCode?: string;
 }): Session {
   const source = options.source ?? "claude";
+  const capabilities = options.capabilities ?? ALL_SESSION_CAPABILITIES;
   return {
     session_id: options.id,
     source,
@@ -94,6 +97,10 @@ function session(options: {
     ended_at_ms: 2,
     confidence: "high",
     events: [],
+    capabilities,
+    capability_descriptor: legacyCapabilitiesToDescriptor(
+      ALL_SESSION_CAPABILITIES,
+    ),
     warnings: options.warningCode === undefined
       ? []
       : [{
@@ -102,9 +109,6 @@ function session(options: {
         source_path: "/private/SECRET.jsonl",
         session_ref: "SECRET-session",
       }],
-    ...(options.capabilities === undefined
-      ? {}
-      : { capabilities: options.capabilities }),
   };
 }
 
@@ -229,7 +233,7 @@ test("ruleCoverage defines empty input as finite full coverage", () => {
   }
 });
 
-test("ruleCoverage is order-independent and undefined capabilities remain full", () => {
+test("ruleCoverage is order-independent and an absent subset fails closed", () => {
   const sessions = [
     session({ id: "legacy" }),
     session({
@@ -240,6 +244,18 @@ test("ruleCoverage is order-independent and undefined capabilities remain full",
   ];
   assert.deepEqual(ruleCoverage(sessions), ruleCoverage([...sessions].reverse()));
   assert.equal(coverage(ruleCoverage([sessions[0]!]), "R007").status, "full");
+
+  const absentSubset = session({ id: "absent-subset" });
+  delete absentSubset.capabilities;
+  assert.deepEqual(coverage(ruleCoverage([absentSubset]), "R007"), {
+    rule_id: "R007",
+    eligible_sessions: 0,
+    total_sessions: 1,
+    status: "partial",
+    missing_capabilities: ["token_usage"],
+    completeness: 0,
+    truncated: false,
+  });
 });
 
 test("ruleCoverage computes the R001 ratio and canonical missing capabilities", () => {

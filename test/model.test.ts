@@ -12,6 +12,8 @@ import {
   ruleApplicability,
   RULE_REQUIRED_CAPABILITIES,
 } from "../src/rules/capabilities.js";
+import { legacyCapabilitiesToDescriptor } from
+  "../src/protocol/legacy-capability-descriptor.js";
 
 test("report v2 serializes the exact public wire contract", () => {
   assert.equal(makeSessionRef("s1", "u1"), "s1#u1");
@@ -103,7 +105,7 @@ test("report v2 serializes the exact public wire contract", () => {
 
 function makeSession(
   sessionId: string,
-  capabilities?: readonly SessionCapability[],
+  capabilities: readonly SessionCapability[] = ALL_SESSION_CAPABILITIES,
 ): Session {
   return {
     session_id: sessionId,
@@ -116,21 +118,31 @@ function makeSession(
     confidence: "high",
     events: [],
     warnings: [],
-    ...(capabilities === undefined ? {} : { capabilities }),
+    capabilities,
+    capability_descriptor: legacyCapabilitiesToDescriptor(capabilities),
   };
 }
 
-test("ruleApplicability: every rule is applicable when capabilities are unspecified (full compatibility)", () => {
-  const sessions = [makeSession("s1"), makeSession("s2")];
-  const results = ruleApplicability(sessions);
+test("ruleApplicability: required evidence needs an explicit subset and descriptor", () => {
+  const withoutSubset = makeSession("without-subset");
+  delete withoutSubset.capabilities;
+  const withoutDescriptor = makeSession("without-descriptor");
+  delete withoutDescriptor.capability_descriptor;
 
-  assert.deepEqual(
-    results.map((entry) => entry.rule_id).sort(),
-    Object.keys(RULE_REQUIRED_CAPABILITIES).sort(),
-  );
-  for (const entry of results) {
-    assert.equal(entry.applicable, true, `${entry.rule_id} should be applicable`);
-    assert.deepEqual(entry.missing, []);
+  for (const session of [withoutSubset, withoutDescriptor]) {
+    const results = ruleApplicability([session]);
+    const required = results.find(({ rule_id }) => rule_id === "R007");
+    const requirementEmpty = results.find(({ rule_id }) => rule_id === "R002");
+    assert.deepEqual(required, {
+      rule_id: "R007",
+      applicable: false,
+      missing: ["token_usage"],
+    });
+    assert.deepEqual(requirementEmpty, {
+      rule_id: "R002",
+      applicable: true,
+      missing: [],
+    });
   }
 });
 
