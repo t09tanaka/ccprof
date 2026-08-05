@@ -5,6 +5,7 @@ import {
   type JsonObject,
   type JsonValue,
   type NormalizedEvent,
+  type NormalizedSession,
   type Session,
   type SessionCapability,
 } from "../core/model.js";
@@ -53,6 +54,7 @@ export interface SessionSource {
 }
 export interface ValidatedSessionSource extends SessionSource {
   readonly contract: NormalizedSessionSourceContract;
+  discover(query: SessionQuery): Promise<NormalizedSession[]>;
 }
 
 export type SessionSourceValidationCode =
@@ -237,6 +239,30 @@ function sameCapabilities(
 ): boolean {
   return left.length === right.length &&
     left.every((capability, index) => capability === right[index]);
+}
+
+function sameCapabilityDescriptors(
+  left: CapabilityDescriptorV1,
+  right: CapabilityDescriptorV1,
+): boolean {
+  return left.$schema === right.$schema &&
+    left.schema_version === right.schema_version &&
+    left.descriptor_version === right.descriptor_version &&
+    left.undeclared_capability_state === right.undeclared_capability_state &&
+    left.capabilities.length === right.capabilities.length &&
+    left.capabilities.every((entry, index) => {
+      const other = right.capabilities[index];
+      return other !== undefined &&
+        entry.id === other.id &&
+        entry.legacy_id === other.legacy_id &&
+        entry.version === other.version &&
+        entry.version_range === other.version_range &&
+        entry.requirement === other.requirement &&
+        entry.state === other.state &&
+        entry.evidence.quality === other.evidence.quality &&
+        entry.evidence.provenance === other.evidence.provenance &&
+        entry.timestamp_precision === other.timestamp_precision;
+    });
 }
 
 function makeContract(
@@ -800,14 +826,14 @@ function warningSnapshot(value: unknown): Session["warnings"][number] {
 function validateDiscoveredSessions(
   value: unknown,
   contract: NormalizedSessionSourceContract,
-): Session[] {
+): NormalizedSession[] {
   return denseArrayValues(value, "invalid_result").map((candidate) => {
     const snapshot = dataObject(candidate);
     exactFields(snapshot, [
       "session_id", "source", "source_path", "observed_cwds",
       "observed_branches", "started_at_ms", "ended_at_ms", "confidence",
       "events", "warnings",
-    ], ["capabilities", "verified_ended_at_ms"]);
+    ], ["capabilities", "capability_descriptor", "verified_ended_at_ms"]);
     const source = canonicalBuiltinSourceAdapterId(
       snapshot.source,
       "adapter_mismatch",
@@ -820,6 +846,16 @@ function validateDiscoveredSessions(
     if (capabilities.some((capability) => !declared.has(capability))) {
       return fail("invalid_capability");
     }
+    const capabilityDescriptor = Object.hasOwn(
+        snapshot,
+        "capability_descriptor",
+      )
+      ? canonicalCapabilityDescriptor(snapshot.capability_descriptor)
+      : contract.capability_descriptor;
+    if (!sameCapabilityDescriptors(
+      capabilityDescriptor,
+      contract.capability_descriptor,
+    )) return fail("invalid_capability");
     const sessionId = text(snapshot.session_id);
     const sourcePath = text(snapshot.source_path);
     const sessionIdentity = {
@@ -843,6 +879,7 @@ function validateDiscoveredSessions(
         warningSnapshot,
       ),
       capabilities: Object.freeze([...capabilities]),
+      capability_descriptor: contract.capability_descriptor,
       ...(snapshot.verified_ended_at_ms === undefined
         ? {}
         : {
@@ -857,7 +894,7 @@ function validateDiscoveredSessions(
 function normalizeDiscoveredSessions(
   value: unknown,
   contract: NormalizedSessionSourceContract,
-): Session[] {
+): NormalizedSession[] {
   try {
     return validateDiscoveredSessions(value, contract);
   } catch (error) {
@@ -890,7 +927,7 @@ export function validateSessionSource(value: unknown): ValidatedSessionSource {
   const discover = discoverMethod(value);
   return Object.freeze({
     contract,
-    async discover(query: SessionQuery): Promise<Session[]> {
+    async discover(query: SessionQuery): Promise<NormalizedSession[]> {
       let result: unknown;
       try {
         result = await discover.call(value, query);

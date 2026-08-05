@@ -1252,7 +1252,11 @@ function sourceFailureSnapshot(error: unknown): unknown {
 }
 function sourceSnapshot(sessions: readonly Session[], repoRoot: string): unknown[] {
   return sessions.map((session) => {
-    const { source_path: _sourcePath, ...rest } = session;
+    const {
+      source_path: _sourcePath,
+      capability_descriptor: _capabilityDescriptor,
+      ...rest
+    } = session;
     const projected = { ...rest,
       source: projectSourceAdapterIdV1(session.source),
       observed_cwds: session.observed_cwds.map(

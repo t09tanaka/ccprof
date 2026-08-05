@@ -218,13 +218,16 @@ function sessionDescriptorWithNeutral(
   return result;
 }
 
-function sessionEvent(sourceIndex: number): Session["events"][number] {
+function sessionEvent(
+  sourceIndex: number,
+  sessionId = "session-1",
+): Session["events"][number] {
   return {
     kind: "assistant",
     timestamp_ms: 100 + sourceIndex,
-    session_id: "session-1",
+    session_id: sessionId,
     entry_uuid: `entry-${sourceIndex}`,
-    session_ref: `session-1#entry-${sourceIndex}`,
+    session_ref: `${sessionId}#entry-${sourceIndex}`,
     source_index: sourceIndex,
     agent_id: "main",
     is_sidechain: false,
@@ -234,8 +237,9 @@ function sessionEvent(sourceIndex: number): Session["events"][number] {
 }
 
 function rawSession(overrides: Partial<RawSession> = {}): RawSession {
+  const sessionId = overrides.session_id ?? "session-1";
   return {
-    session_id: "session-1",
+    session_id: sessionId,
     source: "claude",
     source_path: "/logs/session-1.jsonl",
     observed_cwds: ["/repo"],
@@ -243,7 +247,7 @@ function rawSession(overrides: Partial<RawSession> = {}): RawSession {
     started_at_ms: 100,
     ended_at_ms: 101,
     confidence: "high",
-    events: [sessionEvent(0), sessionEvent(1)],
+    events: [sessionEvent(0, sessionId), sessionEvent(1, sessionId)],
     warnings: [],
     ...overrides,
   };
@@ -619,10 +623,6 @@ test("normalized sessions keep neutral declarations without projecting them into
     "approvals",
     "tool_timestamps",
   ]);
-  sourceDescriptor.capabilities.push(unsupported(
-    LEGACY_ID("edit_fragments"),
-    "unsupported",
-  ));
   const result = await discoverNormalized(contract({
     capability_descriptor: sourceDescriptor,
   }), [rawSession()]);
@@ -633,7 +633,10 @@ test("normalized sessions keep neutral declarations without projecting them into
     normalized.capability_descriptor.capabilities.map(({ id }) => id),
     [
       LEGACY_ID("approvals"),
+      LEGACY_ID("branch_rows"),
       LEGACY_ID("edit_fragments"),
+      LEGACY_ID("sidechains"),
+      LEGACY_ID("token_usage"),
       LEGACY_ID("tool_timestamps"),
       "dummy.example/capabilities/neutral_signal",
     ],

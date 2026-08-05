@@ -552,7 +552,11 @@ test("all matching source spellings preserve persisted audit identity", async ()
     [validated!],
     referenceWindow!,
   );
-  const { source_path: _sourcePath, ...rest } = sliced!;
+  const {
+    source_path: _sourcePath,
+    capability_descriptor: _capabilityDescriptor,
+    ...rest
+  } = sliced!;
   const legacyProjected = {
     ...rest,
     source: "claude",
@@ -1188,6 +1192,9 @@ test("validated discovery returns a fully detached Session snapshot", async () =
   const original = richSession();
   const expected = structuredClone(original);
   expected.source = CANONICAL_CLAUDE;
+  expected.capability_descriptor = legacyCapabilitiesToDescriptor(
+    ALL_CAPABILITIES,
+  );
   const [snapshot] = await discoveryOf([original]);
   assert.ok(snapshot);
 
