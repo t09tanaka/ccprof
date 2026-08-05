@@ -3248,7 +3248,11 @@ function adoption(
 
 test("adoptions are additive and keep the first record for each finding key", async () => {
   await temporaryStore(async (paths) => {
-    const first = adoption("finding-a", { method: "claude_md_edit" });
+    const first = adoption("finding-a", {
+      scope: "instruction_resource",
+      method: "instruction_resource_edit",
+      evidence: { commit: "a".repeat(40), path: "CLAUDE.md" },
+    });
     assert.deepEqual(await saveAdoptions(paths, [
       first,
       adoption("finding-a", { method: "target_file_edit" }),
@@ -3270,6 +3274,123 @@ test("adoptions are additive and keep the first record for each finding key", as
       adoption("finding-c"),
     ]);
     assert.equal((await readdir(paths.repo_dir)).includes("adoptions.json"), false);
+  });
+});
+
+test("canonical instruction-resource adoptions round-trip through exact legacy SQLite bytes", async () => {
+  await temporaryStore(async (paths) => {
+    const runtime = adoption("finding-resource", {
+      scope: "instruction_resource",
+      method: "instruction_resource_edit",
+      evidence: { commit: "a".repeat(40), path: "CLAUDE.md" },
+    });
+    const legacy = {
+      ...runtime,
+      scope: "claude_md",
+      method: "claude_md_edit",
+    };
+
+    assert.deepEqual(await saveAdoptions(paths, [runtime]), []);
+    const database = openStoreDatabase(paths);
+    try {
+      const raw = database.prepare(
+        "SELECT record_json FROM adoptions WHERE finding_key = ?",
+      ).pluck().get(runtime.finding_key);
+      assert.equal(raw, canonicalJson(legacy));
+    } finally {
+      database.close();
+    }
+
+    assert.deepEqual(await loadAdoptions(paths), {
+      records: [runtime],
+      warnings: [],
+    });
+  });
+});
+
+test("adoption Store rejects invalid runtime identities before inserting a row", async () => {
+  await temporaryStore(async (paths) => {
+    const invalid = [
+      adoption("invalid-scope-case", { scope: "INSTRUCTION_RESOURCE" as never }),
+      adoption("invalid-scope-space", { scope: " instruction_resource" as never }),
+      adoption("invalid-scope-nul", { scope: "instruction_resource\0bad" as never }),
+      adoption("invalid-scope-legacy", { scope: "claude_md" as never }),
+      adoption("invalid-method-case", { method: "INSTRUCTION_RESOURCE_EDIT" as never }),
+      adoption("invalid-method-space", { method: "instruction_resource_edit " as never }),
+      adoption("invalid-method-nul", { method: "instruction_resource_edit\0bad" as never }),
+      adoption("invalid-method-legacy", { method: "claude_md_edit" as never }),
+    ];
+
+    for (const record of invalid) {
+      const warnings = await saveAdoptions(paths, [record]);
+      assert.equal(warnings.length, 1);
+      assert.equal(warnings[0]?.code, "adoption_write_failed");
+      assert.doesNotMatch(warnings[0]?.message ?? "", /INSTRUCTION|claude_md|bad/u);
+    }
+
+    const database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare("SELECT count(*) FROM adoptions").pluck().get(), 0);
+    } finally {
+      database.close();
+    }
+  });
+});
+
+test("adoption Store authenticates legacy wire bytes before runtime normalization", async () => {
+  await temporaryStore(async (paths) => {
+    assert.deepEqual(await loadAdoptions(paths), { records: [], warnings: [] });
+    const legacy = {
+      finding_key: "legacy-authenticated",
+      rule_id: "R002",
+      scope: "claude_md",
+      fingerprint: "fp-legacy-authenticated",
+      method: "claude_md_edit",
+      detected_at_ms: 1_000,
+      evidence: { commit: "a".repeat(40), path: "CLAUDE.md" },
+    };
+    const canonicalWire = {
+      ...legacy,
+      finding_key: "canonical-wire-rejected",
+      fingerprint: "fp-canonical-wire-rejected",
+      scope: "instruction_resource",
+      method: "instruction_resource_edit",
+    };
+    const nonCanonical = {
+      ...legacy,
+      finding_key: "noncanonical-wire-rejected",
+      fingerprint: "fp-noncanonical-wire-rejected",
+    };
+    const database = openStoreDatabase(paths);
+    try {
+      const insert = database.prepare(`INSERT INTO adoptions
+        (finding_key, detected_at_ms, record_json) VALUES (?, ?, ?)`);
+      insert.run(legacy.finding_key, legacy.detected_at_ms, canonicalJson(legacy));
+      insert.run(
+        canonicalWire.finding_key,
+        canonicalWire.detected_at_ms,
+        canonicalJson(canonicalWire),
+      );
+      insert.run(
+        nonCanonical.finding_key,
+        nonCanonical.detected_at_ms,
+        JSON.stringify(nonCanonical),
+      );
+    } finally {
+      database.close();
+    }
+
+    const loaded = await loadAdoptions(paths);
+    assert.deepEqual(loaded.records, [adoption("legacy-authenticated", {
+      scope: "instruction_resource",
+      fingerprint: legacy.fingerprint,
+      method: "instruction_resource_edit",
+      evidence: legacy.evidence,
+    })]);
+    assert.equal(
+      loaded.warnings.filter(({ code }) => code === "corrupt_adoptions").length,
+      2,
+    );
   });
 });
 
@@ -3338,7 +3459,20 @@ test("legacy dismissal and adoption JSON migrate once with their existing dedupe
       finding_key: "finding-b",
       dismissed_at_ms: 1_500,
     };
-    const firstAdoption = adoption("finding-a", { method: "claude_md_edit" });
+    const firstAdoption = {
+      ...adoption("finding-a", {
+        scope: "instruction_resource",
+        method: "instruction_resource_edit",
+        evidence: { commit: "a".repeat(40), path: "CLAUDE.md" },
+      }),
+      scope: "claude_md" as const,
+      method: "claude_md_edit" as const,
+    };
+    const canonicalFirstAdoption = adoption("finding-a", {
+      scope: "instruction_resource",
+      method: "instruction_resource_edit",
+      evidence: firstAdoption.evidence,
+    });
     const secondAdoption = adoption("finding-b");
     const dismissalJson = `${JSON.stringify({
       schema_version: 1,
@@ -3360,7 +3494,7 @@ test("legacy dismissal and adoption JSON migrate once with their existing dedupe
       warnings: [],
     });
     assert.deepEqual(await loadAdoptions(paths), {
-      records: [firstAdoption, secondAdoption],
+      records: [canonicalFirstAdoption, secondAdoption],
       warnings: [],
     });
 
@@ -3374,6 +3508,9 @@ test("legacy dismissal and adoption JSON migrate once with their existing dedupe
       assert.equal(database.prepare(
         "SELECT count(*) FROM store_migrations WHERE name = ?",
       ).pluck().get("legacy-adoptions-json-v1"), 1);
+      assert.equal(database.prepare(
+        "SELECT record_json FROM adoptions WHERE finding_key = ?",
+      ).pluck().get(firstAdoption.finding_key), canonicalJson(firstAdoption));
     } finally {
       database.close();
     }
@@ -3393,7 +3530,7 @@ test("legacy dismissal and adoption JSON migrate once with their existing dedupe
       secondDismissal,
     ]);
     assert.deepEqual((await loadAdoptions(paths)).records, [
-      firstAdoption,
+      canonicalFirstAdoption,
       secondAdoption,
     ]);
   });
