@@ -5,6 +5,15 @@ import test from "node:test";
 
 import { Ajv2020 } from "ajv/dist/2020.js";
 
+import {
+  CAPABILITY_DESCRIPTOR_SCHEMA_ID as RUNTIME_SCHEMA_ID,
+  CAPABILITY_DESCRIPTOR_SCHEMA_VERSION,
+  CAPABILITY_DESCRIPTOR_VERSION,
+  CAPABILITY_UNDECLARED_STATE,
+  CapabilityDescriptorValidationError,
+  validateCapabilityDescriptor,
+} from "../src/protocol/capability-descriptor.js";
+
 type JsonObject = Record<string, unknown>;
 type Evidence = {
   quality: string;
@@ -95,12 +104,22 @@ test("publishes a closed Draft 2020-12 capability descriptor contract", async ()
   const { schema } = await loadContract();
   assert.equal(schema.$schema, "https://json-schema.org/draft/2020-12/schema");
   assert.equal(schema.$id, SCHEMA_ID);
+  assert.equal(RUNTIME_SCHEMA_ID, SCHEMA_ID);
   assert.equal(schema.type, "object");
   assertClosedObjects(schema);
 
-  assert.equal(property(schema, "schema_version").const, 1);
-  assert.equal(property(schema, "descriptor_version").const, "1.0.0");
-  assert.equal(property(schema, "undeclared_capability_state").const, "unknown");
+  assert.equal(
+    property(schema, "schema_version").const,
+    CAPABILITY_DESCRIPTOR_SCHEMA_VERSION,
+  );
+  assert.equal(
+    property(schema, "descriptor_version").const,
+    CAPABILITY_DESCRIPTOR_VERSION,
+  );
+  assert.equal(
+    property(schema, "undeclared_capability_state").const,
+    CAPABILITY_UNDECLARED_STATE,
+  );
   const capabilityId = object(
     object(schema.$defs, "$defs").capability_id,
     "capability_id",
@@ -125,6 +144,7 @@ test("Ajv 2020 accepts the canonical fixture and every support state", async () 
   const validate = new Ajv2020({ strict: true, allErrors: true }).compile(schema);
 
   assert.equal(validate(fixture), true, JSON.stringify(validate.errors));
+  assert.deepEqual(validateCapabilityDescriptor(fixture), fixture);
 
   const supportedStates: Array<[string, string, string]> = [
     ["supported_exact", "exact", "producer_declared"],
@@ -170,6 +190,7 @@ test("Ajv 2020 accepts the canonical fixture and every support state", async () 
       true,
       `${rangeValue}: ${JSON.stringify(validate.errors)}`,
     );
+    assert.deepEqual(validateCapabilityDescriptor(range), range);
   }
 });
 
@@ -178,6 +199,11 @@ test("Ajv 2020 rejects malformed, ambiguous, and contradictory descriptors", asy
   const validate = new Ajv2020({ strict: true, allErrors: true }).compile(schema);
   const reject = (candidate: Descriptor, label: string): void => {
     assert.equal(validate(candidate), false, label);
+    assert.throws(
+      () => validateCapabilityDescriptor(candidate),
+      CapabilityDescriptorValidationError,
+      label,
+    );
   };
 
   const rootUnknown = structuredClone(fixture);
