@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { Ajv2020 } from "ajv/dist/2020.js";
 
 import {
   CliUsageError,
@@ -122,6 +123,115 @@ function assertClosedObjects(value: unknown, path = "#"): void {
   for (const [key, child] of Object.entries(node)) {
     assertClosedObjects(child, `${path}/${key}`);
   }
+}
+
+function reportV3Fixture(): JsonObject {
+  return {
+    schema_version: 3,
+    producer: {
+      name: "ccprof",
+      version: "1.0.0",
+      build_sha: "a".repeat(40),
+      ruleset_version: "2026-08-04",
+    },
+    analysis: {
+      analysis_id: "analysis",
+      snapshot_id: "snapshot",
+      created_at_ms: 2,
+      deterministic_digest: `sha256:${"a".repeat(64)}`,
+    },
+    work_unit: {
+      repository_id: "repository",
+      pr_ref: "main...head",
+      base_oid: "a".repeat(40),
+      head_oid: "b".repeat(40),
+      merge_base_oid: "c".repeat(40),
+      workspace_ids: [],
+    },
+    window: {
+      started_at_ms: 0,
+      ended_at_ms: 1,
+      start_source: "explicit",
+      end_source: "analysis_time",
+      completeness: "complete",
+    },
+    sources: [{
+      adapter_id: "claude",
+      adapter_version: "1.0.0",
+      schema_fingerprint: `sha256:${"d".repeat(64)}`,
+      capabilities: [],
+      coverage: {
+        files_discovered: 0,
+        files_parsed: 0,
+        rows_seen: 0,
+        rows_accepted: 0,
+        events_emitted: 0,
+      },
+    }],
+    policy: {
+      schema_version: 1,
+      digest: `sha256:${"e".repeat(64)}`,
+      privacy_profile: "strict",
+    },
+    summary: {
+      critical_path: {
+        measured_ms: 0,
+        confirmed_recoverable_ms: 0,
+        possible_recoverable_upper_ms: 0,
+        human_wait_ms: 0,
+        unexplained_ms: 0,
+      },
+      resource_cost: {
+        tool_runtime_ms: 0,
+        estimated_input_tokens: 0,
+        estimated_output_tokens: 0,
+      },
+    },
+    findings: {
+      total: 1,
+      returned: 1,
+      truncated: false,
+      items: [{
+        finding_id: "finding-id",
+        finding_key: "finding-key",
+        rule: { id: "R001", version: "1.0.0", compatibility_epoch: 1 },
+        classification: "classification",
+        scope: "this_pr",
+        impact: { kind: "critical_path_latency", lower_ms: 0, upper_ms: 0 },
+        confidence: { evidence: "high", causal: "high", source_completeness: 1 },
+        evidence: {},
+        recipe: {
+          kind: "proposal",
+          trust: "untrusted",
+          suggestion: "suggestion",
+          verification: null,
+        },
+      }],
+    },
+    rule_coverage: [{
+      rule_id: "R001",
+      eligible_sessions: 0,
+      total_sessions: 0,
+      status: "full",
+      missing_capabilities: [],
+      completeness: 1,
+      truncated: false,
+    }],
+    diagnostics: { warning_counts: {} },
+  };
+}
+
+function fixtureSource(report: JsonObject): JsonObject {
+  return jsonObject((report.sources as unknown[])[0], "fixture source");
+}
+
+function fixtureFinding(report: JsonObject): JsonObject {
+  const findings = jsonObject(report.findings, "fixture findings");
+  return jsonObject((findings.items as unknown[])[0], "fixture finding");
+}
+
+function fixtureCoverage(report: JsonObject): JsonObject {
+  return jsonObject((report.rule_coverage as unknown[])[0], "fixture coverage");
 }
 
 async function capture(
@@ -346,6 +456,170 @@ test("published Report v3 schema is closed and carries the audited contract", as
     "completeness",
     "truncated",
   ]);
+});
+
+test("published Report v3 schema accepts canonical identities with legacy compatibility", async () => {
+  const raw = await readFile(
+    resolve(process.cwd(), "schemas/report-v3.schema.json"),
+    "utf8",
+  );
+  const schema = jsonObject(JSON.parse(raw), "report v3 schema");
+  const ajv = new Ajv2020({ strict: true, allowUnionTypes: true });
+  ajv.addKeyword("x-ccprof-runtime-constraints");
+  const validate = ajv.compile(schema);
+  const assertValid = (report: JsonObject, label: string): void => {
+    assert.equal(validate(report), true, `${label}: ${JSON.stringify(validate.errors)}`);
+  };
+  const assertInvalid = (report: JsonObject, label: string): void => {
+    assert.equal(validate(report), false, label);
+  };
+
+  assert.equal(
+    schema.$id,
+    "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/report-v3.schema.json",
+  );
+  assert.equal(property(schema, schema, "schema_version").const, 3);
+  const findings = property(schema, schema, "findings");
+  const finding = dereference(
+    schema,
+    dereference(
+      schema,
+      jsonObject(findings.properties, "findings properties").items,
+    ).items,
+  );
+  assert.deepEqual(property(schema, finding, "scope").enum, [
+    "this_pr",
+    "separate_issue",
+    "claude_md",
+    "instruction_resource",
+  ]);
+
+  const source = dereference(schema, property(schema, schema, "sources").items);
+  const sourceCapabilities = jsonObject(
+    property(schema, source, "capabilities"),
+    "source capabilities",
+  );
+  const coverage = dereference(
+    schema,
+    property(schema, schema, "rule_coverage").items,
+  );
+  const missingCapabilities = jsonObject(
+    property(schema, coverage, "missing_capabilities"),
+    "missing capabilities",
+  );
+  assert.equal(
+    jsonObject(sourceCapabilities.items, "source capability items").$ref,
+    "#/$defs/capability",
+  );
+  assert.equal(
+    jsonObject(missingCapabilities.items, "missing capability items").$ref,
+    "#/$defs/capability",
+  );
+
+  for (const scope of [
+    "this_pr",
+    "separate_issue",
+    "claude_md",
+    "instruction_resource",
+  ]) {
+    const report = reportV3Fixture();
+    fixtureFinding(report).scope = scope;
+    assertValid(report, `scope ${scope}`);
+  }
+
+  const sourceAdapterIdAtMaxLength = [
+    "a.a",
+    "a".repeat(64),
+    "b".repeat(64),
+    "c".repeat(64),
+    "d".repeat(56),
+  ].join("/");
+  const sourceAdapterIdOverMaxLength = [
+    "a.a",
+    "a".repeat(64),
+    "b".repeat(64),
+    "c".repeat(64),
+    "d".repeat(57),
+  ].join("/");
+  assert.equal(sourceAdapterIdAtMaxLength.length, 255);
+  assert.equal(sourceAdapterIdOverMaxLength.length, 256);
+  for (const adapterId of [
+    "claude",
+    "codex",
+    "dummy-agent",
+    "ccprof.dev/adapters/claude",
+    "dev.example.agent/adapters/dummy-agent",
+    "ccprof.dev/adapters/claude/v1",
+    sourceAdapterIdAtMaxLength,
+  ]) {
+    const report = reportV3Fixture();
+    fixtureSource(report).adapter_id = adapterId;
+    assertValid(report, `adapter ${adapterId}`);
+  }
+
+  for (const adapterId of [
+    "CCprof.dev/adapters/claude",
+    "ccprof.dev/adapters/Claude",
+    "ccprof..dev/adapters/claude",
+    "ccprof.dev//adapters/claude",
+    "ccprof.dev/adapters/",
+    sourceAdapterIdOverMaxLength,
+  ]) {
+    const report = reportV3Fixture();
+    fixtureSource(report).adapter_id = adapterId;
+    assertInvalid(report, `malformed adapter ${adapterId}`);
+  }
+
+  const legacyCapabilities = [
+    "tool_timestamps",
+    "token_usage",
+    "sidechains",
+    "branch_rows",
+    "edit_fragments",
+    "approvals",
+  ];
+  const capabilityAtMaxLength = `a.a/capabilities/${"a".repeat(238)}`;
+  const capabilityOverMaxLength = `a.a/capabilities/${"a".repeat(239)}`;
+  assert.equal(capabilityAtMaxLength.length, 255);
+  assert.equal(capabilityOverMaxLength.length, 256);
+  const canonicalCapabilities = [
+    "ccprof.dev/capabilities/tool_timestamps",
+    "dev.example.agent/capabilities/dummy-agent",
+    capabilityAtMaxLength,
+  ];
+  for (const capabilities of [legacyCapabilities, canonicalCapabilities]) {
+    for (const location of ["source", "coverage"] as const) {
+      const report = reportV3Fixture();
+      if (location === "source") {
+        fixtureSource(report).capabilities = capabilities;
+      } else {
+        fixtureCoverage(report).missing_capabilities = capabilities;
+      }
+      assertValid(report, `${location} capabilities ${capabilities.join(",")}`);
+    }
+  }
+
+  for (const capability of [
+    "unknown_capability",
+    "CCprof.dev/capabilities/tool_timestamps",
+    "ccprof.dev/capabilities/Tool_timestamps",
+    "ccprof..dev/capabilities/tool_timestamps",
+    "ccprof.dev//capabilities/tool_timestamps",
+    "ccprof.dev/not-capabilities/tool_timestamps",
+    "ccprof.dev/capabilities/",
+    "ccprof.dev/capabilities/tool_timestamps/extra",
+    capabilityOverMaxLength,
+  ]) {
+    for (const location of ["source", "coverage"] as const) {
+      const report = reportV3Fixture();
+      if (location === "source") {
+        fixtureSource(report).capabilities = [capability];
+      } else {
+        fixtureCoverage(report).missing_capabilities = [capability];
+      }
+      assertInvalid(report, `malformed ${location} capability ${capability}`);
+    }
+  }
 });
 
 test("built schema command works from an arbitrary cwd and a symlink", async () => {

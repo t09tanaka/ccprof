@@ -68,6 +68,17 @@
       "type": "string",
       "pattern": "^[a-z][a-z0-9._-]{0,127}$"
     },
+    "sourceAdapterId": {
+      "type": "string",
+      "maxLength": 255,
+      "pattern": "^(?:[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?(?:/[a-z][a-z0-9._-]{0,63})*(?![\\s\\S])"
+    },
+    "reportV3AdapterId": {
+      "anyOf": [
+        { "$ref": "#/$defs/token" },
+        { "$ref": "#/$defs/sourceAdapterId" }
+      ]
+    },
     "findingIdentifier": {
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"
@@ -77,13 +88,22 @@
       "pattern": "^R[0-9]{3}$"
     },
     "capability": {
-      "enum": [
-        "tool_timestamps",
-        "token_usage",
-        "sidechains",
-        "branch_rows",
-        "edit_fragments",
-        "approvals"
+      "anyOf": [
+        {
+          "enum": [
+            "tool_timestamps",
+            "token_usage",
+            "sidechains",
+            "branch_rows",
+            "edit_fragments",
+            "approvals"
+          ]
+        },
+        {
+          "type": "string",
+          "maxLength": 255,
+          "pattern": "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?/capabilities/[a-z][a-z0-9_]*(?:[.-][a-z0-9_]+)*(?![\\s\\S])"
+        }
       ]
     },
     "jsonPrimitive": {
@@ -264,7 +284,7 @@
       ],
       "properties": {
         "adapter_id": {
-          "$ref": "#/$defs/token"
+          "$ref": "#/$defs/reportV3AdapterId"
         },
         "adapter_version": {
           "$ref": "#/$defs/semver"
@@ -472,7 +492,12 @@
           "$ref": "#/$defs/token"
         },
         "scope": {
-          "enum": ["this_pr", "separate_issue", "claude_md"]
+          "enum": [
+            "this_pr",
+            "separate_issue",
+            "claude_md",
+            "instruction_resource"
+          ]
         },
         "impact": {
           "$ref": "#/$defs/impact"

@@ -75,8 +75,12 @@ The sections follow the approved audit contract:
 - `window`: integer start/end timestamps, their source identifiers, and
   `complete`/`partial` completeness, matching the current analysis-window
   vocabulary.
-- each source: adapter identifier and SemVer, schema fingerprint, unique
-  declared capabilities, and measured file/row/event coverage counters.
+- each source: a legacy lower-case token adapter identifier or a canonical
+  `SourceAdapterId` (`<dns>` followed by zero or more lowercase path
+  segments), SemVer, schema fingerprint, unique declared capabilities, and
+  measured file/row/event coverage counters. Canonical adapter IDs are limited
+  to 255 characters; the legacy token contract remains accepted for published
+  Report v3 compatibility.
 - `policy`: schema version `1`, SHA-256 digest, and
   `strict`/`balanced`/`raw` privacy profile.
 - `summary`: the audit's critical-path and resource-cost counters, all as
@@ -107,8 +111,9 @@ recipe { kind, trust, suggestion, verification }
 
 Rule versions are SemVer, compatibility epochs are positive safe integers,
 impact kinds are `critical_path_latency` or `resource_cost`, confidence levels
-are `low`/`medium`/`high`, and source completeness is in `[0, 1]`. `scope`
-retains the existing `this_pr`, `separate_issue`, and `claude_md` values.
+are `low`/`medium`/`high`, and source completeness is in `[0, 1]`. `scope` is
+exactly `this_pr`, `separate_issue`, `claude_md` (explicit legacy
+compatibility), or the canonical `instruction_resource` value.
 Classification is a bounded identifier rather than the Report v2 enum because
 the approved v3 example introduces `policy_latency`. Evidence is JSON data in
 a closed dictionary whose property names and recursively nested values are
@@ -118,7 +123,10 @@ authorize execution of its suggestion.
 `rule_coverage` reuses the current additive coverage vocabulary. Each closed
 entry requires `rule_id`, eligible and total session counters, `full`/`partial`
 status, unique missing capabilities, completeness in `[0, 1]`, and `truncated`.
-This publication does not change current Report v2 coverage output.
+Both capability arrays reference one shared definition: they accept the six
+published legacy capability tokens or a 255-character Capability Descriptor v1
+identifier in the form `<dns>/capabilities/<capability-name>`. This publication
+does not change current Report v2 coverage output or any runtime producer.
 
 ## Runtime-only semantic constraints
 
