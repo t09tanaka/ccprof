@@ -345,6 +345,11 @@ test("validated sources canonicalize identity and capabilities without mutating 
   const validated = validateSessionSource(source(input));
 
   const discovered = await validated.discover(QUERY);
+  const normalized = discovered as Array<Session & {
+    readonly capability_descriptor?: ReturnType<
+      typeof legacyCapabilitiesToDescriptor
+    >;
+  }>;
 
   assert.notEqual(discovered, input);
   assert.notEqual(discovered[0], omitted);
@@ -364,6 +369,15 @@ test("validated sources canonicalize identity and capabilities without mutating 
   ]);
   assert.equal(Object.isFrozen(discovered[0]?.capabilities), true);
   assert.equal(Object.isFrozen(discovered[1]?.capabilities), true);
+  assert.equal(
+    normalized[0]?.capability_descriptor,
+    validated.contract.capability_descriptor,
+  );
+  assert.equal(
+    normalized[1]?.capability_descriptor,
+    validated.contract.capability_descriptor,
+  );
+  assert.equal(Object.isFrozen(normalized[0]?.capability_descriptor), true);
   assert.deepEqual(
     deriveSourceDescriptor(discovered[1]!),
     deriveSourceDescriptor({
@@ -538,7 +552,11 @@ test("all matching source spellings preserve persisted audit identity", async ()
     [validated!],
     referenceWindow!,
   );
-  const { source_path: _sourcePath, ...rest } = sliced!;
+  const {
+    source_path: _sourcePath,
+    capability_descriptor: _capabilityDescriptor,
+    ...rest
+  } = sliced!;
   const legacyProjected = {
     ...rest,
     source: "claude",
@@ -1174,6 +1192,9 @@ test("validated discovery returns a fully detached Session snapshot", async () =
   const original = richSession();
   const expected = structuredClone(original);
   expected.source = CANONICAL_CLAUDE;
+  expected.capability_descriptor = legacyCapabilitiesToDescriptor(
+    ALL_CAPABILITIES,
+  );
   const [snapshot] = await discoveryOf([original]);
   assert.ok(snapshot);
 

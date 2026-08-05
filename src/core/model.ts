@@ -12,6 +12,8 @@ import type { EventIdentity } from "./event-identity.js";
 import type { ProducerId } from "./source-identity.js";
 import type { SourceDescriptor } from "./source-descriptor.js";
 import type { AnalysisBudgetResult } from "../analysis/budgets.js";
+import type { CapabilityDescriptorV1 } from
+  "../protocol/capability-descriptor.js";
 
 export type JsonPrimitive = boolean | number | string | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | JsonObject;
@@ -211,6 +213,8 @@ export interface Session {
    * set this explicitly; legacy `undefined` means full capabilities.
    */
   capabilities?: readonly SessionCapability[];
+  /** Neutral source capability/evidence contract after boundary validation. */
+  capability_descriptor?: CapabilityDescriptorV1;
   /**
    * A hook-recorded (`Stop` event) wall-clock end time for this session,
    * set only when `applyHookEvents` extended `ended_at_ms` from an
@@ -222,6 +226,12 @@ export interface Session {
    * and test is unaffected).
    */
   verified_ended_at_ms?: number;
+}
+
+/** Session output after a SessionSource has passed runtime validation. */
+export interface NormalizedSession extends Session {
+  capabilities: readonly SessionCapability[];
+  capability_descriptor: CapabilityDescriptorV1;
 }
 
 export interface Interval {
