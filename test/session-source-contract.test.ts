@@ -345,6 +345,11 @@ test("validated sources canonicalize identity and capabilities without mutating 
   const validated = validateSessionSource(source(input));
 
   const discovered = await validated.discover(QUERY);
+  const normalized = discovered as Array<Session & {
+    readonly capability_descriptor?: ReturnType<
+      typeof legacyCapabilitiesToDescriptor
+    >;
+  }>;
 
   assert.notEqual(discovered, input);
   assert.notEqual(discovered[0], omitted);
@@ -364,6 +369,15 @@ test("validated sources canonicalize identity and capabilities without mutating 
   ]);
   assert.equal(Object.isFrozen(discovered[0]?.capabilities), true);
   assert.equal(Object.isFrozen(discovered[1]?.capabilities), true);
+  assert.equal(
+    normalized[0]?.capability_descriptor,
+    validated.contract.capability_descriptor,
+  );
+  assert.equal(
+    normalized[1]?.capability_descriptor,
+    validated.contract.capability_descriptor,
+  );
+  assert.equal(Object.isFrozen(normalized[0]?.capability_descriptor), true);
   assert.deepEqual(
     deriveSourceDescriptor(discovered[1]!),
     deriveSourceDescriptor({
