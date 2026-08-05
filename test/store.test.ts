@@ -4381,9 +4381,9 @@ test("analysis Store scope compatibility preserves nonlegacy scopes and rejects 
 
   await temporaryStore(async (paths) => {
     const records = ["this_pr", "separate_issue"] as const;
-    for (const scope of records) {
+    for (const [index, scope] of records.entries()) {
       const stored = makeAnalysisRecord({
-        ...record(`scope-compat-${scope}`, 70),
+        ...record(`scope-compat-${scope}`, 70 + index),
         findings: [{ ...finding(`scope-compat-${scope}`, "npm test", 2), scope }],
       });
       assert.deepEqual((await saveAnalysis(paths, stored)).warnings, []);

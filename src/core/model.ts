@@ -8,7 +8,10 @@
 
 import { types as utilTypes } from "node:util";
 
+import type { LegacyFindingScope } from
+  "../compat/instruction-resource.js";
 import type { EventIdentity } from "./event-identity.js";
+import type { FindingScope } from "./finding-scope.js";
 import type { ProducerId } from "./source-identity.js";
 import type { SourceDescriptor } from "./source-descriptor.js";
 import type { AnalysisBudgetResult } from "../analysis/budgets.js";
@@ -52,7 +55,7 @@ export interface CommandIdentity {
   executor: CommandExecutor;
 }
 export type Classification = "repo" | "config" | "behavior";
-export type Scope = "this_pr" | "separate_issue" | "claude_md";
+export type Scope = FindingScope | LegacyFindingScope;
 export type RuleId =
   | "R001"
   | "R002"
