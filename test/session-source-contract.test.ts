@@ -28,6 +28,8 @@ import {
 } from "../src/core/source-descriptor.js";
 import { CANONICAL_SOURCE_ADAPTER_IDS } from "../src/core/source-identity.js";
 import type { CommandRunner } from "../src/git/client.js";
+import { legacyCapabilitiesToDescriptor } from
+  "../src/protocol/legacy-capability-descriptor.js";
 import { ClaudeSessionSource } from "../src/sources/claude/discover.js";
 import { CombinedSessionSource } from "../src/sources/combined.js";
 import { CodexSessionSource } from "../src/sources/codex/discover.js";
@@ -269,28 +271,45 @@ function discoveryOf(value: unknown): Promise<Session[]> {
   } as unknown as SessionSource).discover(QUERY);
 }
 
-test("raw built-in contracts remain legacy while validated contracts are canonical", () => {
+test("descriptor-backed built-in contracts preserve their legacy projections", () => {
   assert.deepEqual(CLAUDE_SESSION_SOURCE_CONTRACT, {
     adapter_id: "claude",
     adapter_version: "1.0.0",
     capabilities: ALL_CAPABILITIES,
+    capability_descriptor: legacyCapabilitiesToDescriptor(ALL_CAPABILITIES),
   });
   assert.deepEqual(CODEX_SESSION_SOURCE_CONTRACT, {
     adapter_id: "codex",
     adapter_version: "1.0.0",
     capabilities: ["edit_fragments", "tool_timestamps"],
+    capability_descriptor: legacyCapabilitiesToDescriptor([
+      "edit_fragments",
+      "tool_timestamps",
+    ]),
   });
   for (const contract of [
     CLAUDE_SESSION_SOURCE_CONTRACT,
     CODEX_SESSION_SOURCE_CONTRACT,
   ]) {
+    const capabilityDescriptor = (contract as unknown as {
+      readonly capability_descriptor: ReturnType<
+        typeof legacyCapabilitiesToDescriptor
+      >;
+    }).capability_descriptor;
     assert.deepEqual(Object.keys(contract), [
       "adapter_id",
       "adapter_version",
       "capabilities",
+      "capability_descriptor",
     ]);
     assert.equal(Object.isFrozen(contract), true);
     assert.equal(Object.isFrozen(contract.capabilities), true);
+    assert.equal(Object.isFrozen(capabilityDescriptor), true);
+    assert.equal(Object.isFrozen(capabilityDescriptor.capabilities), true);
+    for (const capability of capabilityDescriptor.capabilities) {
+      assert.equal(Object.isFrozen(capability), true);
+      assert.equal(Object.isFrozen(capability.evidence), true);
+    }
   }
   const claude = new ClaudeSessionSource("/tmp/claude-contract-test");
   const codex = new CodexSessionSource({
