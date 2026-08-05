@@ -81,10 +81,24 @@ test("maps the exact legacy vocabulary to deterministic v1 declarations", async 
   );
   assert.deepEqual(validateCapabilityDescriptor(result), result);
 
-  const schema = JSON.parse(await readFile(
-    resolve(process.cwd(), "schemas/capability-descriptor-v1.schema.json"),
-    "utf8",
-  )) as object;
+  const [schemaRaw, fixtureRaw] = await Promise.all([
+    readFile(
+      resolve(process.cwd(), "schemas/capability-descriptor-v1.schema.json"),
+      "utf8",
+    ),
+    readFile(
+      resolve(
+        process.cwd(),
+        "test/fixtures/protocol/capability-descriptor-v1.json",
+      ),
+      "utf8",
+    ),
+  ]);
+  assert.deepEqual(
+    legacyCapabilitiesToDescriptor([...EXPECTED_LEGACY_IDS]),
+    JSON.parse(fixtureRaw),
+  );
+  const schema = JSON.parse(schemaRaw) as object;
   const validate = new Ajv2020({ strict: true, allErrors: true }).compile(schema);
   assert.equal(validate(result), true, JSON.stringify(validate.errors));
 });
@@ -192,20 +206,35 @@ test("rejects accessors, proxies, revoked proxies, and hostile prototypes", () =
   );
 });
 
-test("rejects oversized arrays before collecting their property descriptors", () => {
+test("rejects invalid key sets before collecting property descriptors", () => {
   const oversized = new Array(7);
+  const polluted: string[] = [];
+  for (let index = 0; index < 64; index += 1) {
+    Object.defineProperty(polluted, `extra_${index}`, {
+      value: "must-not-leak",
+      enumerable: true,
+    });
+  }
   const original = Object.getOwnPropertyDescriptors;
-  let oversizedDescriptorReads = 0;
+  const reads = new Map<object, number>([
+    [oversized, 0],
+    [polluted, 0],
+  ]);
   Object.getOwnPropertyDescriptors = ((target: object) => {
-    if (target === oversized) oversizedDescriptorReads += 1;
+    const count = reads.get(target);
+    if (count !== undefined) reads.set(target, count + 1);
     return original(target);
   }) as typeof Object.getOwnPropertyDescriptors;
   try {
     expectLegacyValidationError(() =>
       legacyCapabilitiesToDescriptor(oversized)
     );
+    expectLegacyValidationError(() =>
+      legacyCapabilitiesToDescriptor(polluted)
+    );
   } finally {
     Object.getOwnPropertyDescriptors = original;
   }
-  assert.equal(oversizedDescriptorReads, 0);
+  assert.equal(reads.get(oversized), 0);
+  assert.equal(reads.get(polluted), 0);
 });

@@ -54,19 +54,23 @@ function legacyCapabilityValues(value: unknown): LegacyCapabilityId[] {
     length.value < 0 || length.value > LEGACY_CAPABILITY_IDS.length
   ) fail();
 
-  let descriptors: PropertyDescriptorMap;
+  let keys: PropertyKey[];
   try {
-    descriptors = Object.getOwnPropertyDescriptors(value) as unknown as
-      PropertyDescriptorMap;
+    keys = Reflect.ownKeys(value);
   } catch {
     return fail();
   }
-  if (Reflect.ownKeys(descriptors).length !== length.value + 1) fail();
+  if (keys.length !== length.value + 1) fail();
 
   const result: LegacyCapabilityId[] = [];
   const seen = new Set<string>();
   for (let index = 0; index < length.value; index += 1) {
-    const descriptor = descriptors[String(index)];
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    } catch {
+      return fail();
+    }
     if (
       descriptor === undefined || !("value" in descriptor) ||
       descriptor.enumerable !== true || typeof descriptor.value !== "string" ||

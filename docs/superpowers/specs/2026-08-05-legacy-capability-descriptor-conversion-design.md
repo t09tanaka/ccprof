@@ -69,8 +69,8 @@ prototype is exactly `Array.prototype`, with at most six dense enumerable data
 properties and no own properties beyond numeric indexes and `length`.
 
 Proxy detection precedes `Array.isArray` and property inspection. The length
-descriptor is checked before collecting all descriptors, bounding inspection
-of oversized arrays. Sparse arrays, accessors, symbols, extra properties,
+descriptor and own-key count are checked before reading at most six numeric
+index descriptors. Sparse arrays, accessors, symbols, extra properties,
 non-enumerable indexes, non-string entries, unknown tokens, duplicates,
 subclass or replaced prototypes, proxies, and revoked proxies all fail with
 `LegacyCapabilityValidationError`. Its stable code and message contain no
