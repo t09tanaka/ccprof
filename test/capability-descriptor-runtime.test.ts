@@ -345,6 +345,40 @@ test("support lookup is namespaced, state-aware, and version fail-closed", () =>
   }), false);
 });
 
+test("support lookup rejects structurally forged invalid descriptors", () => {
+  const invalidDeclarations: Array<[string, Record<string, unknown>]> = [
+    ["exact with unsupported evidence", capability({
+      state: "supported_exact",
+      evidence: { quality: "none", provenance: "unknown" },
+    })],
+    ["estimated with exact evidence", capability({
+      state: "supported_estimated",
+      evidence: { quality: "exact", provenance: "observed" },
+    })],
+    ["estimated with unknown provenance", capability({
+      state: "supported_estimated",
+      evidence: { quality: "estimated", provenance: "unknown" },
+    })],
+    ["partial with exact evidence", capability({
+      state: "supported_partial",
+      evidence: { quality: "exact", provenance: "observed" },
+    })],
+    ["partial with unknown provenance", capability({
+      state: "supported_partial",
+      evidence: { quality: "unknown", provenance: "unknown" },
+    })],
+    ["invalid runtime state", capability({ state: "supported" })],
+  ];
+
+  for (const [label, invalid] of invalidDeclarations) {
+    const forged = descriptor([invalid]) as unknown as CapabilityDescriptorV1;
+    assert.equal(supportsCapability(forged, {
+      id: "dev.example/capabilities/fixtures",
+      version: "1.2.3",
+    }), false, label);
+  }
+});
+
 test("validated types retain the fixed schema surface", () => {
   const snapshot: CapabilityDescriptorV1 = validateCapabilityDescriptor(descriptor());
   assert.equal(snapshot.$schema, CAPABILITY_DESCRIPTOR_SCHEMA_ID);

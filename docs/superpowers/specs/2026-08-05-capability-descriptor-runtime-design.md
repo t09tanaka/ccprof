@@ -52,8 +52,9 @@ validated primitive values and deeply frozen; no caller-owned object or array
 is retained.
 
 Validation failures throw `CapabilityDescriptorValidationError`. Its stable
-code is `invalid_descriptor`, and its message contains only that code.
-Rejected input is never interpolated.
+code is `invalid_descriptor`, and its fixed message is
+`invalid capability descriptor: invalid_descriptor`. Rejected input is never
+interpolated.
 
 ## Schema parity and evidence consistency
 

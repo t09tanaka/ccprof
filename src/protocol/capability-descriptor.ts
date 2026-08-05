@@ -275,7 +275,8 @@ export function supportsCapability(
       object.id, CAPABILITY_ID_PATTERN, 255, "invalid_descriptor",
     );
     const requested = versionContract(object, "invalid_descriptor");
-    const found = descriptor.capabilities.find((item) => item.id === id);
+    const snapshot = validateCapabilityDescriptor(descriptor);
+    const found = snapshot.capabilities.find((item) => item.id === id);
     if (!found || found.state === "unsupported" || found.state === "unknown") {
       return false;
     }
