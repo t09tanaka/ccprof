@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schemas.ccprof.dev/trace-envelope/v1.json",
+  "protocol_version": "1.0.0",
+  "producer": {
+    "id": "org.example.dummy-agent",
+    "version": "1.2.3",
+    "instance_id": "dummy-run-001"
+  },
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "span_id": "00f067aa0ba902b7",
+  "sequence": 7,
+  "timestamp": {
+    "wall_time_unix_ns": "1754352000123456789",
+    "monotonic_offset_ns": "9007199254740993",
+    "uncertainty_ns": "1000"
+  },
+  "work_unit": {
+    "kind": "org.example.work-unit/task",
+    "id": "task-001"
+  },
+  "event": {
+    "type": "urn:example:events:task-observed:v1",
+    "payload_schema": "https://example.org/schemas/task-observed-v1.json",
+    "payload": {
+      "task_id": "task-001",
+      "state": "completed",
+      "details": {
+        "attempt": 1
+      }
+    }
+  },
+  "privacy": {
+    "classification": "internal",
+    "content_retained": false
+  },
+  "provenance": [
+    {
+      "path": "/timestamp/wall_time_unix_ns",
+      "source": "urn:example:clock:wall",
+      "method": "observed"
+    },
+    {
+      "path": "/event/payload/state",
+      "source": "urn:example:dummy-agent:observation",
+      "method": "reported"
+    }
+  ]
+}
