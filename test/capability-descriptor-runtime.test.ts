@@ -281,6 +281,45 @@ test("rejects hostile data without invoking getters or leaking input", () => {
   expectValidationError(() => validateCapabilityDescriptor(evidenceProxy));
 });
 
+test("rejects invalid prototypes before descriptor inspection", () => {
+  const typedArray = new Uint8Array(32);
+  const invalidCapabilities = [capability()];
+  Object.setPrototypeOf(invalidCapabilities, null);
+  const invalidDescriptor = descriptor(invalidCapabilities);
+  const calls = new Map<object, number>([
+    [typedArray, 0],
+    [invalidCapabilities, 0],
+  ]);
+  const originalDescriptor = Object.getOwnPropertyDescriptor(
+    Object,
+    "getOwnPropertyDescriptors",
+  );
+  assert.ok(originalDescriptor);
+  const original = Object.getOwnPropertyDescriptors;
+  const observed = ((target: object) => {
+    const count = calls.get(target);
+    if (count !== undefined) calls.set(target, count + 1);
+    return original(target);
+  }) as typeof Object.getOwnPropertyDescriptors;
+
+  Object.defineProperty(Object, "getOwnPropertyDescriptors", {
+    ...originalDescriptor,
+    value: observed,
+  });
+  try {
+    expectValidationError(() => validateCapabilityDescriptor(typedArray));
+    expectValidationError(() => validateCapabilityDescriptor(invalidDescriptor));
+  } finally {
+    Object.defineProperty(
+      Object,
+      "getOwnPropertyDescriptors",
+      originalDescriptor,
+    );
+  }
+
+  assert.deepEqual([...calls.values()], [0, 0]);
+});
+
 test("support lookup is namespaced, state-aware, and version fail-closed", () => {
   const declarations = [
     ["exact", "supported_exact", "exact", "producer_declared"],

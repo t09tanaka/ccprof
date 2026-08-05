@@ -100,15 +100,19 @@ function dataObject(
     Array.isArray(value)
   ) fail(code);
   let prototype: object | null;
-  let descriptors: PropertyDescriptorMap;
   try {
     prototype = Object.getPrototypeOf(value) as object | null;
+  } catch {
+    return fail(code);
+  }
+  if (prototype !== Object.prototype) fail(code);
+  let descriptors: PropertyDescriptorMap;
+  try {
     descriptors = Object.getOwnPropertyDescriptors(value) as unknown as
       PropertyDescriptorMap;
   } catch {
     return fail(code);
   }
-  if (prototype !== Object.prototype) fail(code);
   const allowedSet = new Set(allowed);
   const keys = Reflect.ownKeys(descriptors);
   if (keys.some((key) => typeof key !== "string" || !allowedSet.has(key))) {
@@ -132,9 +136,14 @@ function denseArray(
 ): unknown[] {
   if (utilTypes.isProxy(value) || !Array.isArray(value)) fail(code);
   let prototype: object | null;
-  let descriptors: PropertyDescriptorMap;
   try {
     prototype = Object.getPrototypeOf(value) as object | null;
+  } catch {
+    return fail(code);
+  }
+  if (prototype !== Array.prototype) fail(code);
+  let descriptors: PropertyDescriptorMap;
+  try {
     descriptors = Object.getOwnPropertyDescriptors(value) as unknown as
       PropertyDescriptorMap;
   } catch {
@@ -142,7 +151,7 @@ function denseArray(
   }
   const length = descriptors.length;
   if (
-    prototype !== Array.prototype || !length || !("value" in length) ||
+    !length || !("value" in length) ||
     !Number.isSafeInteger(length.value) || length.value < 0 ||
     Reflect.ownKeys(descriptors).length !== length.value + 1
   ) fail(code);
