@@ -104,6 +104,34 @@ test("finding scope identities normalize and project through the instruction res
     projectLegacyFindingScope(CANONICAL_FINDING_SCOPES.separate_issue),
     LEGACY_FINDING_SCOPES.separate_issue,
   );
+
+  assert.equal(
+    projectLegacyFindingScope(
+      normalizeFindingScopeIdentity(LEGACY_FINDING_SCOPES.claude_md),
+    ),
+    LEGACY_FINDING_SCOPES.claude_md,
+  );
+  assert.equal(
+    normalizeFindingScopeIdentity(
+      projectLegacyFindingScope(
+        CANONICAL_FINDING_SCOPES.instruction_resource,
+      ),
+    ),
+    CANONICAL_FINDING_SCOPES.instruction_resource,
+  );
+  for (const unchanged of [
+    CANONICAL_FINDING_SCOPES.this_pr,
+    CANONICAL_FINDING_SCOPES.separate_issue,
+  ]) {
+    assert.equal(
+      projectLegacyFindingScope(normalizeFindingScopeIdentity(unchanged)),
+      unchanged,
+    );
+    assert.equal(
+      normalizeFindingScopeIdentity(projectLegacyFindingScope(unchanged)),
+      unchanged,
+    );
+  }
 });
 
 test("adoption method identities normalize and project through the instruction resource", () => {
@@ -125,15 +153,48 @@ test("adoption method identities normalize and project through the instruction r
     projectLegacyAdoptionMethod(CANONICAL_ADOPTION_METHODS.target_file_edit),
     LEGACY_ADOPTION_METHODS.target_file_edit,
   );
+
+  assert.equal(
+    projectLegacyAdoptionMethod(
+      normalizeAdoptionMethodIdentity(
+        LEGACY_ADOPTION_METHODS.claude_md_edit,
+      ),
+    ),
+    LEGACY_ADOPTION_METHODS.claude_md_edit,
+  );
+  assert.equal(
+    normalizeAdoptionMethodIdentity(
+      projectLegacyAdoptionMethod(
+        CANONICAL_ADOPTION_METHODS.instruction_resource_edit,
+      ),
+    ),
+    CANONICAL_ADOPTION_METHODS.instruction_resource_edit,
+  );
+  assert.equal(
+    projectLegacyAdoptionMethod(
+      normalizeAdoptionMethodIdentity(
+        CANONICAL_ADOPTION_METHODS.target_file_edit,
+      ),
+    ),
+    CANONICAL_ADOPTION_METHODS.target_file_edit,
+  );
+  assert.equal(
+    normalizeAdoptionMethodIdentity(
+      projectLegacyAdoptionMethod(
+        CANONICAL_ADOPTION_METHODS.target_file_edit,
+      ),
+    ),
+    CANONICAL_ADOPTION_METHODS.target_file_edit,
+  );
 });
 
-test("finding scope parsing fails closed with content-free stable errors", () => {
+test("finding scope functions fail closed with content-free stable errors", () => {
   for (const value of [
     "invalid_finding_scope",
     "THIS_PR",
     " this_pr",
     "this_pr ",
-    "this_pr\\0",
+    "this_pr\0",
     "!",
     Symbol("finding-scope"),
     1n,
@@ -143,16 +204,18 @@ test("finding scope parsing fails closed with content-free stable errors", () =>
     undefined,
   ]) {
     assertFindingScopeError(() => parseFindingScope(value));
+    assertFindingScopeError(() => normalizeFindingScopeIdentity(value));
+    assertFindingScopeError(() => projectLegacyFindingScope(value));
   }
 });
 
-test("adoption method parsing fails closed with content-free stable errors", () => {
+test("adoption method functions fail closed with content-free stable errors", () => {
   for (const value of [
     "invalid_adoption_method",
     "TARGET_FILE_EDIT",
     " target_file_edit",
     "target_file_edit ",
-    "target_file_edit\\0",
+    "target_file_edit\0",
     "!",
     Symbol("adoption-method"),
     1n,
@@ -162,15 +225,19 @@ test("adoption method parsing fails closed with content-free stable errors", () 
     undefined,
   ]) {
     assertAdoptionMethodError(() => parseAdoptionMethod(value));
+    assertAdoptionMethodError(() => normalizeAdoptionMethodIdentity(value));
+    assertAdoptionMethodError(() => projectLegacyAdoptionMethod(value));
   }
 });
 
-test("legacy values are invalid inputs to canonical-only projectors", () => {
+test("legacy values are invalid inputs to canonical parsers and projectors", () => {
+  assertFindingScopeError(() => parseFindingScope("claude_md"));
   assertFindingScopeError(() => projectLegacyFindingScope("claude_md"));
+  assertAdoptionMethodError(() => parseAdoptionMethod("claude_md_edit"));
   assertAdoptionMethodError(() => projectLegacyAdoptionMethod("claude_md_edit"));
 });
 
-test("identity parsers reject accessor objects and proxies without observation", () => {
+test("identity functions reject accessor objects and proxies without observation", () => {
   let getterCalls = 0;
   const accessor = Object.defineProperty({}, "value", {
     enumerable: true,
@@ -203,7 +270,11 @@ test("identity parsers reject accessor objects and proxies without observation",
 
   for (const value of [accessor, hostile, revocable.proxy]) {
     assertFindingScopeError(() => parseFindingScope(value));
+    assertFindingScopeError(() => normalizeFindingScopeIdentity(value));
+    assertFindingScopeError(() => projectLegacyFindingScope(value));
     assertAdoptionMethodError(() => parseAdoptionMethod(value));
+    assertAdoptionMethodError(() => normalizeAdoptionMethodIdentity(value));
+    assertAdoptionMethodError(() => projectLegacyAdoptionMethod(value));
   }
 
   assert.equal(getterCalls, 0);
