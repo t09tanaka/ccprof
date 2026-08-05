@@ -17,6 +17,16 @@ import {
   projectLegacySourceAdapterId,
   projectSourceAdapterIdV1,
 } from "../core/source-identity.js";
+import {
+  CAPABILITY_DESCRIPTOR_VERSION,
+  supportsCapability,
+  validateCapabilityDescriptor,
+  type CapabilityDescriptorV1,
+} from "../protocol/capability-descriptor.js";
+import {
+  LEGACY_CAPABILITY_IDS,
+  legacyCapabilitiesToDescriptor,
+} from "../protocol/legacy-capability-descriptor.js";
 import type { AnalysisBudgetMeter } from "../analysis/budgets.js";
 
 export interface SessionQuery {
@@ -30,11 +40,19 @@ export interface SessionQuery {
 export interface SessionSourceContract {
   adapter_id: SourceAdapterId;
   adapter_version: SourceAdapterVersion;
+  capabilities?: readonly SessionCapability[];
+  capability_descriptor?: CapabilityDescriptorV1;
+}
+export interface NormalizedSessionSourceContract extends SessionSourceContract {
   capabilities: readonly SessionCapability[];
+  capability_descriptor: CapabilityDescriptorV1;
 }
 export interface SessionSource {
   readonly contract: SessionSourceContract;
   discover(query: SessionQuery): Promise<Session[]>;
+}
+export interface ValidatedSessionSource extends SessionSource {
+  readonly contract: NormalizedSessionSourceContract;
 }
 
 export type SessionSourceValidationCode =
@@ -55,7 +73,12 @@ export function isSessionSourceValidationError(
 ): value is SessionSourceValidationError {
   return typeof value === "object" && value !== null && VALIDATION_ERRORS.has(value);
 }
-const CONTRACT_FIELDS = ["adapter_id", "adapter_version", "capabilities"] as const;
+const CONTRACT_REQUIRED_FIELDS = ["adapter_id", "adapter_version"] as const;
+const CONTRACT_FIELDS = [
+  ...CONTRACT_REQUIRED_FIELDS,
+  "capabilities",
+  "capability_descriptor",
+] as const;
 const CONTRACT_FIELD_SET = new Set<string>(CONTRACT_FIELDS);
 const CAPABILITY_SET = new Set<string>(ALL_SESSION_CAPABILITIES);
 const MAX_DISCOVERY_ITEMS = 100_000;
@@ -167,14 +190,65 @@ function validatedCapabilities(
   ) return fail("invalid_capability");
   return Object.freeze(canonical);
 }
+
+function canonicalCapabilityDescriptor(
+  value: unknown,
+): CapabilityDescriptorV1 {
+  try {
+    const descriptor = validateCapabilityDescriptor(value);
+    return validateCapabilityDescriptor({
+      $schema: descriptor.$schema,
+      schema_version: descriptor.schema_version,
+      descriptor_version: descriptor.descriptor_version,
+      undeclared_capability_state: descriptor.undeclared_capability_state,
+      capabilities: [...descriptor.capabilities].sort((left, right) =>
+        compareCodeUnits(left.id, right.id)
+      ),
+    });
+  } catch {
+    return fail("invalid_capability");
+  }
+}
+
+function descriptorFromLegacyCapabilities(
+  value: unknown,
+): CapabilityDescriptorV1 {
+  try {
+    return canonicalCapabilityDescriptor(legacyCapabilitiesToDescriptor(value));
+  } catch {
+    return fail("invalid_capability");
+  }
+}
+
+function legacyCapabilitiesFromDescriptor(
+  descriptor: CapabilityDescriptorV1,
+): readonly SessionCapability[] {
+  return Object.freeze(LEGACY_CAPABILITY_IDS.filter((legacyId) =>
+    supportsCapability(descriptor, {
+      id: `ccprof.dev/capabilities/${legacyId}`,
+      version: CAPABILITY_DESCRIPTOR_VERSION,
+    })
+  ));
+}
+
+function sameCapabilities(
+  left: readonly SessionCapability[],
+  right: readonly SessionCapability[],
+): boolean {
+  return left.length === right.length &&
+    left.every((capability, index) => capability === right[index]);
+}
+
 function makeContract(
   adapter_id: SourceAdapterId,
   capabilities: readonly SessionCapability[],
-): SessionSourceContract {
+): NormalizedSessionSourceContract {
+  const legacyCapabilities = validatedCapabilities(capabilities, true);
   return Object.freeze({
     adapter_id,
     adapter_version: "1.0.0",
-    capabilities: validatedCapabilities(capabilities, true),
+    capabilities: legacyCapabilities,
+    capability_descriptor: descriptorFromLegacyCapabilities(legacyCapabilities),
   });
 }
 export const CLAUDE_SESSION_SOURCE_CONTRACT = makeContract(
@@ -185,7 +259,7 @@ export const CODEX_SESSION_SOURCE_CONTRACT = makeContract(
   "codex",
   ["edit_fragments", "tool_timestamps"],
 );
-function validateContract(value: unknown): SessionSourceContract {
+function validateContract(value: unknown): NormalizedSessionSourceContract {
   if (
     value === null || typeof value !== "object" || utilTypes.isProxy(value) ||
     Array.isArray(value)
@@ -205,11 +279,13 @@ function validateContract(value: unknown): SessionSourceContract {
       typeof key !== "string" || !CONTRACT_FIELD_SET.has(key)
     )
   ) return fail("unknown_field");
-  if (CONTRACT_FIELDS.some((field) => !Object.hasOwn(descriptors, field))) {
+  if (
+    CONTRACT_REQUIRED_FIELDS.some((field) => !Object.hasOwn(descriptors, field))
+  ) {
     return fail("invalid_shape");
   }
-  for (const field of CONTRACT_FIELDS) {
-    const descriptor = descriptors[field]!;
+  for (const field of keys as string[]) {
+    const descriptor = descriptors[field];
     if (
       descriptor === undefined || !("value" in descriptor) ||
       descriptor.enumerable !== true
@@ -224,10 +300,26 @@ function validateContract(value: unknown): SessionSourceContract {
   if (descriptors.adapter_version!.value !== "1.0.0") {
     return fail("unsupported_version");
   }
-  return makeContract(
-    adapterId,
-    validatedCapabilities(descriptors.capabilities!.value, true),
-  );
+  const hasLegacy = Object.hasOwn(descriptors, "capabilities");
+  const hasDescriptor = Object.hasOwn(descriptors, "capability_descriptor");
+  if (!hasLegacy && !hasDescriptor) return fail("invalid_capability");
+  const declaredLegacy = hasLegacy
+    ? validatedCapabilities(descriptors.capabilities!.value, true)
+    : undefined;
+  const capabilityDescriptor = hasDescriptor
+    ? canonicalCapabilityDescriptor(descriptors.capability_descriptor!.value)
+    : descriptorFromLegacyCapabilities(declaredLegacy);
+  const projectedLegacy = legacyCapabilitiesFromDescriptor(capabilityDescriptor);
+  if (
+    declaredLegacy !== undefined && hasDescriptor &&
+    !sameCapabilities(declaredLegacy, projectedLegacy)
+  ) return fail("invalid_capability");
+  return Object.freeze({
+    adapter_id: adapterId,
+    adapter_version: "1.0.0",
+    capabilities: declaredLegacy ?? projectedLegacy,
+    capability_descriptor: capabilityDescriptor,
+  });
 }
 function ownContract(source: object): unknown {
   let descriptor: PropertyDescriptor | undefined;
@@ -707,7 +799,7 @@ function warningSnapshot(value: unknown): Session["warnings"][number] {
 
 function validateDiscoveredSessions(
   value: unknown,
-  contract: SessionSourceContract,
+  contract: NormalizedSessionSourceContract,
 ): Session[] {
   return denseArrayValues(value, "invalid_result").map((candidate) => {
     const snapshot = dataObject(candidate);
@@ -764,7 +856,7 @@ function validateDiscoveredSessions(
 
 function normalizeDiscoveredSessions(
   value: unknown,
-  contract: SessionSourceContract,
+  contract: NormalizedSessionSourceContract,
 ): Session[] {
   try {
     return validateDiscoveredSessions(value, contract);
@@ -789,7 +881,7 @@ function isRevokedProxyResultError(value: unknown): boolean {
   }
 }
 
-export function validateSessionSource(value: unknown): SessionSource {
+export function validateSessionSource(value: unknown): ValidatedSessionSource {
   if (
     value === null || typeof value !== "object" || utilTypes.isProxy(value) ||
     Array.isArray(value)
