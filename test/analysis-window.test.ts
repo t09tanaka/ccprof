@@ -12,6 +12,8 @@ import type { CommandRunner } from "../src/git/client.js";
 import type { PrContext } from "../src/git/pr-context.js";
 import { sliceSessionsToAnalysisWindow } from "../src/analysis/window.js";
 import type { AnalysisWindow, GenuineUserEvent, Session } from "../src/core/model.js";
+import { legacyCapabilitiesToDescriptor } from
+  "../src/protocol/legacy-capability-descriptor.js";
 import { CLAUDE_SESSION_SOURCE_CONTRACT } from "../src/sources/session-source.js";
 
 function context(overrides: Partial<PrContext> = {}): PrContext {
@@ -149,7 +151,7 @@ test("invalid session transition evidence warns and uses the commit fallback", (
   }
 });
 
-test("derives only a conservative earliest Claude branch transition", () => {
+test("derives only a conservative capability-backed branch transition", () => {
   const event = (
     id: string,
     timestamp_ms: number,
@@ -164,10 +166,15 @@ test("derives only a conservative earliest Claude branch transition", () => {
     id: string,
     source: Session["source"],
     events: GenuineUserEvent[],
+    hasBranchRows = true,
   ): Session => ({
     session_id: id, source, source_path: `/${id}.jsonl`, observed_cwds: [],
     observed_branches: ["feature"], started_at_ms: 0, ended_at_ms: 1_000,
     confidence: "high", events, warnings: [],
+    capabilities: hasBranchRows ? ["branch_rows"] : [],
+    capability_descriptor: legacyCapabilitiesToDescriptor(
+      hasBranchRows ? ["branch_rows"] : [],
+    ),
   });
   const branchless = (id: string, timestampMs: number): GenuineUserEvent => {
     const value = event(id, timestampMs); delete value.branch;
@@ -181,6 +188,26 @@ test("derives only a conservative earliest Claude branch transition", () => {
   assert.equal(deriveSessionBranchTransitionAtMs(
     [sameTime, candidate], "feature", 1_000, 400,
   ), 200);
+  assert.deepEqual({
+    dummy: deriveSessionBranchTransitionAtMs([
+      make(
+        "dummy",
+        "dev.example/producers/dummy-agent",
+        [event("dummy-first", 200)],
+      ),
+    ], "feature", 1_000, 400),
+    claudeWithoutBranchRows: deriveSessionBranchTransitionAtMs([
+      make(
+        "claude-without-branch-rows",
+        "claude",
+        [event("unsupported-first", 200)],
+        false,
+      ),
+    ], "feature", 1_000, 400),
+  }, {
+    dummy: 200,
+    claudeWithoutBranchRows: undefined,
+  });
   assert.equal(deriveSessionBranchTransitionAtMs([
     make("epoch-zero", "claude", [event("zero", 100, { branch_epoch: 0 })]),
   ], "feature", 1_000, 400), undefined);

@@ -32,10 +32,7 @@ import type {
   ToolUseEvent,
 } from "./model.js";
 import { sourceDescriptorsForSessions } from "./source-descriptor.js";
-import {
-  matchesBuiltinSourceAdapterId,
-  projectSourceAdapterIdV1,
-} from "./source-identity.js";
+import { projectSourceAdapterIdV1 } from "./source-identity.js";
 import {
   detectAdoptions,
   detectability,
@@ -110,6 +107,7 @@ import {
 } from "../policy/rule-safety.js";
 import {
   ruleCoverage,
+  sessionSupportsCapability,
   sessionSupportsRule,
 } from "../rules/capabilities.js";
 import {
@@ -883,7 +881,7 @@ export function deriveSessionBranchTransitionAtMs(
         timestampMs,
       );
       if (
-        matchesBuiltinSourceAdapterId(session.source, "claude") &&
+        sessionSupportsCapability(session, "branch_rows") &&
         event.branch === headBranch &&
         Number.isSafeInteger(event.branch_epoch) &&
         (event.branch_epoch ?? 0) > 0 &&
