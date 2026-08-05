@@ -109,6 +109,49 @@ jobs:
           npm install --global --prefix "$RUNNER_TEMP/ccprof-prefix" "$RUNNER_TEMP/ccprof-pack"/*.tgz
           "$RUNNER_TEMP/ccprof-prefix/bin/ccprof" --version
           "$RUNNER_TEMP/ccprof-prefix/bin/ccprof" --help
+          (
+            mkdir -p "$RUNNER_TEMP/ccprof-consumer"
+            cd "$RUNNER_TEMP/ccprof-consumer"
+            npm init --yes
+            npm install "$RUNNER_TEMP/ccprof-pack"/*.tgz
+            node --input-type=module -e '
+              const sdk = await import("ccprof/adapter-sdk");
+              if (
+                !Object.isFrozen(sdk.ADAPTER_PROTOCOL_VERSIONS) ||
+                sdk.ADAPTER_PROTOCOL_VERSIONS.length !== 1 ||
+                sdk.ADAPTER_PROTOCOL_VERSIONS[0] !== "1.0.0"
+              ) process.exit(1);
+            '
+            cat > adapter-sdk-smoke.mts <<'EOF'
+          import {
+            ADAPTER_PROTOCOL_VERSIONS,
+            type AdapterRpcRequest,
+            type AdapterRpcResponse,
+          } from "ccprof/adapter-sdk";
+
+          const request = {
+            jsonrpc: "2.0",
+            id: "shutdown-smoke",
+            method: "shutdown",
+            params: {},
+          } satisfies AdapterRpcRequest<"shutdown">;
+          const response = {
+            jsonrpc: "2.0",
+            id: request.id,
+            result: { acknowledged: true },
+          } satisfies AdapterRpcResponse<"shutdown">;
+
+          if (ADAPTER_PROTOCOL_VERSIONS[0] !== "1.0.0") {
+            throw new Error("adapter SDK protocol version mismatch");
+          }
+          void response;
+          EOF
+            "$GITHUB_WORKSPACE/node_modules/.bin/tsc" --noEmit --strict --target ES2022 --module NodeNext --moduleResolution NodeNext adapter-sdk-smoke.mts
+            node --input-type=module -e '
+              const legacy = await import("ccprof/dist/protocol/capability-descriptor.js");
+              if (typeof legacy.supportsCapability !== "function") process.exit(1);
+            '
+          )
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/ccprof-prefix/bin/ccprof" schema report-v3 > "$RUNNER_TEMP/ccprof-report-v3.schema.json"
           node -e '

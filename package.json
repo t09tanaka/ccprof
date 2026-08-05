@@ -23,6 +23,15 @@
   "bin": {
     "ccprof": "dist/cli.js"
   },
+  "exports": {
+    "./adapter-sdk": {
+      "types": "./dist/adapter-sdk/index.d.ts",
+      "import": "./dist/adapter-sdk/index.js"
+    },
+    "./dist/*": "./dist/*",
+    "./schemas/*": "./schemas/*",
+    "./package.json": "./package.json"
+  },
   "files": [
     "dist",
     "!dist/**/*.map",
