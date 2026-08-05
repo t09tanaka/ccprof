@@ -827,6 +827,25 @@ function validateDiscoveredSessions(
   value: unknown,
   contract: NormalizedSessionSourceContract,
 ): NormalizedSession[] {
+  const descriptorCache = new WeakMap<object, CapabilityDescriptorV1>();
+  const validatedDescriptor = (candidate: unknown): CapabilityDescriptorV1 => {
+    const cacheKey = candidate !== null && typeof candidate === "object"
+      ? candidate
+      : undefined;
+    const cached = cacheKey === undefined
+      ? undefined
+      : descriptorCache.get(cacheKey);
+    if (cached !== undefined) return cached;
+    const descriptor = canonicalCapabilityDescriptor(candidate);
+    if (!sameCapabilityDescriptors(
+      descriptor,
+      contract.capability_descriptor,
+    )) return fail("invalid_capability");
+    if (cacheKey !== undefined) {
+      descriptorCache.set(cacheKey, contract.capability_descriptor);
+    }
+    return contract.capability_descriptor;
+  };
   return denseArrayValues(value, "invalid_result").map((candidate) => {
     const snapshot = dataObject(candidate);
     exactFields(snapshot, [
@@ -846,16 +865,13 @@ function validateDiscoveredSessions(
     if (capabilities.some((capability) => !declared.has(capability))) {
       return fail("invalid_capability");
     }
-    const capabilityDescriptor = Object.hasOwn(
-        snapshot,
-        "capability_descriptor",
-      )
-      ? canonicalCapabilityDescriptor(snapshot.capability_descriptor)
+    const hasCapabilityDescriptor = Object.hasOwn(
+      snapshot,
+      "capability_descriptor",
+    );
+    const capabilityDescriptor = hasCapabilityDescriptor
+      ? validatedDescriptor(snapshot.capability_descriptor)
       : contract.capability_descriptor;
-    if (!sameCapabilityDescriptors(
-      capabilityDescriptor,
-      contract.capability_descriptor,
-    )) return fail("invalid_capability");
     const sessionId = text(snapshot.session_id);
     const sourcePath = text(snapshot.source_path);
     const sessionIdentity = {
@@ -879,7 +895,7 @@ function validateDiscoveredSessions(
         warningSnapshot,
       ),
       capabilities: Object.freeze([...capabilities]),
-      capability_descriptor: contract.capability_descriptor,
+      capability_descriptor: capabilityDescriptor,
       ...(snapshot.verified_ended_at_ms === undefined
         ? {}
         : {
