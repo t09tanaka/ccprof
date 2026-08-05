@@ -125,10 +125,15 @@ test("legacy projection is built-in-only", () => {
 });
 
 test("identity ordering uses deterministic code-unit comparison", () => {
-  const values = ["dev.z.example/kind", "dev.a.example/kind"];
-  assert.deepEqual(values.sort(compareSourceIdentities), [
-    "dev.a.example/kind",
-    "dev.z.example/kind",
+  const hyphenated = parseSourceAdapterId("dev.example/a-b");
+  const underscored = parseSourceAdapterId("dev.example/a_b");
+
+  assert.equal(compareSourceIdentities(hyphenated, underscored), -1);
+  assert.equal(compareSourceIdentities(underscored, hyphenated), 1);
+  assert.equal(compareSourceIdentities(hyphenated, hyphenated), 0);
+  assert.deepEqual([underscored, hyphenated].sort(compareSourceIdentities), [
+    hyphenated,
+    underscored,
   ]);
 });
 
