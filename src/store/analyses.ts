@@ -25,6 +25,11 @@ import {
 import type { StatsAggregationInput } from "../analysis/stats-input.js";
 import { normalizeRepoPath } from "../analysis/test-map.js";
 import {
+  normalizeFindingScopeIdentity,
+  projectLegacyFindingScope,
+  type LegacyFindingScope,
+} from "../compat/instruction-resource.js";
+import {
   findingCompatibilityMetadata,
   findingScoringRationale,
   findingSeverity,
@@ -223,12 +228,54 @@ const RULE_IDS = new Set([
   "R008",
 ]);
 const CLASSIFICATIONS = new Set(["repo", "config", "behavior"]);
-const SCOPES = new Set(["this_pr", "separate_issue", "claude_md"]);
 const CONFIDENCES = new Set(["low", "medium", "high"]);
 const BOUNDS = new Set(["point", "upper"]);
 const OID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const LEGACY_FINDING_FIELDS = new Set([
+  "finding_key", "rule_id", "title", "target", "classification", "cause",
+  "scope", "confidence", "evidence", "recoverable", "fix_recipe", "caveats",
+  "impact", "finding_confidence", "severity", "scoring_rationale",
+  "rule_version", "compatibility_epoch",
+]);
+const REQUIRED_FINDING_FIELDS = [
+  "finding_key", "rule_id", "title", "classification", "scope",
+  "confidence", "evidence", "recoverable", "fix_recipe", "caveats",
+] as const;
+const LEGACY_RECORD_FIELDS = new Set([
+  "schema_version", "analysis_id", "created_at_ms", "unit", "summary",
+  "findings", "metrics", "command_costs", "read_observations",
+  "analysis_budget", "terminal_stats_snapshot",
+]);
+const REQUIRED_RECORD_FIELDS = [
+  "schema_version", "analysis_id", "created_at_ms", "unit", "summary",
+  "findings", "metrics", "command_costs",
+] as const;
 
-function isStoredFinding(value: unknown): value is Finding {
+type LegacyStoredFinding = Omit<Finding, "scope"> & {
+  scope: LegacyFindingScope;
+};
+
+function hasCanonicalFindingScope(value: unknown): boolean {
+  try {
+    return normalizeFindingScopeIdentity(value) === value;
+  } catch {
+    return false;
+  }
+}
+
+function hasLegacyFindingScope(value: unknown): value is LegacyFindingScope {
+  try {
+    return projectLegacyFindingScope(normalizeFindingScopeIdentity(value)) ===
+      value;
+  } catch {
+    return false;
+  }
+}
+
+function isStoredFinding(
+  value: unknown,
+  scopeGuard: (scope: unknown) => boolean = hasCanonicalFindingScope,
+): value is Finding {
   if (!isObjectRecord(value)) return false;
   const recoverable = value.recoverable;
   const evidence = value.evidence;
@@ -241,8 +288,7 @@ function isStoredFinding(value: unknown): value is Finding {
     typeof value.title === "string" &&
     typeof value.classification === "string" &&
     CLASSIFICATIONS.has(value.classification) &&
-    typeof value.scope === "string" &&
-    SCOPES.has(value.scope) &&
+    scopeGuard(value.scope) &&
     typeof value.confidence === "string" &&
     CONFIDENCES.has(value.confidence) &&
     (
@@ -268,6 +314,20 @@ function isStoredFinding(value: unknown): value is Finding {
     isStringArray(value.caveats) &&
     findingCompatibilityMetadata(value).valid
   );
+}
+
+function isStrictStoredFinding(
+  value: unknown,
+  scopeGuard: (scope: unknown) => boolean,
+): value is Finding {
+  return isObjectRecord(value) &&
+    Object.keys(value).every((field) => LEGACY_FINDING_FIELDS.has(field)) &&
+    REQUIRED_FINDING_FIELDS.every((field) => Object.hasOwn(value, field)) &&
+    isStoredFinding(value, scopeGuard);
+}
+
+function isLegacyStoredFinding(value: unknown): value is LegacyStoredFinding {
+  return isStrictStoredFinding(value, hasLegacyFindingScope);
 }
 
 function snapshotScoringRationale(value: unknown): FindingScoringRationale[] {
@@ -403,7 +463,7 @@ function snapshotStoredFinding(value: Finding): Finding {
       target: read("target"),
       classification: read("classification"),
       cause: read("cause"),
-      scope: read("scope"),
+      scope: normalizeFindingScopeIdentity(read("scope")),
       confidence: read("confidence"),
       evidence: read("evidence"),
       recoverable: read("recoverable"),
@@ -501,6 +561,23 @@ function snapshotStoredFindings(values: readonly Finding[]): Finding[] {
   } catch {
     throw new TypeError("invalid finding");
   }
+}
+
+function projectLegacyStoredFinding(value: Finding): LegacyStoredFinding {
+  return {
+    ...cloneJson(value),
+    scope: projectLegacyFindingScope(value.scope),
+  };
+}
+
+function projectLegacyStoredValue<T extends { findings: Finding[] }>(
+  value: T,
+): Omit<T, "findings"> & { findings: LegacyStoredFinding[] } {
+  const { findings, ...rest } = value;
+  return {
+    ...cloneJson(rest),
+    findings: findings.map(projectLegacyStoredFinding),
+  };
 }
 
 function summaryMetrics(summary: AnalysisSummary): Record<string, number> {
@@ -766,7 +843,7 @@ export function makeAnalysisRecord(
     }),
   };
   const generatedId = createHash("sha256")
-    .update(canonicalJson(content))
+    .update(canonicalJson(projectLegacyStoredValue(content)))
     .digest("hex");
   return {
     ...content,
@@ -782,7 +859,10 @@ function recordOrder(
     left.analysis_id.localeCompare(right.analysis_id);
 }
 
-function isRecord(value: unknown): value is AnalysisRecord {
+function isRecordWithFindings(
+  value: unknown,
+  findingGuard: (finding: unknown) => boolean,
+): value is AnalysisRecord {
   if (value === null || typeof value !== "object") return false;
   const record = value as Partial<AnalysisRecord>;
   if (
@@ -797,7 +877,7 @@ function isRecord(value: unknown): value is AnalysisRecord {
     !isStringArray(record.unit.sessions) ||
     !isObjectRecord(record.summary) ||
     !Array.isArray(record.findings) ||
-    !record.findings.every(isStoredFinding) ||
+    !record.findings.every(findingGuard) ||
     record.metrics === undefined ||
     record.metrics === null ||
     !isObjectRecord(record.metrics) ||
@@ -841,6 +921,33 @@ function isRecord(value: unknown): value is AnalysisRecord {
         isCommandIdentity(cost.command_identity)) &&
       (cost.cache_state === undefined || cost.cache_state === "cold" ||
         cost.cache_state === "warm")
+    );
+}
+
+function isRecord(value: unknown): value is AnalysisRecord {
+  return isRecordWithFindings(value, (finding) => isStoredFinding(finding));
+}
+
+type LegacyAnalysisRecord = Omit<AnalysisRecord, "findings"> & {
+  findings: LegacyStoredFinding[];
+};
+
+function isLegacyAnalysisRecord(
+  value: unknown,
+): value is LegacyAnalysisRecord {
+  return isObjectRecord(value) &&
+    Object.keys(value).every((field) => LEGACY_RECORD_FIELDS.has(field)) &&
+    REQUIRED_RECORD_FIELDS.every((field) => Object.hasOwn(value, field)) &&
+    isRecordWithFindings(value, isLegacyStoredFinding);
+}
+
+function isCanonicalMigrationRecord(value: unknown): value is AnalysisRecord {
+  return isObjectRecord(value) &&
+    Object.keys(value).every((field) => LEGACY_RECORD_FIELDS.has(field)) &&
+    REQUIRED_RECORD_FIELDS.every((field) => Object.hasOwn(value, field)) &&
+    isRecordWithFindings(
+      value,
+      (finding) => isStrictStoredFinding(finding, hasCanonicalFindingScope),
     );
 }
 
@@ -968,8 +1075,33 @@ function asRecord(
 
 type StoreDatabase = ReturnType<typeof openStoreDatabase>;
 function closeDatabase(database: StoreDatabase | undefined): void { try { database?.close(); } catch { /* Preserve the operation result. */ } }
-type SnapshotEnvelope = { schema_version: 1; identity: AnalysisSnapshotEnvelopeIdentity;
-  payload: Omit<AnalysisRecord, "analysis_id" | "created_at_ms"> };
+type LegacySnapshotPayload = Omit<
+  LegacyAnalysisRecord,
+  "analysis_id" | "created_at_ms"
+>;
+type SnapshotEnvelope = {
+  schema_version: 1;
+  identity: AnalysisSnapshotEnvelopeIdentity;
+  payload: LegacySnapshotPayload;
+};
+function isLegacySnapshotEnvelope(
+  value: unknown,
+): value is SnapshotEnvelope {
+  if (
+    !isObjectRecord(value) ||
+    Object.keys(value).length !== 3 ||
+    value.schema_version !== 1 ||
+    !isObjectRecord(value.identity) ||
+    !isObjectRecord(value.payload) ||
+    "analysis_id" in value.payload ||
+    "created_at_ms" in value.payload
+  ) return false;
+  return isLegacyAnalysisRecord({
+    ...value.payload,
+    analysis_id: "legacy-wire-validation",
+    created_at_ms: 0,
+  });
+}
 interface PreparedAnalysis {
   record: AnalysisRecord;
   envelope: SnapshotEnvelope;
@@ -1120,10 +1252,11 @@ function captureSnapshotOption(
     : normalizeSnapshotIdentity(descriptor.value);
 }
 function snapshotEnvelope(record: AnalysisRecord, identity?: AnalysisSnapshotIdentity): SnapshotEnvelope {
-  const { analysis_id: _id, created_at_ms: _time, ...payload } = record;
+  const { analysis_id: _id, created_at_ms: _time, ...runtimePayload } = record;
+  const payload = projectLegacyStoredValue(runtimePayload);
   return { schema_version: 1, identity: identity === undefined
       ? { mode: "content-fallback" } : normalizeSnapshotIdentity(identity),
-    payload: cloneJson(payload) };
+    payload };
 }
 function prepareAnalysis(
   record: AnalysisRecord,
@@ -1350,7 +1483,12 @@ function readLegacyRecord(path: string): AnalysisRecord {
   const read = readLegacyJson(path);
   if (read.kind === "missing") throw new Error("legacy analysis file disappeared while scanning");
   if (read.kind === "corrupt") throw new CorruptLegacyRecord(read.message);
-  if (!isRecord(read.value)) throw new CorruptLegacyRecord("unsupported or invalid analysis record");
+  if (
+    !isLegacyAnalysisRecord(read.value) &&
+    !isCanonicalMigrationRecord(read.value)
+  ) {
+    throw new CorruptLegacyRecord("unsupported or invalid analysis record");
+  }
   try {
     return normalizeRecordFindings(read.value);
   } catch (error) {
@@ -1410,15 +1548,15 @@ function parseSnapshot(recordJson: string, snapshotId: string,
     record: AnalysisRecord;
   } {
   const value = JSON.parse(recordJson) as unknown;
-  if (!isObjectRecord(value) || value.schema_version !== 1 ||
-    !isObjectRecord(value.payload) || "analysis_id" in value.payload ||
-    "created_at_ms" in value.payload || !isObjectRecord(value.identity) ||
-    canonicalJson(value) !== recordJson ||
+  if (canonicalJson(value) !== recordJson ||
     analysisDigest("analysis-snapshot-v1", value) !== snapshotId) {
     throw new TypeError("unsupported or invalid analysis snapshot");
   }
+  if (!isLegacySnapshotEnvelope(value)) {
+    throw new TypeError("unsupported or invalid analysis snapshot");
+  }
   let identity: AnalysisHistoryEntry["identity"];
-  if (value.identity.mode === "content-fallback") {
+  if ("mode" in value.identity && value.identity.mode === "content-fallback") {
     if (Object.keys(value.identity).length !== 1) throw new TypeError("invalid fallback identity");
     identity = { mode: "content-fallback" };
   } else {
@@ -1428,7 +1566,9 @@ function parseSnapshot(recordJson: string, snapshotId: string,
     identity = normalized;
   }
   const record = { ...value.payload, analysis_id: executionId, created_at_ms: executedAtMs };
-  if (!isRecord(record)) throw new TypeError("unsupported or invalid analysis record");
+  if (!isLegacyAnalysisRecord(record)) {
+    throw new TypeError("unsupported or invalid analysis record");
+  }
   return { identity, record: normalizeRecordFindings(record) };
 }
 

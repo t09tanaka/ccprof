@@ -4211,6 +4211,296 @@ test("validates an existing snapshot digest before normalizing its legacy findin
   });
 });
 
+test("loads a historical Store v1 finding without cause without rewriting its snapshot", async () => {
+  await temporaryStore(async (paths) => {
+    const source = {
+      ...record("historical-finding-without-cause", 40),
+      findings: [{
+        ...finding("historical-finding-without-cause", "npm test", 2),
+        scope: "claude_md" as never,
+      }],
+    };
+    const {
+      cause: _omittedCause,
+      ...historicalFinding
+    } = source.findings[0]!;
+    const {
+      analysis_id: executionId,
+      created_at_ms: executedAtMs,
+      ...payload
+    } = {
+      ...source,
+      findings: [historicalFinding],
+    };
+    const envelope = {
+      schema_version: 1 as const,
+      identity: { mode: "content-fallback" as const },
+      payload,
+    };
+    const recordJson = canonicalJson(envelope);
+    const snapshotId = analysisDigest("analysis-snapshot-v1", envelope);
+    let database = openStoreDatabase(paths);
+    try {
+      database.prepare(`INSERT INTO analysis_snapshots
+        (snapshot_id, created_at_ms, record_json) VALUES (?, ?, ?)`)
+        .run(snapshotId, executedAtMs, recordJson);
+      database.prepare(`INSERT INTO analysis_executions
+        (execution_id, snapshot_id, executed_at_ms) VALUES (?, ?, ?)`)
+        .run(executionId, snapshotId, executedAtMs);
+    } finally {
+      database.close();
+    }
+
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded.warnings, []);
+    assert.equal(loaded.records.length, 1);
+    assert.equal(
+      loaded.records[0]?.findings[0]?.scope,
+      "instruction_resource",
+    );
+    assert.equal(
+      Object.hasOwn(loaded.records[0]?.findings[0] ?? {}, "cause"),
+      false,
+    );
+
+    database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT record_json FROM analysis_snapshots WHERE snapshot_id = ?",
+      ).pluck().get(snapshotId), recordJson);
+    } finally {
+      database.close();
+    }
+  });
+});
+
+test("analysis Store canonicalizes instruction-resource runtime findings without changing Store v1 identities", async () => {
+  const { analysis_id: _ignored, ...input } = record("scope-compat", 41);
+  const legacyFinding = {
+    ...finding("scope-compat-finding", "npm test", 2),
+    scope: "claude_md" as never,
+  };
+  const canonicalFinding = {
+    ...legacyFinding,
+    scope: "instruction_resource" as never,
+  };
+  const legacy = makeAnalysisRecord({ ...input, findings: [legacyFinding] });
+  const canonical = makeAnalysisRecord({ ...input, findings: [canonicalFinding] });
+
+  assert.equal(canonical.analysis_id, legacy.analysis_id);
+  assert.deepEqual(analysisAuditIdentity(canonical), analysisAuditIdentity(legacy));
+  assert.equal(canonical.findings[0]?.scope, "instruction_resource");
+  assert.equal(legacy.findings[0]?.scope, "instruction_resource");
+
+  await temporaryStore(async (paths) => {
+    const saved = await saveAnalysis(paths, canonical);
+    assert.deepEqual(saved.warnings, []);
+    assert.equal(saved.record.findings[0]?.scope, "instruction_resource");
+
+    const legacyProjection = {
+      ...canonical,
+      findings: [{ ...canonical.findings[0]!, scope: "claude_md" }],
+    };
+    const {
+      analysis_id: _analysisId,
+      created_at_ms: _createdAtMs,
+      ...payload
+    } = legacyProjection;
+    const expectedRaw = canonicalJson({
+      schema_version: 1,
+      identity: { mode: "content-fallback" },
+      payload,
+    });
+    const database = openStoreDatabase(paths);
+    let raw: string;
+    try {
+      raw = database.prepare(
+        "SELECT record_json FROM analysis_snapshots WHERE snapshot_id = ?",
+      ).pluck().get(saved.audit_identity.snapshot_id) as string;
+    } finally {
+      database.close();
+    }
+    assert.equal(raw!, expectedRaw);
+    assert.match(raw!, /"scope": "claude_md"/u);
+    assert.doesNotMatch(raw!, /instruction_resource/u);
+
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded.warnings, []);
+    assert.deepEqual(loaded.records, [canonical]);
+  });
+});
+
+test("analysis snapshots authenticate legacy wire bytes before scope normalization", async () => {
+  await temporaryStore(async (paths) => {
+    const legacy = {
+      ...record("raw-legacy-scope", 51),
+      findings: [{
+        ...finding("raw-legacy-scope-finding", "npm test", 2),
+        scope: "claude_md" as never,
+      }],
+    };
+    const {
+      analysis_id: executionId,
+      created_at_ms: executedAtMs,
+      ...payload
+    } = legacy;
+    const envelope = {
+      schema_version: 1 as const,
+      identity: { mode: "content-fallback" as const },
+      payload,
+    };
+    const normalizedDigestEnvelope = structuredClone(envelope);
+    normalizedDigestEnvelope.payload.findings[0]!.scope =
+      "instruction_resource" as never;
+    const canonicalWireEnvelope = structuredClone(normalizedDigestEnvelope);
+    canonicalWireEnvelope.payload.unit.pr_ref = "main...raw-canonical-token";
+    const malformedScopes = [
+      "unknown",
+      "CLAUDE_MD",
+      " claude_md",
+      "claude_md\\0suffix",
+    ];
+    const database = openStoreDatabase(paths);
+    try {
+      const insertSnapshot = database.prepare(`INSERT INTO analysis_snapshots
+        (snapshot_id, created_at_ms, record_json) VALUES (?, ?, ?)`);
+      const insertExecution = database.prepare(`INSERT INTO analysis_executions
+        (execution_id, snapshot_id, executed_at_ms) VALUES (?, ?, ?)`);
+      const insert = (
+        id: string,
+        rawEnvelope: typeof envelope,
+        digestEnvelope = rawEnvelope,
+      ) => {
+        const snapshotId = analysisDigest("analysis-snapshot-v1", digestEnvelope);
+        insertSnapshot.run(snapshotId, executedAtMs, canonicalJson(rawEnvelope));
+        insertExecution.run(id, snapshotId, executedAtMs);
+      };
+      insert(executionId, envelope);
+      insert("legacy-digest-after-normalization", envelope, normalizedDigestEnvelope);
+      insert("raw-canonical-token", canonicalWireEnvelope);
+      for (const [index, scope] of malformedScopes.entries()) {
+        const malformed = structuredClone(envelope);
+        malformed.payload.findings[0]!.scope = scope as never;
+        insert(`raw-malformed-${index}`, malformed);
+      }
+    } finally {
+      database.close();
+    }
+
+    const loaded = await loadAnalyses(paths);
+    assert.equal(loaded.records.length, 1);
+    assert.equal(loaded.records[0]?.analysis_id, executionId);
+    assert.equal(loaded.records[0]?.findings[0]?.scope, "instruction_resource");
+    assert.equal(
+      loaded.warnings.filter(({ code }) => code === "corrupt_analysis_record").length,
+      malformedScopes.length + 2,
+    );
+  });
+});
+
+test("analysis Store scope compatibility preserves nonlegacy scopes and rejects hostile inputs without mutation", async () => {
+  const source = {
+    ...finding("scope-compat-input", "npm test", 2),
+    scope: "claude_md" as never,
+  };
+  const before = structuredClone(source);
+  const normalized = makeAnalysisRecord({
+    ...record("scope-compat-input", 61),
+    findings: [source],
+  });
+  assert.deepEqual(source, before);
+  assert.equal(normalized.findings[0]?.scope, "instruction_resource");
+
+  const canary = "SCOPE_ACCESSOR_CANARY";
+  let getterCalled = false;
+  const accessor = { ...source };
+  Object.defineProperty(accessor, "scope", {
+    enumerable: true,
+    get() {
+      getterCalled = true;
+      throw new Error(canary);
+    },
+  });
+  const proxied = new Proxy(source, {
+    get() {
+      throw new Error(canary);
+    },
+  });
+  for (const hostile of [accessor, proxied]) {
+    assert.throws(
+      () => makeAnalysisRecord({
+        ...record("scope-compat-hostile", 62),
+        findings: [hostile],
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof TypeError);
+        assert.equal(error.message, "invalid finding");
+        assert.equal(error.message.includes(canary), false);
+        return true;
+      },
+    );
+  }
+  assert.equal(getterCalled, false);
+
+  await temporaryStore(async (paths) => {
+    const records = ["this_pr", "separate_issue"] as const;
+    for (const [index, scope] of records.entries()) {
+      const stored = makeAnalysisRecord({
+        ...record(`scope-compat-${scope}`, 70 + index),
+        findings: [{ ...finding(`scope-compat-${scope}`, "npm test", 2), scope }],
+      });
+      assert.deepEqual((await saveAnalysis(paths, stored)).warnings, []);
+    }
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(
+      loaded.records.map((entry) => entry.findings[0]?.scope),
+      [...records],
+    );
+    const database = openStoreDatabase(paths);
+    try {
+      const raw = database.prepare(
+        "SELECT record_json FROM analysis_snapshots ORDER BY created_at_ms, snapshot_id",
+      ).pluck().all() as string[];
+      assert.match(raw[0]!, /"scope": "this_pr"/u);
+      assert.match(raw[1]!, /"scope": "separate_issue"/u);
+    } finally {
+      database.close();
+    }
+  });
+});
+
+test("legacy analysis scope migration retains source bytes and projects canonical runtime findings", async () => {
+  await temporaryStore(async (paths) => {
+    const legacy = {
+      ...record("legacy-scope-file", 81),
+      findings: [{
+        ...finding("legacy-scope-file-finding", "npm test", 2),
+        scope: "claude_md" as never,
+      }],
+    };
+    const sourcePath = join(paths.analyses_dir, "legacy-scope-file.json");
+    const sourceJson = canonicalJson(legacy);
+    await mkdir(paths.analyses_dir, { recursive: true });
+    await writeFile(sourcePath, sourceJson, "utf8");
+
+    const migrated = await loadAnalyses(paths);
+    assert.deepEqual(migrated.warnings, []);
+    assert.equal(migrated.records[0]?.findings[0]?.scope, "instruction_resource");
+    assert.equal(await readFile(sourcePath, "utf8"), sourceJson);
+
+    const database = openStoreDatabase(paths);
+    try {
+      const raw = database.prepare(
+        "SELECT record_json FROM analysis_snapshots",
+      ).pluck().get() as string;
+      assert.match(raw, /"scope": "claude_md"/u);
+      assert.doesNotMatch(raw, /instruction_resource/u);
+    } finally {
+      database.close();
+    }
+  });
+});
+
 test("rejects hostile canonical finding shapes without invoking or disclosing them", () => {
   const source = finding("hostile-canonical", "npm test", 2);
   const canary = "ATTACKER_CANARY";
