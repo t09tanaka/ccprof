@@ -11,7 +11,16 @@ import {
 import {
   ruleApplicability,
   RULE_REQUIRED_CAPABILITIES,
+  sessionSupportsRule,
 } from "../src/rules/capabilities.js";
+import {
+  CAPABILITY_DESCRIPTOR_SCHEMA_ID,
+  CAPABILITY_DESCRIPTOR_SCHEMA_VERSION,
+  CAPABILITY_DESCRIPTOR_VERSION,
+  CAPABILITY_UNDECLARED_STATE,
+  validateCapabilityDescriptor,
+  type CapabilityDescriptorV1,
+} from "../src/protocol/capability-descriptor.js";
 import { legacyCapabilitiesToDescriptor } from
   "../src/protocol/legacy-capability-descriptor.js";
 
@@ -106,10 +115,13 @@ test("report v2 serializes the exact public wire contract", () => {
 function makeSession(
   sessionId: string,
   capabilities: readonly SessionCapability[] = ALL_SESSION_CAPABILITIES,
+  capabilityDescriptor: CapabilityDescriptorV1 =
+    legacyCapabilitiesToDescriptor(ALL_SESSION_CAPABILITIES),
+  source: Session["source"] = "claude",
 ): Session {
   return {
     session_id: sessionId,
-    source: "claude",
+    source,
     source_path: `/repo/${sessionId}.jsonl`,
     observed_cwds: ["/repo"],
     observed_branches: ["main"],
@@ -119,30 +131,144 @@ function makeSession(
     events: [],
     warnings: [],
     capabilities,
-    capability_descriptor: legacyCapabilitiesToDescriptor(capabilities),
+    capability_descriptor: capabilityDescriptor,
   };
 }
 
-test("ruleApplicability: required evidence needs an explicit subset and descriptor", () => {
-  const withoutSubset = makeSession("without-subset");
-  delete withoutSubset.capabilities;
-  const withoutDescriptor = makeSession("without-descriptor");
-  delete withoutDescriptor.capability_descriptor;
+function descriptorFor(options: {
+  id?: string;
+  state: string;
+  quality: string;
+  provenance: string;
+  timestampPrecision?: string;
+}): CapabilityDescriptorV1 {
+  return validateCapabilityDescriptor({
+    $schema: CAPABILITY_DESCRIPTOR_SCHEMA_ID,
+    schema_version: CAPABILITY_DESCRIPTOR_SCHEMA_VERSION,
+    descriptor_version: CAPABILITY_DESCRIPTOR_VERSION,
+    undeclared_capability_state: CAPABILITY_UNDECLARED_STATE,
+    capabilities: [{
+      id: options.id ?? "ccprof.dev/capabilities/token_usage",
+      version: CAPABILITY_DESCRIPTOR_VERSION,
+      requirement: "optional",
+      state: options.state,
+      evidence: {
+        quality: options.quality,
+        provenance: options.provenance,
+      },
+      timestamp_precision: options.timestampPrecision ?? "not_applicable",
+    }],
+  });
+}
 
-  for (const session of [withoutSubset, withoutDescriptor]) {
-    const results = ruleApplicability([session]);
-    const required = results.find(({ rule_id }) => rule_id === "R007");
-    const requirementEmpty = results.find(({ rule_id }) => rule_id === "R002");
-    assert.deepEqual(required, {
-      rule_id: "R007",
-      applicable: false,
-      missing: ["token_usage"],
-    });
-    assert.deepEqual(requirementEmpty, {
-      rule_id: "R002",
-      applicable: true,
-      missing: [],
-    });
+test("ruleApplicability: every rule is applicable with explicit validated evidence", () => {
+  const sessions = [makeSession("s1"), makeSession("s2")];
+  const results = ruleApplicability(sessions);
+
+  assert.deepEqual(
+    results.map((entry) => entry.rule_id).sort(),
+    Object.keys(RULE_REQUIRED_CAPABILITIES).sort(),
+  );
+  for (const entry of results) {
+    assert.equal(entry.applicable, true, `${entry.rule_id} should be applicable`);
+    assert.deepEqual(entry.missing, []);
+  }
+});
+
+test("rule applicability intersects source-neutral descriptor and session evidence", () => {
+  const source = "dev.example/producers/dummy-agent";
+  const capability = "token_usage" as const;
+  const exact = descriptorFor({
+    state: "supported_exact",
+    quality: "exact",
+    provenance: "producer_declared",
+  });
+  const validDescriptors: readonly [string, CapabilityDescriptorV1][] = [
+    ["exact", exact],
+    ["estimated", descriptorFor({
+      state: "supported_estimated",
+      quality: "estimated",
+      provenance: "observed",
+    })],
+    ["partial", descriptorFor({
+      state: "supported_partial",
+      quality: "partial",
+      provenance: "adapter_declared",
+    })],
+    [
+      "legacy partial unknown",
+      legacyCapabilitiesToDescriptor([capability]),
+    ],
+  ];
+  for (const [label, descriptor] of validDescriptors) {
+    const value = makeSession(
+      label.replaceAll(" ", "-"),
+      [capability],
+      descriptor,
+      source,
+    );
+    assert.equal(value.source, source);
+    assert.equal(sessionSupportsRule(value, "R007"), true, label);
+  }
+
+  const withoutSubset = makeSession("without-subset", [capability], exact, source);
+  delete withoutSubset.capabilities;
+  const withoutDescriptor = makeSession(
+    "without-descriptor",
+    [capability],
+    exact,
+    source,
+  );
+  delete withoutDescriptor.capability_descriptor;
+  const invalidTuple = structuredClone(exact) as unknown as {
+    capabilities: Array<{ evidence: { quality: string } }>;
+  };
+  invalidTuple.capabilities[0]!.evidence.quality = "partial";
+  const failClosed = [
+    ["absent subset", withoutSubset],
+    ["absent descriptor", withoutDescriptor],
+    ["undeclared", makeSession(
+      "undeclared",
+      [capability],
+      descriptorFor({
+        id: "dummy.example/capabilities/neutral_signal",
+        state: "supported_exact",
+        quality: "exact",
+        provenance: "producer_declared",
+      }),
+      source,
+    )],
+    ["unknown", makeSession(
+      "unknown",
+      [capability],
+      descriptorFor({
+        state: "unknown",
+        quality: "unknown",
+        provenance: "unknown",
+        timestampPrecision: "unknown",
+      }),
+      source,
+    )],
+    ["unsupported", makeSession(
+      "unsupported",
+      [capability],
+      descriptorFor({
+        state: "unsupported",
+        quality: "none",
+        provenance: "adapter_declared",
+      }),
+      source,
+    )],
+    ["invalid tuple", makeSession(
+      "invalid-tuple",
+      [capability],
+      invalidTuple as unknown as CapabilityDescriptorV1,
+      source,
+    )],
+  ] as const;
+  for (const [label, value] of failClosed) {
+    assert.equal(sessionSupportsRule(value, "R007"), false, label);
+    assert.equal(sessionSupportsRule(value, "R002"), true, label);
   }
 });
 

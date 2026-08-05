@@ -29,12 +29,12 @@ the behavior under test.
   field rejection.
 - `test/capability-coverage.test.ts`: coverage, lanes, missing legacy tokens,
   empty inputs, and supported/fail-closed matrices.
-- `test/model.test.ts`: direct applicability intersection semantics.
+- `test/session-source-contract.test.ts`: canonical Claude integration fixture
+  with explicit subset and matching descriptor evidence.
 - `test/analysis-window.test.ts`: source-neutral branch-transition behavior and
   unchanged branch/epoch/time/anchor constraints.
-- `test/session-source-capability-descriptor.test.ts`: valid normalized
-  descriptor evidence, including dummy namespaced sources and legacy partial
-  plus unknown quality.
+- `test/model.test.ts`: descriptor/subset intersection matrix, including dummy
+  namespaced sources and legacy partial plus unknown quality.
 - `docs/superpowers/specs/2026-08-05-descriptor-backed-rule-applicability-design.md`:
   approved architecture and compatibility contract.
 - `docs/superpowers/plans/2026-08-05-descriptor-backed-rule-applicability.md`:
@@ -127,7 +127,6 @@ git commit -m "refactor: remove rule source allow lists"
 **Files:**
 - Modify: `test/capability-coverage.test.ts`
 - Modify: `test/model.test.ts`
-- Modify: `test/session-source-capability-descriptor.test.ts`
 - Modify: `src/rules/capabilities.ts`
 
 - [ ] **Step 1: Add descriptor-backed session fixtures**
@@ -190,28 +189,31 @@ Assert rules with no requirements remain applicable without either field.
 Assert `ruleCoverage([])` remains full and finite. Assert coverage
 `missing_capabilities` contains only sorted legacy tokens such as
 `edit_fragments`, `token_usage`, and `tool_timestamps`, never namespaced IDs.
-Update direct model fixtures that previously used missing `capabilities` as
-full support so their intended eligible sessions supply valid descriptor and
-subset evidence.
+Update capability-coverage fixtures that represent full or limited normalized
+sessions so they carry both an explicit subset and the source-wide descriptor.
 
-- [ ] **Step 3: Prove normalized descriptor compatibility and analysis lanes**
+- [ ] **Step 3: Prove supported states and source-neutral applicability**
 
-In `test/session-source-capability-descriptor.test.ts`, retain normalized
-source-boundary fixtures and add assertions that valid exact, estimated,
-partial, and legacy partial/unknown descriptor states support the matching
-rule only with the session subset. Add a valid namespaced dummy source-shaped
-normalized `Session` directly to analysis lanes; this does not call or weaken
-`validateSessionSource` admission.
+Assert in `test/model.test.ts` that valid exact, estimated, partial, and legacy
+partial/unknown descriptor states support the matching rule only with the
+session subset. Use a valid namespaced dummy source-shaped `Session` directly;
+this does not call or weaken `validateSessionSource` admission. Also cover an
+absent subset, absent descriptor, undeclared capability, unknown state,
+unsupported state, and an invalid state/evidence tuple. Every fail-closed
+fixture must still support requirement-empty R002.
 
 ```ts
-assert.deepEqual(
-  laneSessionIds(ruleSessionLanes([dummyNormalizedSession])),
-  { R001: [dummyNormalizedSession.session_id] },
-);
+assert.equal(sessionSupportsRule(dummySession, "R007"), true);
+assert.equal(sessionSupportsRule(withoutDescriptor, "R007"), false);
+assert.equal(sessionSupportsRule(withoutDescriptor, "R002"), true);
 ```
 
-The full expected lane object includes R002-R008 according to their existing
-requirements; requirement-empty lanes remain populated.
+TDD history: this matrix first ran in
+`test/session-source-capability-descriptor.test.ts` and produced the genuine
+three-assertion applicability RED. Before final GREEN it is relocated to
+`test/model.test.ts` with the same real `Session` behavior so the descriptor
+integration file can return exactly to `origin/main` and the final scope stays
+at ten files.
 
 - [ ] **Step 4: Delegate focused RED to a fresh Terra worker**
 
@@ -274,7 +276,7 @@ token assertions are green with no warnings or errors.
 
 ```sh
 git add src/rules/capabilities.ts test/capability-coverage.test.ts \
-  test/model.test.ts test/session-source-capability-descriptor.test.ts
+  test/model.test.ts
 git commit -m "feat: gate rules on descriptor evidence"
 ```
 
@@ -282,7 +284,6 @@ git commit -m "feat: gate rules on descriptor evidence"
 
 **Files:**
 - Modify: `test/analysis-window.test.ts`
-- Modify: `test/session-source-capability-descriptor.test.ts`
 - Modify: `src/core/analyze.ts`
 
 - [ ] **Step 1: Write the failing source-neutral branch tests**
@@ -317,8 +318,7 @@ Run:
 
 ```sh
 npm run build:test && node --test \
-  .test-dist/test/analysis-window.test.js \
-  .test-dist/test/session-source-capability-descriptor.test.js
+  .test-dist/test/analysis-window.test.js
 ```
 
 Expected: FAIL because the current branch candidate condition explicitly
@@ -356,8 +356,7 @@ Run:
 
 ```sh
 npm run build:test && node --test \
-  .test-dist/test/analysis-window.test.js \
-  .test-dist/test/session-source-capability-descriptor.test.js
+  .test-dist/test/analysis-window.test.js
 ```
 
 Expected: PASS. The dummy source supplies a transition, Claude without
@@ -367,17 +366,17 @@ commit-anchor boundary remains green.
 - [ ] **Step 5: Commit the branch cycle**
 
 ```sh
-git add src/core/analyze.ts src/rules/capabilities.ts \
-  test/analysis-window.test.ts test/session-source-capability-descriptor.test.ts
+git add src/core/analyze.ts test/analysis-window.test.ts
 git commit -m "refactor: gate branch rows by capability"
 ```
 
-### Task 4: Final verification and scope audit
+### Task 4: Reconcile the canonical integration fixture and verify
 
 **Files:**
-- Verify only: the exact ten files listed in the file map
+- Modify: `test/session-source-contract.test.ts`
+- Verify: the exact ten files listed in the file map
 
-- [ ] **Step 1: Delegate the full repository check to a fresh Terra worker**
+- [ ] **Step 1: Record the first full-repository RED**
 
 Run:
 
@@ -385,12 +384,41 @@ Run:
 npm run check
 ```
 
-Expected: PASS with clean TypeScript diagnostics and all repository tests
-passing; the baseline was 1,198 tests and the final count may increase only by
-the added focused regressions. Output contains no failures, warnings, or
-unexpected skips.
+Observed: typecheck passed and 1,198 of 1,199 tests passed. The sole failure was
+`canonical Claude sessions retain transition, hook, and verified-tail
+semantics`: its `richSession()` fixture declared the all-capabilities legacy
+subset but omitted the descriptor now required by the shared `branch_rows`
+predicate. This is a genuine canonical integration-fixture RED; production
+must not add a Claude fallback.
 
-- [ ] **Step 2: Delegate local GitHub Actions verification before push**
+- [ ] **Step 2: Add matching descriptor evidence to the canonical fixture**
+
+Keep the existing explicit subset and add the already imported legacy
+descriptor conversion directly after it:
+
+```ts
+capabilities: [...ALL_CAPABILITIES],
+capability_descriptor: legacyCapabilitiesToDescriptor(ALL_CAPABILITIES),
+```
+
+Do not alter the transition assertion. Relocate the earlier applicability
+matrix from `test/session-source-capability-descriptor.test.ts` to
+`test/model.test.ts`, then restore the descriptor integration file exactly to
+`origin/main`. This preserves the genuine RED behavior and keeps the final
+change set at ten files.
+
+- [ ] **Step 3: Delegate final full GREEN to a fresh Terra worker**
+
+Run:
+
+```sh
+npm run check
+```
+
+Expected: PASS with clean TypeScript diagnostics and all 1,199 repository tests
+passing. Output contains no failures, warnings, or unexpected skips.
+
+- [ ] **Step 4: Delegate local GitHub Actions verification before push**
 
 Run the repository's `/run-github-actions-locally` workflow through a fresh
 `gpt-5.6-terra` worker. It must identify the workflows affected by the changed
@@ -400,7 +428,7 @@ Expected: GREEN for every applicable local job. A remote job that terminates
 within five seconds solely for account payment or spending-limit annotations
 does not override these local GREEN results.
 
-- [ ] **Step 3: Audit scope and compatibility without editing**
+- [ ] **Step 5: Audit scope and compatibility without editing**
 
 Run:
 

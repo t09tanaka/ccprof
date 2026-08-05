@@ -133,8 +133,8 @@ Regression changes are limited to:
 - `test/rule-manifest.cases.ts`;
 - `test/capability-coverage.test.ts`;
 - `test/model.test.ts`;
-- `test/analysis-window.test.ts`; and
-- `test/session-source-capability-descriptor.test.ts`.
+- `test/session-source-contract.test.ts`;
+- `test/analysis-window.test.ts`.
 
 Together with this design and its implementation plan, that is the complete
 ten-file change set. Production changes remain below 300 changed lines.
@@ -157,7 +157,13 @@ their production files:
 2. Applicability tests cover both halves of the intersection, missing and
    invalid evidence, every supported state, legacy partial/unknown evidence,
    required-empty rules, empty-session coverage, stable legacy missing tokens,
-   order independence, and report/analysis lane behavior.
+   order independence, and report/analysis lane behavior. The fail-closed
+   matrix lives in `capability-coverage.test.ts` and `model.test.ts`; the
+   canonical Claude integration fixture in `session-source-contract.test.ts`
+   carries both its explicit legacy subset and valid source-wide descriptor
+   evidence. The matrix first produced genuine RED in
+   `session-source-capability-descriptor.test.ts`, then moved unchanged in
+   intent to `model.test.ts` so the final change set stays within ten files.
 3. Branch-transition tests prove neutral dummy support, Claude denial without
    capability evidence, and preservation of all existing transition
    boundaries.
