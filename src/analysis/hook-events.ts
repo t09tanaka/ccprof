@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 
 import type { Session } from "../core/model.js";
+import { matchesBuiltinSourceAdapterId } from "../core/source-identity.js";
 import type { StoreWarning } from "../store/analyses.js";
 
 /**
@@ -142,7 +143,7 @@ export function applyHookEvents(
         .map((event) => event.agent_id),
     );
     if (
-      session.source !== "claude" ||
+      !matchesBuiltinSourceAdapterId(session.source, "claude") ||
       sessionIdCounts.get(session.session_id) !== 1 ||
       session.observed_branches.length > 1 ||
       mainAgents.size !== 1

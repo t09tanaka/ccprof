@@ -94,6 +94,17 @@ export function projectLegacySourceAdapterId(
   return projectLegacyValue(CANONICAL_SOURCE_ADAPTER_IDS, value);
 }
 
+export function matchesBuiltinSourceAdapterId(
+  value: SourceAdapterId,
+  legacy: LegacySourceAdapterId,
+): boolean {
+  return value === legacy || value === CANONICAL_SOURCE_ADAPTER_IDS[legacy];
+}
+
+export function projectSourceAdapterIdV1(value: SourceAdapterId): string {
+  return projectLegacySourceAdapterId(value) ?? value;
+}
+
 export function projectLegacySourceKind(
   value: SourceKind,
 ): LegacySourceKind | undefined {

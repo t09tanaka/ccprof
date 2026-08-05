@@ -12,6 +12,11 @@ import type {
   SourceAdapterId,
   SourceAdapterVersion,
 } from "../core/source-descriptor.js";
+import {
+  normalizeSourceAdapterId,
+  projectLegacySourceAdapterId,
+  projectSourceAdapterIdV1,
+} from "../core/source-identity.js";
 import type { AnalysisBudgetMeter } from "../analysis/budgets.js";
 
 export interface SessionQuery {
@@ -61,6 +66,19 @@ function fail(code: SessionSourceValidationCode): never {
   const error = new SessionSourceValidationError(code);
   VALIDATION_ERRORS.add(error);
   throw error;
+}
+function canonicalBuiltinSourceAdapterId(
+  value: unknown,
+  code: SessionSourceValidationCode,
+): SourceAdapterId {
+  let normalized: SourceAdapterId;
+  try {
+    normalized = normalizeSourceAdapterId(value);
+  } catch {
+    return fail(code);
+  }
+  if (projectLegacySourceAdapterId(normalized) === undefined) return fail(code);
+  return normalized;
 }
 function denseArrayValues(
   value: unknown,
@@ -199,10 +217,10 @@ function validateContract(value: unknown): SessionSourceContract {
       return fail("invalid_shape");
     }
   }
-  const adapterId = descriptors.adapter_id!.value;
-  if (adapterId !== "claude" && adapterId !== "codex") {
-    return fail("unknown_adapter");
-  }
+  const adapterId = canonicalBuiltinSourceAdapterId(
+    descriptors.adapter_id!.value,
+    "unknown_adapter",
+  );
   if (descriptors.adapter_version!.value !== "1.0.0") {
     return fail("unsupported_version");
   }
@@ -483,8 +501,12 @@ function eventIdentitySnapshot(
     ],
     ["tool_use_id"],
   );
+  const sourceAdapterId = canonicalBuiltinSourceAdapterId(
+    row.source_adapter_id,
+    "invalid_result",
+  );
   const identity = {
-    source_adapter_id: text(row.source_adapter_id),
+    source_adapter_id: projectSourceAdapterIdV1(sourceAdapterId),
     source_instance_id: text(row.source_instance_id),
     session_id: text(row.session_id),
     agent_id: text(row.agent_id),
@@ -494,7 +516,7 @@ function eventIdentitySnapshot(
     source_index: nonnegativeInteger(row.source_index),
   };
   if (
-    identity.source_adapter_id !== session.source ||
+    sourceAdapterId !== session.source ||
     identity.source_instance_id !== session.source_path ||
     identity.session_id !== session.session_id ||
     identity.agent_id !== event.agent_id ||
@@ -694,8 +716,11 @@ function validateDiscoveredSessions(
       "observed_branches", "started_at_ms", "ended_at_ms", "confidence",
       "events", "warnings",
     ], ["capabilities", "verified_ended_at_ms"]);
-    const source = contract.adapter_id;
-    if (snapshot.source !== source) return fail("adapter_mismatch");
+    const source = canonicalBuiltinSourceAdapterId(
+      snapshot.source,
+      "adapter_mismatch",
+    );
+    if (source !== contract.adapter_id) return fail("adapter_mismatch");
     const capabilities = snapshot.capabilities === undefined
       ? contract.capabilities
       : validatedCapabilities(snapshot.capabilities, false);
@@ -867,8 +892,9 @@ export function admitSessionEventPrefix(
       (last, { source_index }) => Math.max(last, source_index),
       -1,
     );
-    const lastSourceLine =
-      lastSourceIndex + (session.source === "claude" ? 1 : 0);
+    const lastSourceLine = lastSourceIndex + (
+      projectSourceAdapterIdV1(session.source) === "claude" ? 1 : 0
+    );
     const observedCwds = [...new Set(events.flatMap((event) =>
       event.kind === "tool_use" && event.cwd !== undefined && event.cwd !== ""
         ? [event.cwd]

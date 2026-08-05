@@ -7,6 +7,7 @@ import {
 } from "./model.js";
 import {
   compareSourceIdentities,
+  projectLegacySourceAdapterId,
   type LegacySourceAdapterId,
   type LegacySourceKind,
   type SourceAdapterId,
@@ -145,6 +146,14 @@ function registryEntry(adapterId: string): RegistryEntry {
   return BUILTIN_SOURCE_REGISTRY[adapterId];
 }
 
+function derivationRegistryEntry(adapterId: string): RegistryEntry {
+  const legacyAdapterId = adapterId === "claude" || adapterId === "codex"
+    ? adapterId
+    : projectLegacySourceAdapterId(adapterId);
+  if (legacyAdapterId === undefined) return fail("unknown_adapter");
+  return registryEntry(legacyAdapterId);
+}
+
 export function deriveSourceDescriptor(
   session: Pick<
     Session,
@@ -159,7 +168,7 @@ export function deriveSourceDescriptor(
   ) {
     return fail("invalid_field");
   }
-  const registry = registryEntry(session.source);
+  const registry = derivationRegistryEntry(session.source);
   const provided = sortedCapabilities(
     session.capabilities ?? ALL_SESSION_CAPABILITIES,
   );

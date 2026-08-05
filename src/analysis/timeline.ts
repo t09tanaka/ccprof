@@ -22,6 +22,7 @@ import type {
   ToolResultEvent,
   ToolUseEvent,
 } from "../core/model.js";
+import { matchesBuiltinSourceAdapterId } from "../core/source-identity.js";
 
 export const DEFAULT_IDLE_THRESHOLD_MS = 30 * 60 * 1_000;
 
@@ -254,7 +255,7 @@ function verifiedTailActions(
   for (const session of sessions) {
     const verifiedEndedAtMs = session.verified_ended_at_ms;
     if (
-      session.source !== "claude" ||
+      !matchesBuiltinSourceAdapterId(session.source, "claude") ||
       verifiedEndedAtMs === undefined || !Number.isFinite(verifiedEndedAtMs)
     ) {
       continue;

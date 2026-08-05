@@ -5,13 +5,28 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { AnalysisBudgetMeter } from "../src/analysis/budgets.js";
-import { analyze } from "../src/core/analyze.js";
+import { applyHookEvents } from "../src/analysis/hook-events.js";
+import { buildTimeline } from "../src/analysis/timeline.js";
+import { sliceSessionsToAnalysisWindow } from "../src/analysis/window.js";
+import {
+  analyze,
+  deriveSessionBranchTransitionAtMs,
+} from "../src/core/analyze.js";
+import {
+  encodeEventIdentity,
+  eventIdentity,
+} from "../src/core/event-identity.js";
 import type {
   NormalizedEvent,
   Session,
   SessionCapability,
 } from "../src/core/model.js";
-import { deriveSourceDescriptor } from "../src/core/source-descriptor.js";
+import {
+  SourceDescriptorValidationError,
+  deriveSourceDescriptor,
+  validateSourceDescriptor,
+} from "../src/core/source-descriptor.js";
+import { CANONICAL_SOURCE_ADAPTER_IDS } from "../src/core/source-identity.js";
 import type { CommandRunner } from "../src/git/client.js";
 import { ClaudeSessionSource } from "../src/sources/claude/discover.js";
 import { CombinedSessionSource } from "../src/sources/combined.js";
@@ -20,12 +35,14 @@ import {
   CLAUDE_SESSION_SOURCE_CONTRACT,
   CODEX_SESSION_SOURCE_CONTRACT,
   SessionSourceValidationError,
+  admitSessionEventPrefix,
   validateSessionSource,
   type SessionQuery,
   type SessionSource,
   type SessionSourceContract,
   type SessionSourceValidationCode,
 } from "../src/sources/session-source.js";
+import { analysisDigest } from "../src/store/analyses.js";
 
 const ALL_CAPABILITIES = [
   "approvals",
@@ -53,6 +70,8 @@ const BUDGETS = {
 };
 
 const STEADY_CLOCK = { wall_ms: () => 0, cpu_ms: () => 0 };
+const CANONICAL_CLAUDE = CANONICAL_SOURCE_ADAPTER_IDS.claude;
+const CANONICAL_CODEX = CANONICAL_SOURCE_ADAPTER_IDS.codex;
 
 function analysisRunner(onCall: () => void = () => {}): CommandRunner {
   return async (_command, args) => {
@@ -250,7 +269,7 @@ function discoveryOf(value: unknown): Promise<Session[]> {
   } as unknown as SessionSource).discover(QUERY);
 }
 
-test("built-in SessionSource v2 contracts are exact, canonical, and immutable", () => {
+test("raw built-in contracts remain legacy while validated contracts are canonical", () => {
   assert.deepEqual(CLAUDE_SESSION_SOURCE_CONTRACT, {
     adapter_id: "claude",
     adapter_version: "1.0.0",
@@ -288,15 +307,15 @@ test("built-in SessionSource v2 contracts are exact, canonical, and immutable", 
   );
   assert.deepEqual(
     validateSessionSource(claude).contract,
-    CLAUDE_SESSION_SOURCE_CONTRACT,
+    { ...CLAUDE_SESSION_SOURCE_CONTRACT, adapter_id: CANONICAL_CLAUDE },
   );
   assert.deepEqual(
     validateSessionSource(codex).contract,
-    CODEX_SESSION_SOURCE_CONTRACT,
+    { ...CODEX_SESSION_SOURCE_CONTRACT, adapter_id: CANONICAL_CODEX },
   );
 });
 
-test("validated sources normalize explicit capabilities without mutating adapter values", async () => {
+test("validated sources canonicalize identity and capabilities without mutating adapter values", async () => {
   const omitted = session();
   const reordered = session({
     session_id: "session-2",
@@ -312,11 +331,14 @@ test("validated sources normalize explicit capabilities without mutating adapter
   assert.notEqual(discovered[0], omitted);
   assert.notEqual(discovered[1], reordered);
   assert.equal(omitted.capabilities, undefined);
+  assert.equal(omitted.source, "claude");
   assert.deepEqual(reordered.capabilities, [
     "tool_timestamps",
     "edit_fragments",
   ]);
   assert.deepEqual(discovered[0]?.capabilities, ALL_CAPABILITIES);
+  assert.equal(discovered[0]?.source, CANONICAL_CLAUDE);
+  assert.equal(discovered[1]?.source, CANONICAL_CLAUDE);
   assert.deepEqual(discovered[1]?.capabilities, [
     "edit_fragments",
     "tool_timestamps",
@@ -330,6 +352,247 @@ test("validated sources normalize explicit capabilities without mutating adapter
       capabilities: ["edit_fragments", "tool_timestamps"],
     }),
   );
+});
+
+test("validated discovery accepts legacy and canonical built-in spellings", async () => {
+  const cases = [
+    ["claude", "claude"],
+    ["claude", CANONICAL_CLAUDE],
+    [CANONICAL_CLAUDE, "claude"],
+    [CANONICAL_CLAUDE, CANONICAL_CLAUDE],
+  ] as const;
+  for (const [contractAdapter, resultAdapter] of cases) {
+    const raw = session({ source: resultAdapter });
+    const validated = validateSessionSource(source(
+      [raw],
+      declaration({ adapter_id: contractAdapter }),
+    ));
+    const [discovered] = await validated.discover(QUERY);
+
+    assert.equal(validated.contract.adapter_id, CANONICAL_CLAUDE);
+    assert.equal(discovered?.source, CANONICAL_CLAUDE);
+    assert.equal(raw.source, resultAdapter);
+  }
+
+  const validatedCodex = validateSessionSource(source(
+    [session({ source: "codex" })],
+    {
+      ...CODEX_SESSION_SOURCE_CONTRACT,
+      adapter_id: CANONICAL_CODEX,
+    },
+  ));
+  assert.equal(validatedCodex.contract.adapter_id, CANONICAL_CODEX);
+  assert.equal((await validatedCodex.discover(QUERY))[0]?.source, CANONICAL_CODEX);
+});
+
+test("canonicalization keeps unsupported adapters and mismatches fail-closed", async () => {
+  for (const adapter_id of ["other", "dev.example/adapters/dummy-agent"]) {
+    assertSourceError(
+      () => validateSessionSource(source([], declaration({ adapter_id }))),
+      "unknown_adapter",
+      adapter_id,
+    );
+  }
+
+  for (const sourceId of ["codex", CANONICAL_CODEX, "dev.example/adapters/dummy-agent"]) {
+    const candidate = validateSessionSource(source(
+      [session({ source: sourceId })],
+      declaration({ adapter_id: CANONICAL_CLAUDE }),
+    ));
+    await assertAsyncSourceError(
+      () => candidate.discover(QUERY),
+      "adapter_mismatch",
+      sourceId,
+    );
+  }
+});
+
+test("supplied event identities compare canonically and snapshot legacy v1", async () => {
+  for (const suppliedAdapterId of ["claude", CANONICAL_CLAUDE]) {
+    const raw = richSession();
+    for (const event of raw.events) {
+      if (event.event_identity !== undefined) {
+        event.event_identity.source_adapter_id = suppliedAdapterId;
+      }
+    }
+
+    const [discovered] = await discoveryOf([raw]);
+
+    assert.equal(discovered?.source, CANONICAL_CLAUDE);
+    assert.deepEqual(
+      discovered?.events.map((event) => event.event_identity?.source_adapter_id),
+      ["claude", "claude", "claude", "claude", "claude"],
+    );
+  }
+});
+
+test("canonical sessions preserve Event Identity and Source Descriptor v1 bytes", () => {
+  const legacy = richSession();
+  const canonical = { ...legacy, source: CANONICAL_CLAUDE };
+  const legacyIdentity = eventIdentity(legacy, legacy.events[0]!);
+  const canonicalIdentity = eventIdentity(canonical, canonical.events[0]!);
+
+  assert.deepEqual(canonicalIdentity, legacyIdentity);
+  assert.equal(
+    encodeEventIdentity(canonicalIdentity),
+    encodeEventIdentity(legacyIdentity),
+  );
+  assert.deepEqual(
+    deriveSourceDescriptor(canonical),
+    deriveSourceDescriptor(legacy),
+  );
+});
+
+test("Source Descriptor v1 validation rejects canonical adapter spelling", () => {
+  const descriptor = deriveSourceDescriptor(richSession());
+  const canonical = { ...descriptor, adapter_id: CANONICAL_CLAUDE };
+
+  assert.throws(() => validateSourceDescriptor(canonical), (error: unknown) => {
+    assert.ok(error instanceof SourceDescriptorValidationError);
+    assert.equal(error.code, "unknown_adapter");
+    assert.equal(error.message, "invalid source descriptor: unknown_adapter");
+    return true;
+  });
+});
+
+test("all matching source spellings preserve persisted audit identity", async () => {
+  const baseRunner = analysisRunner();
+  const runner: CommandRunner = async (command, args, options) =>
+    args[0] === "--no-pager" && (args[1] === "diff" || args[1] === "log")
+      ? { code: 0, stdout: "", stderr: "" }
+      : baseRunner(command, args, options);
+  const forms = [
+    ["claude", "claude"],
+    ["claude", CANONICAL_CLAUDE],
+    [CANONICAL_CLAUDE, "claude"],
+    [CANONICAL_CLAUDE, CANONICAL_CLAUDE],
+  ] as const;
+  const audits: Array<{
+    source_digest: string;
+    snapshot_id: string;
+    deterministic_digest: string;
+  }> = [];
+  let referenceWindow: Awaited<ReturnType<typeof analyze>>["window"] | undefined;
+  for (const [contractAdapter, resultAdapter] of forms) {
+    const result = await analyze({
+      cwd: "/repo",
+      pr: "main...feature",
+      sinceMs: 0,
+      nowMs: 1_000,
+      runner,
+      persist: false,
+      sessionSource: source([session({
+        source: resultAdapter,
+        events: [{
+          ...eventBase(0),
+          kind: "assistant",
+          text: "Working.",
+        }, {
+          ...eventBase(1),
+          kind: "assistant",
+          text: "Done.",
+        }],
+      })], declaration({ adapter_id: contractAdapter })),
+    });
+    const snapshot = result.audit_identity.snapshot_identity;
+    assert.ok("source_digest" in snapshot);
+    audits.push({
+      source_digest: snapshot.source_digest,
+      snapshot_id: result.audit_identity.snapshot_id,
+      deterministic_digest: result.audit_identity.deterministic_digest,
+    });
+    referenceWindow ??= result.window;
+  }
+
+  const [validated] = await validateSessionSource(source([session({
+    events: [{
+      ...eventBase(0),
+      kind: "assistant",
+      text: "Working.",
+    }, {
+      ...eventBase(1),
+      kind: "assistant",
+      text: "Done.",
+    }],
+  })])).discover(QUERY);
+  const [sliced] = sliceSessionsToAnalysisWindow(
+    [validated!],
+    referenceWindow!,
+  );
+  const { source_path: _sourcePath, ...rest } = sliced!;
+  const legacyProjected = {
+    ...rest,
+    source: "claude",
+    observed_cwds: ["."],
+    capabilities: [...sliced!.capabilities!].sort(),
+    events: sliced!.events,
+    warnings: [],
+  };
+  const legacySourceDigest = analysisDigest("analysis-source-v1", {
+    sessions: [legacyProjected],
+    discovery_failures: [],
+    hook_warnings: [],
+  });
+
+  assert.equal(audits[0]?.source_digest, legacySourceDigest);
+  for (const audit of audits.slice(1)) assert.deepEqual(audit, audits[0]);
+});
+
+test("canonical Claude sessions retain transition, hook, and verified-tail semantics", () => {
+  const canonical = richSession();
+  canonical.source = CANONICAL_CLAUDE;
+  delete canonical.verified_ended_at_ms;
+  canonical.events[0]!.branch_epoch = 1;
+
+  assert.equal(
+    deriveSessionBranchTransitionAtMs([canonical], "feature", 1_000),
+    canonical.events[0]!.timestamp_ms,
+  );
+
+  const [hooked] = applyHookEvents([canonical], [{
+    received_at_ms: 250,
+    session_id: canonical.session_id,
+    hook_event_name: "Stop",
+  }]);
+  assert.equal(hooked?.ended_at_ms, 250);
+  assert.equal(hooked?.verified_ended_at_ms, 250);
+  assert.ok(
+    buildTimeline([hooked!]).actions.some((action) =>
+      action.action_id.endsWith(":verified_end")
+    ),
+  );
+});
+
+test("canonical Claude sessions retain one-based warning lines under truncation", () => {
+  const candidate = session({
+    source: CANONICAL_CLAUDE,
+    events: [{
+      ...eventBase(0),
+      kind: "assistant",
+      text: "First",
+    }, {
+      ...eventBase(1),
+      kind: "assistant",
+      text: "Second",
+    }],
+    warnings: [{
+      code: "line-one",
+      message: "first line",
+      source_path: "/logs/session-1.jsonl",
+      line: 1,
+    }, {
+      code: "line-two",
+      message: "second line",
+      source_path: "/logs/session-1.jsonl",
+      line: 2,
+    }],
+  });
+  const [admitted] = admitSessionEventPrefix(
+    [candidate],
+    new AnalysisBudgetMeter({ ...BUDGETS, max_input_events: 1 }, STEADY_CLOCK),
+  );
+
+  assert.deepEqual(admitted?.warnings.map(({ code }) => code), ["line-one"]);
 });
 
 test("missing, extra, hidden, symbol, and accessor contract fields fail closed", () => {
@@ -891,6 +1154,7 @@ test("discovery validates exact nested records, safe counts, and enums", async (
 test("validated discovery returns a fully detached Session snapshot", async () => {
   const original = richSession();
   const expected = structuredClone(original);
+  expected.source = CANONICAL_CLAUDE;
   const [snapshot] = await discoveryOf([original]);
   assert.ok(snapshot);
 

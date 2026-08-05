@@ -33,6 +33,10 @@ import type {
 } from "./model.js";
 import { sourceDescriptorsForSessions } from "./source-descriptor.js";
 import {
+  matchesBuiltinSourceAdapterId,
+  projectSourceAdapterIdV1,
+} from "./source-identity.js";
+import {
   detectAdoptions,
   detectability,
   type AdoptionCandidateFinding,
@@ -879,7 +883,7 @@ export function deriveSessionBranchTransitionAtMs(
         timestampMs,
       );
       if (
-        session.source === "claude" &&
+        matchesBuiltinSourceAdapterId(session.source, "claude") &&
         event.branch === headBranch &&
         Number.isSafeInteger(event.branch_epoch) &&
         (event.branch_epoch ?? 0) > 0 &&
@@ -1249,7 +1253,9 @@ function sourceFailureSnapshot(error: unknown): unknown {
 function sourceSnapshot(sessions: readonly Session[], repoRoot: string): unknown[] {
   return sessions.map((session) => {
     const { source_path: _sourcePath, ...rest } = session;
-    const projected = { ...rest, observed_cwds: session.observed_cwds.map(
+    const projected = { ...rest,
+      source: projectSourceAdapterIdV1(session.source),
+      observed_cwds: session.observed_cwds.map(
       (path) => snapshotPath(path, repoRoot)),
       ...(session.capabilities === undefined ? {} : { capabilities: uniqueSorted(session.capabilities) }),
       events: session.events.map((event) => event.kind === "tool_use"
@@ -1837,7 +1843,7 @@ export async function analyze(
   );
   const laneKey = (laneSessions: readonly Session[]): string =>
     analysisDigest("rule-session-lane-v1", laneSessions.map((session) => ({
-      source: session.source,
+      source: projectSourceAdapterIdV1(session.source),
       source_path: session.source_path,
       session_id: session.session_id,
     })).sort((left, right) =>
