@@ -3242,9 +3242,9 @@ function adoptionRecordFixture(
   return {
     finding_key: "key",
     rule_id: "R001",
-    scope: "this_pr",
+    scope: "instruction_resource",
     fingerprint: "fingerprint",
-    method: "claude_md_edit",
+    method: "instruction_resource_edit",
     detected_at_ms: 0,
     evidence: {
       commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
@@ -3843,7 +3843,7 @@ test("incomplete selected terminals remain in recurrence and adoption history", 
     finding_key: findingKey,
     rule_id: "R002",
     title: "Observe every terminal work unit",
-    method: "claude_md_edit",
+    method: "instruction_resource_edit",
     detected_at_ms: 1_500,
     analyses_after: 1,
     recurrences_after: 1,
@@ -4310,25 +4310,23 @@ function adoptionFixtureAdoptions(): AdoptionRecord[] {
     adoptionRecordFixture({
       finding_key: "adopted-key",
       rule_id: "R003",
-      method: "claude_md_edit",
       detected_at_ms: ADOPTION_DAY0_MS,
     }),
     adoptionRecordFixture({
       finding_key: "recurred-key",
       rule_id: "R002",
+      scope: "this_pr",
       method: "target_file_edit",
       detected_at_ms: ADOPTION_DAY0_MS + 50_000,
     }),
     adoptionRecordFixture({
       finding_key: "no-data-key",
       rule_id: "R004",
-      method: "claude_md_edit",
       detected_at_ms: ADOPTION_DAY0_MS + 400_000,
     }),
     adoptionRecordFixture({
       finding_key: "orphan-key",
       rule_id: "R005",
-      method: "claude_md_edit",
       detected_at_ms: ADOPTION_DAY0_MS - 200_000,
     }),
   ];
@@ -4345,7 +4343,7 @@ test("stats reports adoption outcomes and coverage without altering existing key
       finding_key: "adopted-key",
       rule_id: "R003",
       title: "Cache the build output",
-      method: "claude_md_edit",
+      method: "instruction_resource_edit",
       detected_at_ms: ADOPTION_DAY0_MS,
       analyses_after: 3,
       recurrences_after: 0,
@@ -4357,7 +4355,7 @@ test("stats reports adoption outcomes and coverage without altering existing key
       finding_key: "no-data-key",
       rule_id: "R004",
       title: "Missing changelog entry",
-      method: "claude_md_edit",
+      method: "instruction_resource_edit",
       detected_at_ms: ADOPTION_DAY0_MS + 400_000,
       analyses_after: 0,
       recurrences_after: 0,
@@ -4369,7 +4367,7 @@ test("stats reports adoption outcomes and coverage without altering existing key
       finding_key: "orphan-key",
       rule_id: "R005",
       title: "",
-      method: "claude_md_edit",
+      method: "instruction_resource_edit",
       detected_at_ms: ADOPTION_DAY0_MS - 200_000,
       analyses_after: 4,
       recurrences_after: 0,
@@ -4401,8 +4399,19 @@ test("stats reports adoption outcomes and coverage without altering existing key
   assert.deepEqual(stats.rule_minutes, legacyStats.rule_minutes);
   assert.deepEqual(stats.recurring_findings, legacyStats.recurring_findings);
 
+  const beforeRender = structuredClone(stats);
   const json = JSON.parse(renderStatsJson(stats)) as typeof stats;
-  assert.deepEqual(json, stats);
+  assert.deepEqual(json, {
+    ...stats,
+    adoptions: stats.adoptions.map((entry) => ({
+      ...entry,
+      method: entry.method === "instruction_resource_edit"
+        ? "claude_md_edit"
+        : entry.method,
+    })),
+  });
+  assert.doesNotMatch(renderStatsJson(stats), /instruction_resource_edit/u);
+  assert.deepEqual(stats, beforeRender);
 });
 
 test("summarizeStats defaults adoptions to an empty array for backward compatibility", () => {
@@ -4545,7 +4554,6 @@ test("stats excludes origin-PR reruns from analyses_after/recurrences_after but 
     adoptionRecordFixture({
       finding_key: "rerun-key",
       rule_id: "R007",
-      method: "claude_md_edit",
       detected_at_ms: detectedAtMs,
     }),
   ];
@@ -4593,7 +4601,6 @@ test("stats keeps status no_recurrence when the only post-adoption match is an o
     adoptionRecordFixture({
       finding_key: "rerun-only-key",
       rule_id: "R007",
-      method: "claude_md_edit",
       detected_at_ms: detectedAtMs,
     }),
   ];

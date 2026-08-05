@@ -2684,11 +2684,11 @@ test("analyze detects and persists a CLAUDE.md adoption of a prior PR's suggesti
       ({ finding_key }) => finding_key === priorFindingKey,
     );
     assert.ok(adopted, "the seeded suggestion must be reported as adopted");
-    assert.equal(adopted?.method, "claude_md_edit");
+    assert.equal(adopted?.method, "instruction_resource_edit");
     assert.equal(adopted?.evidence.path, "CLAUDE.md");
     assert.equal(adopted?.evidence.commit, fixCommit);
     assert.equal(adopted?.rule_id, "R005");
-    assert.equal(adopted?.scope, "claude_md");
+    assert.equal(adopted?.scope, "instruction_resource");
     assert.equal(adopted?.detected_at_ms, NOW_MS);
     assert.deepEqual(
       second.adoptions.map(({ finding_key }) => finding_key),

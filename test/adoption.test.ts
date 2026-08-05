@@ -5,6 +5,8 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 
 import type { AnalysisSummary, Finding } from "../src/core/model.js";
+import type { FindingScope } from "../src/core/finding-scope.js";
+import type { LegacyFindingScope } from "../src/compat/instruction-resource.js";
 
 import {
   detectability,
@@ -20,6 +22,13 @@ import {
   type CommandResult,
   type CommandRunner,
 } from "../src/git/client.js";
+
+type Equal<Left, Right> =
+  (<Value>() => Value extends Left ? 1 : 2) extends
+    (<Value>() => Value extends Right ? 1 : 2)
+    ? true
+    : false;
+type Expect<Value extends true> = Value;
 
 interface Call {
   command: string;
@@ -144,6 +153,14 @@ test("suggestionKeywords sorts non-ASCII tokens by code point, not locale collat
 
 // --- findingFingerprint -------------------------------------------------
 
+test("findingFingerprint exposes only legacy or canonical finding scopes", () => {
+  const contract: Expect<Equal<
+    Parameters<typeof findingFingerprint>[0]["scope"],
+    FindingScope | LegacyFindingScope
+  >> = true;
+  assert.equal(contract, true);
+});
+
 test("findingFingerprint is stable for identical input and changes with any field", () => {
   const finding = {
     scope: "claude_md" as const,
@@ -194,6 +211,49 @@ test("findingFingerprint treats a missing target as an empty string", () => {
   assert.equal(withoutTarget, withEmptyTarget);
 });
 
+test("findingFingerprint preserves the exact legacy digest for instruction resources", () => {
+  const shared = {
+    rule_id: "R001" as const,
+    target: "src/a.ts",
+    fix_recipe: { suggestion: "  Add   a lint step.  ", verify: "npm test" },
+  };
+  const legacy = findingFingerprint({ ...shared, scope: "claude_md" });
+  const canonical = findingFingerprint({
+    ...shared,
+    scope: "instruction_resource",
+  });
+
+  assert.equal(canonical, legacy);
+  assert.equal(
+    canonical,
+    "fbe029e3ac7575f5b1953a86eacff4af9164196a77fb4187cc61d9c8339581fc",
+  );
+});
+
+test("findingFingerprint rejects malformed scope identities without echoing content", () => {
+  for (const scope of [
+    "INSTRUCTION_RESOURCE",
+    " instruction_resource",
+    "instruction_resource ",
+    "instruction_resource\0must-not-leak",
+    "must-not-leak",
+  ]) {
+    assert.throws(
+      () => findingFingerprint({
+        scope: scope as never,
+        rule_id: "R001",
+        fix_recipe: { suggestion: "Add a lint step.", verify: "" },
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, "invalid finding scope: invalid_finding_scope");
+        assert.doesNotMatch(error.message, /must-not-leak/u);
+        return true;
+      },
+    );
+  }
+});
+
 test("legacy finding normalization preserves adoption and compatibility identity", () => {
   const legacy: Finding = {
     finding_key: "stable-adoption-key",
@@ -240,10 +300,14 @@ test("legacy finding normalization preserves adoption and compatibility identity
 
 // --- detectability --------------------------------------------------------
 
-test("detectability routes claude_md scope regardless of rule_id or target", () => {
+test("detectability normalizes legacy and canonical instruction-resource scopes", () => {
   assert.equal(
     detectability({ scope: "claude_md", rule_id: "R001" }),
-    "claude_md",
+    "instruction_resource",
+  );
+  assert.equal(
+    detectability({ scope: "instruction_resource", rule_id: "R001" }),
+    "instruction_resource",
   );
 });
 
@@ -279,7 +343,7 @@ test("detectability is undetectable for this_pr scope, missing target, or unreso
 
 // --- detectAdoptions: claude_md ------------------------------------------
 
-test("detectAdoptions detects a claude_md adoption committed after recorded_at_ms", async () => {
+test("detectAdoptions canonicalizes legacy and neutral candidates for fixed CLAUDE.md evidence", async () => {
   const root = await mkdtemp(join(tmpdir(), "ccprof-adoption-claudemd-"));
   try {
     const repo = await makeRepo(root);
@@ -293,6 +357,12 @@ test("detectAdoptions detects a claude_md adoption committed after recorded_at_m
       recorded_at_ms: Date.parse("2026-01-01T00:00:00.000Z"),
       suggestion: "Add a lint step before merging changes",
     });
+    const canonicalCandidate = baseCandidate({
+      finding_key: "finding-canonical",
+      scope: "instruction_resource",
+      recorded_at_ms: candidate.recorded_at_ms,
+      suggestion: candidate.suggestion,
+    });
     const adoptCommit = await commit(
       repo,
       { "CLAUDE.md": "# Project rules\n\nBe nice.\nAdd a lint step before merging.\n" },
@@ -302,29 +372,33 @@ test("detectAdoptions detects a claude_md adoption committed after recorded_at_m
 
     const result = await detectAdoptions({
       repoRoot: repo,
-      candidates: [candidate],
+      candidates: [candidate, canonicalCandidate],
       detectedAtMs: Date.parse("2026-01-03T00:00:00.000Z"),
     });
 
     assert.deepEqual(result.warnings, []);
-    assert.equal(result.adoptions.length, 1);
-    const [adoption] = result.adoptions;
+    assert.equal(result.adoptions.length, 2);
+    const [adoption, canonicalAdoption] = result.adoptions;
     assert.equal(adoption?.finding_key, candidate.finding_key);
     assert.equal(adoption?.rule_id, candidate.rule_id);
-    assert.equal(adoption?.scope, candidate.scope);
-    assert.equal(adoption?.method, "claude_md_edit");
+    assert.equal(adoption?.scope, "instruction_resource");
+    assert.equal(adoption?.method, "instruction_resource_edit");
     assert.equal(adoption?.detected_at_ms, Date.parse("2026-01-03T00:00:00.000Z"));
     assert.equal(adoption?.evidence.commit, adoptCommit);
     assert.equal(adoption?.evidence.path, "CLAUDE.md");
     assert.equal(
       adoption?.fingerprint,
       findingFingerprint({
-        scope: candidate.scope,
+        scope: "instruction_resource",
         rule_id: candidate.rule_id,
         fix_recipe: { suggestion: candidate.suggestion, verify: "" },
         ...(candidate.target === undefined ? {} : { target: candidate.target }),
       }),
     );
+    assert.deepEqual(canonicalAdoption, {
+      ...adoption,
+      finding_key: canonicalCandidate.finding_key,
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
