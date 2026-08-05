@@ -1,0 +1,234 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/capability-descriptor-v1.schema.json",
+  "title": "ccprof Capability Descriptor v1",
+  "description": "A neutral capability declaration. A capability omitted from capabilities has state unknown and must never be treated as supported.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "descriptor_version",
+    "undeclared_capability_state",
+    "capabilities"
+  ],
+  "properties": {
+    "$schema": {
+      "description": "The stable identifier of this packaged schema.",
+      "const": "https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/capability-descriptor-v1.schema.json"
+    },
+    "schema_version": { "const": 1 },
+    "descriptor_version": { "const": "1.0.0" },
+    "undeclared_capability_state": {
+      "description": "Fail-closed contract: an undeclared capability is unknown, never supported.",
+      "const": "unknown"
+    },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/capability" }
+    }
+  },
+  "$defs": {
+    "capability_id": {
+      "description": "An open DNS-namespaced capability ID. An undeclared ID is unknown and not supported.",
+      "type": "string",
+      "maxLength": 255,
+      "pattern": "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?/capabilities/[a-z][a-z0-9_]*(?:[.-][a-z0-9_]+)*$"
+    },
+    "legacy_id": {
+      "description": "A preserved legacy capability token; this grammar is intentionally not an enum of built-in IDs.",
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    },
+    "semver": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "semver_range": {
+      "description": "A SemVer range using caret, tilde, or one or two space-separated comparators.",
+      "type": "string",
+      "maxLength": 256,
+      "pattern": "^(?:[~^]|>=|>|<=|<)(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?: (?:>=|>|<=|<)(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?)?$"
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["quality", "provenance"],
+      "properties": {
+        "quality": {
+          "enum": ["exact", "estimated", "partial", "unknown", "none"]
+        },
+        "provenance": {
+          "enum": [
+            "producer_declared",
+            "adapter_declared",
+            "observed",
+            "derived",
+            "unknown"
+          ]
+        }
+      }
+    },
+    "known_provenance": {
+      "enum": [
+        "producer_declared",
+        "adapter_declared",
+        "observed",
+        "derived"
+      ]
+    },
+    "exact_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["quality", "provenance"],
+      "properties": {
+        "quality": { "const": "exact" },
+        "provenance": { "$ref": "#/$defs/known_provenance" }
+      }
+    },
+    "estimated_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["quality", "provenance"],
+      "properties": {
+        "quality": { "const": "estimated" },
+        "provenance": { "$ref": "#/$defs/known_provenance" }
+      }
+    },
+    "partial_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["quality", "provenance"],
+      "properties": {
+        "quality": { "enum": ["partial", "unknown"] },
+        "provenance": { "$ref": "#/$defs/known_provenance" }
+      }
+    },
+    "unsupported_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["quality", "provenance"],
+      "properties": {
+        "quality": { "const": "none" },
+        "provenance": { "$ref": "#/$defs/known_provenance" }
+      }
+    },
+    "unknown_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["quality", "provenance"],
+      "properties": {
+        "quality": { "const": "unknown" },
+        "provenance": { "const": "unknown" }
+      }
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "requirement",
+        "state",
+        "evidence",
+        "timestamp_precision"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/capability_id" },
+        "legacy_id": { "$ref": "#/$defs/legacy_id" },
+        "version": { "$ref": "#/$defs/semver" },
+        "version_range": { "$ref": "#/$defs/semver_range" },
+        "requirement": { "enum": ["required", "optional"] },
+        "state": {
+          "enum": [
+            "supported_exact",
+            "supported_estimated",
+            "supported_partial",
+            "unsupported",
+            "unknown"
+          ]
+        },
+        "evidence": { "$ref": "#/$defs/evidence" },
+        "timestamp_precision": {
+          "enum": [
+            "nanosecond",
+            "microsecond",
+            "millisecond",
+            "second",
+            "unknown",
+            "not_applicable"
+          ]
+        }
+      },
+      "oneOf": [
+        { "required": ["version"], "properties": { "version": {} } },
+        {
+          "required": ["version_range"],
+          "properties": { "version_range": {} }
+        }
+      ],
+      "allOf": [
+        {
+          "if": {
+            "required": ["state"],
+            "properties": { "state": { "const": "supported_exact" } }
+          },
+          "then": {
+            "properties": {
+              "evidence": { "$ref": "#/$defs/exact_evidence" }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["state"],
+            "properties": { "state": { "const": "supported_estimated" } }
+          },
+          "then": {
+            "properties": {
+              "evidence": { "$ref": "#/$defs/estimated_evidence" }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["state"],
+            "properties": { "state": { "const": "supported_partial" } }
+          },
+          "then": {
+            "properties": {
+              "evidence": { "$ref": "#/$defs/partial_evidence" }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["state"],
+            "properties": { "state": { "const": "unsupported" } }
+          },
+          "then": {
+            "properties": {
+              "evidence": { "$ref": "#/$defs/unsupported_evidence" },
+              "timestamp_precision": { "const": "not_applicable" }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["state"],
+            "properties": { "state": { "const": "unknown" } }
+          },
+          "then": {
+            "properties": {
+              "evidence": { "$ref": "#/$defs/unknown_evidence" },
+              "timestamp_precision": { "const": "unknown" }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
