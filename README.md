@@ -621,6 +621,24 @@ with `CCPROF_CODEX_SESSIONS_DIR`). Sessions from both are filtered to the
 repository's canonical working directory and the query's head branch before
 being combined into a single analysis.
 
+### Published Capability Descriptor v1
+
+The npm artifact includes the neutral Draft 2020-12 contract at
+`schemas/capability-descriptor-v1.schema.json`, with the stable schema ID
+`https://raw.githubusercontent.com/t09tanaka/ccprof/main/schemas/capability-descriptor-v1.schema.json`.
+The [canonical legacy fixture](test/fixtures/protocol/capability-descriptor-v1.json)
+losslessly maps all six current capability literals to namespaced IDs without
+closing the schema to those IDs. It conservatively keeps `token_usage` quality
+unknown because the legacy boolean cannot recover whether usage was exact or
+estimated.
+
+Descriptor entries use `supported_exact`, `supported_estimated`,
+`supported_partial`, `unsupported`, or `unknown`, together with evidence
+quality, provenance, and timestamp precision. Within this public contract an
+undeclared capability is always `unknown` and must not be treated as supported.
+This does not change runtime rule gating: legacy stored/session readers still
+interpret `Session.capabilities === undefined` as all six legacy capabilities.
+
 Each new report includes one validated descriptor per distinct source instance.
 The built-in registry accepts only `claude@1.0.0` with source kind
 `claude_transcript_jsonl` and `codex@1.0.0` with source kind
