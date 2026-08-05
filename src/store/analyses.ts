@@ -238,13 +238,9 @@ const LEGACY_FINDING_FIELDS = new Set([
   "rule_version", "compatibility_epoch",
 ]);
 const REQUIRED_FINDING_FIELDS = [
-  "finding_key", "rule_id", "title", "classification", "cause", "scope",
+  "finding_key", "rule_id", "title", "classification", "scope",
   "confidence", "evidence", "recoverable", "fix_recipe", "caveats",
 ] as const;
-const FINDING_CAUSES = new Set([
-  "ambiguous_task", "requirements_changed", "missing_context", "scope_creep",
-  "tool_failure", "unknown",
-]);
 const LEGACY_RECORD_FIELDS = new Set([
   "schema_version", "analysis_id", "created_at_ms", "unit", "summary",
   "findings", "metrics", "command_costs", "read_observations",
@@ -327,8 +323,6 @@ function isStrictStoredFinding(
   return isObjectRecord(value) &&
     Object.keys(value).every((field) => LEGACY_FINDING_FIELDS.has(field)) &&
     REQUIRED_FINDING_FIELDS.every((field) => Object.hasOwn(value, field)) &&
-    (value.cause === null ||
-      (typeof value.cause === "string" && FINDING_CAUSES.has(value.cause))) &&
     isStoredFinding(value, scopeGuard);
 }
 

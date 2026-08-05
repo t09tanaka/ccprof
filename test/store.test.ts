@@ -4211,6 +4211,69 @@ test("validates an existing snapshot digest before normalizing its legacy findin
   });
 });
 
+test("loads a historical Store v1 finding without cause without rewriting its snapshot", async () => {
+  await temporaryStore(async (paths) => {
+    const source = {
+      ...record("historical-finding-without-cause", 40),
+      findings: [{
+        ...finding("historical-finding-without-cause", "npm test", 2),
+        scope: "claude_md" as never,
+      }],
+    };
+    const {
+      cause: _omittedCause,
+      ...historicalFinding
+    } = source.findings[0]!;
+    const {
+      analysis_id: executionId,
+      created_at_ms: executedAtMs,
+      ...payload
+    } = {
+      ...source,
+      findings: [historicalFinding],
+    };
+    const envelope = {
+      schema_version: 1 as const,
+      identity: { mode: "content-fallback" as const },
+      payload,
+    };
+    const recordJson = canonicalJson(envelope);
+    const snapshotId = analysisDigest("analysis-snapshot-v1", envelope);
+    let database = openStoreDatabase(paths);
+    try {
+      database.prepare(`INSERT INTO analysis_snapshots
+        (snapshot_id, created_at_ms, record_json) VALUES (?, ?, ?)`)
+        .run(snapshotId, executedAtMs, recordJson);
+      database.prepare(`INSERT INTO analysis_executions
+        (execution_id, snapshot_id, executed_at_ms) VALUES (?, ?, ?)`)
+        .run(executionId, snapshotId, executedAtMs);
+    } finally {
+      database.close();
+    }
+
+    const loaded = await loadAnalyses(paths);
+    assert.deepEqual(loaded.warnings, []);
+    assert.equal(loaded.records.length, 1);
+    assert.equal(
+      loaded.records[0]?.findings[0]?.scope,
+      "instruction_resource",
+    );
+    assert.equal(
+      Object.hasOwn(loaded.records[0]?.findings[0] ?? {}, "cause"),
+      false,
+    );
+
+    database = openStoreDatabase(paths);
+    try {
+      assert.equal(database.prepare(
+        "SELECT record_json FROM analysis_snapshots WHERE snapshot_id = ?",
+      ).pluck().get(snapshotId), recordJson);
+    } finally {
+      database.close();
+    }
+  });
+});
+
 test("analysis Store canonicalizes instruction-resource runtime findings without changing Store v1 identities", async () => {
   const { analysis_id: _ignored, ...input } = record("scope-compat", 41);
   const legacyFinding = {
