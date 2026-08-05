@@ -5,6 +5,8 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 
 import type { AnalysisSummary, Finding } from "../src/core/model.js";
+import type { FindingScope } from "../src/core/finding-scope.js";
+import type { LegacyFindingScope } from "../src/compat/instruction-resource.js";
 
 import {
   detectability,
@@ -20,6 +22,13 @@ import {
   type CommandResult,
   type CommandRunner,
 } from "../src/git/client.js";
+
+type Equal<Left, Right> =
+  (<Value>() => Value extends Left ? 1 : 2) extends
+    (<Value>() => Value extends Right ? 1 : 2)
+    ? true
+    : false;
+type Expect<Value extends true> = Value;
 
 interface Call {
   command: string;
@@ -144,6 +153,14 @@ test("suggestionKeywords sorts non-ASCII tokens by code point, not locale collat
 
 // --- findingFingerprint -------------------------------------------------
 
+test("findingFingerprint exposes only legacy or canonical finding scopes", () => {
+  const contract: Expect<Equal<
+    Parameters<typeof findingFingerprint>[0]["scope"],
+    FindingScope | LegacyFindingScope
+  >> = true;
+  assert.equal(contract, true);
+});
+
 test("findingFingerprint is stable for identical input and changes with any field", () => {
   const finding = {
     scope: "claude_md" as const,
@@ -223,7 +240,7 @@ test("findingFingerprint rejects malformed scope identities without echoing cont
   ]) {
     assert.throws(
       () => findingFingerprint({
-        scope,
+        scope: scope as never,
         rule_id: "R001",
         fix_recipe: { suggestion: "Add a lint step.", verify: "" },
       }),
