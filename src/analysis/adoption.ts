@@ -1,7 +1,14 @@
 import { createHash } from "node:crypto";
 
 import type { AnalyzeWarning } from "../core/analyze.js";
-import type { Finding, RuleId, Scope } from "../core/model.js";
+import type { Finding, RuleId } from "../core/model.js";
+import type { FindingScope } from "../core/finding-scope.js";
+import {
+  CLAUDE_MD_INSTRUCTION_RESOURCE_COMPATIBILITY,
+  normalizeFindingScopeIdentity,
+  projectLegacyFindingScope,
+  type LegacyFindingScope,
+} from "../compat/instruction-resource.js";
 import { runCommand, type CommandResult, type CommandRunner } from "../git/client.js";
 import type { AdoptionMethod, AdoptionRecord } from "../store/adoptions.js";
 import { normalizeRepoPath } from "./test-map.js";
@@ -14,15 +21,21 @@ const OID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
  * `verify` does not participate.
  */
 export function findingFingerprint(
-  finding: Pick<Finding, "scope" | "rule_id" | "fix_recipe"> & { target?: string },
+  finding: Pick<Finding, "rule_id" | "fix_recipe"> & {
+    scope: unknown;
+    target?: string;
+  },
 ): string {
+  const legacyScope = projectLegacyFindingScope(
+    normalizeFindingScopeIdentity(finding.scope),
+  );
   const normalizedSuggestion = finding.fix_recipe.suggestion
     .normalize("NFC")
     .trim()
     .replace(/\s+/gu, " ");
   return createHash("sha256")
     .update(
-      `${finding.scope}\0${finding.rule_id}\0${finding.target ?? ""}\0${normalizedSuggestion}`,
+      `${legacyScope}\0${finding.rule_id}\0${finding.target ?? ""}\0${normalizedSuggestion}`,
     )
     .digest("hex");
 }
@@ -46,13 +59,16 @@ export function suggestionKeywords(suggestion: string): string[] {
 export interface AdoptionCandidateFinding {
   finding_key: string;
   rule_id: RuleId;
-  scope: Scope;
+  scope: FindingScope | LegacyFindingScope;
   target?: string;
   suggestion: string;
   recorded_at_ms: number;
 }
 
-export type AdoptionDetectability = "claude_md" | "target_file" | "undetectable";
+export type AdoptionDetectability =
+  | "instruction_resource"
+  | "target_file"
+  | "undetectable";
 
 /**
  * Decides which deterministic detection strategy (if any) applies to a
@@ -61,8 +77,12 @@ export type AdoptionDetectability = "claude_md" | "target_file" | "undetectable"
 export function detectability(
   finding: Pick<AdoptionCandidateFinding, "scope" | "rule_id" | "target">,
 ): AdoptionDetectability {
-  if (finding.scope === "claude_md") return "claude_md";
-  if (finding.rule_id === "R008" || finding.scope === "separate_issue") {
+  const scope = normalizeFindingScopeIdentity(finding.scope);
+  if (
+    scope ===
+      CLAUDE_MD_INSTRUCTION_RESOURCE_COMPATIBILITY.resource.canonical_finding_scope
+  ) return "instruction_resource";
+  if (finding.rule_id === "R008" || scope === "separate_issue") {
     if (finding.target === undefined) return "undetectable";
     try {
       normalizeRepoPath(finding.target);
@@ -172,12 +192,13 @@ function makeRecord(
   path: string,
   detectedAtMs: number,
 ): AdoptionRecord {
+  const scope = normalizeFindingScopeIdentity(candidate.scope);
   return {
     finding_key: candidate.finding_key,
     rule_id: candidate.rule_id,
-    scope: candidate.scope,
+    scope,
     fingerprint: findingFingerprint({
-      scope: candidate.scope,
+      scope,
       rule_id: candidate.rule_id,
       fix_recipe: { suggestion: candidate.suggestion, verify: "" },
       ...(candidate.target === undefined ? {} : { target: candidate.target }),
@@ -216,7 +237,7 @@ function partialOutputWarning(path: string, result: CommandResult): AnalyzeWarni
   };
 }
 
-async function detectClaudeMdAdoptions(
+async function detectInstructionResourceAdoptions(
   candidates: readonly AdoptionCandidateFinding[],
   repoRoot: string,
   runner: CommandRunner,
@@ -224,18 +245,33 @@ async function detectClaudeMdAdoptions(
   warnings: AnalyzeWarning[],
 ): Promise<AdoptionRecord[]> {
   if (candidates.length === 0) return [];
+  const compatibility = CLAUDE_MD_INSTRUCTION_RESOURCE_COMPATIBILITY;
   const result = await runner(
     "git",
-    ["--no-pager", "log", "--format=%H%x00%ct", "-p", "--unified=0", "--", "CLAUDE.md"],
+    [
+      "--no-pager",
+      "log",
+      "--format=%H%x00%ct",
+      "-p",
+      "--unified=0",
+      "--",
+      compatibility.resource.path,
+    ],
     { cwd: repoRoot },
   );
-  const partialWarning = partialOutputWarning("CLAUDE.md", result);
+  const partialWarning = partialOutputWarning(
+    compatibility.detector.evidence_path,
+    result,
+  );
   if (partialWarning !== undefined) {
     warnings.push(partialWarning);
     return [];
   }
   if (result.code !== 0) {
-    warnings.push(detectionFailedWarning("CLAUDE.md", result.stderr));
+    warnings.push(detectionFailedWarning(
+      compatibility.detector.evidence_path,
+      result.stderr,
+    ));
     return [];
   }
   const commits = parseClaudeMdLog(result.stdout);
@@ -249,7 +285,13 @@ async function detectClaudeMdAdoptions(
     );
     const match = oldestQualifying(qualifying);
     if (match !== undefined) {
-      adoptions.push(makeRecord(candidate, "claude_md_edit", match.oid, "CLAUDE.md", detectedAtMs));
+      adoptions.push(makeRecord(
+        candidate,
+        compatibility.detector.canonical_adoption_method,
+        match.oid,
+        compatibility.detector.evidence_path,
+        detectedAtMs,
+      ));
     }
   }
   return adoptions;
@@ -299,16 +341,17 @@ export async function detectAdoptions(
 ): Promise<DetectAdoptionsResult> {
   const runner = options.runner ?? runCommand;
   const warnings: AnalyzeWarning[] = [];
-  const claudeMdCandidates: AdoptionCandidateFinding[] = [];
+  const instructionResourceCandidates: AdoptionCandidateFinding[] = [];
   const targetFileCandidates: AdoptionCandidateFinding[] = [];
   for (const candidate of options.candidates) {
     const kind = detectability(candidate);
-    if (kind === "claude_md") claudeMdCandidates.push(candidate);
-    else if (kind === "target_file") targetFileCandidates.push(candidate);
+    if (kind === "instruction_resource") {
+      instructionResourceCandidates.push(candidate);
+    } else if (kind === "target_file") targetFileCandidates.push(candidate);
   }
 
-  const adoptions = await detectClaudeMdAdoptions(
-    claudeMdCandidates,
+  const adoptions = await detectInstructionResourceAdoptions(
+    instructionResourceCandidates,
     options.repoRoot,
     runner,
     options.detectedAtMs,

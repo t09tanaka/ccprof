@@ -20,6 +20,7 @@ import {
 } from "../rules/chronic-cost.js";
 import type { AnalysisRecord } from "../store/analyses.js";
 import type { AdoptionMethod, AdoptionRecord } from "../store/adoptions.js";
+import { projectLegacyAdoptionMethod } from "../compat/instruction-resource.js";
 import { sanitizeHumanText } from "./sanitize.js";
 import { formatMinutes } from "./tty.js";
 
@@ -484,7 +485,7 @@ export function summarizeTerminalStats(
 }
 
 export function renderStatsJson(stats: StatsReport): string {
-  const stable: StatsReport = {
+  const stable = {
     history_count: stats.history_count,
     ...(stats.metadata === undefined ? {} : { metadata: {
       ...stats.metadata,
@@ -515,7 +516,10 @@ export function renderStatsJson(stats: StatsReport): string {
     })),
     rule_minutes: [...stats.rule_minutes],
     recurring_findings: [...stats.recurring_findings],
-    adoptions: [...stats.adoptions],
+    adoptions: stats.adoptions.map((entry) => ({
+      ...entry,
+      method: projectLegacyAdoptionMethod(entry.method),
+    })),
     adoption_coverage: { ...stats.adoption_coverage },
   };
   return `${JSON.stringify(stable, null, 2)}\n`;
@@ -541,7 +545,8 @@ function adoptionStatusText(entry: StatsAdoption): string {
 }
 
 function adoptionLine(entry: StatsAdoption): string {
-  return `- [${entry.rule_id}] adopted ${utcDate(entry.detected_at_ms)} (${entry.method}): ${
+  const method = projectLegacyAdoptionMethod(entry.method);
+  return `- [${entry.rule_id}] adopted ${utcDate(entry.detected_at_ms)} (${method}): ${
     adoptionStatusText(entry)
   }, ${formatMinutes(entry.minutes_before)} -> ${formatMinutes(entry.minutes_after)}`;
 }
