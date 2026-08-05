@@ -5,12 +5,16 @@ import {
   type Session,
   type SessionCapability,
 } from "./model.js";
+import {
+  compareSourceIdentities,
+  type LegacySourceAdapterId,
+  type LegacySourceKind,
+  type SourceAdapterId,
+  type SourceKind,
+} from "./source-identity.js";
 
-export type SourceAdapterId = "claude" | "codex";
+export type { SourceAdapterId, SourceKind } from "./source-identity.js";
 export type SourceAdapterVersion = "1.0.0";
-export type SourceKind =
-  | "claude_transcript_jsonl"
-  | "codex_rollout_jsonl";
 export type SourceProvenance = "local_filesystem";
 export type SourceSensitivity = "sensitive";
 export type SourceRetentionClass = "raw_evidence";
@@ -50,16 +54,18 @@ export class SourceDescriptorValidationError extends Error {
 }
 
 interface RegistryEntry {
-  adapter_id: SourceAdapterId;
+  adapter_id: LegacySourceAdapterId;
   adapter_version: SourceAdapterVersion;
-  source_kind: SourceKind;
+  source_kind: LegacySourceKind;
   required_capabilities: readonly SessionCapability[];
   provenance: SourceProvenance;
   sensitivity: SourceSensitivity;
   retention_class: SourceRetentionClass;
 }
 
-const BUILTIN_SOURCE_REGISTRY: Readonly<Record<SourceAdapterId, RegistryEntry>> = {
+const BUILTIN_SOURCE_REGISTRY: Readonly<
+  Record<LegacySourceAdapterId, RegistryEntry>
+> = {
   claude: {
     adapter_id: "claude",
     adapter_version: "1.0.0",
@@ -112,9 +118,7 @@ function digest(domain: string, value: unknown): string {
 function sortedCapabilities(
   capabilities: readonly SessionCapability[],
 ): SessionCapability[] {
-  return [...new Set(capabilities)].sort((left, right) =>
-    left.localeCompare(right)
-  );
+  return [...new Set(capabilities)].sort(compareSourceIdentities);
 }
 
 function descriptorFingerprint(
@@ -293,7 +297,7 @@ export function sourceDescriptorsForSessions(
     descriptors.set(key, descriptor);
   }
   return [...descriptors.values()].sort((left, right) =>
-    left.adapter_id.localeCompare(right.adapter_id) ||
-    left.source_instance_id.localeCompare(right.source_instance_id)
+    compareSourceIdentities(left.adapter_id, right.adapter_id) ||
+    compareSourceIdentities(left.source_instance_id, right.source_instance_id)
   );
 }
