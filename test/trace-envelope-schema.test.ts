@@ -3,18 +3,13 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import test from "node:test";
 
-import {
-  Ajv2020,
-  type ErrorObject,
-  type ValidateFunction,
-} from "ajv/dist/2020.js";
+import { Ajv2020, type ErrorObject, type ValidateFunction } from "ajv/dist/2020.js";
 
 type JsonObject = Record<string, unknown>;
 
 const SCHEMA_URI = "https://schemas.ccprof.dev/trace-envelope/v1.json";
 const SCHEMA_PATH = "schemas/trace-envelope-v1.schema.json";
-const FIXTURE_PATH =
-  "test/fixtures/protocol/dummy-agent-trace-envelope-v1.json";
+const FIXTURE_PATH = "test/fixtures/protocol/dummy-agent-trace-envelope-v1.json";
 const FORBIDDEN_FIXTURE_IDENTITIES = /claude|codex|github|pull_request/iu;
 
 function object(value: unknown, label: string): JsonObject {
@@ -49,9 +44,7 @@ function clone(value: JsonObject): JsonObject {
 }
 
 function validationMessage(errors: ErrorObject[] | null | undefined): string {
-  return errors?.map((error) =>
-    `${error.instancePath || "/"} ${error.message ?? "invalid"}`
-  ).join("; ") ?? "no validation errors";
+  return errors?.map((error) => `${error.instancePath || "/"} ${error.message ?? "invalid"}`).join("; ") ?? "no validation errors";
 }
 
 function assertValid(
@@ -312,5 +305,24 @@ test("namespaces, absolute URIs, privacy, and JSON-pointer provenance are constr
     const value = clone(fixture);
     mutate(value);
     assertInvalid(validate, value, label);
+  }
+});
+
+test("terminal patterns reject every trailing ECMAScript line terminator", async () => {
+  const { fixture, validate } = await loadContract();
+  const cases: Array<[string, (value: JsonObject) => [JsonObject, string], string]> = [
+    ["semver", (value) => [at(value, "producer"), "version"], "1.2.3"],
+    ["namespaced name", (value) => [at(value, "producer"), "id"], "org.example.agent"],
+    ["absolute URI", (value) => [at(value, "event"), "type"], "urn:example:event"],
+    ["trace ID", (value) => [value, "trace_id"], "a".repeat(32)],
+    ["span ID", (value) => [value, "span_id"], "a".repeat(16)],
+    ["nanoseconds", (value) => [at(value, "timestamp"), "wall_time_unix_ns"], "1"],
+    ["JSON pointer", (value) => [object((value.provenance as unknown[])[0], "provenance[0]"), "path"], "/event/type"],
+  ];
+  for (const suffix of ["\n", "\r", "\u2028", "\u2029"]) for (const [label, locate, valid] of cases) {
+    const value = clone(fixture);
+    const [target, key] = locate(value);
+    target[key] = `${valid}${suffix}`;
+    assertInvalid(validate, value, `${label} with ${JSON.stringify(suffix)}`);
   }
 });
