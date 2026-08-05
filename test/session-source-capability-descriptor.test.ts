@@ -987,3 +987,65 @@ test("neutral descriptor metadata leaves rule, report, record, and audit identit
     legacy.audit_identity.deterministic_digest,
   );
 });
+
+test("descriptor aliases canonicalize once per discovery call while distinct objects stay independent", async () => {
+  const contractDescriptor = sessionDescriptorWithNeutral();
+  const shared = mutableDescriptor(
+    contractDescriptor as unknown as CapabilityDescriptorV1,
+  );
+  const distinct = mutableDescriptor(
+    contractDescriptor as unknown as CapabilityDescriptorV1,
+  );
+  const once = validateSessionSource(discoveringSource(contract({
+    capabilities: SESSION_ALL_CAPABILITIES,
+    capability_descriptor: contractDescriptor,
+  }), [
+    rawSession({
+      session_id: "shared-1",
+      capability_descriptor: shared,
+    }),
+    rawSession({
+      session_id: "shared-2",
+      source_path: "/logs/shared-2.jsonl",
+      capability_descriptor: shared,
+    }),
+    rawSession({
+      session_id: "distinct",
+      source_path: "/logs/distinct.jsonl",
+      capability_descriptor: distinct,
+    }),
+  ]));
+  const twice = validateSessionSource(once);
+  const normalizedAlias = once.contract.capability_descriptor;
+  let sharedReads = 0;
+  let distinctReads = 0;
+  let normalizedAliasReads = 0;
+  const original = Object.getOwnPropertyDescriptors;
+  Object.getOwnPropertyDescriptors = ((value: object) => {
+    if (value === shared) sharedReads += 1;
+    if (value === distinct) distinctReads += 1;
+    if (value === normalizedAlias) normalizedAliasReads += 1;
+    return original(value);
+  }) as typeof Object.getOwnPropertyDescriptors;
+
+  try {
+    const firstSessions = await once.discover(SESSION_QUERY) as
+      NormalizedSessionProbe[];
+    const secondSessions = await twice.discover(SESSION_QUERY) as
+      NormalizedSessionProbe[];
+
+    assert.equal(firstSessions.length, 3);
+    assert.equal(secondSessions.length, 3);
+    assert.equal(sharedReads, 2);
+    assert.equal(distinctReads, 2);
+    assert.equal(normalizedAliasReads, 1);
+    for (const normalized of secondSessions) {
+      assert.equal(
+        normalized.capability_descriptor,
+        twice.contract.capability_descriptor,
+      );
+    }
+  } finally {
+    Object.getOwnPropertyDescriptors = original;
+  }
+});
