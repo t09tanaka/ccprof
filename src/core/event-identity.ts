@@ -3,6 +3,7 @@ import type {
   Session,
   TimelineAction,
 } from "./model.js";
+import { projectSourceAdapterIdV1 } from "./source-identity.js";
 
 export interface EventIdentity {
   source_adapter_id: string;
@@ -53,7 +54,7 @@ export function eventIdentity(
 ): EventIdentity {
   const id = toolUseId(event);
   return {
-    source_adapter_id: session.source,
+    source_adapter_id: projectSourceAdapterIdV1(session.source),
     source_instance_id: session.source_path,
     session_id: event.session_id,
     agent_id: event.agent_id,
@@ -64,7 +65,7 @@ export function eventIdentity(
 
 export function encodeEventIdentity(identity: EventIdentity): string {
   return encode("event", [
-    identity.source_adapter_id,
+    projectSourceAdapterIdV1(identity.source_adapter_id),
     identity.source_instance_id,
     identity.session_id,
     identity.agent_id,
@@ -75,7 +76,7 @@ export function encodeEventIdentity(identity: EventIdentity): string {
 
 export function encodeInvocationIdentity(identity: EventIdentity): string {
   return encode("invocation", [
-    identity.source_adapter_id,
+    projectSourceAdapterIdV1(identity.source_adapter_id),
     identity.source_instance_id,
     identity.session_id,
     identity.agent_id,
@@ -85,7 +86,7 @@ export function encodeInvocationIdentity(identity: EventIdentity): string {
 
 export function encodeAgentIdentity(identity: EventIdentity): string {
   return encode("agent", [
-    identity.source_adapter_id,
+    projectSourceAdapterIdV1(identity.source_adapter_id),
     identity.source_instance_id,
     identity.session_id,
     identity.agent_id,
@@ -94,7 +95,7 @@ export function encodeAgentIdentity(identity: EventIdentity): string {
 
 export function encodeSessionIdentity(identity: EventIdentity): string {
   return encode("session", [
-    identity.source_adapter_id,
+    projectSourceAdapterIdV1(identity.source_adapter_id),
     identity.source_instance_id,
     identity.session_id,
   ]);
