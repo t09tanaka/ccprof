@@ -44,15 +44,12 @@ import {
 import { applyDismissals } from "../src/store/dismissals.js";
 import { resolveStorePaths } from "../src/store/paths.js";
 
-const SOURCES = ["claude", "codex"] as const;
-
 const EXPECTED: RuleManifest[] = [
   {
     id: "R001",
     version: "1.0.0",
     compatibility_epoch: 1,
     required_capabilities: ["edit_fragments"],
-    supported_sources: [...SOURCES],
     impact_kind: "critical_path_latency",
     default_mode: "enabled",
     aggregation_policy: "union",
@@ -64,7 +61,6 @@ const EXPECTED: RuleManifest[] = [
     version: "1.0.0",
     compatibility_epoch: 1,
     required_capabilities: [],
-    supported_sources: [...SOURCES],
     impact_kind: "critical_path_latency",
     default_mode: "enabled",
     aggregation_policy: "union",
@@ -76,7 +72,6 @@ const EXPECTED: RuleManifest[] = [
     version: "1.0.0",
     compatibility_epoch: 1,
     required_capabilities: [],
-    supported_sources: [...SOURCES],
     impact_kind: "critical_path_latency",
     default_mode: "enabled",
     aggregation_policy: "union",
@@ -88,7 +83,6 @@ const EXPECTED: RuleManifest[] = [
     version: "2.0.0",
     compatibility_epoch: 2,
     required_capabilities: [],
-    supported_sources: [...SOURCES],
     impact_kind: "policy_latency",
     default_mode: "observe_only",
     aggregation_policy: "never_aggregate",
@@ -100,7 +94,6 @@ const EXPECTED: RuleManifest[] = [
     version: "2.0.0",
     compatibility_epoch: 2,
     required_capabilities: ["tool_timestamps"],
-    supported_sources: [...SOURCES],
     impact_kind: "resource_cost",
     default_mode: "enabled",
     aggregation_policy: "max",
@@ -112,7 +105,6 @@ const EXPECTED: RuleManifest[] = [
     version: "2.0.0",
     compatibility_epoch: 2,
     required_capabilities: [],
-    supported_sources: [...SOURCES],
     impact_kind: "resource_cost",
     default_mode: "enabled",
     aggregation_policy: "max",
@@ -124,7 +116,6 @@ const EXPECTED: RuleManifest[] = [
     version: "1.0.0",
     compatibility_epoch: 1,
     required_capabilities: ["token_usage"],
-    supported_sources: [...SOURCES],
     impact_kind: "critical_path_latency",
     default_mode: "enabled",
     aggregation_policy: "max",
@@ -136,7 +127,6 @@ const EXPECTED: RuleManifest[] = [
     version: "1.0.0",
     compatibility_epoch: 1,
     required_capabilities: [],
-    supported_sources: [...SOURCES],
     impact_kind: "critical_path_latency",
     default_mode: "enabled",
     aggregation_policy: "union",
@@ -150,7 +140,6 @@ const FIELDS = [
   "version",
   "compatibility_epoch",
   "required_capabilities",
-  "supported_sources",
   "impact_kind",
   "default_mode",
   "aggregation_policy",
@@ -274,7 +263,6 @@ test("manifest list, lookup, and validator results cannot mutate the registry", 
   const first = listRuleManifests();
   first.reverse();
   first[0]?.required_capabilities.push("approvals");
-  first[0]?.supported_sources.reverse();
   const selected = ruleManifest("R001");
   selected.required_capabilities.length = 0;
   const validated = validateRuleManifestCatalog([...EXPECTED].reverse());
@@ -302,8 +290,9 @@ test("manifest validation fails closed with actionable deterministic codes", () 
   manifestError(invalid((value) => { value[0]!.version = "2.0.0"; }), "version_epoch_mismatch", 0, "compatibility_epoch");
   manifestError(invalid((value) => { value[0]!.required_capabilities = ["unknown"]; }), "invalid_capability", 0, "required_capabilities");
   manifestError(invalid((value) => { value[0]!.required_capabilities = ["approvals", "edit_fragments"]; }), "invalid_capability", 0, "required_capabilities");
-  manifestError(invalid((value) => { value[0]!.supported_sources = ["other"]; }), "invalid_source", 0, "supported_sources");
-  manifestError(invalid((value) => { value[0]!.supported_sources = ["codex", "claude"]; }), "invalid_source", 0, "supported_sources");
+  manifestError(invalid((value) => {
+    value[0]!.supported_sources = ["claude", "codex"];
+  }), "unknown_field", 0, "supported_sources");
   manifestError(invalid((value) => { value[0]!.impact_kind = "time"; }), "invalid_impact_kind", 0, "impact_kind");
   manifestError(invalid((value) => { value[0]!.default_mode = "on"; }), "invalid_mode", 0, "default_mode");
   manifestError(invalid((value) => { value[0]!.aggregation_policy = "average"; }), "invalid_aggregation_policy", 0, "aggregation_policy");
@@ -335,7 +324,7 @@ test("manifest validation fails closed for sparse, hidden, and trapped inputs", 
     }),
     (() => {
       const entry = catalog()[0]!;
-      Object.defineProperty(entry, "supported_sources", {
+      Object.defineProperty(entry, "required_capabilities", {
         configurable: true,
         enumerable: true,
         get() { throw new Error("token-secret getter trap"); },
@@ -387,7 +376,6 @@ test("manifest validation snapshots catalog and nested arrays without Proxy read
 
   for (const [field, code] of [
     ["required_capabilities", "invalid_capability"],
-    ["supported_sources", "invalid_source"],
   ] as const) {
     const value = catalog();
     const source = value[0]![field] as string[];
@@ -421,9 +409,6 @@ test("manifest validation snapshots catalog and nested arrays without Proxy read
 test("manifest validation rejects valid-looking deviations from every rule contract", () => {
   for (const [index, expected] of EXPECTED.entries()) {
     manifestError(invalid((value) => {
-      value[index]!.supported_sources = [];
-    }), "invalid_source", index, "supported_sources");
-    manifestError(invalid((value) => {
       value[index]!.impact_kind = "evidence_only";
     }), "invalid_impact_kind", index, "impact_kind");
     manifestError(invalid((value) => {
@@ -441,10 +426,10 @@ test("manifest validation rejects valid-looking deviations from every rule contr
 test("manifest validation snapshots accessor-backed inputs before returning them", () => {
   const value = catalog();
   let reads = 0;
-  Object.defineProperty(value[0]!, "supported_sources", {
+  Object.defineProperty(value[0]!, "required_capabilities", {
     configurable: true,
     enumerable: true,
-    get: () => reads++ === 0 ? ["claude", "codex"] : [],
+    get: () => reads++ === 0 ? ["edit_fragments"] : [],
   });
 
   assert.deepEqual(validateRuleManifestCatalog(value), EXPECTED);

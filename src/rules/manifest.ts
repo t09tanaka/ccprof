@@ -4,13 +4,11 @@ import {
   type RuleId,
   type SessionCapability,
 } from "../core/model.js";
-import type { SourceAdapterId } from "../core/source-descriptor.js";
 export interface RuleManifest {
   id: RuleId;
   version: string;
   compatibility_epoch: number;
   required_capabilities: SessionCapability[];
-  supported_sources: SourceAdapterId[];
   impact_kind: "critical_path_latency" | "resource_cost" | "policy_latency" | "evidence_only";
   default_mode: "enabled" | "observe_only" | "disabled";
   aggregation_policy: "sum" | "union" | "max" | "never_aggregate";
@@ -22,7 +20,7 @@ type ValidationCode =
   | "invalid_catalog" | "invalid_entry" | "missing_field" | "unknown_field"
   | "duplicate_id" | "invalid_rule_id" | "unknown_rule_id" | "missing_rule_id"
   | "invalid_version" | "invalid_epoch" | "version_epoch_mismatch"
-  | "invalid_capability" | "invalid_source" | "invalid_impact_kind"
+  | "invalid_capability" | "invalid_impact_kind"
   | "invalid_mode" | "invalid_aggregation_policy" | "invalid_evidence_schema"
   | "invalid_policy_risk";
 export class RuleManifestValidationError extends Error {
@@ -39,14 +37,12 @@ export class RuleManifestValidationError extends Error {
 const RULE_IDS = ["R001", "R002", "R003", "R004", "R005", "R006", "R007", "R008"] as const satisfies readonly RuleId[];
 const FIELDS = [
   "id", "version", "compatibility_epoch", "required_capabilities",
-  "supported_sources", "impact_kind", "default_mode", "aggregation_policy",
-  "evidence_schema", "policy_risk",
+  "impact_kind", "default_mode", "aggregation_policy", "evidence_schema",
+  "policy_risk",
 ] as const;
 const FIELD_SET = new Set<string>(FIELDS);
 const RULE_ID_SET = new Set<string>(RULE_IDS);
 const CAPABILITY_SET = new Set<string>(ALL_SESSION_CAPABILITIES);
-const SOURCE_IDS = ["claude", "codex"] as const;
-const SOURCE_SET = new Set<string>(SOURCE_IDS);
 const VERSION_PATTERN = /^([1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u;
 function fail(code: ValidationCode, index?: number, field?: string): never {
   throw new RuleManifestValidationError(code, index, field);
@@ -137,7 +133,7 @@ const RAW_CATALOG: RuleManifest[] = ROWS.map(([
   risk,
 ]) => ({
   id, version, compatibility_epoch: compatibilityEpoch,
-  required_capabilities: [...capabilities], supported_sources: [...SOURCE_IDS],
+  required_capabilities: [...capabilities],
   impact_kind: impact, default_mode: mode, aggregation_policy: aggregation,
   evidence_schema: `ccprof://rules/${id}/evidence/v${compatibilityEpoch}`,
   policy_risk: risk,
@@ -224,15 +220,6 @@ export function validateRuleManifestCatalog(value: unknown): RuleManifest[] {
       !sameList(requiredCapabilities, declared.required_capabilities)) {
       return fail("invalid_capability", index, "required_capabilities");
     }
-    const supportedSources = snapshotArrayValues(
-      entry.supported_sources,
-      () => fail("invalid_source", index, "supported_sources"),
-      () => fail("invalid_source", index, "supported_sources"),
-    );
-    if (!isCanonicalList(supportedSources, SOURCE_SET) ||
-      !sameList(supportedSources, declared.supported_sources)) {
-      return fail("invalid_source", index, "supported_sources");
-    }
     const impact = enumValue(entry.impact_kind,
       ["critical_path_latency", "resource_cost", "policy_latency", "evidence_only"],
       "invalid_impact_kind", index, "impact_kind");
@@ -261,7 +248,6 @@ export function validateRuleManifestCatalog(value: unknown): RuleManifest[] {
     return {
       id, version: entry.version as string, compatibility_epoch: epoch,
       required_capabilities: [...requiredCapabilities] as SessionCapability[],
-      supported_sources: [...supportedSources] as SourceAdapterId[],
       impact_kind: impact, default_mode: mode, aggregation_policy: aggregation,
       evidence_schema: entry.evidence_schema as string, policy_risk: risk,
     };
@@ -277,14 +263,12 @@ const BUILTIN_CATALOG = Object.freeze(
   validateRuleManifestCatalog(RAW_CATALOG).map((entry) => Object.freeze({
     ...entry,
     required_capabilities: Object.freeze(entry.required_capabilities),
-    supported_sources: Object.freeze(entry.supported_sources),
   })),
 );
 function clone(entry: (typeof BUILTIN_CATALOG)[number]): RuleManifest {
   return {
     ...entry,
     required_capabilities: [...entry.required_capabilities],
-    supported_sources: [...entry.supported_sources],
   };
 }
 export function listRuleManifests(): RuleManifest[] { return BUILTIN_CATALOG.map(clone); }

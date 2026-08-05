@@ -197,7 +197,6 @@ test("R006 v2 remains a history-only rule with full capability coverage", () => 
     version: "2.0.0",
     compatibility_epoch: 2,
     required_capabilities: [],
-    supported_sources: ["claude", "codex"],
     impact_kind: "resource_cost",
     default_mode: "enabled",
     aggregation_policy: "max",
