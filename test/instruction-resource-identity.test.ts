@@ -79,6 +79,18 @@ test("instruction-resource identities expose the exact frozen vocabularies", () 
   }
 });
 
+test("finding scope parser accepts every canonical identity exactly", () => {
+  for (const scope of Object.values(CANONICAL_FINDING_SCOPES)) {
+    assert.equal(parseFindingScope(scope), scope);
+  }
+});
+
+test("adoption method parser accepts every canonical identity exactly", () => {
+  for (const method of Object.values(CANONICAL_ADOPTION_METHODS)) {
+    assert.equal(parseAdoptionMethod(method), method);
+  }
+});
+
 test("finding scope identities normalize and project through the instruction resource", () => {
   assert.equal(
     normalizeFindingScopeIdentity(LEGACY_FINDING_SCOPES.claude_md),
