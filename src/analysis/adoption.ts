@@ -22,7 +22,7 @@ const OID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
  */
 export function findingFingerprint(
   finding: Pick<Finding, "rule_id" | "fix_recipe"> & {
-    scope: unknown;
+    scope: FindingScope | LegacyFindingScope;
     target?: string;
   },
 ): string {
