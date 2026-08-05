@@ -3349,13 +3349,32 @@ test("adoption Store authenticates legacy wire bytes before runtime normalizatio
       detected_at_ms: 1_000,
       evidence: { commit: "a".repeat(40), path: "CLAUDE.md" },
     };
-    const canonicalWire = {
+    const invalidWireIdentities = [
+      {
+        name: "canonical-scope",
+        scope: "instruction_resource",
+        method: "claude_md_edit",
+      },
+      {
+        name: "canonical-method",
+        scope: "claude_md",
+        method: "instruction_resource_edit",
+      },
+      { name: "scope-case", scope: "CLAUDE_MD", method: "claude_md_edit" },
+      { name: "scope-space", scope: " claude_md", method: "claude_md_edit" },
+      { name: "scope-nul", scope: "claude_md\0bad", method: "claude_md_edit" },
+      { name: "scope-unknown", scope: "unknown", method: "claude_md_edit" },
+      { name: "method-case", scope: "claude_md", method: "CLAUDE_MD_EDIT" },
+      { name: "method-space", scope: "claude_md", method: " claude_md_edit" },
+      { name: "method-nul", scope: "claude_md", method: "claude_md_edit\0bad" },
+      { name: "method-unknown", scope: "claude_md", method: "unknown" },
+    ].map(({ name, scope, method }) => ({
       ...legacy,
-      finding_key: "canonical-wire-rejected",
-      fingerprint: "fp-canonical-wire-rejected",
-      scope: "instruction_resource",
-      method: "instruction_resource_edit",
-    };
+      finding_key: `invalid-wire-${name}`,
+      fingerprint: `fp-invalid-wire-${name}`,
+      scope,
+      method,
+    }));
     const nonCanonical = {
       ...legacy,
       finding_key: "noncanonical-wire-rejected",
@@ -3366,11 +3385,13 @@ test("adoption Store authenticates legacy wire bytes before runtime normalizatio
       const insert = database.prepare(`INSERT INTO adoptions
         (finding_key, detected_at_ms, record_json) VALUES (?, ?, ?)`);
       insert.run(legacy.finding_key, legacy.detected_at_ms, canonicalJson(legacy));
-      insert.run(
-        canonicalWire.finding_key,
-        canonicalWire.detected_at_ms,
-        canonicalJson(canonicalWire),
-      );
+      for (const record of invalidWireIdentities) {
+        insert.run(
+          record.finding_key,
+          record.detected_at_ms,
+          canonicalJson(record),
+        );
+      }
       insert.run(
         nonCanonical.finding_key,
         nonCanonical.detected_at_ms,
@@ -3389,7 +3410,7 @@ test("adoption Store authenticates legacy wire bytes before runtime normalizatio
     })]);
     assert.equal(
       loaded.warnings.filter(({ code }) => code === "corrupt_adoptions").length,
-      2,
+      invalidWireIdentities.length + 1,
     );
   });
 });
@@ -3797,6 +3818,12 @@ test("non-canonical and mismatched SQLite records cannot disable healthy keys", 
         ...adoption("adoption-mismatch"),
         detected_at_ms: 3_000,
       }));
+      database.prepare(
+        "INSERT INTO adoptions(finding_key, detected_at_ms, record_json) VALUES (?, ?, ?)",
+      ).run("adoption-key-mismatch", 2_000, canonicalJson({
+        ...adoption("different-adoption-key"),
+        detected_at_ms: 2_000,
+      }));
       const noncanonicalAdoption = adoption("adoption-noncanonical");
       database.prepare(
         "INSERT INTO adoptions(finding_key, detected_at_ms, record_json) VALUES (?, ?, ?)",
@@ -3811,7 +3838,10 @@ test("non-canonical and mismatched SQLite records cannot disable healthy keys", 
     assert.deepEqual(dismissals.records, [healthyDismissal]);
     assert.ok(dismissals.warnings.some(({ code }) => code === "corrupt_dismissals"));
     assert.deepEqual(adoptions.records, [healthyAdoption]);
-    assert.ok(adoptions.warnings.some(({ code }) => code === "corrupt_adoptions"));
+    assert.equal(
+      adoptions.warnings.filter(({ code }) => code === "corrupt_adoptions").length,
+      3,
+    );
   });
 });
 
