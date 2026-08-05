@@ -9,6 +9,7 @@
 import { types as utilTypes } from "node:util";
 
 import type { EventIdentity } from "./event-identity.js";
+import type { ProducerId } from "./source-identity.js";
 import type { SourceDescriptor } from "./source-descriptor.js";
 import type { AnalysisBudgetResult } from "../analysis/budgets.js";
 
@@ -196,7 +197,7 @@ export type NormalizedEvent =
 
 export interface Session {
   session_id: string;
-  source: "claude" | "codex";
+  source: ProducerId;
   source_path: string;
   observed_cwds: string[];
   observed_branches: string[];
