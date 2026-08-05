@@ -527,6 +527,22 @@ test("published Report v3 schema accepts canonical identities with legacy compat
     assertValid(report, `scope ${scope}`);
   }
 
+  const sourceAdapterIdAtMaxLength = [
+    "a.a",
+    "a".repeat(64),
+    "b".repeat(64),
+    "c".repeat(64),
+    "d".repeat(56),
+  ].join("/");
+  const sourceAdapterIdOverMaxLength = [
+    "a.a",
+    "a".repeat(64),
+    "b".repeat(64),
+    "c".repeat(64),
+    "d".repeat(57),
+  ].join("/");
+  assert.equal(sourceAdapterIdAtMaxLength.length, 255);
+  assert.equal(sourceAdapterIdOverMaxLength.length, 256);
   for (const adapterId of [
     "claude",
     "codex",
@@ -534,23 +550,20 @@ test("published Report v3 schema accepts canonical identities with legacy compat
     "ccprof.dev/adapters/claude",
     "dev.example.agent/adapters/dummy-agent",
     "ccprof.dev/adapters/claude/v1",
+    sourceAdapterIdAtMaxLength,
   ]) {
     const report = reportV3Fixture();
     fixtureSource(report).adapter_id = adapterId;
     assertValid(report, `adapter ${adapterId}`);
   }
 
-  const overlongAdapterId = `a.a/${Array.from(
-    { length: 4 },
-    () => "a".repeat(64),
-  ).join("/")}`;
   for (const adapterId of [
     "CCprof.dev/adapters/claude",
     "ccprof.dev/adapters/Claude",
     "ccprof..dev/adapters/claude",
     "ccprof.dev//adapters/claude",
     "ccprof.dev/adapters/",
-    overlongAdapterId,
+    sourceAdapterIdOverMaxLength,
   ]) {
     const report = reportV3Fixture();
     fixtureSource(report).adapter_id = adapterId;
@@ -565,9 +578,14 @@ test("published Report v3 schema accepts canonical identities with legacy compat
     "edit_fragments",
     "approvals",
   ];
+  const capabilityAtMaxLength = `a.a/capabilities/${"a".repeat(238)}`;
+  const capabilityOverMaxLength = `a.a/capabilities/${"a".repeat(239)}`;
+  assert.equal(capabilityAtMaxLength.length, 255);
+  assert.equal(capabilityOverMaxLength.length, 256);
   const canonicalCapabilities = [
     "ccprof.dev/capabilities/tool_timestamps",
     "dev.example.agent/capabilities/dummy-agent",
+    capabilityAtMaxLength,
   ];
   for (const capabilities of [legacyCapabilities, canonicalCapabilities]) {
     for (const location of ["source", "coverage"] as const) {
@@ -581,7 +599,6 @@ test("published Report v3 schema accepts canonical identities with legacy compat
     }
   }
 
-  const overlongCapability = `a.a/capabilities/${"a".repeat(240)}`;
   for (const capability of [
     "unknown_capability",
     "CCprof.dev/capabilities/tool_timestamps",
@@ -591,7 +608,7 @@ test("published Report v3 schema accepts canonical identities with legacy compat
     "ccprof.dev/not-capabilities/tool_timestamps",
     "ccprof.dev/capabilities/",
     "ccprof.dev/capabilities/tool_timestamps/extra",
-    overlongCapability,
+    capabilityOverMaxLength,
   ]) {
     for (const location of ["source", "coverage"] as const) {
       const report = reportV3Fixture();
