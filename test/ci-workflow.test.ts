@@ -291,6 +291,41 @@ test("existing named checks and CodeQL use Node 24", async () => {
   }
 });
 
+test("package smoke installs and consumes the adapter SDK without regressing CLI or deep imports", async () => {
+  const workflow = await readProjectFile(".github/workflows/ci.yml");
+  const packageSmoke = job(workflow, "package-smoke");
+
+  assert.match(
+    packageSmoke,
+    /npm pack --pack-destination "\$RUNNER_TEMP\/ccprof-pack"/u,
+  );
+  assert.match(
+    packageSmoke,
+    /npm install --global --prefix "\$RUNNER_TEMP\/ccprof-prefix"/u,
+  );
+  assert.match(packageSmoke, /ccprof-prefix\/bin\/ccprof" --version/u);
+  assert.match(packageSmoke, /ccprof-prefix\/bin\/ccprof" --help/u);
+
+  assert.match(packageSmoke, /mkdir -p "\$RUNNER_TEMP\/ccprof-consumer"/u);
+  assert.match(packageSmoke, /cd "\$RUNNER_TEMP\/ccprof-consumer"/u);
+  assert.match(packageSmoke, /npm init --yes/u);
+  assert.match(
+    packageSmoke,
+    /npm install "\$RUNNER_TEMP\/ccprof-pack"\/\*\.tgz/u,
+  );
+  assert.match(packageSmoke, /import\(["']ccprof\/adapter-sdk["']\)/u);
+  assert.match(packageSmoke, /adapter-sdk-smoke\.mts/u);
+  assert.match(packageSmoke, /from ["']ccprof\/adapter-sdk["']/u);
+  assert.match(
+    packageSmoke,
+    /node_modules\/\.bin\/tsc["']? --noEmit --strict[\s\S]*--module NodeNext/u,
+  );
+  assert.match(
+    packageSmoke,
+    /import\(["']ccprof\/dist\/protocol\/capability-descriptor\.js["']\)/u,
+  );
+});
+
 test("the native addon smoke is portable and closes its in-memory database", async () => {
   const smoke = await readProjectFile("tools/smoke-better-sqlite3.cjs");
   assert.match(smoke, /require\(["']better-sqlite3["']\)/u);
